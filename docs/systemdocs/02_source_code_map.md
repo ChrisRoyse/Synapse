@@ -23,7 +23,7 @@ Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `ru
 | MCP / HTTP | `rmcp` 1.7 (server, stdio, streamable-http, macros, schemars), `axum` 0.8 (ws), `hyper`, `tower`, `reqwest` |
 | Serialization | `serde`, `serde_json`, `toml`, `schemars`, `base64` |
 | Storage | Calyx vault, `calyx-aster`, `fs2` |
-| Windows platform | `windows` 0.62 (Win32 Foundation/UI/Graphics/Media OCR/etc.), `windows-capture`, `uiautomation` 0.25 |
+| Windows platform | `windows` 0.62 (Win32 Foundation/UI/GDI/DWM/Media OCR/etc.), `uiautomation` 0.25 |
 | Browser/CDP | `chromiumoxide` 0.9 |
 | Input/HID | `enigo`, `vigem-client`, `arboard` (clipboard), `x11rb` (non-Windows) |
 | ML / audio | `ort` 2.0-rc (ONNX Runtime), `wasapi` |
@@ -133,11 +133,11 @@ crates/synapse-a11y/src/platform/windows/window.rs   # HWND enumeration / foregr
 `benches/` targets were removed repo-wide by D1 policy.
 
 ### crates/synapse-capture
-Screen/window capture (Windows Graphics Capture + DXGI fallback), DPI, coordinate mapping. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.
+Windows visible-surface screen/window capture through GDI `BitBlt`, owned BGRA buffers, DPI, and coordinate mapping. It deliberately has no WGC/DXGI fallback; GDI may still be accelerated internally by Windows or the display driver. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.
 
 ```
 crates/synapse-capture/src/lib.rs            # crate root; CaptureController, capture-loop spawn, target resolve
-crates/synapse-capture/src/backend.rs        # CaptureBackend preference + DXGI fallback decision
+crates/synapse-capture/src/backend.rs        # GDI backend policy + typed refusal of explicit-GPU requests
 crates/synapse-capture/src/bitmap.rs         # screen_region_to_bgra_bitmap + WinRT SoftwareBitmap helpers
 crates/synapse-capture/src/config.rs         # CaptureConfig / CaptureTarget / ResolvedCaptureTarget
 crates/synapse-capture/src/controller.rs     # capture loop controller + metrics registration
@@ -145,17 +145,16 @@ crates/synapse-capture/src/coords.rs         # coordinate transforms
 crates/synapse-capture/src/dpi.rs            # DPI awareness init + scaling
 crates/synapse-capture/src/error.rs          # capture errors
 crates/synapse-capture/src/frame.rs          # captured frame buffer type
-crates/synapse-capture/src/stats.rs          # CaptureStats, thread-priority knobs
+crates/synapse-capture/src/stats.rs          # frame/readback stats + terminal worker state
 crates/synapse-capture/src/platform/mod.rs           # platform dispatch
 crates/synapse-capture/src/platform/non_windows.rs   # off-Windows stub
-crates/synapse-capture/src/platform/windows/bitmap.rs   # Windows bitmap conversion
-crates/synapse-capture/src/platform/windows/capture.rs  # WGC / DXGI frame grab
+crates/synapse-capture/src/platform/windows/bitmap.rs   # GDI BitBlt/explicit bounded-worker PrintWindow bitmap paths
+crates/synapse-capture/src/platform/windows/capture.rs  # demand-driven GDI frame loop
 crates/synapse-capture/src/platform/windows/common.rs   # shared Win32 helpers
 crates/synapse-capture/src/platform/windows/coords.rs   # window-to-screen coordinate math
 crates/synapse-capture/src/platform/windows/dpi.rs      # per-monitor DPI
-crates/synapse-capture/src/platform/windows/target.rs   # HWND/monitor capture target
+crates/synapse-capture/src/platform/windows/target.rs   # visible-window/monitor target validation
 ```
-`benches/capture_loop.rs`.
 
 ### crates/synapse-perception
 Assembles observations from capture + a11y + OCR + object detection + HUD/template reads. Depends on `synapse-a11y`, `synapse-capture`, `synapse-core`.
@@ -295,14 +294,14 @@ crates/synapse-profiles/src/package/validation.rs # package permission/signature
 Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-models
-ONNX model registry, download, verification (sha256), ORT session loading (DirectML EP). Depends on `synapse-core`.
+ONNX model registry, download, verification (sha256), and ORT CPU-session loading. The installed daemon has no CUDA or DirectML execution provider. Depends on `synapse-core`.
 
 ```
 crates/synapse-models/src/lib.rs       # Detector trait, DetectionFrame/DetectOpts, registry exports
 crates/synapse-models/src/registry.rs   # registered models (RT-DETRv2-S COCO), class map, defaults
 crates/synapse-models/src/download.rs   # ModelDescriptor + model download/dir resolution
 crates/synapse-models/src/session.rs    # ModelLoader / ORT session factory + LoadedModel
-crates/synapse-models/src/ep.rs         # execution-provider order (DirectML/CPU)
+crates/synapse-models/src/ep.rs         # CPU default/provider; typed CUDA refusal unless separately feature-compiled
 crates/synapse-models/src/verify.rs     # sha256_file / digest normalization
 crates/synapse-models/src/error.rs      # model errors
 ```

@@ -1,7 +1,7 @@
 mod detection;
 pub(crate) use detection::{
     detection_bundle_readback, run_detection_worker_from_cli,
-    run_detection_worker_from_process_args,
+    run_detection_worker_from_process_args, validate_detection_backend_policy,
 };
 mod ocr;
 mod search;
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use synapse_capture::{
     CAPTURE_CHANNEL_CAPACITY, CaptureBackend, CaptureConfig, CaptureController, CaptureTarget,
-    CaptureThreadPriority, resolve_capture_target,
+    CaptureThreadPriority, MAX_CAPTURE_INTERVAL_MS, MIN_CAPTURE_INTERVAL_MS,
+    NO_EXPLICIT_GPU_API_CAPTURE_BACKEND, resolve_capture_target,
 };
 use synapse_core::{
     AccessibleNode, CaptureRuntimeReadback, ElementId, FocusedElement, ForegroundContext,
@@ -44,8 +45,7 @@ use sources::{
 };
 
 pub type SharedM1State = Arc<Mutex<M1State>>;
-const MIN_CAPTURE_UPDATE_INTERVAL_MS: u64 = 16;
-const MIN_CAPTURE_UPDATE_INTERVAL_MS_U32: u32 = 16;
+const MIN_CAPTURE_UPDATE_INTERVAL_MS: u64 = MIN_CAPTURE_INTERVAL_MS;
 
 #[derive(Debug)]
 pub struct M1State {
@@ -123,9 +123,7 @@ impl M1State {
                 ),
                 generation: self.capture_controller.generation(),
                 min_update_interval_ms: Some(
-                    u32::try_from(self.capture_config.min_update_interval_ms)
-                        .unwrap_or(u32::MAX)
-                        .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
+                    u32::try_from(self.capture_config.min_update_interval_ms).unwrap_or(u32::MAX),
                 ),
                 cursor_visible: Some(self.capture_config.cursor_visible),
                 dirty_region_only: Some(self.capture_config.dirty_region_only),
@@ -138,14 +136,24 @@ impl M1State {
                 channel_capacity: CAPTURE_CHANNEL_CAPACITY,
                 thread_priority: None,
                 stop_requested: false,
+                worker_finished: false,
+                terminal_error_code: None,
+                terminal_error_message: None,
             };
         };
 
         let stats = handle.stats();
+        let terminal_error = stats.terminal_error();
         let active_config = handle.config();
         let latest_frame = stats.latest_frame();
         CaptureRuntimeReadback {
-            status: "running".to_owned(),
+            status: if terminal_error.is_some() {
+                "failed".to_owned()
+            } else if stats.worker_finished() {
+                "stopped".to_owned()
+            } else {
+                "running".to_owned()
+            },
             target: Some(observation_target_from_capture_target(
                 &handle.target().target,
             )),
@@ -155,9 +163,7 @@ impl M1State {
             selected_backend: Some(capture_backend_name(handle.target().backend).to_owned()),
             generation: self.capture_controller.generation(),
             min_update_interval_ms: Some(
-                u32::try_from(active_config.min_update_interval_ms)
-                    .unwrap_or(u32::MAX)
-                    .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
+                u32::try_from(active_config.min_update_interval_ms).unwrap_or(u32::MAX),
             ),
             cursor_visible: Some(active_config.cursor_visible),
             dirty_region_only: Some(active_config.dirty_region_only),
@@ -170,6 +176,9 @@ impl M1State {
             channel_capacity: handle.channel_capacity(),
             thread_priority: Some(capture_thread_priority_name(stats.thread_priority())),
             stop_requested: handle.is_stop_requested(),
+            worker_finished: stats.worker_finished(),
+            terminal_error_code: terminal_error.as_ref().map(|error| error.code.clone()),
+            terminal_error_message: terminal_error.map(|error| error.message),
         }
     }
 }
@@ -544,16 +553,18 @@ pub struct CaptureGifParams {
     /// Total recording window in milliseconds (default 3000, max 60000).
     #[serde(default)]
     pub duration_ms: Option<u64>,
-    /// Delay between captured frames in milliseconds (default 500, min 100).
+    /// Delay between captured frames in milliseconds (default 500, min 250).
     #[serde(default)]
+    #[schemars(range(min = 250))]
     pub interval_ms: Option<u64>,
     /// Window HWND to record. Defaults to this session's bound target window.
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Downscale (aspect-preserving) so each frame's longest edge never exceeds
-    /// this. Default 800; set 0 to disable.
+    /// this. Default 800; accepted range 1..=2048.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 2048))]
     pub max_long_edge: Option<u32>,
     #[serde(default)]
     pub overwrite: bool,
@@ -1067,6 +1078,7 @@ pub struct HiddenDesktopPipFrameResponse {
 pub struct SetCaptureTargetParams {
     pub target: CaptureTargetParam,
     #[serde(default)]
+    #[schemars(range(min = 250, max = 60_000))]
     pub min_update_interval_ms: Option<u64>,
     #[serde(default)]
     pub cursor_visible: Option<bool>,
@@ -4818,7 +4830,7 @@ pub fn set_capture_target_in_state(
     let mut config = state.capture_config.clone();
     config.target = capture_target_from_param(params.target)?;
     if let Some(interval) = params.min_update_interval_ms {
-        config.min_update_interval_ms = clamp_capture_interval(interval);
+        config.min_update_interval_ms = validate_capture_interval(interval)?;
     }
     if let Some(cursor_visible) = params.cursor_visible {
         config.cursor_visible = cursor_visible;
@@ -4879,12 +4891,8 @@ pub fn apply_profile_runtime_config_in_state(
     state.detection_config = detection_config;
 
     let mut config = state.capture_config.clone();
-    config.min_update_interval_ms = u64::from(
-        profile
-            .capture
-            .min_update_interval_ms
-            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
-    );
+    config.min_update_interval_ms =
+        validate_capture_interval(u64::from(profile.capture.min_update_interval_ms))?;
     config.cursor_visible = profile.capture.cursor_visible;
     if let Some(target) = capture_target_from_profile_target(&profile.capture.target) {
         config.target = target;
@@ -5042,9 +5050,7 @@ fn observation_capture_from_capture_config(
 ) -> ObservationCaptureConfig {
     ObservationCaptureConfig {
         target: observation_target_from_capture_target(&config.target),
-        min_update_interval_ms: u32::try_from(config.min_update_interval_ms)
-            .unwrap_or(u32::MAX)
-            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
+        min_update_interval_ms: u32::try_from(config.min_update_interval_ms).unwrap_or(u32::MAX),
         cursor_visible: config.cursor_visible,
         dirty_region_only: config.dirty_region_only,
         generation,
@@ -5060,9 +5066,7 @@ fn observation_capture_from_profile_capture(
 ) -> ObservationCaptureConfig {
     ObservationCaptureConfig {
         target: observation_target_from_profile_target(&capture.target),
-        min_update_interval_ms: capture
-            .min_update_interval_ms
-            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
+        min_update_interval_ms: capture.min_update_interval_ms,
         cursor_visible: capture.cursor_visible,
         dirty_region_only,
         generation,
@@ -5117,12 +5121,16 @@ fn capture_config_without_generation_eq(
         && left.source == right.source
 }
 
-const fn clamp_capture_interval(interval_ms: u64) -> u64 {
-    if interval_ms < MIN_CAPTURE_UPDATE_INTERVAL_MS {
-        MIN_CAPTURE_UPDATE_INTERVAL_MS
-    } else {
-        interval_ms
+fn validate_capture_interval(interval_ms: u64) -> Result<u64, ErrorData> {
+    if !(MIN_CAPTURE_UPDATE_INTERVAL_MS..=MAX_CAPTURE_INTERVAL_MS).contains(&interval_ms) {
+        return Err(mcp_error(
+            error_codes::CAPTURE_UNSUPPORTED_SEMANTICS,
+            format!(
+                "min_update_interval_ms={interval_ms} is outside the CPU/GDI low-CPU policy range {MIN_CAPTURE_UPDATE_INTERVAL_MS}..={MAX_CAPTURE_INTERVAL_MS}"
+            ),
+        ));
     }
+    Ok(interval_ms)
 }
 
 fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget, ErrorData> {
@@ -5177,8 +5185,7 @@ const fn capture_target_wire(target: &CaptureTarget) -> CaptureTargetWire {
 
 const fn capture_backend_name(backend: CaptureBackend) -> &'static str {
     match backend {
-        CaptureBackend::GraphicsCaptureApi => "graphics_capture_api",
-        CaptureBackend::DxgiDuplication => "dxgi_duplication",
+        CaptureBackend::GdiBitBlt => NO_EXPLICIT_GPU_API_CAPTURE_BACKEND,
     }
 }
 

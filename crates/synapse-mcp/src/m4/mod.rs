@@ -49,6 +49,15 @@ const SW_HIDE: u16 = 0;
 #[cfg(windows)]
 const SW_SHOWNOACTIVATE: u16 = 4;
 const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 120_000;
+/// Decimal process-private ceiling promised by the lightweight Synapse
+/// runtime. The installed Windows job object is the kernel backstop; this
+/// pre-trigger check provides an actionable refusal before a child is spawned.
+const SYNAPSE_PROCESS_HARD_LIMIT_BYTES: u64 = synapse_core::SYNAPSE_PROCESS_HARD_LIMIT_BYTES;
+/// Largest integer exactly representable by the f64 ratios consumed by the
+/// frozen resource-headroom lens. The writer enforces the decoder's domain so
+/// a command cannot execute and only later discover that its prestate is
+/// unmeasurable.
+const SHELL_RESOURCE_MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 pub const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u64 = 60_000;
 const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
@@ -16013,6 +16022,7 @@ fn shell_precondition_snapshot(
     command: &str,
     args: &[String],
 ) -> Result<Value, ErrorData> {
+    let resource_prestate = shell_resource_prestate(effective_working_dir)?;
     let mut env = child_base_environment();
     ensure_child_temp_environment(&mut env);
     apply_requested_shell_environment(&mut env, requested_env);
@@ -16056,8 +16066,8 @@ fn shell_precondition_snapshot(
         })
         .collect();
     Ok(json!({
-        "schema_version": 2,
-        "source_of_truth": "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata",
+        "schema_version": 3,
+        "source_of_truth": "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata + queried immediate Windows Job aggregate committed memory + OS process-private commit/working-set telemetry/system-memory/target-volume counters",
         "platform": if cfg!(windows) { "windows" } else { "non_windows" },
         "delivered_environment_count": delivered.len(),
         "required_environment_count": if cfg!(windows) { REQUIRED_CHILD_ENVIRONMENT_KEYS.len() } else { 0 },
@@ -16071,8 +16081,413 @@ fn shell_precondition_snapshot(
         "executable_resolution": executable.state,
         "executable_resolution_source": executable.source,
         "resolved_path_sha256": executable.resolved_path_sha256,
+        "resource_prestate": resource_prestate,
         "secret_values_persisted": false,
     }))
+}
+
+fn shell_resource_prestate(effective_working_dir: Option<&str>) -> Result<Value, ErrorData> {
+    let job_memory = shell_job_memory_snapshot()?;
+    let private_bytes = synapse_calyx::process_private_bytes().map_err(|error| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell resource precondition could not read process private commit: {error}"),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "process_private_commit_probe_failed",
+                "remediation": "Repair the host process-memory counter before retrying; Synapse refuses to execute without an authoritative private-commit reading.",
+            }),
+        )
+    })?;
+    let working_set_bytes = synapse_calyx::process_working_set_bytes().map_err(|error| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell resource precondition could not read process working set: {error}"),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "process_working_set_probe_failed",
+                "remediation": "Repair the host process-memory counter before retrying; Synapse refuses to persist a partial resource snapshot.",
+            }),
+        )
+    })?;
+    let system = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing()
+            .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
+    );
+    let system_total_memory_bytes = system.total_memory();
+    let system_available_memory_bytes = system.available_memory();
+    if system_total_memory_bytes == 0 || system_available_memory_bytes > system_total_memory_bytes {
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell resource precondition received an invalid system-memory snapshot",
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "system_memory_probe_invalid",
+                "total_bytes": system_total_memory_bytes,
+                "available_bytes": system_available_memory_bytes,
+                "remediation": "Repair the OS memory-status provider; Synapse refuses to execute with missing or contradictory system-memory state.",
+            }),
+        ));
+    }
+
+    let (volume_probe_path, target_volume_probe_class) = match effective_working_dir {
+        Some(path) => (PathBuf::from(path), "effective_working_directory"),
+        None => (
+            std::env::current_dir().map_err(|error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("act_run_shell resource precondition could not read the daemon current directory: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "resource_volume_current_directory_failed",
+                        "os_error": error.raw_os_error(),
+                        "remediation": "Restore an accessible daemon current directory before retrying.",
+                    }),
+                )
+            })?,
+            "daemon_current_directory",
+        ),
+    };
+    let target_volume_total_bytes = fs2::total_space(&volume_probe_path).map_err(|error| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell resource precondition could not read target-volume capacity: {error}"),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "target_volume_total_probe_failed",
+                "probe_path_class": target_volume_probe_class,
+                "os_error": error.raw_os_error(),
+                "remediation": "Restore the requested working directory and its volume, then retry.",
+            }),
+        )
+    })?;
+    let target_volume_available_bytes =
+        fs2::available_space(&volume_probe_path).map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("act_run_shell resource precondition could not read target-volume free space: {error}"),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "reason": "target_volume_available_probe_failed",
+                    "probe_path_class": target_volume_probe_class,
+                    "os_error": error.raw_os_error(),
+                    "remediation": "Restore the requested working directory and its volume, then retry.",
+                }),
+            )
+        })?;
+    if target_volume_total_bytes == 0 || target_volume_available_bytes > target_volume_total_bytes {
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell resource precondition received an invalid target-volume snapshot",
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "target_volume_probe_invalid",
+                "probe_path_class": target_volume_probe_class,
+                "total_bytes": target_volume_total_bytes,
+                "available_bytes": target_volume_available_bytes,
+                "remediation": "Repair the target volume or filesystem capacity provider before retrying.",
+            }),
+        ));
+    }
+    let exact_resource_counters = [
+        job_memory.current_bytes,
+        job_memory.limit_bytes,
+        job_memory.headroom_bytes,
+        job_memory.peak_bytes,
+        private_bytes,
+        working_set_bytes,
+        SYNAPSE_PROCESS_HARD_LIMIT_BYTES.saturating_sub(private_bytes),
+        system_total_memory_bytes,
+        system_available_memory_bytes,
+        target_volume_total_bytes,
+        target_volume_available_bytes,
+    ];
+    if exact_resource_counters
+        .into_iter()
+        .any(|value| value > SHELL_RESOURCE_MAX_EXACT_F64_INT)
+    {
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell resource precondition exceeds the frozen exact-f64 integer domain",
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "resource_counter_exact_f64_bound_exceeded",
+                "max_exact_integer": SHELL_RESOURCE_MAX_EXACT_F64_INT,
+                "job_memory_bytes": job_memory.current_bytes,
+                "job_memory_limit_bytes": job_memory.limit_bytes,
+                "job_memory_headroom_bytes": job_memory.headroom_bytes,
+                "job_peak_memory_bytes": job_memory.peak_bytes,
+                "process_private_bytes": private_bytes,
+                "process_working_set_bytes": working_set_bytes,
+                "system_total_memory_bytes": system_total_memory_bytes,
+                "system_available_memory_bytes": system_available_memory_bytes,
+                "target_volume_total_bytes": target_volume_total_bytes,
+                "target_volume_available_bytes": target_volume_available_bytes,
+                "remediation": "Version the resource lens with a bounded logarithmic integer encoding before executing on a host whose authoritative counter exceeds 2^53-1; the current lens refuses lossy conversion.",
+            }),
+        ));
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "source_of_truth": "queried immediate Windows Job class-28 current/peak committed memory + exact kill-on-close/process-memory/job-memory extended-limit contract + OS process-private commit and working-set telemetry counters + OS system-memory counter + target-volume filesystem capacity counter",
+        "job_memory_bytes": job_memory.current_bytes,
+        "job_memory_limit_bytes": job_memory.limit_bytes,
+        "job_memory_headroom_bytes": job_memory.headroom_bytes,
+        "job_peak_memory_bytes": job_memory.peak_bytes,
+        "job_limit_flags": job_memory.limit_flags,
+        "process_private_bytes": private_bytes,
+        "process_working_set_bytes": working_set_bytes,
+        "process_private_limit_bytes": SYNAPSE_PROCESS_HARD_LIMIT_BYTES,
+        "process_private_headroom_bytes": SYNAPSE_PROCESS_HARD_LIMIT_BYTES.saturating_sub(private_bytes),
+        "system_total_memory_bytes": system_total_memory_bytes,
+        "system_available_memory_bytes": system_available_memory_bytes,
+        "target_volume_total_bytes": target_volume_total_bytes,
+        "target_volume_available_bytes": target_volume_available_bytes,
+        "target_volume_probe_class": target_volume_probe_class,
+        "gpu_measurement_required": false,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct ShellJobMemorySnapshot {
+    current_bytes: u64,
+    limit_bytes: u64,
+    headroom_bytes: u64,
+    peak_bytes: u64,
+    limit_flags: u32,
+}
+
+#[cfg(windows)]
+fn shell_job_memory_snapshot() -> Result<ShellJobMemorySnapshot, ErrorData> {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, JobObjectReserved11Information,
+        QueryInformationJobObject,
+    };
+
+    // Windows exposes information class 28 as reserved in the public SDK, but
+    // the kernel ABI (also consumed by Microsoft's hcsshim) is exactly these
+    // two u64 counters: current and peak committed memory for the Job.  Do not
+    // substitute the similarly named violation-information class: its memory
+    // field is only defined for a notification event and is not a live value.
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(non_snake_case)]
+    struct JobObjectMemoryUsageInformation {
+        JobMemory: u64,
+        PeakJobMemoryUsed: u64,
+    }
+
+    let internal_error = |reason: &'static str, detail: String| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell could not verify its aggregate Windows Job memory contract: {detail}"
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": reason,
+                "detail": detail,
+                "remediation": "Reinstall the repo-built daemon so the setup-owned supervisor assigns it to the bounded Windows Job before resume; Synapse refuses process execution without kernel Job readback.",
+            }),
+        )
+    };
+    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+        .map_err(|error| internal_error("job_limit_size_conversion_failed", error.to_string()))?;
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let mut returned_limit_bytes = 0_u32;
+    unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            limit_size,
+            Some(&raw mut returned_limit_bytes),
+        )
+    }
+    .map_err(|error| internal_error("current_process_job_limit_query_failed", error.to_string()))?;
+    if returned_limit_bytes != limit_size {
+        return Err(internal_error(
+            "current_process_job_limit_readback_size_mismatch",
+            format!("returned={returned_limit_bytes} expected={limit_size}"),
+        ));
+    }
+    let expected_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_JOB_MEMORY;
+    let limit_flags = limits.BasicLimitInformation.LimitFlags;
+    if limit_flags != expected_flags {
+        return Err(internal_error(
+            "current_process_job_limit_flags_mismatch",
+            format!(
+                "actual=0x{:x} expected_exact=0x{:x}",
+                limit_flags.0, expected_flags.0
+            ),
+        ));
+    }
+    let limit_bytes = u64::try_from(limits.JobMemoryLimit)
+        .map_err(|error| internal_error("job_memory_limit_conversion_failed", error.to_string()))?;
+    let process_limit_bytes = u64::try_from(limits.ProcessMemoryLimit).map_err(|error| {
+        internal_error("process_memory_limit_conversion_failed", error.to_string())
+    })?;
+    let extended_peak_bytes = u64::try_from(limits.PeakJobMemoryUsed)
+        .map_err(|error| internal_error("job_peak_memory_conversion_failed", error.to_string()))?;
+    if limit_bytes != SYNAPSE_PROCESS_HARD_LIMIT_BYTES
+        || process_limit_bytes != SYNAPSE_PROCESS_HARD_LIMIT_BYTES
+    {
+        return Err(internal_error(
+            "job_committed_memory_limits_mismatch",
+            format!(
+                "job_memory={limit_bytes} process_memory={process_limit_bytes} expected_job_process_committed_private_max={SYNAPSE_PROCESS_HARD_LIMIT_BYTES}"
+            ),
+        ));
+    }
+
+    let usage_size = u32::try_from(std::mem::size_of::<JobObjectMemoryUsageInformation>())
+        .map_err(|error| {
+            internal_error("job_memory_usage_size_conversion_failed", error.to_string())
+        })?;
+    let mut usage = JobObjectMemoryUsageInformation::default();
+    let mut returned_usage_bytes = 0_u32;
+    unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectReserved11Information,
+            (&raw mut usage).cast(),
+            usage_size,
+            Some(&raw mut returned_usage_bytes),
+        )
+    }
+    .map_err(|error| {
+        internal_error("current_process_job_memory_query_failed", error.to_string())
+    })?;
+    if returned_usage_bytes != usage_size {
+        return Err(internal_error(
+            "current_process_job_memory_readback_size_mismatch",
+            format!("returned={returned_usage_bytes} expected={usage_size}"),
+        ));
+    }
+    if usage.PeakJobMemoryUsed < extended_peak_bytes {
+        return Err(internal_error(
+            "current_process_job_memory_peak_regressed",
+            format!(
+                "memory_usage_information_peak={} extended_limit_information_earlier_peak={extended_peak_bytes}",
+                usage.PeakJobMemoryUsed
+            ),
+        ));
+    }
+    let current_bytes = usage.JobMemory;
+    let peak_bytes = usage.PeakJobMemoryUsed;
+    if peak_bytes < current_bytes {
+        return Err(internal_error(
+            "current_process_job_memory_bounds_invalid",
+            format!("current={current_bytes} peak={peak_bytes} limit={limit_bytes}"),
+        ));
+    }
+    let headroom_bytes = limit_bytes.saturating_sub(current_bytes);
+    Ok(ShellJobMemorySnapshot {
+        current_bytes,
+        limit_bytes,
+        headroom_bytes,
+        peak_bytes,
+        limit_flags: limit_flags.0,
+    })
+}
+
+#[cfg(not(windows))]
+fn shell_job_memory_snapshot() -> Result<ShellJobMemorySnapshot, ErrorData> {
+    Err(shell_tool_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        "act_run_shell cannot verify the required aggregate Job memory limit on this platform",
+        json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "reason": "aggregate_job_memory_unsupported_platform",
+            "remediation": "Add and physically verify an equivalent cgroup/resource-controller aggregate memory contract before enabling shell execution; process-only accounting is not accepted as a fallback.",
+        }),
+    ))
+}
+
+/// Returns the fail-closed execution refusal implied by an already captured
+/// resource snapshot. The snapshot is deliberately constructed first so a
+/// resource-caused outcome can be durably associated with its exact
+/// point-in-time cause instead of disappearing into a generic denied audit.
+///
+/// Probe failures never reach this function: they remain typed measurement
+/// errors, and no missing counter is replaced by zero or another sentinel.
+pub fn shell_precondition_resource_refusal(
+    preconditions: &Value,
+) -> Result<Option<ErrorData>, ErrorData> {
+    let invalid = |field: &'static str| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell resource precondition snapshot is missing or invalid at {field}"
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "resource_snapshot_internal_contract_invalid",
+                "field": field,
+                "remediation": "Preserve the action-log evidence and repair the versioned resource snapshot writer before allowing process execution.",
+            }),
+        )
+    };
+    let resource = preconditions
+        .get("resource_prestate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("resource_prestate"))?;
+    let private_bytes = resource
+        .get("process_private_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("resource_prestate.process_private_bytes"))?;
+    let working_set_bytes = resource
+        .get("process_working_set_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("resource_prestate.process_working_set_bytes"))?;
+    let private_limit_bytes = resource
+        .get("process_private_limit_bytes")
+        .and_then(Value::as_u64)
+        .filter(|value| *value == SYNAPSE_PROCESS_HARD_LIMIT_BYTES)
+        .ok_or_else(|| invalid("resource_prestate.process_private_limit_bytes"))?;
+    let job_memory_bytes = resource
+        .get("job_memory_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("resource_prestate.job_memory_bytes"))?;
+    let job_memory_limit_bytes = resource
+        .get("job_memory_limit_bytes")
+        .and_then(Value::as_u64)
+        .filter(|value| *value == private_limit_bytes)
+        .ok_or_else(|| invalid("resource_prestate.job_memory_limit_bytes"))?;
+    if private_bytes < private_limit_bytes && job_memory_bytes < job_memory_limit_bytes {
+        return Ok(None);
+    }
+    let reason = match (
+        private_bytes >= private_limit_bytes,
+        job_memory_bytes >= job_memory_limit_bytes,
+    ) {
+        (_, true) => "aggregate_job_memory_limit_reached",
+        (true, false) => "process_private_commit_limit_reached",
+        (false, false) => return Ok(None),
+    };
+    Ok(Some(shell_tool_error(
+        error_codes::ACTION_RESOURCE_BUDGET_EXCEEDED,
+        format!(
+            "act_run_shell refused before execution because committed/private resource use reached the hard {private_limit_bytes}-byte limit (job={job_memory_bytes}, private={private_bytes}; working_set_telemetry={working_set_bytes})"
+        ),
+        json!({
+            "code": error_codes::ACTION_RESOURCE_BUDGET_EXCEEDED,
+            "reason": reason,
+            "process_private_bytes": private_bytes,
+            "process_working_set_bytes": working_set_bytes,
+            "job_memory_bytes": job_memory_bytes,
+            "job_memory_limit_bytes": job_memory_limit_bytes,
+            "max_bytes": private_limit_bytes,
+            "requested_bytes": 0,
+            "resource_snapshot_persisted_before_refusal": true,
+            "remediation": "Inspect health resource accounting, release the retained owner, and retry only after process private commit and aggregate Job commit are below their hard limits. Working set is telemetry, not a Job-enforced limit.",
+        }),
+    )))
 }
 
 struct ShellExecutablePreflight {

@@ -136,8 +136,10 @@ isolated session, while you keep working.
 
 Everything runs **on your machine**. No screen-scraping cloud service, no remote agent,
 no data leaving your PC. Synapse is Windows-native to the metal: Win32 `SendInput`, UI
-Automation, Windows Graphics Capture / DXGI, optional debug-gated WASAPI audio capture,
-and local process control.
+Automation, visible-desktop GDI `BitBlt` capture with no explicit GPU API, optional
+debug-gated WASAPI audio capture, and local process control. Windows or the display
+driver may still accelerate GDI internally; that backend identity is not a physical
+zero-VRAM attestation.
 
 ---
 
@@ -158,17 +160,22 @@ screenshot it has to squint at:
 - **`observe`** — the focused window, the full UI Automation element tree (every button,
   field, and menu with its on-screen box), detected entities, and HUD.
 - **`find`** — locate any element or on-screen entity by name, role, or free text.
-- **`read_text`** — OCR any region or element. Reads pixels directly, so it works even
-  where the accessibility API can't reach (canvases and custom UIs).
-- **`screenshot`** — per-window Windows Graphics Capture (and GIF capture), so an agent
-  can photograph *its own* window even when it's behind yours.
+- **`read_text`** — OCR a region or element when its pixels are physically visible, or
+  use the exact CDP path for an owned browser target. Native visible-surface OCR reaches
+  canvases and custom UIs but retains any occluding pixels.
+- **`screenshot`** — one-shot and GIF capture of physical desktop pixels through GDI
+  `BitBlt`. A window must be visible, restored, uncloaked, and fully within the virtual
+  desktop; pixels from any occluding window remain in the image. Unsupported hidden or
+  off-screen semantics fail with a typed capture error instead of switching backends.
 - **`subscribe`** — stream live events (focus changes, new windows, audio) instead of
   polling.
 - **Browser DOM mode** — Synapse-launched Chromium browsers expose real page nodes
   through CDP; `observe` and `find` merge them in.
 
-All of it is **window-targetable**: point a session at a specific window with
-`target` (`operation=set`) and perception watches *that* window — focused or not.
+Structured UIA/CDP perception is **window-targetable**: point a session at a specific
+window with `target` (`operation=set`) and Synapse can inspect that target without
+foregrounding it. Pixel capture remains a physical visible-surface snapshot; raw-CDP
+browser screenshots are the separate exact background-tab path.
 
 <br clear="all">
 
@@ -493,7 +500,7 @@ it from <https://rustup.rs> first, or let the agent install it.
 
 Synapse has exactly **one controlling body**: the Windows-native `synapse-mcp.exe` HTTP
 daemon. It is the only process that can perform real Win32 `SendInput`, UI Automation, and
-WGC/DXGI capture — and it controls **both** Windows programs (native windows) **and** WSL
+visible-desktop GDI `BitBlt` capture — and it controls **both** Windows programs (native windows) **and** WSL
 programs (WSLg GUI apps render as real Windows windows; `shell` / `process` reach WSL CLIs
 via `wsl.exe`). Every MCP client — on Windows or in WSL — connects to that one daemon, so
 *wherever you install from, the result is identical*: one Windows daemon driving both worlds.
@@ -738,7 +745,7 @@ always backed by evidence. Full mapping and migration notes:
 |---|---|
 | Language / runtime | **Rust** (edition 2024), `tokio` |
 | Protocol | **MCP** via `rmcp` — stdio + streamable HTTP/SSE, one shared daemon, per-session state |
-| Perception | Windows UI Automation, Windows Graphics Capture / DXGI duplication, WinRT OCR |
+| Perception | Windows UI Automation, GDI `BitBlt` visible-surface capture (no explicit GPU API), WinRT OCR |
 | Browser | **Chrome DevTools Protocol** — DOM/AX-tree perception, background tabs, page input; bundled extension bridge for normal profiles |
 | Action | Win32 `SendInput` (`enigo`), UIA control patterns, CDP input, verified readback |
 | Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, Calyx-backed mailboxes + workspace blackboard, approvals & escalation |

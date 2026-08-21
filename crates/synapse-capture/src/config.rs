@@ -1,4 +1,7 @@
-use crate::{CaptureBackend, CaptureBackendPreference, backend::resolved_backend};
+use crate::{
+    CaptureBackend, CaptureBackendPreference, DEFAULT_CAPTURE_INTERVAL_MS,
+    backend::resolved_backend,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum CaptureTarget {
@@ -26,11 +29,11 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             target: CaptureTarget::Primary,
-            min_update_interval_ms: 16,
+            min_update_interval_ms: DEFAULT_CAPTURE_INTERVAL_MS,
             cursor_visible: true,
-            secondary_windows: true,
-            dirty_region_only: true,
-            backend_preference: CaptureBackendPreference::Auto,
+            secondary_windows: false,
+            dirty_region_only: false,
+            backend_preference: CaptureBackendPreference::GdiBitBlt,
         }
     }
 }
@@ -38,9 +41,8 @@ impl Default for CaptureConfig {
 impl CaptureConfig {
     #[must_use]
     pub fn with_env_backend(mut self) -> Self {
-        self.backend_preference = CaptureBackendPreference::from_force_dxgi_value(
-            std::env::var("SYNAPSE_CAPTURE_FORCE_DXGI").ok().as_deref(),
-        );
+        self.backend_preference = crate::backend::capture_backend_preference_from_environment()
+            .unwrap_or(CaptureBackendPreference::InvalidEnvironment);
         self
     }
 

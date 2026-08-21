@@ -7,8 +7,10 @@
 .DESCRIPTION
   Synapse has exactly ONE controlling body: the Windows-native synapse-mcp.exe
   HTTP daemon. It is the only process that can do real Win32 SendInput / UI
-  Automation / WGC-DXGI capture, and it controls BOTH Windows programs (native
-  windows) and WSL programs (WSLg GUI apps render as real Windows windows;
+  Automation / visible-desktop GDI BitBlt capture without an explicit GPU API
+  (Windows or the display driver may still accelerate GDI internally), and it
+  controls BOTH Windows programs (native windows) and WSL programs (WSLg GUI
+  apps render as real Windows windows;
   act_run_shell / act_launch reach WSL CLIs via wsl.exe). Every MCP client -- on
   Windows or in WSL -- connects to this one daemon.
 
@@ -107,11 +109,12 @@
   -AllowedPermissions; inconsistent configurations fail before the build.
 
 .PARAMETER CalyxConfigPath
-  Optional Calyx tuning file passed explicitly to both the isolated candidate
-  and the installed daemon as --calyx-config. Defaults to
-  SYNAPSE_CALYX_CONFIG when set. Setup resolves the path and verifies the file
-  is readable before building; the real candidate daemon validates its TOML
-  content before handoff so candidate/live tuning cannot silently diverge.
+  Optional explicit Calyx tuning file passed to both the isolated candidate and
+  installed daemon as --calyx-config. When omitted, setup atomically installs
+  and pins an immutable content-addressed CPU-only config with math_backend="cpu" and
+  vram_budget_bytes=0. An explicit file remains eligible only when the real
+  candidate reports the same no-explicit-GPU-provider/API contract; the persistent supervisor
+  pins its SHA-256 and refuses to launch after config drift.
 
 .PARAMETER Bind
   Loopback address the daemon binds. Default 127.0.0.1:7700.
@@ -300,6 +303,26 @@ $SynapseChromeBridgeReloadReadinessSuccessSpacingMs = 250
 $SynapseChromeBridgeReloadReadinessMinBackoffMs = 250
 $SynapseChromeBridgeReloadReadinessMaxBackoffMs = 2000
 $SynapseBindFinalDeadOwnerSettleSeconds = 15
+# One lifetime parent Job contains the native scheduled-task bootstrap, its
+# PowerShell supervisor, every daemon generation, and every descendant. Its
+# aggregate JOB_MEMORY cap is the authoritative post-association whole-tree
+# bound. A separate 50,002,432-byte measured reserve covers the bootstrap image
+# before it can self-associate. Each daemon generation is also placed in a
+# nested child Job with a tighter process/aggregate committed-memory cap. The
+# resident working set is measured from OS process counters but is not limited:
+# host-isolated class-9 probes prove the privilege-dependent
+# JOB_OBJECT_LIMIT_WORKINGSET path is unavailable to the configured launch
+# token, while the exact 0x2300 committed-memory contract succeeds.
+$SynapseSupervisorMemoryLimitBytes = [uint64]949997568
+$SynapseDaemonProcessMemoryLimitBytes = [uint64]789999616
+$SynapseOwnedMemoryLimitBytes = [uint64]949997568
+$SynapseBootstrapPreAssociationReserveBytes = [uint64]50002432
+$SynapseSupervisorCpuRate = [uint32]2500
+# Nested Job CPU rates are relative to the immediate parent. Give the daemon
+# child Job 100% of the supervisor-owned parent's 25% system allocation; using
+# 25% on both levels would multiply into an unintended 6.25% effective cap.
+$SynapseDaemonCpuRate = [uint32]10000
+$SynapseCalyxConfigMaxBytesV1 = 65536
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
 $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
 $script:SynapseChromeBridgeMaintenancePausePrepared = $false
@@ -321,6 +344,8 @@ $script:SynapseChromeBridgePendingPath = $ChromeBridgePendingPath
 $script:SynapseSetupPartialState = $null
 $script:SynapseSetupPartialReadback = $null
 $script:SynapseCurrentDaemonStagingDirectory = $null
+$script:SynapseManagedCalyxConfig = $false
+$script:SynapseCalyxConfigSha256 = $null
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
 $script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
 $script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
@@ -772,86 +797,6 @@ function Get-SynapseUnixTimeMilliseconds {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 }
 
-function Resolve-SynapseMsvcCcbinPath {
-    param(
-        [Parameter(Mandatory=$true)][string]$PathValue,
-        [Parameter(Mandatory=$true)][string]$Context
-    )
-
-    $expanded = [System.Environment]::ExpandEnvironmentVariables($PathValue.Trim().Trim('"'))
-    if ([string]::IsNullOrWhiteSpace($expanded)) {
-        throw "SYNAPSE_CUDA_NVCC_CCBIN_EMPTY context=$Context remediation=NVCC_CCBIN must point to cl.exe or a directory containing cl.exe"
-    }
-    $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction Stop).Path
-    $item = Get-Item -LiteralPath $resolved -ErrorAction Stop
-    if ($item.PSIsContainer) {
-        $cl = Join-Path $item.FullName 'cl.exe'
-        if (Test-Path -LiteralPath $cl -PathType Leaf) {
-            return $item.FullName
-        }
-    } elseif ($item.Name -ieq 'cl.exe' -and $item.DirectoryName) {
-        return $item.DirectoryName
-    }
-    throw "SYNAPSE_CUDA_NVCC_CCBIN_INVALID context=$Context path=$PathValue resolved=$resolved remediation=NVCC_CCBIN must point to cl.exe or a directory containing cl.exe"
-}
-
-function Get-SynapseMsvcHostCompilerDir {
-    $roots = @()
-    foreach ($programRoot in @(
-        [System.Environment]::GetEnvironmentVariable('ProgramFiles'),
-        [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    )) {
-        if (-not [string]::IsNullOrWhiteSpace($programRoot)) {
-            $vsRoot = Join-Path $programRoot 'Microsoft Visual Studio'
-            if (Test-Path -LiteralPath $vsRoot -PathType Container) {
-                $roots += $vsRoot
-            }
-        }
-    }
-
-    $candidates = New-Object System.Collections.Generic.List[string]
-    foreach ($root in $roots) {
-        foreach ($majorDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-            foreach ($editionDir in @(Get-ChildItem -LiteralPath $majorDir.FullName -Directory -ErrorAction SilentlyContinue)) {
-                $msvcRoot = Join-Path $editionDir.FullName 'VC\Tools\MSVC'
-                if (-not (Test-Path -LiteralPath $msvcRoot -PathType Container)) {
-                    continue
-                }
-                foreach ($versionDir in @(Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue)) {
-                    $ccbin = Join-Path $versionDir.FullName 'bin\Hostx64\x64'
-                    if (Test-Path -LiteralPath (Join-Path $ccbin 'cl.exe') -PathType Leaf) {
-                        $candidates.Add($ccbin)
-                    }
-                }
-            }
-        }
-    }
-
-    if ($candidates.Count -lt 1) {
-        return $null
-    }
-    return @($candidates | Sort-Object)[-1]
-}
-
-function Add-SynapseNvccAppendFlag {
-    param(
-        [AllowNull()][string]$ExistingFlags,
-        [Parameter(Mandatory=$true)][string]$RequiredFlag
-    )
-
-    $existing = if ($null -eq $ExistingFlags) { '' } else { $ExistingFlags.Trim() }
-    if ($existing -match '/Zc:preprocessor-') {
-        Die "SYNAPSE_CUDA_NVCC_APPEND_FLAGS_CONFLICT value=$existing remediation=remove the conflicting /Zc:preprocessor- flag before setup can enable CUDA 13.x CCCL builds"
-    }
-    if ($existing -match '/Zc:preprocessor(?!-)') {
-        return $existing
-    }
-    if ([string]::IsNullOrWhiteSpace($existing)) {
-        return $RequiredFlag
-    }
-    return "$existing $RequiredFlag"
-}
-
 function Get-SynapseDirectoryFootprint {
     <#
       Measures a directory's exact on-disk footprint by enumerating its files.
@@ -985,124 +930,336 @@ function Resolve-SynapseCargoTargetDirectory {
 
 function Get-SynapseCudaBuildCapability {
     <#
-      Decides whether this build compiles the Calyx CUDA kernels, from physical
-      host evidence rather than an assumption (#1859).
-
-      calyx-forge's build script shells out to nvcc from a CUDA 13.3 toolkit
-      whenever its `cuda` feature is on, so enabling it unconditionally makes
-      the daemon unbuildable on any host without that toolkit. Both facts must
-      hold before the feature is selected:
-        1. an NVIDIA display device is physically present (PCI vendor 10DE), and
-        2. an nvcc executable is resolvable.
-
-      A partial match is reported explicitly, never silently downgraded past the
-      operator. SYNAPSE_CALYX_CUDA=require forces the feature on and fails
-      closed when the evidence is absent; SYNAPSE_CALYX_CUDA=off forces it off.
+      The shipped daemon has a binding no-explicit-GPU-provider/API contract.
+      CUDA availability is therefore not a build-selection input: setup always
+      leaves `calyx-cuda` uncompiled. GDI capture may still be accelerated by
+      Windows. An explicit CUDA request fails instead of being ignored.
     #>
-    $nvidiaDevices = @()
-    $deviceProbeError = $null
-    try {
-        $nvidiaDevices = @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -match 'VEN_10DE' } |
-            ForEach-Object { "{0}|{1}|{2}" -f $_.Status, $_.Class, $_.FriendlyName })
-    } catch {
-        $deviceProbeError = $_.Exception.Message
+    foreach ($backendVariable in @('SYNAPSE_DETECTION_BACKEND', 'SYNAPSE_STT_BACKEND')) {
+        $backendEntry = Get-Item "Env:$backendVariable" -ErrorAction SilentlyContinue
+        $backendValue = if ($null -eq $backendEntry) { $null } else { [string]$backendEntry.Value }
+        if ($null -ne $backendValue -and $backendValue.Trim().ToLowerInvariant() -ne 'cpu') {
+            Die "SYNAPSE_ZERO_VRAM_BACKEND_ENV_CONTRADICTION scope=process name=$backendVariable value=$backendValue remediation=unset $backendVariable or set it to cpu; setup will not hide a contradictory accelerator request by overwriting it"
+        }
+        foreach ($backendScope in @([System.EnvironmentVariableTarget]::User, [System.EnvironmentVariableTarget]::Machine)) {
+            try {
+                $durableBackendValue = [System.Environment]::GetEnvironmentVariable($backendVariable, $backendScope)
+            } catch {
+                Die "SYNAPSE_ZERO_VRAM_BACKEND_ENV_READ_FAILED scope=$backendScope name=$backendVariable error=$($_.Exception.Message) remediation=repair environment-registry read access; setup cannot prove durable accelerator requests are absent"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($durableBackendValue) -and
+                $durableBackendValue.Trim().ToLowerInvariant() -ne 'cpu') {
+                Die "SYNAPSE_ZERO_VRAM_BACKEND_ENV_CONTRADICTION scope=$backendScope name=$backendVariable value=$durableBackendValue remediation=remove the durable value or set it to cpu; setup will not hide a contradictory accelerator request by overwriting the daemon environment"
+            }
+        }
     }
 
-    $nvcc = (Get-Command nvcc -ErrorAction SilentlyContinue).Source
-    if (-not $nvcc -and -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
-        $candidate = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $nvcc = $candidate }
+    foreach ($captureScope in @('Process', 'User', 'Machine')) {
+        $captureTarget = switch ($captureScope) {
+            'User' { [System.EnvironmentVariableTarget]::User }
+            'Machine' { [System.EnvironmentVariableTarget]::Machine }
+            default { [System.EnvironmentVariableTarget]::Process }
+        }
+        try {
+            $captureBackendValue = [System.Environment]::GetEnvironmentVariable('SYNAPSE_CAPTURE_BACKEND', $captureTarget)
+            $forceDxgiValue = [System.Environment]::GetEnvironmentVariable('SYNAPSE_CAPTURE_FORCE_DXGI', $captureTarget)
+        } catch {
+            Die "SYNAPSE_NO_EXPLICIT_GPU_CAPTURE_ENV_READ_FAILED scope=$captureScope error=$($_.Exception.Message) remediation=repair environment-registry read access; setup cannot prove durable explicit-GPU-API capture requests are absent"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($captureBackendValue) -and
+            $captureBackendValue.Trim().ToLowerInvariant() -notin @('cpu', 'gdi', 'gdi_bitblt')) {
+            Die "SYNAPSE_NO_EXPLICIT_GPU_CAPTURE_ENV_CONTRADICTION scope=$captureScope name=SYNAPSE_CAPTURE_BACKEND value=$captureBackendValue remediation=remove the value or set it to gdi_bitblt; setup will not overwrite or hide an automatic/explicit-GPU-API capture request"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($forceDxgiValue) -and
+            $forceDxgiValue.Trim().ToLowerInvariant() -notin @('0', 'false', 'no')) {
+            Die "SYNAPSE_NO_EXPLICIT_GPU_CAPTURE_ENV_CONTRADICTION scope=$captureScope name=SYNAPSE_CAPTURE_FORCE_DXGI value=$forceDxgiValue remediation=remove the legacy value or set it to false; setup will not overwrite or hide a DXGI request"
+        }
     }
 
-    $deviceProven = ($null -eq $deviceProbeError) -and ($nvidiaDevices.Count -gt 0)
     $override = if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_CALYX_CUDA)) { '' } else { $env:SYNAPSE_CALYX_CUDA.Trim().ToLowerInvariant() }
     if ($override -notin @('', 'auto', 'require', 'off')) {
-        Die "SYNAPSE_CALYX_CUDA_OVERRIDE_INVALID value=$env:SYNAPSE_CALYX_CUDA remediation=set SYNAPSE_CALYX_CUDA to auto, require, or off"
+        Die "SYNAPSE_CALYX_CUDA_OVERRIDE_INVALID value=$env:SYNAPSE_CALYX_CUDA remediation=unset SYNAPSE_CALYX_CUDA or set it to off; installed Calyx/model execution is CPU-only with no explicit GPU provider"
+    }
+    if ($override -in @('auto', 'require')) {
+        Die "SYNAPSE_CALYX_CUDA_FORBIDDEN_BY_ACCELERATOR_POLICY value=$override remediation=unset SYNAPSE_CALYX_CUDA or set it to off; this installer deliberately cannot compile or launch a CUDA-backed Synapse daemon"
     }
 
-    $enabled = $deviceProven -and $nvcc
-    $basis = "nvidia_pnp_devices=$($nvidiaDevices.Count); device_probe_error=$(if ($deviceProbeError) { $deviceProbeError } else { 'none' }); nvcc=$(if ($nvcc) { $nvcc } else { 'not_found' }); cuda_path=$(if ($env:CUDA_PATH) { $env:CUDA_PATH } else { 'unset' }); override=$(if ($override) { $override } else { 'auto' })"
-
-    switch ($override) {
-        'require' {
-            if (-not $enabled) {
-                Die "SYNAPSE_CALYX_CUDA_REQUIRED_BUT_UNAVAILABLE basis=$basis remediation=install an NVIDIA driver and the CUDA 13.3 toolkit (set CUDA_PATH to its root) or unset SYNAPSE_CALYX_CUDA=require"
-            }
-            $enabled = $true
-        }
-        'off' { $enabled = $false }
-    }
-
-    if ($enabled) {
-        Info "Calyx CUDA kernels ENABLED for this build (--features calyx-cuda). Basis: $basis"
-    } else {
-        Info "Calyx CUDA kernels DISABLED for this build; the daemon will run CPU math. Basis: $basis"
-        if ($deviceProven -and -not $nvcc) {
-            Info "WARN: this host HAS an NVIDIA device but no nvcc, so the daemon will refuse math_backend=auto/cuda at runtime (SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED). Install the CUDA 13.3 toolkit and rerun setup to compile GPU kernels."
-        }
-    }
+    $basis = "policy=cpu_only_no_explicit_gpu_provider; override=$(if ($override) { $override } else { 'unset' }); calyx_cuda_feature=false"
+    Info "Calyx CUDA kernels DISABLED by binding no-explicit-GPU-provider policy. Basis: $basis"
 
     return [pscustomobject][ordered]@{
-        schema = 'synapse_setup_cuda_build_capability/v1'
-        enabled = [bool]$enabled
-        cargo_features = $(if ($enabled) { @('calyx-cuda') } else { @() })
-        nvidia_pnp_device_count = $nvidiaDevices.Count
-        nvidia_pnp_devices = $nvidiaDevices
-        device_probe_error = $deviceProbeError
-        nvcc_path = $nvcc
+        schema = 'synapse_setup_cuda_build_capability/v2'
+        enabled = $false
+        cargo_features = @()
+        nvidia_pnp_device_count = $null
+        nvidia_pnp_devices = @()
+        device_probe_error = $null
+        nvcc_path = $null
         cuda_path_env = $env:CUDA_PATH
-        override = $(if ($override) { $override } else { 'auto' })
+        override = $(if ($override) { $override } else { 'unset' })
+        policy = 'cpu_only_no_explicit_gpu_provider'
         basis = $basis
         observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
     }
 }
 
-function Set-SynapseCudaBuildEnvironment {
-    $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
-    if (-not $nvcc -and -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
-        $cudaPathNvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
-        if (Test-Path -LiteralPath $cudaPathNvcc -PathType Leaf) {
-            $nvcc = [pscustomobject]@{ Source = $cudaPathNvcc }
+function Ensure-SynapseAtomicFileType {
+    if ('SynapseSetup.AtomicFile' -as [type]) { return }
+    Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace SynapseSetup
+{
+    public static class AtomicFile
+    {
+        private const uint MOVEFILE_REPLACE_EXISTING = 0x00000001;
+        private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool MoveFileEx(
+            string existingFileName,
+            string newFileName,
+            uint flags);
+
+        public static void ReplaceWriteThrough(string sourcePath, string destinationPath)
+        {
+            if (String.IsNullOrWhiteSpace(sourcePath) || String.IsNullOrWhiteSpace(destinationPath))
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_ATOMIC_FILE_PATH_INVALID remediation=provide exact non-empty source and destination paths");
+            }
+            if (!MoveFileEx(
+                sourcePath,
+                destinationPath,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_ATOMIC_FILE_REPLACE_FAILED win32=" + error +
+                    " remediation=repair filesystem permissions/durability support; no non-atomic fallback is permitted");
+            }
+        }
+
+        public static void InstallNewWriteThrough(string sourcePath, string destinationPath)
+        {
+            if (String.IsNullOrWhiteSpace(sourcePath) || String.IsNullOrWhiteSpace(destinationPath))
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_ATOMIC_FILE_PATH_INVALID remediation=provide exact non-empty source and destination paths");
+            }
+            if (!MoveFileEx(sourcePath, destinationPath, MOVEFILE_WRITE_THROUGH))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_ATOMIC_FILE_INSTALL_NEW_FAILED win32=" + error +
+                    " remediation=the content-addressed destination must be absent; no replace/fallback is permitted");
+            }
         }
     }
-    if (-not $nvcc) {
-        Info "CUDA nvcc not found; skipping NVCC_CCBIN/NVCC_APPEND_FLAGS setup for optional CUDA builds."
-        return
-    }
+}
+"@
+}
 
-    $existingCcbin = if (-not [string]::IsNullOrWhiteSpace($env:NVCC_CCBIN)) {
-        $env:NVCC_CCBIN
-    } else {
-        [System.Environment]::GetEnvironmentVariable('NVCC_CCBIN', 'User')
-    }
-    $ccbin = $null
-    if (-not [string]::IsNullOrWhiteSpace($existingCcbin)) {
+function Write-SynapseAtomicUtf8TextFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory=$true)][string]$Purpose
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $parent = Split-Path -Parent $resolvedPath
+    $encoding = [System.Text.UTF8Encoding]::new($false, $true)
+    $expectedBytes = $encoding.GetBytes($Content)
+    $tempPath = Join-Path $parent (".{0}.tmp-{1}-{2}" -f ([System.IO.Path]::GetFileName($resolvedPath)), $PID, ([Guid]::NewGuid().ToString('N')))
+    $stream = $null
+    try {
+        New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
+        $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+        if (-not $parentItem.PSIsContainer -or ($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "SYNAPSE_ATOMIC_TEXT_PARENT_INVALID purpose=$Purpose path=$parent attributes=$($parentItem.Attributes) remediation=use a real local setup-owned directory"
+        }
+        $destinationExisted = Test-Path -LiteralPath $resolvedPath
+        if ($destinationExisted) {
+            $destinationItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+            if ($destinationItem.PSIsContainer -or ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "SYNAPSE_ATOMIC_TEXT_DESTINATION_INVALID purpose=$Purpose path=$resolvedPath attributes=$($destinationItem.Attributes) remediation=replace the unexpected directory/reparse point with a regular setup-owned file"
+            }
+        }
+        $stream = [System.IO.FileStream]::new(
+            $tempPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::WriteThrough)
+        $stream.Write($expectedBytes, 0, $expectedBytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        Ensure-SynapseAtomicFileType
+        if ($destinationExisted) {
+            [SynapseSetup.AtomicFile]::ReplaceWriteThrough($tempPath, $resolvedPath)
+        } else {
+            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $resolvedPath)
+        }
+        if (Test-Path -LiteralPath $tempPath) {
+            throw "SYNAPSE_ATOMIC_TEXT_TEMP_RETAINED purpose=$Purpose path=$tempPath remediation=repair atomic rename semantics before retrying"
+        }
+        $readbackItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+        if ($readbackItem.PSIsContainer -or ($readbackItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "SYNAPSE_ATOMIC_TEXT_READBACK_TYPE_INVALID purpose=$Purpose path=$resolvedPath attributes=$($readbackItem.Attributes) remediation=repair concurrent filesystem mutation"
+        }
+        if ([uint64]$readbackItem.Length -ne [uint64]$expectedBytes.Length) {
+            throw "SYNAPSE_ATOMIC_TEXT_READBACK_LENGTH_MISMATCH purpose=$Purpose path=$resolvedPath expected=$($expectedBytes.Length) actual=$($readbackItem.Length) remediation=repair concurrent filesystem mutation or storage durability"
+        }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
         try {
-            $ccbin = Resolve-SynapseMsvcCcbinPath -PathValue $existingCcbin -Context 'existing_NVCC_CCBIN'
-        } catch {
-            Info "WARN: existing NVCC_CCBIN is invalid and will be repaired by Visual Studio discovery: $($_.Exception.Message)"
+            $expectedSha256 = ([System.BitConverter]::ToString($sha.ComputeHash($expectedBytes))).Replace('-', '')
+        } finally {
+            $sha.Dispose()
         }
+        $actualSha256 = Get-SynapseFileSha256 -Path $resolvedPath
+        if ($actualSha256 -ine $expectedSha256) {
+            throw "SYNAPSE_ATOMIC_TEXT_READBACK_BYTES_MISMATCH purpose=$Purpose path=$resolvedPath remediation=repair concurrent filesystem mutation or storage durability"
+        }
+        return [pscustomobject][ordered]@{
+            path = $resolvedPath
+            sha256 = $actualSha256
+            byte_length = [uint64]$expectedBytes.Length
+            encoding = 'utf-8-no-bom'
+        }
+    } catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
+        throw "SYNAPSE_ATOMIC_TEXT_WRITE_FAILED purpose=$Purpose path=$resolvedPath error=$($_.Exception.Message) remediation=repair setup-owned filesystem permissions/durability; no non-atomic or lossy fallback is permitted"
     }
-    if ([string]::IsNullOrWhiteSpace($ccbin)) {
-        $ccbin = Get-SynapseMsvcHostCompilerDir
+}
+
+function Get-SynapseManagedCpuOnlyCalyxConfigIdentity {
+    $content = "[calyx]`r`nmath_backend = `"cpu`"`r`nvram_budget_bytes = 0`r`n"
+    $contentBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($content)
+    if ($contentBytes.Length -gt $SynapseCalyxConfigMaxBytesV1) {
+        Die "SYNAPSE_CALYX_CONFIG_TOO_LARGE phase=identity max_bytes=$SynapseCalyxConfigMaxBytesV1 actual_bytes=$($contentBytes.Length) remediation=repair the setup-owned canonical CPU-only config template"
     }
-    if ([string]::IsNullOrWhiteSpace($ccbin)) {
-        Die "SYNAPSE_CUDA_MSVC_HOST_COMPILER_MISSING nvcc=$($nvcc.Source) remediation=install Visual Studio Build Tools with MSVC x64 tools, then rerun setup so NVCC_CCBIN can be set for CUDA builds"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $sha256 = ([System.BitConverter]::ToString($sha.ComputeHash($contentBytes))).Replace('-', '')
+    } finally {
+        $sha.Dispose()
+    }
+    return [pscustomobject][ordered]@{
+        content = $content
+        bytes = $contentBytes
+        sha256 = $sha256
+    }
+}
+
+function Write-SynapseManagedCpuOnlyCalyxConfig {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $parent = Split-Path -Parent $resolvedPath
+    $identity = Get-SynapseManagedCpuOnlyCalyxConfigIdentity
+    $content = [string]$identity.content
+    $contentBytes = [byte[]]$identity.bytes
+    $tempPath = Join-Path $parent (".{0}.tmp-{1}-{2}" -f ([System.IO.Path]::GetFileName($resolvedPath)), $PID, ([Guid]::NewGuid().ToString('N')))
+    $writeStream = $null
+    try {
+        New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
+        $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+        if (-not $parentItem.PSIsContainer -or ($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "SYNAPSE_CALYX_CONFIG_PARENT_INVALID path=$parent attributes=$($parentItem.Attributes) remediation=use a real local directory; setup will not write through a reparse point"
+        }
+        if (Test-Path -LiteralPath $resolvedPath) {
+            $existingItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+            if ($existingItem.PSIsContainer -or ($existingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "SYNAPSE_CALYX_CONFIG_DESTINATION_INVALID path=$resolvedPath attributes=$($existingItem.Attributes) remediation=replace the unexpected directory/reparse point with a regular setup-owned file"
+            }
+        } else {
+            $writeStream = [System.IO.FileStream]::new(
+                $tempPath,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None,
+                4096,
+                [System.IO.FileOptions]::WriteThrough)
+            $writeStream.Write($contentBytes, 0, $contentBytes.Length)
+            $writeStream.Flush($true)
+            $writeStream.Dispose()
+            $writeStream = $null
+            Ensure-SynapseAtomicFileType
+            # The filename is the content SHA. Never replace an existing object:
+            # a prior generation may still pin it and MoveFileEx(REPLACE) would
+            # recreate the same cross-generation TOCTOU under a different name.
+            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $resolvedPath)
+            if (Test-Path -LiteralPath $tempPath) {
+                throw "SYNAPSE_CALYX_CONFIG_TEMP_RETAINED path=$tempPath remediation=repair atomic rename semantics; setup refuses ambiguous source/destination ownership"
+            }
+        }
+        $writtenItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+        if ($writtenItem.PSIsContainer -or ($writtenItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "SYNAPSE_CALYX_CONFIG_WRITE_READBACK_TYPE_INVALID path=$resolvedPath attributes=$($writtenItem.Attributes) remediation=repair concurrent filesystem mutation; setup requires a regular file after atomic replacement"
+        }
+    } catch {
+        if ($null -ne $writeStream) { $writeStream.Dispose() }
+        try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
+        Die "SYNAPSE_CALYX_CPU_CONFIG_WRITE_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=repair the setup-owned runtime-bin directory; setup requires a durable explicit math_backend=cpu, vram_budget_bytes=0 config before candidate launch"
     }
 
-    $requiredNvccAppendFlag = '-Xcompiler=/Zc:preprocessor'
-    $existingAppendFlags = if (-not [string]::IsNullOrWhiteSpace($env:NVCC_APPEND_FLAGS)) {
-        $env:NVCC_APPEND_FLAGS
-    } else {
-        [System.Environment]::GetEnvironmentVariable('NVCC_APPEND_FLAGS', 'User')
+    $configStream = $null
+    $boundedLength = 0
+    $readbackBytes = $null
+    try {
+        $configStream = [System.IO.File]::Open(
+            $resolvedPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read)
+        $boundedBuffer = [byte[]]::new($SynapseCalyxConfigMaxBytesV1 + 1)
+        $boundedLength = 0
+        while ($boundedLength -lt $boundedBuffer.Length) {
+            $readCount = $configStream.Read($boundedBuffer, $boundedLength, $boundedBuffer.Length - $boundedLength)
+            if ($readCount -eq 0) { break }
+            $boundedLength += $readCount
+        }
+        if ($boundedLength -le $SynapseCalyxConfigMaxBytesV1) {
+            $readbackBytes = [byte[]]::new($boundedLength)
+            [System.Array]::Copy($boundedBuffer, $readbackBytes, $boundedLength)
+            $readback = [System.Text.UTF8Encoding]::new($false, $true).GetString($readbackBytes)
+        }
+    } catch {
+        Die "SYNAPSE_CALYX_CPU_CONFIG_READBACK_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=repair the setup-owned config file; setup cannot launch from unverified tuning bytes"
+    } finally {
+        if ($null -ne $configStream) { $configStream.Dispose() }
     }
-    $appendFlags = Add-SynapseNvccAppendFlag -ExistingFlags $existingAppendFlags -RequiredFlag $requiredNvccAppendFlag
-
-    $env:NVCC_CCBIN = $ccbin
-    $env:NVCC_APPEND_FLAGS = $appendFlags
-    [System.Environment]::SetEnvironmentVariable('NVCC_CCBIN', $ccbin, 'User')
-    [System.Environment]::SetEnvironmentVariable('NVCC_APPEND_FLAGS', $appendFlags, 'User')
-    Info "CUDA build env set: NVCC_CCBIN=$ccbin; NVCC_APPEND_FLAGS includes $requiredNvccAppendFlag."
+    if ($boundedLength -gt $SynapseCalyxConfigMaxBytesV1) {
+        Die "SYNAPSE_CALYX_CONFIG_TOO_LARGE phase=readback path=$resolvedPath max_bytes=$SynapseCalyxConfigMaxBytesV1 observed_at_least_bytes=$boundedLength remediation=replace the setup-owned tuning document with the canonical bounded CPU-only config"
+    }
+    if ($readback -cne $content) {
+        Die "SYNAPSE_CALYX_CPU_CONFIG_READBACK_MISMATCH path=$resolvedPath expected_chars=$($content.Length) actual_chars=$($readback.Length) remediation=inspect filesystem mutation or encoding drift; setup refuses to launch from bytes that differ from the CPU-only contract"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $sha256 = ([System.BitConverter]::ToString($sha.ComputeHash($readbackBytes))).Replace('-', '')
+    } finally {
+        $sha.Dispose()
+    }
+    if ($sha256 -ine [string]$identity.sha256) {
+        Die "SYNAPSE_CALYX_CPU_CONFIG_CONTENT_ADDRESS_MISMATCH path=$resolvedPath filename_sha256=$($identity.sha256) actual_sha256=$sha256 remediation=refuse to mutate or use an occupied content-addressed path whose bytes do not match its identity"
+    }
+    Info "Managed Calyx CPU-only content-addressed config readback path=$resolvedPath sha256=$sha256 math_backend=cpu vram_budget_bytes=0 immutable_existing=$([bool](Test-Path -LiteralPath $resolvedPath -PathType Leaf))"
+    return [pscustomobject][ordered]@{
+        schema = 'synapse_setup_calyx_cpu_config/v1'
+        path = $resolvedPath
+        sha256 = $sha256
+        math_backend = 'cpu'
+        vram_budget_bytes = [int64]0
+    }
 }
 
 function Assert-SynapseChromeBridgeMaintenancePauseBudget {
@@ -1483,6 +1640,449 @@ function Wait-SynapsePostExitParent {
 # ---------------------------------------------------------------------------
 $script:SynapseDeployStopRequestPath = $null
 $script:SynapseDeployTaskSuspendedName = $null
+$script:SynapseDeployPriorTaskResumeAllowed = $true
+$script:SynapseDeploymentTransaction = $null
+$script:SynapseDeploymentTransactionPreparingRoot = $null
+
+function Invoke-SynapseDeploymentTransactionRollbackBestEffort {
+    param([Parameter(Mandatory=$true)][string]$PrimaryFailure)
+
+    $transaction = $script:SynapseDeploymentTransaction
+    if ($null -eq $transaction -or -not [bool]$transaction.Armed -or [bool]$transaction.Committed) {
+        return [pscustomobject]@{ Attempted = $false; Ok = $true; Detail = 'transaction_not_armed' }
+    }
+    if ([bool]$transaction.RollbackInProgress) {
+        return [pscustomobject]@{ Attempted = $true; Ok = $false; Detail = 'rollback_reentry_refused' }
+    }
+    $transaction.RollbackInProgress = $true
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $rollbackOperationalDetail = 'prior_task_absent_restored'
+    $rollbackManifestWrite = $null
+    # Enter-SynapseChromeBridgeMaintenancePause scopes its prepared state to the
+    # exact reason token. Both rollback drain passes are one maintenance action,
+    # so they must reuse one token rather than manufacturing a scope mismatch.
+    $rollbackDrainReason = 'deployment_transaction_rollback'
+    try {
+        try {
+            $task = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue
+            if ($task) {
+                Stop-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue
+                Disable-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue | Out-Null
+            }
+        } catch {
+            $errors.Add("revoke_candidate_task:$($_.Exception.Message)")
+        }
+        try {
+            $task = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue
+            if ($task) {
+                Unregister-ScheduledTask -TaskName $transaction.TaskName -Confirm:$false -ErrorAction Stop
+            }
+            if (Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue) {
+                throw 'task remained registered after unregister'
+            }
+        } catch {
+            $errors.Add("remove_candidate_task:$($_.Exception.Message)")
+        }
+
+        # Preserve the daemon's authenticated graceful-shutdown opportunity
+        # before stopping its supervisor. A detached legacy supervisor may still
+        # relaunch once after this drain; the authority stop and second drain
+        # below close that bounded race before any executable is restored.
+        try {
+            Stop-SynapseMcpProcesses `
+                -Reason $rollbackDrainReason `
+                -Bind $transaction.Bind `
+                -DbPath $transaction.DbPath `
+                -TokenPath $transaction.TokenPath `
+                -ForceRestart `
+                -AllowUnacknowledgedChromeBridgePauseForRollback `
+                -TimeoutSeconds 300
+        } catch {
+            $errors.Add("drain_candidate_generation:$($_.Exception.Message)")
+        }
+
+        # Unregistering a legacy WScript task removes its future trigger but not
+        # the detached PowerShell supervisor it already spawned. That supervisor
+        # can otherwise relaunch the daemon after the first drain and race an
+        # atomic executable restore with a newly mapped image. Quiesce every
+        # exact setup-managed supervisor path, then drain any child that escaped
+        # during that authority-revocation window. Keep the current stop-request
+        # snapshot in force until all files have been restored.
+        try {
+            $transactionSupervisorPaths = @($transaction.FileSnapshots |
+                Where-Object { [System.IO.Path]::GetFileName([string]$_.Path) -ieq 'synapse-daemon-supervisor.ps1' } |
+                ForEach-Object { [System.IO.Path]::GetFullPath([string]$_.Path) } |
+                Sort-Object -Unique)
+            if ($transactionSupervisorPaths.Count -eq 0) {
+                throw 'no setup-managed supervisor path was present in the armed transaction'
+            }
+            foreach ($transactionSupervisorPath in $transactionSupervisorPaths) {
+                Stop-SynapseDaemonSupervisorProcessesForInstallHandoff `
+                    -SupervisorPath $transactionSupervisorPath `
+                    -TimeoutSeconds 30
+            }
+
+            # A legacy supervisor may have started one last daemon between the
+            # task revocation and its exact-PID stop. This second-stage drain is
+            # intentionally after every supervisor authority has been removed.
+            Stop-SynapseMcpProcesses `
+                -Reason $rollbackDrainReason `
+                -Bind $transaction.Bind `
+                -DbPath $transaction.DbPath `
+                -TokenPath $transaction.TokenPath `
+                -ForceRestart `
+                -AllowUnacknowledgedChromeBridgePauseForRollback `
+                -TimeoutSeconds 300
+
+            # The native bootstrap is the lifetime owner of the parent Job and
+            # executable. It should exit naturally once its exact supervisor is
+            # gone; never replace its snapshotted image while that owner remains
+            # mapped, and never kill a bootstrap whose exact path was not part of
+            # this transaction.
+            $transactionBootstrapPaths = @($transaction.FileSnapshots |
+                Where-Object { [System.IO.Path]::GetFileName([string]$_.Path) -ieq 'synapse-supervisor-bootstrap.exe' } |
+                ForEach-Object { Normalize-SynapseSetupPathForCompare -Path ([string]$_.Path) } |
+                Sort-Object -Unique)
+            if ($transactionBootstrapPaths.Count -eq 0) {
+                throw 'no setup-managed native bootstrap path was present in the armed transaction'
+            }
+            $bootstrapExitDeadline = (Get-Date).AddSeconds(30)
+            do {
+                $remainingBootstraps = @(Get-CimInstance Win32_Process -Filter "Name='synapse-supervisor-bootstrap.exe'" -ErrorAction SilentlyContinue | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+                    $transactionBootstrapPaths -icontains (Normalize-SynapseSetupPathForCompare -Path ([string]$_.ExecutablePath))
+                })
+                if ($remainingBootstraps.Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+            } while ((Get-Date) -lt $bootstrapExitDeadline)
+            if ($remainingBootstraps.Count -ne 0) {
+                throw "exact native bootstrap remained live paths=$($transactionBootstrapPaths -join ',') pids=$(@($remainingBootstraps | ForEach-Object { $_.ProcessId }) -join ',')"
+            }
+
+            $taskAfterQuiescence = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue
+            $supervisorsAfterQuiescence = @($transactionSupervisorPaths | ForEach-Object {
+                Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $_
+            })
+            $daemonsAfterQuiescence = @(Select-SynapseMcpDeployTargetProcesses `
+                -Snapshot @(Get-SynapseMcpProcessSnapshot) `
+                -Bind $transaction.Bind `
+                -DbPath $transaction.DbPath)
+            $listenersAfterQuiescence = @(Get-SynapseTcpBindListenerSnapshot -Bind $transaction.Bind)
+            if ($null -ne $taskAfterQuiescence -or
+                $supervisorsAfterQuiescence.Count -ne 0 -or
+                $daemonsAfterQuiescence.Count -ne 0 -or
+                $listenersAfterQuiescence.Count -ne 0) {
+                throw "runtime authority remained after quiescence task_present=$($null -ne $taskAfterQuiescence) supervisor_count=$($supervisorsAfterQuiescence.Count) supervisor_pids=$(@($supervisorsAfterQuiescence | ForEach-Object { $_.ProcessId }) -join ',') daemon_count=$($daemonsAfterQuiescence.Count) daemon_pids=$(@($daemonsAfterQuiescence | ForEach-Object { $_.ProcessId }) -join ',') listener_count=$($listenersAfterQuiescence.Count) listener_pids=$(@($listenersAfterQuiescence | ForEach-Object { $_.OwningProcess }) -join ',')"
+            }
+            Info "SYNAPSE_DEPLOYMENT_TRANSACTION_RUNTIME_QUIESCED task=$($transaction.TaskName) task_present=false supervisor_paths=$($transactionSupervisorPaths -join ',') supervisor_count=0 bootstrap_paths=$($transactionBootstrapPaths -join ',') bootstrap_count=0 daemon_count=0 listener_count=0 next=restore_snapshotted_files"
+        } catch {
+            $errors.Add("quiesce_runtime_authorities:$($_.Exception.Message)")
+        }
+
+        if ($errors.Count -eq 0) {
+            Ensure-SynapseAtomicFileType
+            foreach ($snapshot in @($transaction.FileSnapshots)) {
+                try {
+                    $path = [System.IO.Path]::GetFullPath([string]$snapshot.Path)
+                    if ([bool]$snapshot.Existed) {
+                        if (-not (Test-Path -LiteralPath $snapshot.BackupPath -PathType Leaf)) {
+                            throw "backup missing path=$($snapshot.BackupPath)"
+                        }
+                        $backupHash = Get-SynapseFileSha256 -Path $snapshot.BackupPath
+                        if ($backupHash -ine [string]$snapshot.Sha256) {
+                            throw "backup hash mismatch expected=$($snapshot.Sha256) actual=$backupHash"
+                        }
+                        $parent = Split-Path -Parent $path
+                        New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
+                        $tempPath = Join-Path $parent (".{0}.rollback-{1}-{2}" -f ([System.IO.Path]::GetFileName($path)), $PID, ([Guid]::NewGuid().ToString('N')))
+                        $sourceStream = $null
+                        $targetStream = $null
+                        try {
+                            $sourceStream = [System.IO.File]::Open($snapshot.BackupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                            $targetStream = [System.IO.FileStream]::new($tempPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 65536, [System.IO.FileOptions]::WriteThrough)
+                            $sourceStream.CopyTo($targetStream)
+                            $targetStream.Flush($true)
+                        } finally {
+                            if ($null -ne $targetStream) { $targetStream.Dispose() }
+                            if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+                        }
+                        if (Test-Path -LiteralPath $path) {
+                            $currentItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                            if ($currentItem.PSIsContainer -or ($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                                throw "destination identity invalid attributes=$($currentItem.Attributes)"
+                            }
+                            [SynapseSetup.AtomicFile]::ReplaceWriteThrough($tempPath, $path)
+                        } else {
+                            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $path)
+                        }
+                        if ((Get-SynapseFileSha256 -Path $path) -ine [string]$snapshot.Sha256) {
+                            throw 'restored destination hash mismatch'
+                        }
+                    } elseif (Test-Path -LiteralPath $path) {
+                        $currentItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or ($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                            throw "refusing to remove non-file/reparse destination attributes=$($currentItem.Attributes)"
+                        }
+                        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                        if (Test-Path -LiteralPath $path) { throw 'destination absence was not restored' }
+                    }
+                } catch {
+                    $errors.Add("restore_file:$($snapshot.Path):$($_.Exception.Message)")
+                }
+            }
+        }
+
+        if ($errors.Count -eq 0) {
+            try {
+                $priorTask = $transaction.PreviousTask
+                if ([bool]$priorTask.Present) {
+                    Register-ScheduledTask -TaskName $transaction.TaskName -Xml ([string]$priorTask.Xml) -Force -ErrorAction Stop | Out-Null
+                    $restoredTask = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop
+                    $restoredActions = @($restoredTask.Actions)
+                    if ($restoredActions.Count -ne 1 -or
+                        [string]$restoredActions[0].Execute -cne [string]$priorTask.Execute -or
+                        [string]$restoredActions[0].Arguments -cne [string]$priorTask.Arguments -or
+                        [string]$restoredActions[0].WorkingDirectory -cne [string]$priorTask.WorkingDirectory) {
+                        throw 'restored task action differs from the pre-transaction Source of Truth'
+                    }
+                    $restoredXml = [string](Export-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop)
+                    if ((Get-SynapseSha256Hex -Text $restoredXml) -ine [string]$priorTask.XmlSha256) {
+                        throw 'restored task XML hash differs from the pre-transaction Source of Truth'
+                    }
+                    if (-not [bool]$priorTask.Enabled) {
+                        Disable-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop | Out-Null
+                        $disabledTask = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop
+                        if ([string]$disabledTask.State -ne 'Disabled') {
+                            throw 'restored task did not retain the prior disabled state'
+                        }
+                        $rollbackOperationalDetail = 'prior_task_disabled_restored'
+                    } else {
+                        Enable-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop | Out-Null
+                        $enabledTask = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop
+                        if ([string]$enabledTask.State -eq 'Disabled') {
+                            throw 'restored task remained disabled after enabling prior restart authority'
+                        }
+                        # The legacy WScript action exits after spawning its daemon, so its
+                        # Scheduled Task state is normally Ready even while the prior runtime
+                        # is live. Start every previously enabled exact task definition; the
+                        # candidate tree was already stopped and the restored action/files are
+                        # the pre-transaction Source of Truth.
+                        Start-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop
+
+                        # Start-ScheduledTask proves only that Task Scheduler accepted the
+                        # request. In particular, the legacy WScript launcher may exit zero
+                        # after failing to leave a daemon behind. Do not call rollback
+                        # complete until independent process, socket, authenticated health,
+                        # executable, command-line, and task-definition readbacks converge on
+                        # one restored runtime identity.
+                        $tokenRead = Read-SynapseSetupTokenForRestartGuard -TokenPath $transaction.TokenPath
+                        if (-not $tokenRead.Ok) {
+                            throw "restored enabled task cannot be authenticated code=$($tokenRead.Code) detail=$($tokenRead.Detail)"
+                        }
+                        $restoredDaemonSnapshots = @($transaction.FileSnapshots | Where-Object {
+                            [bool]$_.Existed -and
+                            (Test-SynapseMcpExecutableLeafName -Name ([System.IO.Path]::GetFileName([string]$_.Path)))
+                        })
+                        if ($restoredDaemonSnapshots.Count -ne 1) {
+                            throw "restored daemon snapshot identity is ambiguous expected_count=1 actual_count=$($restoredDaemonSnapshots.Count)"
+                        }
+                        $restoredDaemonSnapshot = $restoredDaemonSnapshots[0]
+                        $restoredDaemonPath = [System.IO.Path]::GetFullPath([string]$restoredDaemonSnapshot.Path)
+                        $restoredDaemonSha256 = Get-SynapseFileSha256 -Path $restoredDaemonPath
+                        if ($restoredDaemonSha256 -ine [string]$restoredDaemonSnapshot.Sha256) {
+                            throw "restored daemon hash differs before operational readback expected=$($restoredDaemonSnapshot.Sha256) actual=$restoredDaemonSha256"
+                        }
+
+                        $operationalTimeoutSeconds = [Math]::Min(300, [Math]::Max(120, [int]$InstallHealthTimeoutSeconds))
+                        $operationalDeadline = (Get-Date).AddSeconds($operationalTimeoutSeconds)
+                        $lastOperationalDetail = 'no readback attempted'
+                        $operationalProof = $null
+                        do {
+                            $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($operationalDeadline - (Get-Date)).TotalSeconds))
+                            $healthTimeoutSeconds = [Math]::Min(10, $remainingSeconds)
+                            $healthRead = Read-SynapseHealthForRestartGuard `
+                                -Bind $transaction.Bind `
+                                -Token $tokenRead.Token `
+                                -TimeoutSec $healthTimeoutSeconds
+                            $healthPid = 0
+                            $healthOk = $false
+                            if ($healthRead.Ok) {
+                                try { $healthPid = [int]$healthRead.Health.pid } catch { $healthPid = 0 }
+                                $healthOk = ($healthRead.Health.ok -eq $true)
+                            }
+
+                            $matchingDaemons = @(Select-SynapseMcpDeployTargetProcesses `
+                                -Snapshot @(Get-SynapseMcpProcessSnapshot) `
+                                -Bind $transaction.Bind `
+                                -DbPath $transaction.DbPath)
+                            $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $transaction.Bind)
+                            $daemonPid = if ($matchingDaemons.Count -eq 1) { [int]$matchingDaemons[0].ProcessId } else { 0 }
+                            $listenerPid = if ($listeners.Count -eq 1) { [int]$listeners[0].OwningProcess } else { 0 }
+                            $daemonPath = if ($matchingDaemons.Count -eq 1) {
+                                Normalize-SynapseSetupPathForCompare -Path ([string]$matchingDaemons[0].ExecutablePath)
+                            } else { '' }
+                            $daemonBind = if ($matchingDaemons.Count -eq 1) {
+                                Get-SynapseCommandLineArgumentValue -CommandLine ([string]$matchingDaemons[0].CommandLine) -Name '--bind'
+                            } else { $null }
+                            $daemonDb = if ($matchingDaemons.Count -eq 1) {
+                                Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine ([string]$matchingDaemons[0].CommandLine) -Name '--db')
+                            } else { '' }
+                            $expectedDaemonPath = Normalize-SynapseSetupPathForCompare -Path $restoredDaemonPath
+                            $expectedDbPath = Normalize-SynapseSetupPathForCompare -Path $transaction.DbPath
+
+                            $taskIdentityOk = $false
+                            $taskIdentityDetail = '<unread>'
+                            try {
+                                $operationalTask = Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop
+                                $operationalActions = @($operationalTask.Actions)
+                                $operationalXml = [string](Export-ScheduledTask -TaskName $transaction.TaskName -ErrorAction Stop)
+                                $operationalXmlSha256 = Get-SynapseSha256Hex -Text $operationalXml
+                                $taskIdentityOk = (
+                                    [string]$operationalTask.State -ne 'Disabled' -and
+                                    $operationalActions.Count -eq 1 -and
+                                    [string]$operationalActions[0].Execute -ceq [string]$priorTask.Execute -and
+                                    [string]$operationalActions[0].Arguments -ceq [string]$priorTask.Arguments -and
+                                    [string]$operationalActions[0].WorkingDirectory -ceq [string]$priorTask.WorkingDirectory -and
+                                    $operationalXmlSha256 -ieq [string]$priorTask.XmlSha256)
+                                $taskIdentityDetail = "state=$($operationalTask.State) action_count=$($operationalActions.Count) xml_sha256=$operationalXmlSha256"
+                            } catch {
+                                $taskIdentityDetail = "read_failed:$($_.Exception.Message)"
+                            }
+
+                            $lastOperationalDetail = "health_transport_ok=$($healthRead.Ok) health_ok=$healthOk health_pid=$healthPid daemon_count=$($matchingDaemons.Count) daemon_pid=$daemonPid daemon_path=$(if ($daemonPath) { $daemonPath } else { '<missing>' }) daemon_bind=$(if ($daemonBind) { $daemonBind } else { '<missing>' }) daemon_db=$(if ($daemonDb) { $daemonDb } else { '<missing>' }) listener_count=$($listeners.Count) listener_pid=$listenerPid task_identity=[$taskIdentityDetail] health_error=$(if ($healthRead.Error) { $healthRead.Error } else { '<none>' })"
+                            if ($healthRead.Ok -and
+                                $healthOk -and
+                                $healthPid -gt 0 -and
+                                $matchingDaemons.Count -eq 1 -and
+                                $listeners.Count -eq 1 -and
+                                $daemonPid -eq $healthPid -and
+                                $listenerPid -eq $healthPid -and
+                                $daemonPath -ieq $expectedDaemonPath -and
+                                $daemonBind -ieq $transaction.Bind -and
+                                $daemonDb -ieq $expectedDbPath -and
+                                $taskIdentityOk) {
+                                $operationalProof = [pscustomobject]@{
+                                    Pid = $healthPid
+                                    ExecutablePath = $daemonPath
+                                    ExecutableSha256 = $restoredDaemonSha256
+                                    TaskXmlSha256 = $operationalXmlSha256
+                                }
+                                break
+                            }
+                            if ((Get-Date) -lt $operationalDeadline) {
+                                Start-Sleep -Seconds 1
+                            }
+                        } while ((Get-Date) -lt $operationalDeadline)
+
+                        if ($null -eq $operationalProof) {
+                            throw "restored enabled task did not become operational timeout_s=$operationalTimeoutSeconds last_readback=[$lastOperationalDetail]"
+                        }
+                        $rollbackOperationalDetail = "prior_enabled_task_operational task=$($transaction.TaskName) pid=$($operationalProof.Pid) bind=$($transaction.Bind) executable_path=$($operationalProof.ExecutablePath) executable_sha256=$($operationalProof.ExecutableSha256) task_xml_sha256=$($operationalProof.TaskXmlSha256) health_ok=true listener_pid=$($operationalProof.Pid)"
+                    }
+                } elseif (Get-ScheduledTask -TaskName $transaction.TaskName -ErrorAction SilentlyContinue) {
+                    throw 'prior task absence was not restored'
+                }
+            } catch {
+                $errors.Add("restore_task:$($_.Exception.Message)")
+            }
+        }
+    } catch {
+        $errors.Add("rollback_unhandled:$($_.Exception.Message)")
+    }
+
+    # The manifest is the durable transaction Source of Truth. Publish its
+    # terminal state only after every required restoration/readback succeeded,
+    # and make failure to durably publish that verdict a rollback failure.
+    if ($errors.Count -eq 0) {
+        try {
+            $manifestPath = [System.IO.Path]::GetFullPath([string]$transaction.ManifestPath)
+            $transactionRoot = [System.IO.Path]::GetFullPath([string]$transaction.Root)
+            if ((Split-Path -Parent $manifestPath) -ine $transactionRoot) {
+                throw "manifest path escaped transaction root manifest=$manifestPath root=$transactionRoot"
+            }
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                throw "armed manifest missing path=$manifestPath"
+            }
+            $armedManifestSha256 = Get-SynapseFileSha256 -Path $manifestPath
+            if ($armedManifestSha256 -ine [string]$transaction.ManifestSha256) {
+                throw "armed manifest hash changed expected=$($transaction.ManifestSha256) actual=$armedManifestSha256"
+            }
+            try {
+                $terminalManifest = Get-Content -Raw -LiteralPath $manifestPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                throw "armed manifest unreadable path=$manifestPath error=$($_.Exception.Message)"
+            }
+            if ([string]$terminalManifest.schema -ne 'synapse_deployment_transaction/v1' -or
+                [string]$terminalManifest.state -ne 'armed' -or
+                [string]$terminalManifest.task_name -cne [string]$transaction.TaskName -or
+                [System.IO.Path]::GetFullPath([string]$terminalManifest.transaction_root) -ine $transactionRoot) {
+                throw "armed manifest identity/state mismatch path=$manifestPath schema=$($terminalManifest.schema) state=$($terminalManifest.state) task=$($terminalManifest.task_name) root=$($terminalManifest.transaction_root)"
+            }
+            $rolledBackAtUtc = [DateTime]::UtcNow.ToString('o')
+            $rollbackDetailSha256 = Get-SynapseSha256Hex -Text $rollbackOperationalDetail
+            $primaryFailureSha256 = Get-SynapseSha256Hex -Text $PrimaryFailure
+            $terminalManifest.state = 'rolled_back'
+            $terminalManifest | Add-Member -NotePropertyName rolled_back_at_utc -NotePropertyValue $rolledBackAtUtc -Force
+            $terminalManifest | Add-Member -NotePropertyName rollback_detail -NotePropertyValue $rollbackOperationalDetail -Force
+            $terminalManifest | Add-Member -NotePropertyName rollback_detail_sha256 -NotePropertyValue $rollbackDetailSha256 -Force
+            $terminalManifest | Add-Member -NotePropertyName primary_failure_sha256 -NotePropertyValue $primaryFailureSha256 -Force
+            $rollbackManifestWrite = Write-SynapseAtomicUtf8TextFile `
+                -Path $manifestPath `
+                -Content ($terminalManifest | ConvertTo-Json -Depth 10) `
+                -Purpose 'deployment_transaction_rollback_terminal'
+            try {
+                $terminalReadback = Get-Content -Raw -LiteralPath $manifestPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                throw "terminal manifest unreadable after atomic write path=$manifestPath error=$($_.Exception.Message)"
+            }
+            # PowerShell 7 deserializes an ISO-8601 JSON string to DateTime, while
+            # Windows PowerShell may retain it as String. Casting either to
+            # [string] is not stable: DateTime uses the current culture and drops
+            # the round-trip rendering even though its UTC ticks are identical.
+            # Normalize both representations to UTC ticks before comparison.
+            $terminalTimestampMatches = $false
+            try {
+                $expectedTimestampTicks = ([DateTimeOffset]::Parse(
+                    $rolledBackAtUtc,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind)).UtcDateTime.Ticks
+                $readbackTimestampValue = $terminalReadback.rolled_back_at_utc
+                $readbackTimestampTicks = if ($readbackTimestampValue -is [DateTime]) {
+                    ([DateTime]$readbackTimestampValue).ToUniversalTime().Ticks
+                } elseif ($readbackTimestampValue -is [DateTimeOffset]) {
+                    ([DateTimeOffset]$readbackTimestampValue).UtcDateTime.Ticks
+                } else {
+                    ([DateTimeOffset]::Parse(
+                        [string]$readbackTimestampValue,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::RoundtripKind)).UtcDateTime.Ticks
+                }
+                $terminalTimestampMatches = ($readbackTimestampTicks -eq $expectedTimestampTicks)
+            } catch {
+                $terminalTimestampMatches = $false
+            }
+            if ([string]$terminalReadback.state -ne 'rolled_back' -or
+                -not $terminalTimestampMatches -or
+                [string]$terminalReadback.rollback_detail -cne $rollbackOperationalDetail -or
+                [string]$terminalReadback.rollback_detail_sha256 -cne $rollbackDetailSha256 -or
+                [string]$terminalReadback.primary_failure_sha256 -cne $primaryFailureSha256 -or
+                (Get-SynapseFileSha256 -Path $manifestPath) -ine [string]$rollbackManifestWrite.sha256) {
+                throw "terminal manifest semantic/hash readback mismatch path=$manifestPath"
+            }
+            $transaction.ManifestSha256 = [string]$rollbackManifestWrite.sha256
+        } catch {
+            $errors.Add("terminalize_manifest:$($_.Exception.Message)")
+        }
+    }
+    $transaction.RollbackInProgress = $false
+    $transaction.RolledBack = ($errors.Count -eq 0)
+    if ($errors.Count -eq 0) {
+        $transaction.Armed = $false
+        Clear-SynapseDeployRestartAuthorityRevocation
+        return [pscustomobject]@{ Attempted = $true; Ok = $true; Detail = "rollback_complete operational_proof=[$rollbackOperationalDetail] manifest=$($rollbackManifestWrite.path) manifest_sha256=$($rollbackManifestWrite.sha256) primary_failure=[$PrimaryFailure]" }
+    }
+    return [pscustomobject]@{ Attempted = $true; Ok = $false; Detail = "rollback_errors=$($errors -join '; ') primary_failure=[$PrimaryFailure]" }
+}
 
 function Set-SynapseDeployRestartAuthorityRevocation {
     param(
@@ -1528,6 +2128,8 @@ function Restore-SynapseDeployRestartAuthorityBestEffort {
             $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
             if ($null -eq $task) {
                 Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_SKIPPED reason=$Reason task=$taskName task_present=false"
+            } elseif (-not $script:SynapseDeployPriorTaskResumeAllowed) {
+                Info "SYNAPSE_DEPLOY_PRIOR_TASK_PARKED reason=$Reason task=$taskName state=$($task.State) remediation=the prior task did not prove the native bounded-bootstrap contract and is deliberately not resumed after a failed repair handoff"
             } elseif ([string]$task.State -eq 'Disabled') {
                 Enable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
                 $after = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -1560,13 +2162,33 @@ trap {
             Info "WARN: SYNAPSE_SETUP_PHASE_LEDGER_TRAP_REPORT_FAILED detail=$($_.Exception.Message) remediation=preserve the primary setup error and inspect LogDir manually"
         } catch {}
     }
-    # #2092: the deploy drain's restart-authority revocation is DURABLE -- it
-    # outlives this process by design, which is exactly what makes it safe
-    # against the install-handoff race and exactly what would strand the host if
-    # a failed deploy left it behind. Restoring it is the first thing the trap
-    # does, before any manifest/lock bookkeeping that could itself throw.
+    # Once armed, deployment rollback owns restart authority and must restore
+    # the complete prior generation before any task can be re-enabled. The old
+    # revocation-only cleanup is safe only before a deployment transaction was
+    # armed; otherwise it could start a mixed generation.
+    $transactionRollback = Invoke-SynapseDeploymentTransactionRollbackBestEffort -PrimaryFailure (($errorText -replace '\s+', ' ').Trim())
+    if ($transactionRollback.Attempted) {
+        Info "SYNAPSE_DEPLOYMENT_TRANSACTION_ROLLBACK attempted=true ok=$($transactionRollback.Ok) detail=$($transactionRollback.Detail)"
+        if (-not $transactionRollback.Ok) {
+            $errorText = "$errorText`nSYNAPSE_DEPLOYMENT_TRANSACTION_ROLLBACK_FAILED $($transactionRollback.Detail) remediation=restart authority remains absent; inspect the durable transaction backups and restore only the exact snapshotted generation"
+        }
+    }
+    if (-not $transactionRollback.Attempted -and -not [string]::IsNullOrWhiteSpace([string]$script:SynapseDeploymentTransactionPreparingRoot)) {
+        try {
+            [void](Remove-SynapseDeploymentTransactionArtifact `
+                -Path $script:SynapseDeploymentTransactionPreparingRoot `
+                -ExpectedRoot (Join-Path $LogDir 'setup-transactions') `
+                -ExpectedState 'unarmed' `
+                -Reason 'unarmed_deployment_transaction_cleanup')
+            $script:SynapseDeploymentTransactionPreparingRoot = $null
+        } catch {
+            $errorText = "$errorText`nSYNAPSE_UNARMED_DEPLOYMENT_TRANSACTION_CLEANUP_FAILED root=$($script:SynapseDeploymentTransactionPreparingRoot) error=$($_.Exception.Message)"
+        }
+    }
     try {
-        Restore-SynapseDeployRestartAuthorityBestEffort -Reason 'setup_failed'
+        if (-not $transactionRollback.Attempted) {
+            Restore-SynapseDeployRestartAuthorityBestEffort -Reason 'setup_failed'
+        }
     } catch {
         Info "WARN: SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORE_TRAP_FAILED error=$($_.Exception.Message)"
     }
@@ -1579,7 +2201,7 @@ trap {
             $errorText = "$errorText`n$cleanupError"
         }
     }
-    if ($script:SynapseSetupPartialState -eq 'bridge_pending') {
+    if ($script:SynapseSetupPartialState -eq 'bridge_pending' -and -not $transactionRollback.Attempted) {
         try {
             Write-SynapseSetupRepairManifestState `
                 -State 'bridge_pending' `
@@ -1615,6 +2237,22 @@ function Quote-WindowsCommandArgument {
     $escaped = $Value -replace '(\\*)"', '$1$1\"'
     $escaped = $escaped -replace '(\\+)$', '$1$1'
     return '"' + $escaped + '"'
+}
+
+function Get-SynapseSupervisorBootstrapTaskArgumentText {
+    param(
+        [Parameter(Mandatory=$true)][string]$PowerShellPath,
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory,
+        [Parameter(Mandatory=$true)][string]$LogPath
+    )
+
+    return (@(
+        (Quote-WindowsCommandArgument ([System.IO.Path]::GetFullPath($PowerShellPath))),
+        (Quote-WindowsCommandArgument ([System.IO.Path]::GetFullPath($SupervisorPath))),
+        (Quote-WindowsCommandArgument ([System.IO.Path]::GetFullPath($WorkingDirectory))),
+        (Quote-WindowsCommandArgument ([System.IO.Path]::GetFullPath($LogPath)))
+    ) -join ' ')
 }
 
 function Quote-VbsString {
@@ -1660,7 +2298,8 @@ function Get-SynapseDaemonArgumentText {
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256
     )
 
     $daemonArguments = @(
@@ -1670,9 +2309,10 @@ function Get-SynapseDaemonArgumentText {
         '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
         '--log-level', 'info'
     )
-    if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
-        $daemonArguments += @('--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath))
-    }
+    $daemonArguments += @(
+        '--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath),
+        '--calyx-config-sha256', $ExpectedCalyxConfigSha256.ToUpperInvariant()
+    )
     if ($EnableAudio) {
         $daemonArguments += '--enable-audio'
     }
@@ -1812,7 +2452,9 @@ function New-HiddenDaemonLauncher {
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256,
+        [bool]$OneShot = $false
     )
 
     $daemonLogDir = $LogDir
@@ -1827,6 +2469,15 @@ function New-HiddenDaemonLauncher {
     # stop-request deleted by a log sweep would silently RESTORE restart
     # authority, which is the fail-open direction.
     $supervisorStopRequestPath = Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir (Split-Path -Parent $OutputPath)
+    if ([string]::IsNullOrWhiteSpace($CalyxConfigPath) -or
+        -not (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf)) {
+        Die "SYNAPSE_DAEMON_CPU_CONFIG_MISSING path=$(if ($CalyxConfigPath) { $CalyxConfigPath } else { '<absent>' }) remediation=generate or supply the explicit CPU-only Calyx config before creating the persistent supervisor"
+    }
+    $expectedCalyxConfigSha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+    $actualCalyxConfigSha256 = Get-SynapseFileSha256 -Path $CalyxConfigPath
+    if ($actualCalyxConfigSha256 -ine $expectedCalyxConfigSha256) {
+        Die "SYNAPSE_DAEMON_CPU_CONFIG_IDENTITY_MISMATCH path=$CalyxConfigPath expected_sha256=$expectedCalyxConfigSha256 actual_sha256=$actualCalyxConfigSha256 remediation=refuse launcher generation; preserve the exact candidate-validated config bytes through handoff"
+    }
     $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
     $daemonArgumentText = Get-SynapseDaemonArgumentText `
         -Bind $Bind `
@@ -1834,13 +2485,26 @@ function New-HiddenDaemonLauncher {
         -ProfilesDir $ProfilesDir `
         -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
-        -CalyxConfigPath $CalyxConfigPath
+        -CalyxConfigPath $CalyxConfigPath `
+        -ExpectedCalyxConfigSha256 $expectedCalyxConfigSha256
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
         Die "SYNAPSE_HIDDEN_SUPERVISOR_POWERSHELL_MISSING path=$powerShellExe remediation=repair Windows PowerShell before registering the daemon supervisor"
     }
 
-    $supervisorScript = @'
+$supervisorScript = @'
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidatePattern('^Local\\SynapseOwned-[A-Za-z0-9-]+$')]
+    [string]$ParentJobName
+)
+
+# The native bootstrap inherits setup's pwsh environment verbatim. Pin module
+# discovery before the first command can auto-load a Core-only PowerShell 7
+# module into this Windows PowerShell 5.1 supervisor.
+$trustedWinPsModuleRoot = [System.IO.Path]::Combine([string]$PSHOME, 'Modules')
+$env:PSModulePath = $trustedWinPsModuleRoot
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -1856,9 +2520,20 @@ $SupervisorEvents = __SUPERVISOR_EVENTS__
 $MaintenanceLockPath = __MAINTENANCE_LOCK_PATH__
 $SupervisorStopRequestPath = __SUPERVISOR_STOP_REQUEST_PATH__
 $ExpectedCalyxConfigPath = __EXPECTED_CALYX_CONFIG_PATH__
+$ExpectedCalyxConfigSha256 = __EXPECTED_CALYX_CONFIG_SHA256__
 $DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
 $ExpectedAllowedPermissions = __EXPECTED_ALLOWED_PERMISSIONS__
 $ExpectedEnableAudio = __EXPECTED_ENABLE_AUDIO__
+$ProcessMemoryLimitBytes = [uint64]__PROCESS_MEMORY_LIMIT_BYTES__
+$SupervisorMemoryLimitBytes = [uint64]__SUPERVISOR_MEMORY_LIMIT_BYTES__
+$BootstrapPreAssociationReserveBytes = [uint64]__BOOTSTRAP_PREASSOCIATION_RESERVE_BYTES__
+$CommittedPrivatePolicyCeilingBytes = [uint64]1000000000
+$DaemonCpuRate = [uint32]__DAEMON_CPU_RATE__
+$SupervisorCpuRate = [uint32]__SUPERVISOR_CPU_RATE__
+$OneShot = [System.Convert]::ToBoolean(__ONE_SHOT__)
+$supervisorJobLifetimeOwner = 'native_bootstrap_only'
+$supervisorResourceJob = $null
+$supervisorJobName = $null
 
 $restartFloorSeconds = 2
 $restartCeilingSeconds = 60
@@ -1901,8 +2576,17 @@ function Write-SupervisorState {
         [int]$Generation,
         [AllowNull()][object]$ChildPid,
         [AllowNull()][object]$ExitCode,
-        [Parameter(Mandatory=$true)][string]$Message
+        [Parameter(Mandatory=$true)][string]$Message,
+        [hashtable]$Fields = @{}
     )
+    if ($null -ne $supervisorResourceJob) {
+        $supervisorResourceJob.RefreshAccounting()
+        if ([uint64]$supervisorResourceJob.CurrentJobMemoryUsedBytes -gt $SupervisorMemoryLimitBytes -or
+            [uint64]$supervisorResourceJob.PeakJobMemoryUsedBytes -gt $SupervisorMemoryLimitBytes -or
+            [uint64]$supervisorResourceJob.PeakProcessMemoryUsedBytes -gt $SupervisorMemoryLimitBytes) {
+            throw "SYNAPSE_SUPERVISOR_PARENT_JOB_MEMORY_CONTRACT_VIOLATED job_name=$($supervisorResourceJob.JobName) hard_limit_bytes=$SupervisorMemoryLimitBytes current_job_memory_bytes=$($supervisorResourceJob.CurrentJobMemoryUsedBytes) peak_job_memory_bytes=$($supervisorResourceJob.PeakJobMemoryUsedBytes) peak_process_memory_bytes=$($supervisorResourceJob.PeakProcessMemoryUsedBytes) remediation=identify and optimize the retained owner; the supervisor will not publish an in-budget state"
+        }
+    }
     $stateObject = [ordered]@{
         updated_utc = (Get-Date).ToUniversalTime().ToString('o')
         state = $State
@@ -1913,9 +2597,1046 @@ function Write-SupervisorState {
         bind = $Bind
         db_path = $DbPath
         exe_path = $ExePath
+        calyx_config_path = $ExpectedCalyxConfigPath
+        calyx_config_sha256 = $ExpectedCalyxConfigSha256
+        math_backend = 'cpu'
+        vram_budget_bytes = 0
+        detection_backend = 'cpu'
+        stt_backend = 'cpu'
+        capture_backend = 'gdi_bitblt'
+        capture_force_dxgi = $false
+        search_open_generation_cache_entries = 1
+        job_limit_flags_expected_hex = '0x00002300'
+        job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        daemon_cpu_rate = $DaemonCpuRate
+        working_set_policy = 'measured_only'
+        job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+        process_memory_limit_bytes = $ProcessMemoryLimitBytes
+        job_memory_limit_bytes = $ProcessMemoryLimitBytes
+        supervisor_job_limit_flags_expected_hex = '0x00002300'
+        supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        supervisor_process_memory_limit_bytes = $SupervisorMemoryLimitBytes
+        supervisor_job_memory_limit_bytes = $SupervisorMemoryLimitBytes
+        supervisor_cpu_rate = $SupervisorCpuRate
+        owned_combined_memory_limit_bytes = $SupervisorMemoryLimitBytes
+        bootstrap_preassociation_reserve_bytes = $BootstrapPreAssociationReserveBytes
+        owned_committed_private_ceiling_bytes = $CommittedPrivatePolicyCeilingBytes
+        supervisor_job_name = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.JobName })
+        supervisor_job_lifetime_owner = $supervisorJobLifetimeOwner
+        supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+        supervisor_job_limit_flags_hex = $(if ($null -eq $supervisorResourceJob) { $null } else { '0x{0:X8}' -f $supervisorResourceJob.JobLimitFlags })
+        supervisor_job_cpu_rate_control_flags_hex = $(if ($null -eq $supervisorResourceJob) { $null } else { '0x{0:X8}' -f $supervisorResourceJob.CpuRateControlFlags })
+        supervisor_job_process_memory_limit_bytes = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.ProcessMemoryLimitBytes })
+        supervisor_job_memory_limit_bytes_actual = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.JobMemoryLimitBytes })
+        supervisor_job_cpu_rate = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.CpuRate })
+        supervisor_job_current_memory_used_bytes = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.CurrentJobMemoryUsedBytes })
+        supervisor_job_memory_headroom_bytes = $(if ($null -eq $supervisorResourceJob) { $null } elseif ($supervisorResourceJob.CurrentJobMemoryUsedBytes -ge $SupervisorMemoryLimitBytes) { [uint64]0 } else { [uint64]($SupervisorMemoryLimitBytes - $supervisorResourceJob.CurrentJobMemoryUsedBytes) })
+        supervisor_job_peak_process_memory_used_bytes = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.PeakProcessMemoryUsedBytes })
+        supervisor_job_peak_memory_used_bytes = $(if ($null -eq $supervisorResourceJob) { $null } else { $supervisorResourceJob.PeakJobMemoryUsedBytes })
         message = $Message
     }
-    $stateObject | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SupervisorState -Encoding ascii
+    foreach ($key in $Fields.Keys) {
+        $stateObject[$key] = $Fields[$key]
+    }
+    $stateJson = $stateObject | ConvertTo-Json -Depth 8
+    [SynapseDaemonSupervisor.BoundedProcess]::PersistUtf8Atomic($SupervisorState, $stateJson)
+}
+
+function Initialize-SynapseDaemonBoundedProcessType {
+    if ('SynapseDaemonSupervisor.BoundedProcess' -as [type]) { return }
+
+    try {
+        Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace SynapseDaemonSupervisor
+{
+    public sealed class BoundedProcess : IDisposable
+    {
+        private const uint CREATE_SUSPENDED = 0x00000004;
+        private const uint CREATE_NO_WINDOW = 0x08000000;
+        private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private const uint STARTF_USESHOWWINDOW = 0x00000001;
+        private static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST =
+            new IntPtr(0x0002000D);
+        private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST =
+            new IntPtr(0x00020002);
+        private const uint STARTF_USESTDHANDLES = 0x00000100;
+        private const ushort SW_HIDE = 0;
+        private const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100;
+        private const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const uint JOB_OBJECT_QUERY = 0x00000004;
+        private const uint EXPECTED_JOB_LIMIT_FLAGS =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+            JOB_OBJECT_LIMIT_JOB_MEMORY |
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        private const uint EXPECTED_SUPERVISOR_JOB_LIMIT_FLAGS =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+            JOB_OBJECT_LIMIT_JOB_MEMORY |
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        private const int JobObjectExtendedLimitInformation = 9;
+        private const int JobObjectCpuRateControlInformation = 15;
+        // Raw JOBOBJECTINFOCLASS 28. Microsoft hcsshim uses this exact
+        // two-ULONG64 ABI for current and peak aggregate Job commit.
+        private const int JobObjectMemoryUsageInformation = 28;
+        private const uint JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001;
+        private const uint JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004;
+        private const uint EXPECTED_CPU_RATE_CONTROL_FLAGS =
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        private const uint FILE_APPEND_DATA = 0x00000004;
+        private const uint GENERIC_READ = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint OPEN_ALWAYS = 4;
+        private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+        private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+        private const uint MOVEFILE_REPLACE_EXISTING = 0x00000001;
+        private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+        private const uint EXIT_ASSIGN_FAILED = 125;
+        private const uint EXIT_RESUME_FAILED = 126;
+        private const int ERROR_ALREADY_EXISTS = 183;
+        private const int ERROR_INSUFFICIENT_BUFFER = 122;
+        private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+        {
+            public uint ControlFlags;
+            public uint CpuRate;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_MEMORY_USAGE_INFORMATION
+        {
+            public ulong JobMemory;
+            public ulong PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bInheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {
+            public uint cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenJobObject(
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength,
+            out uint lpReturnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFile(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            ref SECURITY_ATTRIBUTES lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool MoveFileEx(
+            string existingFileName,
+            string newFileName,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcess(
+            string lpApplicationName,
+            StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFOEX lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            uint flags,
+            ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(
+            IntPtr processHandle,
+            IntPtr jobHandle,
+            [MarshalAs(UnmanagedType.Bool)] out bool result);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentProcessId();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+            string stringSecurityDescriptor,
+            uint stringSDRevision,
+            out IntPtr securityDescriptor,
+            out uint securityDescriptorSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+
+        private IntPtr jobHandle;
+        private IntPtr processHandle;
+        private bool queryImmediateCurrentProcessJob;
+        private bool disposed;
+
+        public uint ProcessId { get; private set; }
+        public string JobName { get; private set; }
+        public uint JobLimitFlags { get; private set; }
+        public ulong ProcessMemoryLimitBytes { get; private set; }
+        public ulong JobMemoryLimitBytes { get; private set; }
+        public ulong PeakProcessMemoryUsedBytes { get; private set; }
+        public ulong PeakJobMemoryUsedBytes { get; private set; }
+        public ulong CurrentJobMemoryUsedBytes { get; private set; }
+        public uint CpuRateControlFlags { get; private set; }
+        public uint CpuRate { get; private set; }
+
+        private BoundedProcess()
+        {
+        }
+
+        public static void PersistUtf8Atomic(string path, string content)
+        {
+            if (String.IsNullOrWhiteSpace(path) || content == null)
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_SUPERVISOR_STATE_INPUT_INVALID remediation=provide an exact state path and non-null JSON content");
+            }
+            string destination = Path.GetFullPath(path);
+            string parent = Path.GetDirectoryName(destination);
+            if (String.IsNullOrWhiteSpace(parent) || !Directory.Exists(parent))
+            {
+                throw new InvalidOperationException(
+                    "SYNAPSE_SUPERVISOR_STATE_PARENT_MISSING path=" + destination +
+                    " remediation=repair the setup-owned supervisor state directory before restart");
+            }
+            if ((File.GetAttributes(parent) & (FileAttributes)FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                (File.Exists(destination) &&
+                 (File.GetAttributes(destination) & (FileAttributes)FILE_ATTRIBUTE_REPARSE_POINT) != 0))
+            {
+                throw new InvalidOperationException(
+                    "SYNAPSE_SUPERVISOR_STATE_REPARSE_REFUSED path=" + destination +
+                    " remediation=replace the reparse point with the exact setup-owned regular path");
+            }
+
+            byte[] expected = new UTF8Encoding(false, true).GetBytes(content);
+            string temporary = Path.Combine(
+                parent,
+                "." + Path.GetFileName(destination) + ".synapse-" + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    4096,
+                    FileOptions.WriteThrough))
+                {
+                    stream.Write(expected, 0, expected.Length);
+                    stream.Flush(true);
+                }
+                if (!MoveFileEx(
+                    temporary,
+                    destination,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                {
+                    ThrowLastError("SYNAPSE_SUPERVISOR_STATE_ATOMIC_REPLACE_FAILED");
+                }
+                byte[] actual = File.ReadAllBytes(destination);
+                if (actual.Length != expected.Length)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_SUPERVISOR_STATE_READBACK_LENGTH_MISMATCH expected=" + expected.Length +
+                        " actual=" + actual.Length +
+                        " remediation=repair filesystem durability before restart");
+                }
+                for (int index = 0; index < expected.Length; index++)
+                {
+                    if (actual[index] != expected[index])
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_SUPERVISOR_STATE_READBACK_BYTES_MISMATCH index=" + index +
+                            " remediation=repair filesystem durability before restart");
+                    }
+                }
+            }
+            finally
+            {
+                if (File.Exists(temporary))
+                {
+                    File.Delete(temporary);
+                }
+            }
+        }
+
+        public static BoundedProcess Launch(
+            string applicationName,
+            string arguments,
+            string workingDirectory,
+            string stderrPath,
+            string jobName,
+            ulong processMemoryLimitBytes,
+            uint cpuRate)
+        {
+            if (String.IsNullOrWhiteSpace(applicationName) ||
+                String.IsNullOrWhiteSpace(workingDirectory) ||
+                String.IsNullOrWhiteSpace(stderrPath) ||
+                String.IsNullOrWhiteSpace(jobName))
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_DAEMON_JOB_INPUT_INVALID application, working directory, stderr path, and unique Job name are required; remediation=regenerate the supervisor from complete setup paths");
+            }
+            if (processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 1000000000UL ||
+                cpuRate == 0 || cpuRate > 10000)
+            {
+                throw new ArgumentOutOfRangeException(
+                    "processMemoryLimitBytes",
+                    "SYNAPSE_DAEMON_JOB_LIMIT_INVALID committed-memory limits must be positive and below decimal 1000000000 bytes, and CPU hard rate must be in 1..=10000; remediation=repair the setup-owned constants and regenerate the supervisor");
+            }
+
+            BoundedProcess owner = new BoundedProcess();
+            PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
+            IntPtr limitPointer = IntPtr.Zero;
+            IntPtr stdinHandle = IntPtr.Zero;
+            IntPtr stdoutHandle = IntPtr.Zero;
+            IntPtr stderrHandle = IntPtr.Zero;
+            IntPtr jobSecurityDescriptor = IntPtr.Zero;
+            IntPtr jobAttributesPointer = IntPtr.Zero;
+            IntPtr attributeList = IntPtr.Zero;
+            IntPtr inheritedHandleList = IntPtr.Zero;
+            IntPtr creationJobList = IntPtr.Zero;
+            bool attributeListInitialized = false;
+            bool processCreated = false;
+            bool assigned = false;
+            try
+            {
+                uint jobSecurityDescriptorSize;
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    "D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)",
+                    1,
+                    out jobSecurityDescriptor,
+                    out jobSecurityDescriptorSize))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_SECURITY_DESCRIPTOR_FAILED");
+                }
+                SECURITY_ATTRIBUTES jobSecurity = new SECURITY_ATTRIBUTES();
+                jobSecurity.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                jobSecurity.lpSecurityDescriptor = jobSecurityDescriptor;
+                jobSecurity.bInheritHandle = false;
+                jobAttributesPointer = Marshal.AllocHGlobal(jobSecurity.nLength);
+                Marshal.StructureToPtr(jobSecurity, jobAttributesPointer, false);
+                owner.jobHandle = CreateJobObject(jobAttributesPointer, jobName);
+                if (owner.jobHandle == IntPtr.Zero)
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_CREATE_FAILED");
+                }
+                int createJobError = Marshal.GetLastWin32Error();
+                if (createJobError == ERROR_ALREADY_EXISTS)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_NAME_COLLISION job_name=" + jobName +
+                        " remediation=refuse to attach a new daemon to an existing Job; inspect stale exact supervisor ownership");
+                }
+                owner.JobName = jobName;
+
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits =
+                    new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                limits.BasicLimitInformation.LimitFlags = EXPECTED_JOB_LIMIT_FLAGS;
+                limits.ProcessMemoryLimit = ToUIntPtr(processMemoryLimitBytes);
+                limits.JobMemoryLimit = ToUIntPtr(processMemoryLimitBytes);
+                int limitSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                limitPointer = Marshal.AllocHGlobal(limitSize);
+                Marshal.StructureToPtr(limits, limitPointer, false);
+                if (!SetInformationJobObject(
+                    owner.jobHandle,
+                    JobObjectExtendedLimitInformation,
+                    limitPointer,
+                    (uint)limitSize))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_LIMIT_SET_FAILED");
+                }
+                Marshal.FreeHGlobal(limitPointer);
+                limitPointer = IntPtr.Zero;
+                SetCpuHardRate(owner.jobHandle, cpuRate);
+
+                owner.RefreshAccounting();
+                if (owner.JobLimitFlags != EXPECTED_JOB_LIMIT_FLAGS ||
+                    owner.ProcessMemoryLimitBytes != processMemoryLimitBytes ||
+                    owner.JobMemoryLimitBytes != processMemoryLimitBytes ||
+                    owner.CpuRateControlFlags != EXPECTED_CPU_RATE_CONTROL_FLAGS ||
+                    owner.CpuRate != cpuRate)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_LIMIT_READBACK_MISMATCH expected_flags=0x" +
+                        EXPECTED_JOB_LIMIT_FLAGS.ToString("X8") +
+                        " actual_flags=0x" + owner.JobLimitFlags.ToString("X8") +
+                        " expected_process_memory=" + processMemoryLimitBytes +
+                        " actual_process_memory=" + owner.ProcessMemoryLimitBytes +
+                        " expected_job_memory=" + processMemoryLimitBytes +
+                        " actual_job_memory=" + owner.JobMemoryLimitBytes +
+                        " working_set_policy=measured_only" +
+                        " expected_cpu_rate_flags=0x" + EXPECTED_CPU_RATE_CONTROL_FLAGS.ToString("X8") +
+                        " actual_cpu_rate_flags=0x" + owner.CpuRateControlFlags.ToString("X8") +
+                        " expected_cpu_rate=" + cpuRate +
+                        " actual_cpu_rate=" + owner.CpuRate +
+                        " remediation=repair Windows Job Object limit support; no daemon was created");
+                }
+
+                SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+                security.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                security.bInheritHandle = true;
+                stdinHandle = CreateFile(
+                    "NUL",
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ref security,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    IntPtr.Zero);
+                EnsureHandle(stdinHandle, "SYNAPSE_DAEMON_JOB_STDIN_OPEN_FAILED");
+                stdoutHandle = CreateFile(
+                    "NUL",
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ref security,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    IntPtr.Zero);
+                EnsureHandle(stdoutHandle, "SYNAPSE_DAEMON_JOB_STDOUT_OPEN_FAILED");
+                stderrHandle = CreateFile(
+                    stderrPath,
+                    FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    ref security,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    IntPtr.Zero);
+                EnsureHandle(stderrHandle, "SYNAPSE_DAEMON_JOB_STDERR_OPEN_FAILED");
+
+                IntPtr attributeListSize = IntPtr.Zero;
+                bool attributeSizeResult = InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref attributeListSize);
+                int attributeSizeError = Marshal.GetLastWin32Error();
+                if (attributeSizeResult || attributeSizeError != ERROR_INSUFFICIENT_BUFFER || attributeListSize == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_ATTRIBUTE_LIST_SIZE_FAILED expected_win32=" + ERROR_INSUFFICIENT_BUFFER +
+                        " actual_win32=" + attributeSizeError +
+                        " unexpected_success=" + attributeSizeResult +
+                        " size=" + attributeListSize +
+                        " remediation=the host must support exact STARTUPINFOEX Job/handle-list sizing before daemon creation");
+                }
+                attributeList = Marshal.AllocHGlobal(attributeListSize);
+                if (!InitializeProcThreadAttributeList(attributeList, 2, 0, ref attributeListSize))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_ATTRIBUTE_LIST_INIT_FAILED");
+                }
+                attributeListInitialized = true;
+                inheritedHandleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(inheritedHandleList, 0, stdinHandle);
+                Marshal.WriteIntPtr(inheritedHandleList, IntPtr.Size, stdoutHandle);
+                Marshal.WriteIntPtr(inheritedHandleList, IntPtr.Size * 2, stderrHandle);
+                if (!UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inheritedHandleList,
+                    new IntPtr(IntPtr.Size * 3),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_HANDLE_LIST_UPDATE_FAILED");
+                }
+                creationJobList = Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(creationJobList, owner.jobHandle);
+                if (!UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                    creationJobList,
+                    new IntPtr(IntPtr.Size),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_LIST_UPDATE_FAILED");
+                }
+                STARTUPINFOEX startupInfo = new STARTUPINFOEX();
+                startupInfo.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFOEX));
+                startupInfo.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+                startupInfo.StartupInfo.wShowWindow = SW_HIDE;
+                startupInfo.StartupInfo.hStdInput = stdinHandle;
+                startupInfo.StartupInfo.hStdOutput = stdoutHandle;
+                startupInfo.StartupInfo.hStdError = stderrHandle;
+                startupInfo.lpAttributeList = attributeList;
+                string commandLineText = "\"" + applicationName + "\"";
+                if (!String.IsNullOrWhiteSpace(arguments))
+                {
+                    commandLineText += " " + arguments;
+                }
+                StringBuilder commandLine = new StringBuilder(commandLineText);
+                if (!CreateProcess(
+                    applicationName,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                    IntPtr.Zero,
+                    workingDirectory,
+                    ref startupInfo,
+                    out processInfo))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_CREATE_PROCESS_FAILED");
+                }
+                processCreated = true;
+                owner.processHandle = processInfo.hProcess;
+                owner.ProcessId = processInfo.dwProcessId;
+
+                bool assignedToExactDaemonJob;
+                if (!IsProcessInJob(processInfo.hProcess, owner.jobHandle, out assignedToExactDaemonJob))
+                {
+                    string detail = LastErrorMessage();
+                    TerminateJobObject(owner.jobHandle, EXIT_ASSIGN_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_MEMBERSHIP_READBACK_FAILED error=" + detail +
+                        " remediation=the daemon remained suspended and its creation-time Job was terminated because exact kernel membership could not be read back");
+                }
+                if (!assignedToExactDaemonJob)
+                {
+                    TerminateJobObject(owner.jobHandle, EXIT_ASSIGN_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_MEMBERSHIP_MISMATCH job_name=" + owner.JobName +
+                        " remediation=the daemon remained suspended and was terminated because PROC_THREAD_ATTRIBUTE_JOB_LIST did not establish exact child Job membership at creation");
+                }
+                assigned = true;
+                if (ResumeThread(processInfo.hThread) == 0xffffffff)
+                {
+                    string detail = LastErrorMessage();
+                    TerminateJobObject(owner.jobHandle, EXIT_RESUME_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_RESUME_FAILED error=" + detail +
+                        " remediation=inspect process-thread rights; the assigned Job was terminated before daemon execution");
+                }
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = IntPtr.Zero;
+                return owner;
+            }
+            catch
+            {
+                if (assigned && owner.jobHandle != IntPtr.Zero)
+                {
+                    TerminateJobObject(owner.jobHandle, 127);
+                }
+                else if (processCreated && processInfo.hProcess != IntPtr.Zero)
+                {
+                    TerminateProcess(processInfo.hProcess, 127);
+                }
+                owner.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (limitPointer != IntPtr.Zero) Marshal.FreeHGlobal(limitPointer);
+                if (jobAttributesPointer != IntPtr.Zero) Marshal.FreeHGlobal(jobAttributesPointer);
+                if (jobSecurityDescriptor != IntPtr.Zero) LocalFree(jobSecurityDescriptor);
+                if (attributeList != IntPtr.Zero)
+                {
+                    if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+                    Marshal.FreeHGlobal(attributeList);
+                }
+                if (inheritedHandleList != IntPtr.Zero) Marshal.FreeHGlobal(inheritedHandleList);
+                if (creationJobList != IntPtr.Zero) Marshal.FreeHGlobal(creationJobList);
+                if (processInfo.hThread != IntPtr.Zero) CloseHandle(processInfo.hThread);
+                if (stdinHandle != IntPtr.Zero && stdinHandle != InvalidHandleValue) CloseHandle(stdinHandle);
+                if (stdoutHandle != IntPtr.Zero && stdoutHandle != InvalidHandleValue) CloseHandle(stdoutHandle);
+                if (stderrHandle != IntPtr.Zero && stderrHandle != InvalidHandleValue) CloseHandle(stderrHandle);
+            }
+        }
+
+        public static BoundedProcess BindCurrentSupervisor(
+            string jobName,
+            ulong processMemoryLimitBytes,
+            uint cpuRate)
+        {
+            if (String.IsNullOrWhiteSpace(jobName) ||
+                processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 1000000000UL ||
+                cpuRate == 0 || cpuRate > 10000)
+            {
+                throw new ArgumentOutOfRangeException(
+                    "processMemoryLimitBytes",
+                    "SYNAPSE_SUPERVISOR_JOB_LIMIT_INVALID name and bounded committed-memory/CPU limits are required; remediation=repair setup-owned constants before launching the supervisor");
+            }
+
+            BoundedProcess owner = new BoundedProcess();
+            try
+            {
+                owner.jobHandle = OpenJobObject(JOB_OBJECT_QUERY, false, jobName);
+                if (owner.jobHandle == IntPtr.Zero)
+                {
+                    ThrowLastError("SYNAPSE_SUPERVISOR_PARENT_JOB_OPEN_FAILED");
+                }
+                owner.JobName = jobName;
+
+                owner.ProcessId = GetCurrentProcessId();
+                owner.RefreshAccounting();
+                if (owner.JobLimitFlags != EXPECTED_SUPERVISOR_JOB_LIMIT_FLAGS ||
+                    owner.ProcessMemoryLimitBytes != processMemoryLimitBytes ||
+                    owner.JobMemoryLimitBytes != processMemoryLimitBytes ||
+                    owner.CpuRateControlFlags != EXPECTED_CPU_RATE_CONTROL_FLAGS ||
+                    owner.CpuRate != cpuRate)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_SUPERVISOR_JOB_LIMIT_READBACK_MISMATCH job_name=" + jobName +
+                        " actual_flags=0x" + owner.JobLimitFlags.ToString("X8") +
+                        " actual_process_memory=" + owner.ProcessMemoryLimitBytes +
+                        " actual_job_memory=" + owner.JobMemoryLimitBytes +
+                        " working_set_policy=measured_only" +
+                        " actual_cpu_rate_flags=0x" + owner.CpuRateControlFlags.ToString("X8") +
+                        " actual_cpu_rate=" + owner.CpuRate +
+                        " remediation=repair Windows Job Object support; no unbounded supervisor may continue");
+                }
+                bool currentProcessInJob;
+                if (!IsProcessInJob(GetCurrentProcess(), owner.jobHandle, out currentProcessInJob))
+                {
+                    ThrowLastError("SYNAPSE_SUPERVISOR_JOB_MEMBERSHIP_READBACK_FAILED");
+                }
+                if (!currentProcessInJob)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_SUPERVISOR_PARENT_JOB_MEMBERSHIP_MISMATCH job_name=" + jobName +
+                        " remediation=the native bootstrap or candidate launcher must place PowerShell in the exact parent Job at process creation; post-start assignment is forbidden");
+                }
+                if (!CloseHandle(owner.jobHandle))
+                {
+                    ThrowLastError("SYNAPSE_SUPERVISOR_PARENT_JOB_PROOF_HANDLE_CLOSE_FAILED");
+                }
+                owner.jobHandle = IntPtr.Zero;
+                owner.queryImmediateCurrentProcessJob = true;
+                // Continuing accounting uses QueryInformationJobObject(NULL),
+                // which resolves the current process's immediate Job. Keeping
+                // this named query handle open would defeat KILL_ON_CLOSE when
+                // the native bootstrap (the sole lifetime owner) exits.
+                owner.RefreshAccounting();
+                return owner;
+            }
+            catch
+            {
+                owner.Dispose();
+                throw;
+            }
+        }
+
+        public void RefreshAccounting()
+        {
+            if (disposed || (jobHandle == IntPtr.Zero && !queryImmediateCurrentProcessJob))
+            {
+                throw new ObjectDisposedException(
+                    "BoundedProcess",
+                    "SYNAPSE_DAEMON_JOB_ACCOUNTING_AFTER_DISPOSE remediation=retain the generation Job owner until after the exact child exits");
+            }
+            IntPtr accountingJobHandle = queryImmediateCurrentProcessJob ? IntPtr.Zero : jobHandle;
+            int size = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                uint returned;
+                if (!QueryInformationJobObject(
+                    accountingJobHandle,
+                    JobObjectExtendedLimitInformation,
+                    pointer,
+                    (uint)size,
+                    out returned))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_LIMIT_READBACK_FAILED");
+                }
+                if (returned != (uint)size)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_LIMIT_READBACK_SIZE_MISMATCH expected=" + size +
+                        " actual=" + returned +
+                        " remediation=the host does not expose the expected class-9 Job limit ABI");
+                }
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits =
+                    (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(
+                        pointer,
+                        typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                JobLimitFlags = limits.BasicLimitInformation.LimitFlags;
+                ProcessMemoryLimitBytes = limits.ProcessMemoryLimit.ToUInt64();
+                JobMemoryLimitBytes = limits.JobMemoryLimit.ToUInt64();
+                PeakProcessMemoryUsedBytes = limits.PeakProcessMemoryUsed.ToUInt64();
+                PeakJobMemoryUsedBytes = limits.PeakJobMemoryUsed.ToUInt64();
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+            int memorySize = Marshal.SizeOf(typeof(JOBOBJECT_MEMORY_USAGE_INFORMATION));
+            IntPtr memoryPointer = Marshal.AllocHGlobal(memorySize);
+            try
+            {
+                uint returned;
+                if (!QueryInformationJobObject(
+                    accountingJobHandle,
+                    JobObjectMemoryUsageInformation,
+                    memoryPointer,
+                    (uint)memorySize,
+                    out returned))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_MEMORY_ACCOUNTING_READBACK_FAILED");
+                }
+                if (returned != (uint)memorySize)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_MEMORY_ACCOUNTING_SIZE_MISMATCH expected=" + memorySize +
+                        " actual=" + returned +
+                        " remediation=the host does not expose the expected class-28 Job memory ABI; no unverified accounting is accepted");
+                }
+                JOBOBJECT_MEMORY_USAGE_INFORMATION memory =
+                    (JOBOBJECT_MEMORY_USAGE_INFORMATION)Marshal.PtrToStructure(
+                        memoryPointer,
+                        typeof(JOBOBJECT_MEMORY_USAGE_INFORMATION));
+                if (memory.PeakJobMemoryUsed < PeakJobMemoryUsedBytes)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_MEMORY_PEAK_REGRESSION extended_peak_earlier=" + PeakJobMemoryUsedBytes +
+                        " memory_usage_peak=" + memory.PeakJobMemoryUsed +
+                        " remediation=repair Windows Job Object accounting; a later monotone kernel peak cannot regress");
+                }
+                if (memory.PeakJobMemoryUsed < memory.JobMemory)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_MEMORY_CURRENT_EXCEEDS_PEAK current=" + memory.JobMemory +
+                        " peak=" + memory.PeakJobMemoryUsed +
+                        " remediation=repair Windows Job Object accounting; current aggregate commit cannot exceed its monotone peak");
+                }
+                CurrentJobMemoryUsedBytes = memory.JobMemory;
+                PeakJobMemoryUsedBytes = memory.PeakJobMemoryUsed;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(memoryPointer);
+            }
+            int cpuSize = Marshal.SizeOf(typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+            IntPtr cpuPointer = Marshal.AllocHGlobal(cpuSize);
+            try
+            {
+                uint returned;
+                if (!QueryInformationJobObject(
+                    accountingJobHandle,
+                    JobObjectCpuRateControlInformation,
+                    cpuPointer,
+                    (uint)cpuSize,
+                    out returned))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_CPU_RATE_READBACK_FAILED");
+                }
+                if (returned != (uint)cpuSize)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_DAEMON_JOB_CPU_RATE_READBACK_SIZE_MISMATCH expected=" + cpuSize +
+                        " actual=" + returned +
+                        " remediation=the host does not expose the expected class-15 Job CPU ABI");
+                }
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu =
+                    (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION)Marshal.PtrToStructure(
+                        cpuPointer,
+                        typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+                CpuRateControlFlags = cpu.ControlFlags;
+                CpuRate = cpu.CpuRate;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(cpuPointer);
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        ~BoundedProcess()
+        {
+            Dispose(false);
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (disposed) return;
+            disposed = true;
+            if (processHandle != IntPtr.Zero)
+            {
+                CloseHandle(processHandle);
+                processHandle = IntPtr.Zero;
+            }
+            if (jobHandle != IntPtr.Zero)
+            {
+                CloseHandle(jobHandle);
+                jobHandle = IntPtr.Zero;
+            }
+        }
+
+        private static UIntPtr ToUIntPtr(ulong value)
+        {
+            if (UIntPtr.Size == 8) return new UIntPtr(value);
+            return new UIntPtr(checked((uint)value));
+        }
+
+        private static void SetCpuHardRate(IntPtr jobHandle, uint cpuRate)
+        {
+            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu =
+                new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION();
+            cpu.ControlFlags = EXPECTED_CPU_RATE_CONTROL_FLAGS;
+            cpu.CpuRate = cpuRate;
+            int size = Marshal.SizeOf(typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+            IntPtr pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(cpu, pointer, false);
+                if (!SetInformationJobObject(
+                    jobHandle,
+                    JobObjectCpuRateControlInformation,
+                    pointer,
+                    (uint)size))
+                {
+                    ThrowLastError("SYNAPSE_DAEMON_JOB_CPU_RATE_SET_FAILED");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+
+        private static void EnsureHandle(IntPtr handle, string code)
+        {
+            if (handle == IntPtr.Zero || handle == InvalidHandleValue)
+            {
+                ThrowLastError(code);
+            }
+        }
+
+        private static void ThrowLastError(string code)
+        {
+            throw new InvalidOperationException(
+                code + " error=" + LastErrorMessage() +
+                " remediation=inspect Windows Job Object/process rights and the exact named limit; no unbounded daemon is eligible to run");
+        }
+
+        private static string LastErrorMessage()
+        {
+            int error = Marshal.GetLastWin32Error();
+            return "win32_error=" + error + " message=" + new Win32Exception(error).Message;
+        }
+    }
+}
+"@ | Out-Null
+    } catch {
+        throw "SYNAPSE_DAEMON_JOB_TYPE_LOAD_FAILED error=$($_.Exception.Message) remediation=repair Windows PowerShell Add-Type and the generated supervisor; no unbounded daemon is eligible to launch"
+    }
+}
+
+function Get-SynapseDaemonFileSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $stream = $null
+    $hasher = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        $digest = $hasher.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($digest)).Replace('-', '').ToUpperInvariant()
+    } finally {
+        if ($null -ne $hasher) {
+            $hasher.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Assert-SynapseDaemonCalyxConfigIdentity {
+    if (-not (Test-Path -LiteralPath $ExpectedCalyxConfigPath -PathType Leaf)) {
+        throw "SYNAPSE_DAEMON_CALYX_CONFIG_MISSING path=$ExpectedCalyxConfigPath expected_sha256=$ExpectedCalyxConfigSha256 remediation=rerun setup to restore the setup-owned CPU-only Calyx config"
+    }
+    try {
+        $actualSha256 = Get-SynapseDaemonFileSha256 -Path $ExpectedCalyxConfigPath
+    } catch {
+        throw "SYNAPSE_DAEMON_CALYX_CONFIG_HASH_FAILED path=$ExpectedCalyxConfigPath error=$($_.Exception.Message) remediation=repair access to the pinned config and rerun setup"
+    }
+    if ($actualSha256 -ne $ExpectedCalyxConfigSha256) {
+        throw "SYNAPSE_DAEMON_CALYX_CONFIG_DRIFT path=$ExpectedCalyxConfigPath expected_sha256=$ExpectedCalyxConfigSha256 actual_sha256=$actualSha256 remediation=rerun setup so candidate validation and the persistent supervisor agree on one immutable CPU-only config"
+    }
+    return $actualSha256
+}
+
+function Get-SynapseDaemonMemoryReadback {
+    param(
+        [Parameter(Mandatory=$true)][System.Diagnostics.Process]$Process,
+        [uint64]$PrivateLimitBytes = $ProcessMemoryLimitBytes,
+        [string]$Role = 'daemon'
+    )
+    try {
+        $Process.Refresh()
+        $privateBytes = [uint64]$Process.PrivateMemorySize64
+        $workingSetBytes = [uint64]$Process.WorkingSet64
+    } catch {
+        throw "SYNAPSE_OWNED_PROCESS_MEMORY_READBACK_FAILED role=$Role pid=$($Process.Id) error=$($_.Exception.Message) remediation=repair the OS process counters; the supervisor will not publish unmeasured owned process state"
+    }
+    if ($privateBytes -gt $PrivateLimitBytes) {
+        throw "SYNAPSE_OWNED_PROCESS_MEMORY_LIMIT_READBACK_EXCEEDED role=$Role pid=$($Process.Id) private_bytes=$privateBytes process_memory_limit_bytes=$PrivateLimitBytes working_set_bytes=$workingSetBytes working_set_policy=measured_only remediation=inspect retained owners and startup allocation; no over-budget process will be published"
+    }
+    return [pscustomobject]@{
+        PrivateBytes = $privateBytes
+        WorkingSetBytes = $workingSetBytes
+        PrivateHeadroomBytes = [uint64]($PrivateLimitBytes - $privateBytes)
+    }
 }
 
 function Read-SynapseToken {
@@ -2251,21 +3972,11 @@ function Wait-AdoptedDaemon {
         [Parameter(Mandatory=$true)][int]$OwnerPid,
         [int]$Generation
     )
-    Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_ADOPT_EXISTING generation=$Generation pid=$OwnerPid bind=$Bind"
-    Write-SupervisorEvent 'adopt_existing' @{ generation = $Generation; child_pid = $OwnerPid }
-    Write-SupervisorState -State 'adopted_existing' -Generation $Generation -ChildPid $OwnerPid -ExitCode $null -Message 'Existing expected daemon owns the listener; supervisor is waiting for it to exit before relaunching.'
-    try {
-        Wait-Process -Id $OwnerPid
-    } catch {
-        Write-LogLine "SYNAPSE_DAEMON_ADOPTED_WAIT_ERROR generation=$Generation pid=$OwnerPid error=$($_.Exception.Message)"
-        Write-SupervisorEvent 'adopted_wait_error' @{ generation = $Generation; child_pid = $OwnerPid; error = $_.Exception.Message }
-    }
-    Write-LogLine "SYNAPSE_DAEMON_ADOPTED_EXIT generation=$Generation pid=$OwnerPid"
-    Write-SupervisorEvent 'adopted_exit' @{ generation = $Generation; child_pid = $OwnerPid }
-    Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$Generation reason=adopted_daemon_exit"
-    Write-SupervisorEvent 'supervisor_stop' @{ generation = $Generation; reason = 'adopted_daemon_exit' }
-    Write-SupervisorState -State 'stopped' -Generation $Generation -ChildPid $OwnerPid -ExitCode 0 -Message 'Adopted daemon exited; supervisor stopped instead of launching during a maintenance handoff.'
-    exit 0
+    # An unnamed Job's limit handle cannot be recovered from an arbitrary live
+    # process. Adopting would therefore turn the hard memory contract into an
+    # unverifiable claim. A daemon this supervisor did not create suspended and
+    # assign must be drained by setup before this supervisor is started.
+    throw "SYNAPSE_DAEMON_ADOPTION_FORBIDDEN generation=$Generation pid=$OwnerPid bind=$Bind remediation=run setup's verified daemon handoff so the existing owner is drained and its successor is created suspended inside the setup-owned bounded Job"
 }
 
 function Register-RapidFailure {
@@ -2292,10 +4003,83 @@ trap {
     exit 1
 }
 
+if (-not [System.IO.Directory]::Exists($trustedWinPsModuleRoot)) {
+    throw "SYNAPSE_DAEMON_WINDOWS_POWERSHELL_MODULE_ROOT_MISSING path=$trustedWinPsModuleRoot remediation=repair the OS-shipped Windows PowerShell module root; the supervisor will not load inherited or user modules"
+}
+
 New-Item -ItemType Directory -Force -Path $DaemonLogDir | Out-Null
+Initialize-SynapseDaemonBoundedProcessType
+foreach ($backendVariable in @('SYNAPSE_DETECTION_BACKEND', 'SYNAPSE_STT_BACKEND')) {
+    $backendEntry = Get-Item "Env:$backendVariable" -ErrorAction SilentlyContinue
+    if ($null -ne $backendEntry -and ([string]$backendEntry.Value).Trim().ToLowerInvariant() -ne 'cpu') {
+        throw "SYNAPSE_ZERO_VRAM_BACKEND_ENV_CONTRADICTION scope=supervisor_process name=$backendVariable value=$($backendEntry.Value) remediation=remove the contradictory durable environment value or set it to cpu; the supervisor will not overwrite and hide it"
+    }
+}
+$captureBackendEntry = Get-Item Env:SYNAPSE_CAPTURE_BACKEND -ErrorAction SilentlyContinue
+if ($null -ne $captureBackendEntry -and
+    ([string]$captureBackendEntry.Value).Trim().ToLowerInvariant() -notin @('cpu', 'gdi', 'gdi_bitblt')) {
+    throw "SYNAPSE_NO_EXPLICIT_GPU_CAPTURE_ENV_CONTRADICTION scope=supervisor_process name=SYNAPSE_CAPTURE_BACKEND value=$($captureBackendEntry.Value) remediation=remove the contradictory durable environment value or set it to gdi_bitblt; the supervisor will not overwrite and hide it"
+}
+$forceDxgiEntry = Get-Item Env:SYNAPSE_CAPTURE_FORCE_DXGI -ErrorAction SilentlyContinue
+if ($null -ne $forceDxgiEntry -and
+    ([string]$forceDxgiEntry.Value).Trim().ToLowerInvariant() -notin @('0', 'false', 'no')) {
+    throw "SYNAPSE_NO_EXPLICIT_GPU_CAPTURE_ENV_CONTRADICTION scope=supervisor_process name=SYNAPSE_CAPTURE_FORCE_DXGI value=$($forceDxgiEntry.Value) remediation=remove the contradictory durable environment value or set it to false; the supervisor will not overwrite and hide it"
+}
+$env:SYNAPSE_DETECTION_BACKEND = 'cpu'
+$env:SYNAPSE_STT_BACKEND = 'cpu'
+$env:SYNAPSE_CAPTURE_BACKEND = 'gdi_bitblt'
+$env:SYNAPSE_CAPTURE_FORCE_DXGI = 'false'
+$env:CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES = '1'
+$supervisorJobName = $ParentJobName
+$supervisorResourceJob = [SynapseDaemonSupervisor.BoundedProcess]::BindCurrentSupervisor(
+    $supervisorJobName,
+    $SupervisorMemoryLimitBytes,
+    $SupervisorCpuRate)
+$supervisorProcess = [System.Diagnostics.Process]::GetProcessById($PID)
+$supervisorMemory = Get-SynapseDaemonMemoryReadback `
+    -Process $supervisorProcess `
+    -PrivateLimitBytes $SupervisorMemoryLimitBytes `
+    -Role 'supervisor'
+$supervisorResourceJob.RefreshAccounting()
+$supervisorJobLimitFlagsHex = '0x{0:X8}' -f $supervisorResourceJob.JobLimitFlags
+$supervisorCpuRateFlagsHex = '0x{0:X8}' -f $supervisorResourceJob.CpuRateControlFlags
+$initialCalyxConfigSha256 = Assert-SynapseDaemonCalyxConfigIdentity
 $bindParts = Get-BindParts
-Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_START supervisor_pid=$PID bind=$Bind db=$DbPath exe=$ExePath"
-Write-SupervisorEvent 'supervisor_start' @{ generation = $generation; exe_path = $ExePath }
+Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_START supervisor_pid=$PID bind=$Bind db=$DbPath exe=$ExePath calyx_config=$ExpectedCalyxConfigPath calyx_config_sha256=$initialCalyxConfigSha256 math_backend=cpu vram_budget_bytes=0 detection_backend=cpu stt_backend=cpu capture_backend=gdi_bitblt capture_force_dxgi=false search_open_generation_cache_entries=1 parent_job_name=$supervisorJobName parent_job_limit_flags=$supervisorJobLimitFlagsHex parent_cpu_rate_flags=$supervisorCpuRateFlagsHex parent_cpu_rate=$($supervisorResourceJob.CpuRate) parent_job_memory_limit_bytes=$SupervisorMemoryLimitBytes supervisor_private_bytes=$($supervisorMemory.PrivateBytes) supervisor_working_set_bytes=$($supervisorMemory.WorkingSetBytes) working_set_policy=measured_only daemon_job_limit_flags=0x00002300 daemon_cpu_rate=$DaemonCpuRate daemon_memory_limit_bytes=$ProcessMemoryLimitBytes owned_combined_memory_limit_bytes=$SupervisorMemoryLimitBytes bootstrap_preassociation_reserve_bytes=$BootstrapPreAssociationReserveBytes owned_committed_private_ceiling_bytes=$CommittedPrivatePolicyCeilingBytes"
+Write-SupervisorEvent 'supervisor_start' @{
+    generation = $generation
+    exe_path = $ExePath
+    calyx_config_path = $ExpectedCalyxConfigPath
+    calyx_config_sha256 = $initialCalyxConfigSha256
+    math_backend = 'cpu'
+    vram_budget_bytes = 0
+    detection_backend = 'cpu'
+    stt_backend = 'cpu'
+    capture_backend = 'gdi_bitblt'
+    capture_force_dxgi = $false
+    search_open_generation_cache_entries = 1
+    job_limit_flags_expected_hex = '0x00002300'
+    job_cpu_rate_control_flags_expected_hex = '0x00000005'
+    daemon_cpu_rate = $DaemonCpuRate
+    working_set_policy = 'measured_only'
+    job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+    process_memory_limit_bytes = $ProcessMemoryLimitBytes
+    job_memory_limit_bytes = $ProcessMemoryLimitBytes
+    supervisor_job_name = $supervisorJobName
+    supervisor_job_lifetime_owner = $supervisorJobLifetimeOwner
+    supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+    supervisor_job_limit_flags_hex = $supervisorJobLimitFlagsHex
+    supervisor_job_cpu_rate_control_flags_hex = $supervisorCpuRateFlagsHex
+    supervisor_process_memory_limit_bytes = $supervisorResourceJob.ProcessMemoryLimitBytes
+    supervisor_job_memory_limit_bytes = $supervisorResourceJob.JobMemoryLimitBytes
+    supervisor_cpu_rate = $supervisorResourceJob.CpuRate
+    supervisor_private_bytes = $supervisorMemory.PrivateBytes
+    supervisor_private_headroom_bytes = $supervisorMemory.PrivateHeadroomBytes
+    supervisor_working_set_bytes = $supervisorMemory.WorkingSetBytes
+    owned_combined_memory_limit_bytes = $SupervisorMemoryLimitBytes
+    bootstrap_preassociation_reserve_bytes = $BootstrapPreAssociationReserveBytes
+    owned_committed_private_ceiling_bytes = $CommittedPrivatePolicyCeilingBytes
+}
 Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Supervisor process started.'
 # #2083: a supervisor started while restart authority is revoked (stray logon
 # trigger, a task re-enabled by hand, a second launcher) must park before it
@@ -2409,6 +4193,7 @@ while ($true) {
 
     $generation += 1
     $token = Read-SynapseToken
+    $generationCalyxConfigSha256 = Assert-SynapseDaemonCalyxConfigIdentity
     $env:SYNAPSE_BEARER_TOKEN = $token
     $env:SYNAPSE_LOG_DIR = $DaemonLogDir
 
@@ -2425,12 +4210,38 @@ while ($true) {
     } catch { }
 
     $daemonArgumentTextForGeneration = "$DaemonArgumentText --parent-pid $PID"
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $daemonArgumentTextForGeneration"
-    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $daemonArgumentTextForGeneration; stderr_log = $stderrLog; parent_pid = $PID }
+    $jobName = 'Local\SynapseDaemon-{0}-{1}' -f $PID, $generation
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $daemonArgumentTextForGeneration calyx_config_sha256=$generationCalyxConfigSha256 job_name=$jobName job_limit_flags=0x00002300 process_memory_limit_bytes=$ProcessMemoryLimitBytes job_memory_limit_bytes=$ProcessMemoryLimitBytes working_set_policy=measured_only"
+    Write-SupervisorEvent 'launch_start' @{
+        generation = $generation
+        exe_path = $ExePath
+        arguments = $daemonArgumentTextForGeneration
+        stderr_log = $stderrLog
+        parent_pid = $PID
+        job_name = $jobName
+        calyx_config_sha256 = $generationCalyxConfigSha256
+        job_limit_flags_expected_hex = '0x00002300'
+        job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+        process_memory_limit_bytes = $ProcessMemoryLimitBytes
+        job_memory_limit_bytes = $ProcessMemoryLimitBytes
+        working_set_policy = 'measured_only'
+    }
     Write-SupervisorState -State 'launching' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Starting synapse-mcp daemon.'
 
     $startTime = Get-Date
-    $process = Start-Process -FilePath $ExePath -ArgumentList $daemonArgumentTextForGeneration -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -RedirectStandardError $stderrLog -PassThru
+    $daemonJob = [SynapseDaemonSupervisor.BoundedProcess]::Launch(
+        $ExePath,
+        $daemonArgumentTextForGeneration,
+        (Split-Path -Parent $ExePath),
+        $stderrLog,
+        $jobName,
+        $ProcessMemoryLimitBytes,
+        $DaemonCpuRate)
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById([int]$daemonJob.ProcessId)
+    } catch {
+        throw "SYNAPSE_DAEMON_LAUNCH_PROCESS_LOOKUP_FAILED generation=$generation pid=$($daemonJob.ProcessId) error=$($_.Exception.Message) remediation=inspect daemon stderr; the bounded child exited before its exact process object could be retained"
+    }
     # #2090: touching .Handle caches the native process handle in the
     # System.Diagnostics.Process object. Without it, `Start-Process -PassThru`
     # does not keep a handle open, the kernel object is released when the child
@@ -2457,9 +4268,39 @@ while ($true) {
     if ([string]::IsNullOrWhiteSpace($childCreationDate)) {
         throw "SYNAPSE_DAEMON_LAUNCH_CREATION_TIME_MISSING generation=$generation pid=$($process.Id) remediation=repair Win32_Process identity reads; PID alone cannot identify a daemon generation"
     }
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) creation_date=$childCreationDate parent_pid=$PID stderr_log=$stderrLog exit_code_observable=true"
-    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; parent_pid = $PID; stderr_log = $stderrLog }
-    Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child identity exists; waiting up to ${daemonStartupSeconds}s for exact listener ownership and authenticated health before publishing running."
+    $launchMemory = Get-SynapseDaemonMemoryReadback -Process $process
+    $jobLimitFlagsHex = '0x{0:X8}' -f $daemonJob.JobLimitFlags
+    $jobCpuRateFlagsHex = '0x{0:X8}' -f $daemonJob.CpuRateControlFlags
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) creation_date=$childCreationDate parent_pid=$PID stderr_log=$stderrLog exit_code_observable=true job_name=$($daemonJob.JobName) job_limit_flags=$jobLimitFlagsHex job_cpu_rate_control_flags=$jobCpuRateFlagsHex job_cpu_rate=$($daemonJob.CpuRate) process_memory_limit_bytes=$($daemonJob.ProcessMemoryLimitBytes) job_memory_limit_bytes=$($daemonJob.JobMemoryLimitBytes) private_bytes=$($launchMemory.PrivateBytes) private_headroom_bytes=$($launchMemory.PrivateHeadroomBytes) working_set_bytes=$($launchMemory.WorkingSetBytes) working_set_policy=measured_only"
+    Write-SupervisorEvent 'launch_ok' @{
+        generation = $generation
+        child_pid = $process.Id
+        child_creation_date = $childCreationDate
+        parent_pid = $PID
+        stderr_log = $stderrLog
+        job_name = $daemonJob.JobName
+        job_limit_flags_hex = $jobLimitFlagsHex
+        job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+        job_cpu_rate = $daemonJob.CpuRate
+        process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+        job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+        working_set_policy = 'measured_only'
+        private_bytes = $launchMemory.PrivateBytes
+        private_headroom_bytes = $launchMemory.PrivateHeadroomBytes
+        working_set_bytes = $launchMemory.WorkingSetBytes
+    }
+    Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child identity exists; waiting up to ${daemonStartupSeconds}s for exact listener ownership and authenticated health before publishing running." -Fields @{
+        job_name = $daemonJob.JobName
+        job_limit_flags_hex = $jobLimitFlagsHex
+        job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+        job_cpu_rate = $daemonJob.CpuRate
+        job_process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+        job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+        working_set_policy = 'measured_only'
+        private_bytes = $launchMemory.PrivateBytes
+        private_headroom_bytes = $launchMemory.PrivateHeadroomBytes
+        working_set_bytes = $launchMemory.WorkingSetBytes
+    }
 
     $startupDeadline = (Get-Date).AddSeconds($daemonStartupSeconds)
     $startupAttempts = 0
@@ -2479,16 +4320,57 @@ while ($true) {
         }
         if ($startupAttempts -eq 1 -or ($startupAttempts % 20) -eq 0) {
             $startupElapsedMs = [int64]((Get-Date) - $startTime).TotalMilliseconds
+            $startupMemory = Get-SynapseDaemonMemoryReadback -Process $process
+            $daemonJob.RefreshAccounting()
             Write-LogLine "SYNAPSE_DAEMON_STARTING generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts readiness=$($readiness.Reason)"
             Write-SupervisorEvent 'starting_progress' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; attempts = $startupAttempts; elapsed_ms = $startupElapsedMs; readiness = $readiness.Reason }
-            Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child remains live; readiness=$($readiness.Reason) attempts=$startupAttempts elapsed_ms=$startupElapsedMs. No replacement is eligible."
+            Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child remains live; readiness=$($readiness.Reason) attempts=$startupAttempts elapsed_ms=$startupElapsedMs. No replacement is eligible." -Fields @{
+                job_name = $daemonJob.JobName
+                job_limit_flags_hex = $jobLimitFlagsHex
+                job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+                job_cpu_rate = $daemonJob.CpuRate
+                job_process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+                job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+                working_set_policy = 'measured_only'
+                private_bytes = $startupMemory.PrivateBytes
+                private_headroom_bytes = $startupMemory.PrivateHeadroomBytes
+                working_set_bytes = $startupMemory.WorkingSetBytes
+                peak_process_memory_used_bytes = $daemonJob.PeakProcessMemoryUsedBytes
+                peak_job_memory_used_bytes = $daemonJob.PeakJobMemoryUsedBytes
+            }
         }
         Start-Sleep -Milliseconds $daemonStartupPollMilliseconds
     }
     if ($readiness.Ready -eq $true) {
-        Write-LogLine "SYNAPSE_DAEMON_READY generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts evidence=$($readiness.Reason)"
-        Write-SupervisorEvent 'ready' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; attempts = $startupAttempts; evidence = $readiness.Reason }
-        Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon exact PID/creation/image/arguments own the listener and authenticated health returned 200.'
+        $readyMemory = Get-SynapseDaemonMemoryReadback -Process $process
+        $daemonJob.RefreshAccounting()
+        Write-LogLine "SYNAPSE_DAEMON_READY generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts evidence=$($readiness.Reason) private_bytes=$($readyMemory.PrivateBytes) private_headroom_bytes=$($readyMemory.PrivateHeadroomBytes) working_set_bytes=$($readyMemory.WorkingSetBytes) working_set_policy=measured_only peak_process_memory_used_bytes=$($daemonJob.PeakProcessMemoryUsedBytes) peak_job_memory_used_bytes=$($daemonJob.PeakJobMemoryUsedBytes)"
+        Write-SupervisorEvent 'ready' @{
+            generation = $generation
+            child_pid = $process.Id
+            child_creation_date = $childCreationDate
+            attempts = $startupAttempts
+            evidence = $readiness.Reason
+            private_bytes = $readyMemory.PrivateBytes
+            private_headroom_bytes = $readyMemory.PrivateHeadroomBytes
+            working_set_bytes = $readyMemory.WorkingSetBytes
+            peak_process_memory_used_bytes = $daemonJob.PeakProcessMemoryUsedBytes
+            peak_job_memory_used_bytes = $daemonJob.PeakJobMemoryUsedBytes
+        }
+        Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon exact PID/creation/image/arguments own the listener and authenticated health returned 200.' -Fields @{
+            job_name = $daemonJob.JobName
+            job_limit_flags_hex = $jobLimitFlagsHex
+            job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+            job_cpu_rate = $daemonJob.CpuRate
+            job_process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+            job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+            working_set_policy = 'measured_only'
+            private_bytes = $readyMemory.PrivateBytes
+            private_headroom_bytes = $readyMemory.PrivateHeadroomBytes
+            working_set_bytes = $readyMemory.WorkingSetBytes
+            peak_process_memory_used_bytes = $daemonJob.PeakProcessMemoryUsedBytes
+            peak_job_memory_used_bytes = $daemonJob.PeakJobMemoryUsedBytes
+        }
     }
 
     # #2236: after launch identity has been verified, the retained native
@@ -2509,6 +4391,10 @@ while ($true) {
     if ($null -eq $exitCode) {
         throw "SYNAPSE_DAEMON_EXIT_CODE_UNOBSERVABLE generation=$generation pid=$($process.Id) creation_date=$childCreationDate handle_cached=$($null -ne $daemonProcessHandle) remediation=inspect the retained process handle; the supervisor cannot choose clean-stop versus restart without the physical exit code"
     }
+    $daemonJob.RefreshAccounting()
+    $peakProcessMemoryUsedBytes = $daemonJob.PeakProcessMemoryUsedBytes
+    $peakJobMemoryUsedBytes = $daemonJob.PeakJobMemoryUsedBytes
+    $daemonJob.Dispose()
     $runtimeMs = [int64](($endTime - $startTime).TotalMilliseconds)
     $stderrTail = ''
     try {
@@ -2516,12 +4402,39 @@ while ($true) {
             $stderrTail = ((Get-Content -LiteralPath $stderrLog -Tail 40 -ErrorAction SilentlyContinue) -join ' | ').Trim()
         }
     } catch { }
-    Write-LogLine "SYNAPSE_DAEMON_EXIT generation=$generation pid=$($process.Id) exit_code=$exitCode runtime_ms=$runtimeMs stderr_log=$stderrLog"
+    Write-LogLine "SYNAPSE_DAEMON_EXIT generation=$generation pid=$($process.Id) exit_code=$exitCode runtime_ms=$runtimeMs stderr_log=$stderrLog peak_process_memory_used_bytes=$peakProcessMemoryUsedBytes peak_job_memory_used_bytes=$peakJobMemoryUsedBytes"
     if ($exitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($stderrTail)) {
         Write-LogLine "SYNAPSE_DAEMON_STDERR generation=$generation pid=$($process.Id) exit_code=$exitCode tail=$stderrTail"
     }
-    Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs; stderr_log = $stderrLog; stderr_tail = $stderrTail }
-    Write-SupervisorState -State 'child_exited' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Daemon child exited after ${runtimeMs}ms."
+    Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs; stderr_log = $stderrLog; stderr_tail = $stderrTail; peak_process_memory_used_bytes = $peakProcessMemoryUsedBytes; peak_job_memory_used_bytes = $peakJobMemoryUsedBytes }
+    Write-SupervisorState -State 'child_exited' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Daemon child exited after ${runtimeMs}ms." -Fields @{
+        job_name = $daemonJob.JobName
+        job_limit_flags_hex = $jobLimitFlagsHex
+        job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+        job_cpu_rate = $daemonJob.CpuRate
+        job_process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+        job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+        working_set_policy = 'measured_only'
+        peak_process_memory_used_bytes = $peakProcessMemoryUsedBytes
+        peak_job_memory_used_bytes = $peakJobMemoryUsedBytes
+    }
+
+    if ($OneShot) {
+        Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$generation reason=one_shot_child_exit exit_code=$exitCode"
+        Write-SupervisorEvent 'supervisor_stop' @{ generation = $generation; reason = 'one_shot_child_exit'; exit_code = $exitCode }
+        Write-SupervisorState -State 'stopped' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message 'One-shot candidate generation exited; restart authority was never granted.' -Fields @{
+            job_name = $daemonJob.JobName
+            job_limit_flags_hex = $jobLimitFlagsHex
+            job_cpu_rate_control_flags_hex = $jobCpuRateFlagsHex
+            job_cpu_rate = $daemonJob.CpuRate
+            job_process_memory_limit_bytes = $daemonJob.ProcessMemoryLimitBytes
+            job_memory_limit_bytes = $daemonJob.JobMemoryLimitBytes
+            working_set_policy = 'measured_only'
+            peak_process_memory_used_bytes = $peakProcessMemoryUsedBytes
+            peak_job_memory_used_bytes = $peakJobMemoryUsedBytes
+        }
+        exit $exitCode
+    }
 
     Stop-IfOperatorStopRequested -Phase 'post_child_exit' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode
     Stop-IfSetupMaintenanceActive -Phase 'post_child_exit' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode
@@ -2559,46 +4472,275 @@ while ($true) {
         Replace('__MAINTENANCE_LOCK_PATH__', (Quote-PowerShellSingleQuotedString $MaintenanceLockPath)).
         Replace('__SUPERVISOR_STOP_REQUEST_PATH__', (Quote-PowerShellSingleQuotedString $supervisorStopRequestPath)).
         Replace('__EXPECTED_CALYX_CONFIG_PATH__', (Quote-PowerShellSingleQuotedString $CalyxConfigPath)).
+        Replace('__EXPECTED_CALYX_CONFIG_SHA256__', (Quote-PowerShellSingleQuotedString $expectedCalyxConfigSha256)).
         Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText)).
         Replace('__EXPECTED_ALLOWED_PERMISSIONS__', (Quote-PowerShellSingleQuotedString $allowedPermissionsArgument)).
-        Replace('__EXPECTED_ENABLE_AUDIO__', (Quote-PowerShellSingleQuotedString ([string]$EnableAudio)))
+        Replace('__EXPECTED_ENABLE_AUDIO__', (Quote-PowerShellSingleQuotedString ([string]$EnableAudio))).
+        Replace('__PROCESS_MEMORY_LIMIT_BYTES__', ([string]$SynapseDaemonProcessMemoryLimitBytes)).
+        Replace('__SUPERVISOR_MEMORY_LIMIT_BYTES__', ([string]$SynapseSupervisorMemoryLimitBytes)).
+        Replace('__BOOTSTRAP_PREASSOCIATION_RESERVE_BYTES__', ([string]$SynapseBootstrapPreAssociationReserveBytes)).
+        Replace('__DAEMON_CPU_RATE__', ([string]$SynapseDaemonCpuRate)).
+        Replace('__SUPERVISOR_CPU_RATE__', ([string]$SynapseSupervisorCpuRate))
+    $supervisorScript = $supervisorScript.Replace('__ONE_SHOT__', (Quote-PowerShellSingleQuotedString ([string]$OneShot)))
 
-    $supervisorScript | Set-Content -Path $supervisorPath -Encoding ascii
+    $supervisorWrite = Write-SynapseAtomicUtf8TextFile `
+        -Path $supervisorPath `
+        -Content $supervisorScript `
+        -Purpose 'daemon_supervisor_generation'
+    Info "Daemon supervisor generation atomically persisted path=$($supervisorWrite.path) sha256=$($supervisorWrite.sha256) bytes=$($supervisorWrite.byte_length) encoding=$($supervisorWrite.encoding)"
 
-    $supervisorCommand = @(
-        (Quote-WindowsCommandArgument $powerShellExe),
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', (Quote-WindowsCommandArgument $supervisorPath)
-    ) -join ' '
+    # The historical VBS wrapper was a resident process outside the kernel Job
+    # accounting tree. The native bootstrap is now the only canonical task
+    # action, so retire any exact-path wrapper after the supervisor bytes exist.
+    if (Test-Path -LiteralPath $OutputPath) {
+        Remove-Item -LiteralPath $OutputPath -Force
+        if (Test-Path -LiteralPath $OutputPath) {
+            Die "SYNAPSE_LEGACY_VBS_WRAPPER_RETIRE_FAILED path=$OutputPath remediation=the unbounded resident wrapper must be absent before registering the native bootstrap task"
+        }
+    }
+}
 
-    $wrapperScript = @'
-Option Explicit
-Dim shell, fso, launcherLog, supervisorCommand, exitCode
+function Ensure-SynapseDaemonJobReadbackType {
+    if ('SynapseSetup.DaemonJobReadback' -as [type]) { return }
 
-Set shell = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-launcherLog = __LAUNCHER_LOG__
-supervisorCommand = __SUPERVISOR_COMMAND__
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 
-Sub LogLine(message)
-  Dim logFile
-  Set logFile = fso.OpenTextFile(launcherLog, 8, True)
-  logFile.WriteLine Now & " " & message
-  logFile.Close
-End Sub
+namespace SynapseSetup
+{
+    public sealed class DaemonJobReadback
+    {
+        public uint LimitFlags { get; set; }
+        public ulong ProcessMemoryLimitBytes { get; set; }
+        public ulong JobMemoryLimitBytes { get; set; }
+        public ulong CurrentJobMemoryUsedBytes { get; set; }
+        public ulong PeakJobMemoryUsedBytes { get; set; }
+        public ulong[] ProcessIds { get; set; }
+        public uint CpuRateControlFlags { get; set; }
+        public uint CpuRate { get; set; }
 
-LogLine "SYNAPSE_DAEMON_WRAPPER_START command=" & supervisorCommand
-exitCode = shell.Run(supervisorCommand, 0, True)
-LogLine "SYNAPSE_DAEMON_WRAPPER_EXIT exit_code=" & exitCode
-WScript.Quit exitCode
+        private const uint JOB_OBJECT_QUERY = 0x0004;
+        private const int JobObjectBasicProcessIdList = 3;
+        private const int JobObjectExtendedLimitInformation = 9;
+        private const int JobObjectCpuRateControlInformation = 15;
+        private const int JobObjectMemoryUsageInformation = 28;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_MEMORY_USAGE_INFORMATION
+        {
+            public ulong JobMemory;
+            public ulong PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+        {
+            public uint ControlFlags;
+            public uint CpuRate;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenJobObject(uint dwDesiredAccess, bool bInheritHandle, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength,
+            out uint lpReturnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        public static DaemonJobReadback Query(string jobName)
+        {
+            if (String.IsNullOrWhiteSpace(jobName))
+            {
+                throw new ArgumentException("SYNAPSE_DAEMON_JOB_READBACK_NAME_MISSING");
+            }
+            IntPtr job = OpenJobObject(JOB_OBJECT_QUERY, false, jobName);
+            if (job == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "SYNAPSE_DAEMON_JOB_OPEN_FAILED job_name=" + jobName);
+            }
+            try
+            {
+                DaemonJobReadback result = new DaemonJobReadback();
+                ulong extendedPeakJobMemoryUsedBytes = 0;
+                int limitSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                IntPtr limitPointer = Marshal.AllocHGlobal(limitSize);
+                try
+                {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation, limitPointer, (uint)limitSize, out returned))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "SYNAPSE_DAEMON_JOB_LIMIT_QUERY_FAILED job_name=" + jobName);
+                    }
+                    if (returned != (uint)limitSize)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_DAEMON_JOB_LIMIT_QUERY_SIZE_MISMATCH job_name=" + jobName +
+                            " expected=" + limitSize + " actual=" + returned);
+                    }
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits =
+                        (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(limitPointer, typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                    result.LimitFlags = limits.BasicLimitInformation.LimitFlags;
+                    result.ProcessMemoryLimitBytes = limits.ProcessMemoryLimit.ToUInt64();
+                    result.JobMemoryLimitBytes = limits.JobMemoryLimit.ToUInt64();
+                    extendedPeakJobMemoryUsedBytes = limits.PeakJobMemoryUsed.ToUInt64();
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(limitPointer);
+                }
+
+                int usageSize = Marshal.SizeOf(typeof(JOBOBJECT_MEMORY_USAGE_INFORMATION));
+                IntPtr usagePointer = Marshal.AllocHGlobal(usageSize);
+                try
+                {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, JobObjectMemoryUsageInformation, usagePointer, (uint)usageSize, out returned))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "SYNAPSE_DAEMON_JOB_MEMORY_QUERY_FAILED job_name=" + jobName);
+                    }
+                    if (returned != (uint)usageSize)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_DAEMON_JOB_MEMORY_QUERY_SIZE_MISMATCH job_name=" + jobName +
+                            " expected=" + usageSize + " actual=" + returned);
+                    }
+                    JOBOBJECT_MEMORY_USAGE_INFORMATION usage =
+                        (JOBOBJECT_MEMORY_USAGE_INFORMATION)Marshal.PtrToStructure(usagePointer, typeof(JOBOBJECT_MEMORY_USAGE_INFORMATION));
+                    if (usage.PeakJobMemoryUsed < extendedPeakJobMemoryUsedBytes)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_DAEMON_JOB_MEMORY_PEAK_REGRESSION job_name=" + jobName +
+                            " extended_peak_earlier=" + extendedPeakJobMemoryUsedBytes +
+                            " memory_usage_peak=" + usage.PeakJobMemoryUsed);
+                    }
+                    if (usage.PeakJobMemoryUsed < usage.JobMemory)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_DAEMON_JOB_MEMORY_CURRENT_EXCEEDS_PEAK job_name=" + jobName +
+                            " current=" + usage.JobMemory + " peak=" + usage.PeakJobMemoryUsed);
+                    }
+                    result.CurrentJobMemoryUsedBytes = usage.JobMemory;
+                    result.PeakJobMemoryUsedBytes = usage.PeakJobMemoryUsed;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(usagePointer);
+                }
+
+                int cpuSize = Marshal.SizeOf(typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+                IntPtr cpuPointer = Marshal.AllocHGlobal(cpuSize);
+                try
+                {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, JobObjectCpuRateControlInformation, cpuPointer, (uint)cpuSize, out returned))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "SYNAPSE_DAEMON_JOB_CPU_RATE_QUERY_FAILED job_name=" + jobName);
+                    }
+                    if (returned != (uint)cpuSize)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_DAEMON_JOB_CPU_RATE_QUERY_SIZE_MISMATCH job_name=" + jobName +
+                            " expected=" + cpuSize + " actual=" + returned);
+                    }
+                    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu =
+                        (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION)Marshal.PtrToStructure(cpuPointer, typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+                    result.CpuRateControlFlags = cpu.ControlFlags;
+                    result.CpuRate = cpu.CpuRate;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(cpuPointer);
+                }
+
+                const int processBufferSize = 65536;
+                IntPtr processPointer = Marshal.AllocHGlobal(processBufferSize);
+                try
+                {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, processPointer, processBufferSize, out returned))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "SYNAPSE_DAEMON_JOB_PROCESS_QUERY_FAILED job_name=" + jobName);
+                    }
+                    uint count = unchecked((uint)Marshal.ReadInt32(processPointer, sizeof(uint)));
+                    ulong[] processIds = new ulong[checked((int)count)];
+                    for (uint index = 0; index < count; index++)
+                    {
+                        IntPtr entry = IntPtr.Add(processPointer, (2 * sizeof(uint)) + checked((int)index * IntPtr.Size));
+                        processIds[index] = IntPtr.Size == 8
+                            ? unchecked((ulong)Marshal.ReadInt64(entry))
+                            : unchecked((uint)Marshal.ReadInt32(entry));
+                    }
+                    result.ProcessIds = processIds;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(processPointer);
+                }
+                return result;
+            }
+            finally
+            {
+                CloseHandle(job);
+            }
+        }
+    }
+}
 '@
+}
 
-    $wrapperScript = $wrapperScript.
-        Replace('__LAUNCHER_LOG__', (Vbs-Literal $launcherLog)).
-        Replace('__SUPERVISOR_COMMAND__', (Vbs-Literal $supervisorCommand))
+function Get-SynapseDaemonJobKernelReadback {
+    param([Parameter(Mandatory=$true)][string]$JobName)
 
-    $wrapperScript | Set-Content -Path $OutputPath -Encoding ascii
+    Ensure-SynapseDaemonJobReadbackType
+    try {
+        return [SynapseSetup.DaemonJobReadback]::Query($JobName)
+    } catch {
+        throw "SYNAPSE_DAEMON_JOB_KERNEL_READBACK_FAILED job_name=$JobName error=$($_.Exception.Message) remediation=repair named Windows Job query access; mutable supervisor JSON alone is not accepted as proof of the hard resource boundary"
+    }
 }
 
 function Ensure-SynapseSetupProcessJobType {
@@ -3097,6 +5239,506 @@ namespace SynapseSetup
             json.Append(",\"failure\":\"").Append(JsonEscape(failure)).Append("\"");
             json.Append("}");
             return json.ToString();
+        }
+    }
+
+    public sealed class BoundedSupervisorLaunch : IDisposable
+    {
+        private const uint CREATE_SUSPENDED = 0x00000004;
+        private const uint CREATE_NO_WINDOW = 0x08000000;
+        private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private const uint STARTF_USESHOWWINDOW = 0x00000001;
+        private static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST =
+            new IntPtr(0x0002000D);
+        private const ushort SW_HIDE = 0;
+        private const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100;
+        private const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const uint EXPECTED_LIMIT_FLAGS =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+            JOB_OBJECT_LIMIT_JOB_MEMORY |
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        private const int JobObjectExtendedLimitInformation = 9;
+        private const int JobObjectCpuRateControlInformation = 15;
+        private const uint EXPECTED_CPU_FLAGS = 0x00000005;
+        private const uint EXIT_ASSIGN_FAILED = 125;
+        private const uint EXIT_RESUME_FAILED = 126;
+        private const int ERROR_ALREADY_EXISTS = 183;
+        private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+        {
+            public uint ControlFlags;
+            public uint CpuRate;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bInheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {
+            public uint cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcess(
+            string lpApplicationName,
+            StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFOEX lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            uint flags,
+            ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength,
+            out uint lpReturnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(
+            IntPtr processHandle,
+            IntPtr jobHandle,
+            [MarshalAs(UnmanagedType.Bool)] out bool result);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr hProcess, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr hJob, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+            string stringSecurityDescriptor,
+            uint stringSDRevision,
+            out IntPtr securityDescriptor,
+            out uint securityDescriptorSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        private IntPtr processHandle;
+        private IntPtr jobHandle;
+        private bool disposed;
+
+        public uint ProcessId { get; private set; }
+        public string JobName { get; private set; }
+
+        private BoundedSupervisorLaunch()
+        {
+        }
+
+        public static BoundedSupervisorLaunch Launch(
+            string applicationName,
+            string arguments,
+            string workingDirectory,
+            string jobName,
+            ulong memoryLimitBytes,
+            uint cpuRate)
+        {
+            if (String.IsNullOrWhiteSpace(applicationName) ||
+                String.IsNullOrWhiteSpace(workingDirectory) ||
+                String.IsNullOrWhiteSpace(jobName) ||
+                memoryLimitBytes == 0 || memoryLimitBytes >= 1000000000UL ||
+                cpuRate == 0 || cpuRate > 10000)
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_INPUT_INVALID remediation=provide exact paths and a positive sub-one-gigabyte committed-memory limit plus CPU rate 1..10000");
+            }
+
+            BoundedSupervisorLaunch owner = new BoundedSupervisorLaunch();
+            PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
+            IntPtr limitPointer = IntPtr.Zero;
+            IntPtr cpuPointer = IntPtr.Zero;
+            IntPtr descriptor = IntPtr.Zero;
+            IntPtr attributesPointer = IntPtr.Zero;
+            IntPtr attributeList = IntPtr.Zero;
+            IntPtr jobList = IntPtr.Zero;
+            bool attributeListInitialized = false;
+            bool processCreated = false;
+            bool assigned = false;
+            try
+            {
+                owner.JobName = jobName;
+
+                uint descriptorSize;
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    "D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)",
+                    1,
+                    out descriptor,
+                    out descriptorSize))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_SECURITY_DESCRIPTOR_FAILED");
+                }
+                SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES();
+                attributes.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                attributes.lpSecurityDescriptor = descriptor;
+                attributes.bInheritHandle = false;
+                attributesPointer = Marshal.AllocHGlobal(attributes.nLength);
+                Marshal.StructureToPtr(attributes, attributesPointer, false);
+                owner.jobHandle = CreateJobObject(attributesPointer, owner.JobName);
+                if (owner.jobHandle == IntPtr.Zero)
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_CREATE_FAILED");
+                }
+                if (Marshal.GetLastWin32Error() == ERROR_ALREADY_EXISTS)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_NAME_COLLISION job_name=" + owner.JobName +
+                        " remediation=refuse ambiguous PID/Job ownership before candidate execution");
+                }
+
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits =
+                    new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                limits.BasicLimitInformation.LimitFlags = EXPECTED_LIMIT_FLAGS;
+                limits.ProcessMemoryLimit = ToUIntPtr(memoryLimitBytes);
+                limits.JobMemoryLimit = ToUIntPtr(memoryLimitBytes);
+                int limitSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                limitPointer = Marshal.AllocHGlobal(limitSize);
+                Marshal.StructureToPtr(limits, limitPointer, false);
+                if (!SetInformationJobObject(
+                    owner.jobHandle,
+                    JobObjectExtendedLimitInformation,
+                    limitPointer,
+                    (uint)limitSize))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIMIT_SET_FAILED");
+                }
+
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu =
+                    new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION();
+                cpu.ControlFlags = EXPECTED_CPU_FLAGS;
+                cpu.CpuRate = cpuRate;
+                int cpuSize = Marshal.SizeOf(typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+                cpuPointer = Marshal.AllocHGlobal(cpuSize);
+                Marshal.StructureToPtr(cpu, cpuPointer, false);
+                if (!SetInformationJobObject(
+                    owner.jobHandle,
+                    JobObjectCpuRateControlInformation,
+                    cpuPointer,
+                    (uint)cpuSize))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_CPU_RATE_SET_FAILED");
+                }
+
+                uint returned;
+                if (!QueryInformationJobObject(
+                    owner.jobHandle,
+                    JobObjectExtendedLimitInformation,
+                    limitPointer,
+                    (uint)limitSize,
+                    out returned))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIMIT_READBACK_FAILED");
+                }
+                if (returned != (uint)limitSize)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIMIT_READBACK_SIZE_MISMATCH expected=" + limitSize +
+                        " actual=" + returned +
+                        " remediation=the host does not expose the expected class-9 Job limit ABI");
+                }
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limitReadback =
+                    (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(
+                        limitPointer,
+                        typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                if (!QueryInformationJobObject(
+                    owner.jobHandle,
+                    JobObjectCpuRateControlInformation,
+                    cpuPointer,
+                    (uint)cpuSize,
+                    out returned))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_CPU_RATE_READBACK_FAILED");
+                }
+                if (returned != (uint)cpuSize)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_CPU_RATE_READBACK_SIZE_MISMATCH expected=" + cpuSize +
+                        " actual=" + returned +
+                        " remediation=the host does not expose the expected class-15 Job CPU ABI");
+                }
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuReadback =
+                    (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION)Marshal.PtrToStructure(
+                        cpuPointer,
+                        typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION));
+                if (limitReadback.BasicLimitInformation.LimitFlags != EXPECTED_LIMIT_FLAGS ||
+                    limitReadback.ProcessMemoryLimit.ToUInt64() != memoryLimitBytes ||
+                    limitReadback.JobMemoryLimit.ToUInt64() != memoryLimitBytes ||
+                    cpuReadback.ControlFlags != EXPECTED_CPU_FLAGS ||
+                    cpuReadback.CpuRate != cpuRate)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_READBACK_MISMATCH job_name=" + owner.JobName +
+                        " remediation=the kernel did not retain the exact empty parent Job contract before creation-time assignment");
+                }
+
+                IntPtr attributeListSize = IntPtr.Zero;
+                bool attributeSizeResult = InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeListSize);
+                int attributeSizeError = Marshal.GetLastWin32Error();
+                if (attributeSizeResult || attributeSizeError != ERROR_INSUFFICIENT_BUFFER || attributeListSize == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIST_SIZE_FAILED expected_win32=" + ERROR_INSUFFICIENT_BUFFER +
+                        " actual_win32=" + attributeSizeError +
+                        " unexpected_success=" + attributeSizeResult +
+                        " size=" + attributeListSize +
+                        " remediation=the host must support exact STARTUPINFOEX Job-list sizing before candidate creation");
+                }
+                attributeList = Marshal.AllocHGlobal(attributeListSize);
+                if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeListSize))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIST_INIT_FAILED");
+                }
+                attributeListInitialized = true;
+                jobList = Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(jobList, owner.jobHandle);
+                if (!UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                    jobList,
+                    new IntPtr(IntPtr.Size),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_JOB_LIST_UPDATE_FAILED");
+                }
+                STARTUPINFOEX startup = new STARTUPINFOEX();
+                startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFOEX));
+                startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+                startup.StartupInfo.wShowWindow = SW_HIDE;
+                startup.lpAttributeList = attributeList;
+                string commandText = "\"" + applicationName + "\"";
+                if (!String.IsNullOrWhiteSpace(arguments)) commandText += " " + arguments;
+                if (!CreateProcess(
+                    applicationName,
+                    new StringBuilder(commandText),
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    false,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                    IntPtr.Zero,
+                    workingDirectory,
+                    ref startup,
+                    out processInfo))
+                {
+                    ThrowLastError("SYNAPSE_CANDIDATE_SUPERVISOR_CREATE_PROCESS_IN_JOB_FAILED");
+                }
+                processCreated = true;
+                assigned = true;
+                owner.processHandle = processInfo.hProcess;
+                owner.ProcessId = processInfo.dwProcessId;
+                bool assignedToExactParent;
+                if (!IsProcessInJob(processInfo.hProcess, owner.jobHandle, out assignedToExactParent))
+                {
+                    string detail = LastErrorMessage();
+                    TerminateJobObject(owner.jobHandle, EXIT_ASSIGN_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_MEMBERSHIP_READBACK_FAILED error=" + detail +
+                        " remediation=the creation-assigned candidate supervisor remained suspended and the bounded tree was terminated because exact kernel Job membership could not be proven");
+                }
+                if (!assignedToExactParent)
+                {
+                    TerminateJobObject(owner.jobHandle, EXIT_ASSIGN_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_JOB_MEMBERSHIP_MISMATCH job_name=" + owner.JobName +
+                        " remediation=the candidate supervisor remained suspended and was terminated because the kernel did not retain exact parent Job membership");
+                }
+                if (ResumeThread(processInfo.hThread) == 0xffffffff)
+                {
+                    string detail = LastErrorMessage();
+                    TerminateJobObject(owner.jobHandle, EXIT_RESUME_FAILED);
+                    throw new InvalidOperationException(
+                        "SYNAPSE_CANDIDATE_SUPERVISOR_RESUME_FAILED error=" + detail +
+                        " remediation=inspect thread rights; the bounded candidate tree was terminated before supervisor execution");
+                }
+                CloseHandle(processInfo.hThread);
+                processInfo.hThread = IntPtr.Zero;
+                return owner;
+            }
+            catch
+            {
+                if (assigned && owner.jobHandle != IntPtr.Zero)
+                {
+                    TerminateJobObject(owner.jobHandle, 127);
+                }
+                else if (processCreated && processInfo.hProcess != IntPtr.Zero)
+                {
+                    TerminateProcess(processInfo.hProcess, 127);
+                }
+                owner.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (limitPointer != IntPtr.Zero) Marshal.FreeHGlobal(limitPointer);
+                if (cpuPointer != IntPtr.Zero) Marshal.FreeHGlobal(cpuPointer);
+                if (attributesPointer != IntPtr.Zero) Marshal.FreeHGlobal(attributesPointer);
+                if (descriptor != IntPtr.Zero) LocalFree(descriptor);
+                if (attributeList != IntPtr.Zero)
+                {
+                    if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+                    Marshal.FreeHGlobal(attributeList);
+                }
+                if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList);
+                if (processInfo.hThread != IntPtr.Zero) CloseHandle(processInfo.hThread);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            if (processHandle != IntPtr.Zero)
+            {
+                CloseHandle(processHandle);
+                processHandle = IntPtr.Zero;
+            }
+            if (jobHandle != IntPtr.Zero)
+            {
+                CloseHandle(jobHandle);
+                jobHandle = IntPtr.Zero;
+            }
+        }
+
+        private static UIntPtr ToUIntPtr(ulong value)
+        {
+            if (UIntPtr.Size == 8) return new UIntPtr(value);
+            return new UIntPtr(checked((uint)value));
+        }
+
+        private static void ThrowLastError(string code)
+        {
+            throw new InvalidOperationException(code + " error=" + LastErrorMessage());
+        }
+
+        private static string LastErrorMessage()
+        {
+            int error = Marshal.GetLastWin32Error();
+            return "win32=" + error + " detail=" + new Win32Exception(error).Message;
         }
     }
 }
@@ -4404,7 +7046,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
         [Parameter(Mandatory=$true)][string]$ExpectedSha256,
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256
     )
 
     $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
@@ -4419,6 +7062,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
         $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $actualAllowedRaw
         $actualEnableAudio = ([string]$target.CommandLine) -match '(?i)(?:^|\s)--enable-audio(?:\s|$)'
         $actualCalyxConfig = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $target.CommandLine -Name '--calyx-config')
+        $actualCalyxConfigSha256 = Get-SynapseCommandLineArgumentValue -CommandLine $target.CommandLine -Name '--calyx-config-sha256'
         $actualPath = Normalize-SynapseSetupPathForCompare -Path ([string]$target.ExecutablePath)
         $actualSha256 = '<not-read>'
         $hashError = $null
@@ -4437,7 +7081,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
         $permissionDrift = ($actualAllowed -ne $expectedAllowed)
         $audioDrift = ($actualEnableAudio -ne $EnableAudio)
         $calyxConfigDrift = ($actualCalyxConfig -ine $expectedCalyxConfig)
-        if ($pathDrift -or $hashDrift -or $permissionDrift -or $audioDrift -or $calyxConfigDrift) {
+        $calyxConfigSha256Drift = ($actualCalyxConfigSha256 -ine $ExpectedCalyxConfigSha256)
+        if ($pathDrift -or $hashDrift -or $permissionDrift -or $audioDrift -or $calyxConfigDrift -or $calyxConfigSha256Drift) {
             $drifts += [pscustomobject]@{
                 pid = $target.ProcessId
                 expected_executable_path = $expectedPath
@@ -4451,6 +7096,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
                 actual_enable_audio = $actualEnableAudio
                 expected_calyx_config_path = if ([string]::IsNullOrWhiteSpace($expectedCalyxConfig)) { '<defaults>' } else { $expectedCalyxConfig }
                 actual_calyx_config_path = if ([string]::IsNullOrWhiteSpace($actualCalyxConfig)) { '<defaults>' } else { $actualCalyxConfig }
+                expected_calyx_config_sha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+                actual_calyx_config_sha256 = if ([string]::IsNullOrWhiteSpace($actualCalyxConfigSha256)) { '<missing>' } else { $actualCalyxConfigSha256 }
                 command_line = $target.CommandLine
             }
         }
@@ -4586,10 +7233,20 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         [Parameter(Mandatory=$true)][string]$ExpectedSha256,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256
     )
 
     $failures = [System.Collections.Generic.List[string]]::new()
+    $expectedCalyxConfigSha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+    $actualCalyxConfigSha256 = if (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf) {
+        Get-SynapseFileSha256 -Path $CalyxConfigPath
+    } else {
+        '<missing>'
+    }
+    if ($actualCalyxConfigSha256 -ine $expectedCalyxConfigSha256) {
+        $failures.Add("calyx_config_sha256 expected=$expectedCalyxConfigSha256 actual=$actualCalyxConfigSha256")
+    }
     $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     if ($listeners.Count -ne 1) {
         $failures.Add("listener_count expected=1 actual=$($listeners.Count)")
@@ -4616,6 +7273,7 @@ function Get-SynapseInstalledDaemonIdentityReadback {
     $actualDb = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--db')
     $actualProfiles = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
     $actualCalyxConfig = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config')
+    $actualCalyxConfigArgumentSha256 = Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config-sha256'
     $expectedDb = Normalize-SynapseSetupPathForCompare -Path $DbPath
     $expectedProfiles = Normalize-SynapseSetupPathForCompare -Path $ProfilesDir
     $expectedCalyxConfig = Normalize-SynapseSetupPathForCompare -Path $CalyxConfigPath
@@ -4624,6 +7282,7 @@ function Get-SynapseInstalledDaemonIdentityReadback {
     if ($actualDb -ine $expectedDb) { $failures.Add("db expected=$expectedDb actual=$(if ($actualDb) { $actualDb } else { '<missing>' })") }
     if ($actualProfiles -ine $expectedProfiles) { $failures.Add("profiles_dir expected=$expectedProfiles actual=$(if ($actualProfiles) { $actualProfiles } else { '<missing>' })") }
     if ($actualCalyxConfig -ine $expectedCalyxConfig) { $failures.Add("calyx_config expected=$(if ($expectedCalyxConfig) { $expectedCalyxConfig } else { '<defaults>' }) actual=$(if ($actualCalyxConfig) { $actualCalyxConfig } else { '<defaults>' })") }
+    if ($actualCalyxConfigArgumentSha256 -ine $expectedCalyxConfigSha256) { $failures.Add("calyx_config_argument_sha256 expected=$expectedCalyxConfigSha256 actual=$(if ($actualCalyxConfigArgumentSha256) { $actualCalyxConfigArgumentSha256 } else { '<missing>' })") }
     $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
     $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--allowed-permissions')
     if ($actualAllowed -cne $expectedAllowed) {
@@ -4671,11 +7330,70 @@ function Get-SynapseInstalledDaemonIdentityReadback {
     }
     $supervisorStatus = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.state }
     $supervisorChildPid = if ($null -eq $supervisorState -or $null -eq $supervisorState.child_pid) { 0 } else { [int]$supervisorState.child_pid }
-    if ($supervisorStatus -notin @('running', 'adopted_existing')) {
-        $failures.Add("supervisor_state expected=running_or_adopted_existing actual=$supervisorStatus")
+    if ($supervisorStatus -ne 'running') {
+        $failures.Add("supervisor_state expected=running actual=$supervisorStatus")
     }
     if ($supervisorChildPid -ne $HealthPid) {
         $failures.Add("supervisor_child_pid expected=$HealthPid actual=$supervisorChildPid")
+    }
+    $resourceExpectations = [ordered]@{
+        calyx_config_sha256 = $expectedCalyxConfigSha256
+        math_backend = 'cpu'
+        vram_budget_bytes = '0'
+        detection_backend = 'cpu'
+        stt_backend = 'cpu'
+        capture_backend = 'gdi_bitblt'
+        capture_force_dxgi = 'False'
+        search_open_generation_cache_entries = '1'
+        job_limit_flags_expected_hex = '0x00002300'
+        job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        daemon_cpu_rate = [string]$SynapseDaemonCpuRate
+        working_set_policy = 'measured_only'
+        job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+        job_limit_flags_hex = '0x00002300'
+        process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_cpu_rate_control_flags_hex = '0x00000005'
+        job_cpu_rate = [string]$SynapseDaemonCpuRate
+        supervisor_job_limit_flags_expected_hex = '0x00002300'
+        supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        supervisor_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_cpu_rate = [string]$SynapseSupervisorCpuRate
+        supervisor_job_limit_flags_hex = '0x00002300'
+        supervisor_job_cpu_rate_control_flags_hex = '0x00000005'
+        supervisor_job_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_memory_limit_bytes_actual = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
+        owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
+        owned_committed_private_ceiling_bytes = '1000000000'
+    }
+    foreach ($resourceName in $resourceExpectations.Keys) {
+        $actualResourceValue = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.$resourceName }
+        $expectedResourceValue = [string]$resourceExpectations[$resourceName]
+        if ($actualResourceValue -cne $expectedResourceValue) {
+            $failures.Add("supervisor_resource_$resourceName expected=$expectedResourceValue actual=$actualResourceValue")
+        }
+    }
+    if ($null -ne $supervisorState) {
+        try {
+            $privateBytes = [uint64]$supervisorState.private_bytes
+            $privateHeadroomBytes = [uint64]$supervisorState.private_headroom_bytes
+            $workingSetBytes = [uint64]$supervisorState.working_set_bytes
+            if (($privateBytes + $privateHeadroomBytes) -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                $failures.Add("supervisor_private_headroom_reconciliation expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($privateBytes + $privateHeadroomBytes)")
+            }
+        } catch {
+            $failures.Add("supervisor_memory_readback_invalid error=$($_.Exception.Message)")
+        }
+    }
+    $kernelResourceReadback = Get-SynapseLiveSupervisorResourceContractDrift `
+        -LogDir $LogDir `
+        -ExpectedCalyxConfigSha256 $expectedCalyxConfigSha256
+    foreach ($kernelDrift in @($kernelResourceReadback.Drifts)) {
+        $failures.Add("kernel_resource_$kernelDrift")
     }
 
     [pscustomobject]@{
@@ -4691,6 +7409,250 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         SupervisorChildPid = $supervisorChildPid
         SupervisorSettleReads = $supervisorSettleReads
         SupervisorSettleWaitMs = [int][Math]::Round(((Get-Date) - $supervisorSettleStartedAt).TotalMilliseconds)
+        JobName = $kernelResourceReadback.KernelJobName
+        CurrentJobMemoryUsedBytes = $kernelResourceReadback.KernelCurrentJobMemoryUsedBytes
+        JobMemoryHeadroomBytes = $kernelResourceReadback.KernelJobMemoryHeadroomBytes
+        ParentJobName = $kernelResourceReadback.ParentJobName
+        ParentCurrentJobMemoryUsedBytes = $kernelResourceReadback.ParentCurrentJobMemoryUsedBytes
+        ParentPeakJobMemoryUsedBytes = $kernelResourceReadback.ParentPeakJobMemoryUsedBytes
+        ParentJobMemoryHeadroomBytes = $kernelResourceReadback.ParentJobMemoryHeadroomBytes
+        ParentCpuRateControlFlags = $kernelResourceReadback.ParentCpuRateControlFlags
+        ParentCpuRate = $kernelResourceReadback.ParentCpuRate
+        BootstrapPid = $kernelResourceReadback.BootstrapPid
+        BootstrapPrivateBytes = $kernelResourceReadback.BootstrapPrivateBytes
+        BootstrapPeakCommitBytes = $kernelResourceReadback.BootstrapPeakCommitBytes
+        BootstrapWorkingSetBytes = $kernelResourceReadback.BootstrapWorkingSetBytes
+        BootstrapPeakWorkingSetBytes = $kernelResourceReadback.BootstrapPeakWorkingSetBytes
+        BootstrapReserveBytes = $kernelResourceReadback.BootstrapReserveBytes
+    }
+}
+
+function Get-SynapseLiveSupervisorResourceContractDrift {
+    param(
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256
+    )
+
+    $statePath = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $drifts = [System.Collections.Generic.List[string]]::new()
+    $state = $null
+    $kernelJob = $null
+    $parentJob = $null
+    $bootstrapPid = 0
+    $bootstrapPrivateBytes = $null
+    $bootstrapPeakCommitBytes = $null
+    $bootstrapWorkingSetBytes = $null
+    $bootstrapPeakWorkingSetBytes = $null
+    try {
+        $state = Get-Content -Raw -LiteralPath $statePath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $drifts.Add("supervisor_state_unreadable path=$statePath error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+    }
+    if ($null -ne $state) {
+        $expectations = [ordered]@{
+            state = 'running'
+            calyx_config_sha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+            math_backend = 'cpu'
+            vram_budget_bytes = '0'
+            detection_backend = 'cpu'
+            stt_backend = 'cpu'
+            capture_backend = 'gdi_bitblt'
+            capture_force_dxgi = 'False'
+            search_open_generation_cache_entries = '1'
+            job_limit_flags_expected_hex = '0x00002300'
+            job_cpu_rate_control_flags_expected_hex = '0x00000005'
+            daemon_cpu_rate = [string]$SynapseDaemonCpuRate
+            working_set_policy = 'measured_only'
+            job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+            job_limit_flags_hex = '0x00002300'
+            process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+            job_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+            job_process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+            job_cpu_rate_control_flags_hex = '0x00000005'
+            job_cpu_rate = [string]$SynapseDaemonCpuRate
+            supervisor_job_limit_flags_expected_hex = '0x00002300'
+            supervisor_job_lifetime_owner = 'native_bootstrap_only'
+            supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+            supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+            supervisor_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+            supervisor_job_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+            supervisor_cpu_rate = [string]$SynapseSupervisorCpuRate
+            supervisor_job_limit_flags_hex = '0x00002300'
+            supervisor_job_cpu_rate_control_flags_hex = '0x00000005'
+            supervisor_job_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+            supervisor_job_memory_limit_bytes_actual = [string]$SynapseOwnedMemoryLimitBytes
+            supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
+            owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+            bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
+            owned_committed_private_ceiling_bytes = '1000000000'
+        }
+        foreach ($name in $expectations.Keys) {
+            $actual = [string]$state.$name
+            $expected = [string]$expectations[$name]
+            if ($actual -cne $expected) {
+                $drifts.Add("$name expected=$expected actual=$(if ($actual) { $actual } else { '<missing>' })")
+            }
+        }
+        $supervisorPid = if ($null -eq $state.supervisor_pid) { 0 } else { [int]$state.supervisor_pid }
+        $childPid = if ($null -eq $state.child_pid) { 0 } else { [int]$state.child_pid }
+        $supervisorCim = if ($supervisorPid -gt 0) { Get-CimInstance Win32_Process -Filter "ProcessId=$supervisorPid" -ErrorAction SilentlyContinue } else { $null }
+        if ($supervisorPid -le 0 -or -not $supervisorCim) {
+            $drifts.Add("supervisor_process expected=live pid=$supervisorPid actual=absent")
+        } else {
+            $bootstrapPid = [int]$supervisorCim.ParentProcessId
+            $bootstrapCim = if ($bootstrapPid -gt 0) { Get-CimInstance Win32_Process -Filter "ProcessId=$bootstrapPid" -ErrorAction SilentlyContinue } else { $null }
+            $expectedBootstrapPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))
+            $actualBootstrapPath = if ($bootstrapCim -and -not [string]::IsNullOrWhiteSpace([string]$bootstrapCim.ExecutablePath)) {
+                [System.IO.Path]::GetFullPath([string]$bootstrapCim.ExecutablePath)
+            } else {
+                '<missing>'
+            }
+            if (-not $bootstrapCim -or $actualBootstrapPath -ine $expectedBootstrapPath) {
+                $drifts.Add("supervisor_bootstrap_identity expected_pid=$bootstrapPid expected_path=$expectedBootstrapPath actual_path=$actualBootstrapPath")
+            } else {
+                try {
+                    $bootstrapPropertyNames = @($bootstrapCim.PSObject.Properties.Name)
+                    if ($bootstrapPropertyNames -notcontains 'PrivatePageCount' -or
+                        $bootstrapPropertyNames -notcontains 'PeakPageFileUsage' -or
+                        $bootstrapPropertyNames -notcontains 'WorkingSetSize' -or
+                        $bootstrapPropertyNames -notcontains 'PeakWorkingSetSize' -or
+                        $null -eq $bootstrapCim.PrivatePageCount -or
+                        $null -eq $bootstrapCim.PeakPageFileUsage -or
+                        $null -eq $bootstrapCim.WorkingSetSize -or
+                        $null -eq $bootstrapCim.PeakWorkingSetSize) {
+                        throw "required_properties_missing private_present=$($bootstrapPropertyNames -contains 'PrivatePageCount') private_nonnull=$($null -ne $bootstrapCim.PrivatePageCount) peak_commit_present=$($bootstrapPropertyNames -contains 'PeakPageFileUsage') peak_commit_nonnull=$($null -ne $bootstrapCim.PeakPageFileUsage) working_set_present=$($bootstrapPropertyNames -contains 'WorkingSetSize') working_set_nonnull=$($null -ne $bootstrapCim.WorkingSetSize) peak_working_set_present=$($bootstrapPropertyNames -contains 'PeakWorkingSetSize') peak_working_set_nonnull=$($null -ne $bootstrapCim.PeakWorkingSetSize)"
+                    }
+                    $bootstrapPrivateBytes = [uint64]$bootstrapCim.PrivatePageCount
+                    $peakPageFileUsageKb = [uint64]$bootstrapCim.PeakPageFileUsage
+                    $peakWorkingSetKb = [uint64]$bootstrapCim.PeakWorkingSetSize
+                    if ($peakPageFileUsageKb -gt [uint64]::MaxValue / 1024 -or
+                        $peakWorkingSetKb -gt [uint64]::MaxValue / 1024) {
+                        throw "kilobyte_counter_overflow peak_pagefile_kib=$peakPageFileUsageKb peak_working_set_kib=$peakWorkingSetKb"
+                    }
+                    $bootstrapPeakCommitBytes = [uint64]($peakPageFileUsageKb * 1024)
+                    $bootstrapWorkingSetBytes = [uint64]$bootstrapCim.WorkingSetSize
+                    $bootstrapPeakWorkingSetBytes = [uint64]($peakWorkingSetKb * 1024)
+                    $bootstrapConservativeCommitBytes = if ($bootstrapPrivateBytes -ge $bootstrapPeakCommitBytes) { [uint64]$bootstrapPrivateBytes } else { [uint64]$bootstrapPeakCommitBytes }
+                    if ($bootstrapConservativeCommitBytes -gt $SynapseBootstrapPreAssociationReserveBytes -or
+                        ($SynapseOwnedMemoryLimitBytes + $bootstrapConservativeCommitBytes) -gt [uint64]1000000000) {
+                        $drifts.Add("supervisor_bootstrap_preassociation_reserve outer_committed_limit=$SynapseOwnedMemoryLimitBytes reserve=$SynapseBootstrapPreAssociationReserveBytes private=$bootstrapPrivateBytes peak_commit=$bootstrapPeakCommitBytes conservative_commit=$bootstrapConservativeCommitBytes working_set=$bootstrapWorkingSetBytes peak_working_set=$bootstrapPeakWorkingSetBytes working_set_policy=measured_only committed_private_ceiling=1000000000")
+                    }
+                } catch {
+                    $drifts.Add("supervisor_bootstrap_memory_readback_invalid pid=$bootstrapPid error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+                }
+            }
+        }
+        if ($childPid -le 0 -or -not (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
+            $drifts.Add("child_process expected=live pid=$childPid actual=absent")
+        }
+        $jobName = [string]$state.job_name
+        if ([string]::IsNullOrWhiteSpace($jobName)) {
+            $drifts.Add('job_name expected=nonempty actual=<missing>')
+        } else {
+            $expectedJobName = 'Local\SynapseDaemon-{0}-{1}' -f $supervisorPid, ([int]$state.generation)
+            if ($jobName -cne $expectedJobName) {
+                $drifts.Add("job_name expected=$expectedJobName actual=$jobName")
+            }
+            try {
+                $kernelJob = Get-SynapseDaemonJobKernelReadback -JobName $jobName
+                $kernelFlagsHex = '0x{0:X8}' -f $kernelJob.LimitFlags
+                if ($kernelFlagsHex -cne '0x00002300') {
+                    $drifts.Add("kernel_job_limit_flags expected=0x00002300 actual=$kernelFlagsHex")
+                }
+                if ([uint64]$kernelJob.ProcessMemoryLimitBytes -ne $SynapseDaemonProcessMemoryLimitBytes -or
+                    [uint64]$kernelJob.JobMemoryLimitBytes -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                    $drifts.Add("kernel_memory_limits expected_process_and_job=$SynapseDaemonProcessMemoryLimitBytes actual_process=$($kernelJob.ProcessMemoryLimitBytes) actual_job=$($kernelJob.JobMemoryLimitBytes)")
+                }
+                $kernelCpuFlagsHex = '0x{0:X8}' -f $kernelJob.CpuRateControlFlags
+                if ($kernelCpuFlagsHex -cne '0x00000005' -or [uint32]$kernelJob.CpuRate -ne $SynapseDaemonCpuRate) {
+                    $drifts.Add("kernel_job_cpu_rate expected_flags=0x00000005 expected_rate=$SynapseDaemonCpuRate actual_flags=$kernelCpuFlagsHex actual_rate=$($kernelJob.CpuRate)")
+                }
+                if (@($kernelJob.ProcessIds | Where-Object { [uint64]$_ -eq [uint64]$childPid }).Count -ne 1) {
+                    $drifts.Add("kernel_job_child_membership expected_pid=$childPid actual_pids=$(@($kernelJob.ProcessIds) -join ',')")
+                }
+                if ([uint64]$kernelJob.CurrentJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes -or
+                    [uint64]$kernelJob.PeakJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes) {
+                    $drifts.Add("kernel_job_memory_usage limit=$SynapseDaemonProcessMemoryLimitBytes current=$($kernelJob.CurrentJobMemoryUsedBytes) peak=$($kernelJob.PeakJobMemoryUsedBytes)")
+                }
+            } catch {
+                $drifts.Add("kernel_job_readback_failed job_name=$jobName error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+            }
+        }
+        $parentJobName = [string]$state.supervisor_job_name
+        $expectedParentJobName = if ($bootstrapPid -gt 0) { 'Local\SynapseOwned-{0}' -f $bootstrapPid } else { '<missing-bootstrap-pid>' }
+        if ($parentJobName -cne $expectedParentJobName) {
+            $drifts.Add("supervisor_job_name expected=$expectedParentJobName actual=$(if ($parentJobName) { $parentJobName } else { '<missing>' })")
+        } else {
+            try {
+                $parentJob = Get-SynapseDaemonJobKernelReadback -JobName $parentJobName
+                $parentFlagsHex = '0x{0:X8}' -f $parentJob.LimitFlags
+                $parentCpuFlagsHex = '0x{0:X8}' -f $parentJob.CpuRateControlFlags
+                if ($parentFlagsHex -cne '0x00002300') {
+                    $drifts.Add("supervisor_kernel_job_limit_flags expected=0x00002300 actual=$parentFlagsHex")
+                }
+                if ([uint64]$parentJob.ProcessMemoryLimitBytes -ne $SynapseOwnedMemoryLimitBytes -or
+                    [uint64]$parentJob.JobMemoryLimitBytes -ne $SynapseOwnedMemoryLimitBytes) {
+                    $drifts.Add("supervisor_kernel_memory_limits expected_process_and_job=$SynapseOwnedMemoryLimitBytes actual_process=$($parentJob.ProcessMemoryLimitBytes) actual_job=$($parentJob.JobMemoryLimitBytes) working_set_policy=measured_only")
+                }
+                if ($parentCpuFlagsHex -cne '0x00000005' -or [uint32]$parentJob.CpuRate -ne $SynapseSupervisorCpuRate) {
+                    $drifts.Add("supervisor_kernel_cpu_rate expected_flags=0x00000005 expected_rate=$SynapseSupervisorCpuRate actual_flags=$parentCpuFlagsHex actual_rate=$($parentJob.CpuRate)")
+                }
+                foreach ($expectedParentPid in @($bootstrapPid, $supervisorPid, $childPid)) {
+                    if ($expectedParentPid -le 0) { continue }
+                    if (@($parentJob.ProcessIds | Where-Object { [uint64]$_ -eq [uint64]$expectedParentPid }).Count -ne 1) {
+                        $drifts.Add("supervisor_kernel_membership expected_pid=$expectedParentPid actual_pids=$(@($parentJob.ProcessIds) -join ',')")
+                    }
+                }
+                if ([uint64]$parentJob.CurrentJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes -or
+                    [uint64]$parentJob.PeakJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes) {
+                    $drifts.Add("supervisor_kernel_job_memory_usage limit=$SynapseOwnedMemoryLimitBytes current=$($parentJob.CurrentJobMemoryUsedBytes) peak=$($parentJob.PeakJobMemoryUsedBytes)")
+                }
+            } catch {
+                $drifts.Add("supervisor_kernel_job_readback_failed job_name=$parentJobName error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+            }
+        }
+        try {
+            $privateBytes = [uint64]$state.private_bytes
+            $privateHeadroomBytes = [uint64]$state.private_headroom_bytes
+            $workingSetBytes = [uint64]$state.working_set_bytes
+            if (($privateBytes + $privateHeadroomBytes) -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                $drifts.Add("private_headroom_reconciliation expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($privateBytes + $privateHeadroomBytes)")
+            }
+        } catch {
+            $drifts.Add("memory_readback_invalid error=$($_.Exception.Message)")
+        }
+    }
+    return [pscustomobject]@{
+        HasDrift = ($drifts.Count -gt 0)
+        StatePath = $statePath
+        Drifts = $drifts
+        KernelJobName = if ($null -eq $state) { '<missing>' } else { [string]$state.job_name }
+        KernelCurrentJobMemoryUsedBytes = if ($null -eq $kernelJob) { $null } else { [uint64]$kernelJob.CurrentJobMemoryUsedBytes }
+        KernelJobMemoryHeadroomBytes = if ($null -eq $kernelJob) {
+            $null
+        } elseif ([uint64]$kernelJob.CurrentJobMemoryUsedBytes -ge $SynapseDaemonProcessMemoryLimitBytes) {
+            [uint64]0
+        } else {
+            [uint64]($SynapseDaemonProcessMemoryLimitBytes - [uint64]$kernelJob.CurrentJobMemoryUsedBytes)
+        }
+        ParentJobName = if ($null -eq $state) { '<missing>' } else { [string]$state.supervisor_job_name }
+        ParentCurrentJobMemoryUsedBytes = if ($null -eq $parentJob) { $null } else { [uint64]$parentJob.CurrentJobMemoryUsedBytes }
+        ParentPeakJobMemoryUsedBytes = if ($null -eq $parentJob) { $null } else { [uint64]$parentJob.PeakJobMemoryUsedBytes }
+        ParentJobMemoryHeadroomBytes = if ($null -eq $parentJob) {
+            $null
+        } elseif ([uint64]$parentJob.CurrentJobMemoryUsedBytes -ge $SynapseOwnedMemoryLimitBytes) {
+            [uint64]0
+        } else {
+            [uint64]($SynapseOwnedMemoryLimitBytes - [uint64]$parentJob.CurrentJobMemoryUsedBytes)
+        }
+        ParentCpuRateControlFlags = if ($null -eq $parentJob) { $null } else { [uint32]$parentJob.CpuRateControlFlags }
+        ParentCpuRate = if ($null -eq $parentJob) { $null } else { [uint32]$parentJob.CpuRate }
+        BootstrapPid = $bootstrapPid
+        BootstrapPrivateBytes = $bootstrapPrivateBytes
+        BootstrapPeakCommitBytes = $bootstrapPeakCommitBytes
+        BootstrapWorkingSetBytes = $bootstrapWorkingSetBytes
+        BootstrapPeakWorkingSetBytes = $bootstrapPeakWorkingSetBytes
+        BootstrapReserveBytes = $SynapseBootstrapPreAssociationReserveBytes
     }
 }
 
@@ -6864,6 +9826,46 @@ function Test-SynapseHealthCriticalSubsystemsReady {
     }
 }
 
+function Test-SynapseHealthAllNonChromeSubsystemsReady {
+    param([AllowNull()]$Health)
+
+    $critical = Test-SynapseHealthCriticalSubsystemsReady -Health $Health
+    if (-not $critical.Ok) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = "critical_contract=[$($critical.Detail)]"
+        }
+    }
+    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
+    $properties = @($subsystems.PSObject.Properties | Where-Object { $_.Name -cne 'chrome_bridge' } | Sort-Object Name)
+    if ($properties.Count -eq 0) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = 'non_chrome_subsystems=<none>'
+        }
+    }
+
+    $bad = @()
+    foreach ($property in $properties) {
+        $status = [string](Get-SynapseObjectPropertyValue -Object $property.Value -Names @('status'))
+        if ([string]::IsNullOrWhiteSpace($status)) {
+            $bad += ("{0}=<missing>" -f $property.Name)
+        } elseif ($status -ceq 'error') {
+            $bad += ("{0}=error" -f $property.Name)
+        }
+    }
+    if ($bad.Count -gt 0) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = "non_chrome_bad=$(Format-SynapseLimitedList -Items $bad)"
+        }
+    }
+    return [pscustomobject]@{
+        Ok = $true
+        Detail = "all_non_chrome_subsystems_non_error count=$($properties.Count)"
+    }
+}
+
 function Read-SynapseMcpSseJsonResponse {
     param(
         [Parameter(Mandatory=$true)][string]$Content,
@@ -8627,12 +11629,15 @@ function Get-SynapseOrtRuntimeCompanions {
     param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 
     $directory = Split-Path -Parent $ExecutablePath
-    $required = @('onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'onnxruntime_providers_cuda.dll')
+    # The installed runtime deliberately carries only the CPU execution core.
+    # A CUDA provider DLL beside the executable would make GPU acquisition
+    # structurally possible even when configuration currently selects CPU.
+    $required = @('onnxruntime.dll', 'onnxruntime_providers_shared.dll')
     $files = @()
     foreach ($name in $required) {
         $path = Join-Path $directory $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            Die "SYNAPSE_ORT_RUNTIME_COMPANION_MISSING executable=$ExecutablePath companion=$path remediation=the CUDA-enabled daemon is a runtime bundle; build or install the named ONNX Runtime provider DLL beside the executable"
+            Die "SYNAPSE_ORT_RUNTIME_COMPANION_MISSING executable=$ExecutablePath companion=$path remediation=the CPU-only daemon is a runtime bundle; build or install the named ONNX Runtime CPU runtime DLL beside the executable"
         }
         $files += [pscustomobject]@{
             Name = $name
@@ -8643,18 +11648,17 @@ function Get-SynapseOrtRuntimeCompanions {
     return @($files)
 }
 
-function Install-SynapsePinnedOrtGpuRuntime {
+function Install-SynapsePinnedOrtCpuRuntime {
     param([Parameter(Mandatory=$true)][string]$Root)
 
     $version = '1.27.1'
-    $packageSha256 = '07AD9D174F19BA47C13BF1989EE0C9A8D4832481E2EB51A16DD659A71162381F'
+    $packageSha256 = '9359E46EBA4482DED00E678C98F22B68F51BB411D7934F5516D64050EDFA3383'
     $expectedFiles = [ordered]@{
-        'onnxruntime.dll' = '75BBF0C47CB90E17F566DA46F50ECAAB4A0DA978E6D8C2B58FBB89708EA067DE'
-        'onnxruntime_providers_shared.dll' = '3D8EF56BABC5D581153CB032DE6841CFBCC884533A3C74038CEB6DFB6CCB05AE'
-        'onnxruntime_providers_cuda.dll' = '46766BA4A7F971A2D5F01569EA6CCFD501F5CF578F2257734CFD578DC28CAD2E'
+        'onnxruntime.dll' = '79DF49BCBEFB604C019785925DAEF859C0348280616364E28103D73D4152F6D7'
+        'onnxruntime_providers_shared.dll' = 'B8ECC1B05E21D1226DDA18DD3CB70C7FFF16713FCDCEF050CACEA83B8CBF315C'
     }
     $versionRoot = Join-Path $Root $version
-    $packagePath = Join-Path $versionRoot "Microsoft.ML.OnnxRuntime.Gpu.Windows.$version.nupkg"
+    $packagePath = Join-Path $versionRoot "Microsoft.ML.OnnxRuntime.$version.nupkg"
     $extractRoot = Join-Path $versionRoot 'package'
     $nativeDir = Join-Path $extractRoot 'runtimes\win-x64\native'
     New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
@@ -8662,7 +11666,7 @@ function Install-SynapsePinnedOrtGpuRuntime {
         $downloadPath = "$packagePath.download-$PID"
         try {
             try {
-                Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Gpu.Windows/$version" -OutFile $downloadPath -ErrorAction Stop
+                Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$version" -OutFile $downloadPath -ErrorAction Stop
             } catch {
                 Die "SYNAPSE_ORT_RUNTIME_PACKAGE_DOWNLOAD_FAILED path=$downloadPath version=$version error=$($_.Exception.Message) remediation=verify network/TLS access to the authoritative Microsoft NuGet package endpoint and rerun setup"
             }
@@ -8706,7 +11710,7 @@ function Install-SynapsePinnedOrtGpuRuntime {
             Die "SYNAPSE_ORT_RUNTIME_FILE_HASH_MISMATCH path=$path expected_sha256=$($entry.Value) actual_sha256=$actual remediation=the extracted runtime differs from the pinned Microsoft package; refuse the build and reacquire the exact package"
         }
     }
-    Info "Pinned Microsoft ONNX Runtime GPU bundle verified version=$version package_sha256=$packageReadback native_dir=$nativeDir"
+    Info "Pinned Microsoft ONNX Runtime CPU execution core verified version=$version package_sha256=$packageReadback native_dir=$nativeDir installed_cuda_provider=false"
     return [pscustomobject]@{ Version = $version; NativeDir = $nativeDir; PackagePath = $packagePath; PackageSha256 = $packageReadback }
 }
 
@@ -9638,6 +12642,214 @@ function Remove-SynapseCandidateArtifact {
     }
 }
 
+function Get-SynapseDeploymentTransactionArtifactDescriptor {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][ValidateSet('unarmed','rolled_back','committed')][string]$ExpectedState
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $pathFull)).TrimEnd('\')
+    $leaf = Split-Path -Leaf $pathFull
+    $leafMatch = [regex]::Match($leaf, '^deployment-\d{8}T\d{9}Z-(\d+)$')
+    if (-not $parentFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or -not $leafMatch.Success) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ARTIFACT_SCOPE_INVALID path=$pathFull expected_parent=$rootFull actual_parent=$parentFull leaf=$leaf remediation=do not delete the path; only exact setup-transactions/deployment-{UTC timestamp}-{PID} directories are eligible"
+    }
+    $ownerPid = [int]$leafMatch.Groups[1].Value
+    if (-not (Test-Path -LiteralPath $pathFull)) {
+        return [pscustomobject]@{ Path = $pathFull; Exists = $false; OwnerPid = $ownerPid; Entries = @(); ManifestPath = (Join-Path $pathFull 'transaction.json') }
+    }
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ROOT_MISSING root=$rootFull path=$pathFull remediation=do not delete anything; inspect the physical setup-transactions root"
+    }
+    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ROOT_REPARSE_POINT root=$rootFull attributes=$($rootItem.Attributes) remediation=do not follow or delete this link; restore setup-transactions as a physical directory"
+    }
+    $directory = Get-Item -LiteralPath $pathFull -Force -ErrorAction Stop
+    if (-not $directory.PSIsContainer -or ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ARTIFACT_TYPE_INVALID path=$pathFull is_container=$($directory.PSIsContainer) attributes=$($directory.Attributes) remediation=do not recurse into a file or reparse point"
+    }
+    $liveOwner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+    if ($null -ne $liveOwner -and $ownerPid -ne $PID) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_OWNER_STILL_LIVE path=$pathFull owner_pid=$ownerPid current_pid=$PID owner_name=$($liveOwner.ProcessName) remediation=do not delete another live setup invocation's transaction directory"
+    }
+    $pathReferences = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessId -ne $PID -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+        ([string]$_.CommandLine).IndexOf($pathFull, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    if ($pathReferences.Count -gt 0) {
+        $referenceText = ($pathReferences | ForEach-Object { "pid=$($_.ProcessId),name=$($_.Name)" }) -join ';'
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_PROCESS_REFERENCE_LIVE path=$pathFull references=$referenceText remediation=inspect these exact processes; do not delete rollback storage referenced by a live command line"
+    }
+
+    $entries = @(Get-ChildItem -LiteralPath $pathFull -Force -ErrorAction Stop | Sort-Object Name)
+    if ($entries.Count -gt 128) {
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ENTRY_BOUND_EXCEEDED path=$pathFull count=$($entries.Count) max=128 remediation=do not delete the directory; inspect its unexpected contents"
+    }
+    $invalidEntries = @($entries | Where-Object {
+        $_.PSIsContainer -or
+        ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+        $_.Name -notmatch '^(transaction\.json|previous-task\.xml|file-\d{4}\.bin)$'
+    })
+    if ($invalidEntries.Count -gt 0) {
+        $invalidText = ($invalidEntries | ForEach-Object { "name=$($_.Name),container=$($_.PSIsContainer),attributes=$($_.Attributes)" }) -join ';'
+        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_CONTENT_INVALID path=$pathFull invalid=[$invalidText] remediation=do not broaden cleanup; inspect every unexpected entry"
+    }
+
+    $manifestPath = Join-Path $pathFull 'transaction.json'
+    if ($ExpectedState -eq 'unarmed') {
+        if (Test-Path -LiteralPath $manifestPath) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_UNARMED_MANIFEST_PRESENT path=$manifestPath remediation=preserve the manifest; a directory with durable transaction state is not an unarmed artifact"
+        }
+    } else {
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_TERMINAL_MANIFEST_MISSING path=$manifestPath expected_state=$ExpectedState remediation=preserve the backup directory until its terminal state is readable"
+        }
+        $manifestItem = Get-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+        if (($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $manifestItem.Length -gt 1MB) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_TERMINAL_MANIFEST_INVALID path=$manifestPath length=$($manifestItem.Length) attributes=$($manifestItem.Attributes)"
+        }
+        try {
+            $manifest = Get-Content -Raw -LiteralPath $manifestPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_TERMINAL_MANIFEST_UNREADABLE path=$manifestPath error=$($_.Exception.Message)"
+        }
+        if ([string]$manifest.schema -ne 'synapse_deployment_transaction/v1' -or [string]$manifest.state -ne $ExpectedState) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_TERMINAL_STATE_MISMATCH path=$manifestPath expected_schema=synapse_deployment_transaction/v1 actual_schema=$($manifest.schema) expected_state=$ExpectedState actual_state=$($manifest.state)"
+        }
+        $manifestRootProperty = $manifest.PSObject.Properties['transaction_root']
+        if ($null -ne $manifestRootProperty -and
+            -not [string]::IsNullOrWhiteSpace([string]$manifestRootProperty.Value) -and
+            [System.IO.Path]::GetFullPath([string]$manifestRootProperty.Value) -ine $pathFull) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_TERMINAL_ROOT_MISMATCH path=$manifestPath expected_root=$pathFull actual_root=$($manifestRootProperty.Value)"
+        }
+
+        # Rolled-back v1 manifests retain their original file/task snapshot
+        # references. Prove every referenced backup stays a regular direct child
+        # of this exact transaction directory, and that no unreferenced backup
+        # leaf has appeared. Committed manifests intentionally contain only the
+        # terminal installed-generation summary, so their exact namespace/type
+        # guard above is the deletion authority.
+        $snapshotProperty = $manifest.PSObject.Properties['file_snapshots']
+        if ($null -ne $snapshotProperty) {
+            $referencedBackups = @()
+            foreach ($snapshot in @($snapshotProperty.Value)) {
+                if (-not [bool]$snapshot.Existed) { continue }
+                $backupPath = [System.IO.Path]::GetFullPath([string]$snapshot.BackupPath)
+                $backupParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $backupPath)).TrimEnd('\')
+                $backupLeaf = Split-Path -Leaf $backupPath
+                if (-not $backupParent.Equals($pathFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $backupLeaf -notmatch '^file-\d{4}\.bin$') {
+                    throw "SYNAPSE_DEPLOYMENT_TRANSACTION_BACKUP_REFERENCE_OUT_OF_SCOPE manifest=$manifestPath backup=$backupPath expected_parent=$pathFull"
+                }
+                $referencedBackups += $backupPath
+            }
+            $unreferencedBackups = @($entries | Where-Object {
+                $_.Name -match '^file-\d{4}\.bin$' -and $referencedBackups -inotcontains [System.IO.Path]::GetFullPath($_.FullName)
+            })
+            if ($unreferencedBackups.Count -gt 0) {
+                throw "SYNAPSE_DEPLOYMENT_TRANSACTION_UNREFERENCED_BACKUP path=$pathFull files=$(@($unreferencedBackups | ForEach-Object { $_.Name }) -join ',')"
+            }
+        }
+
+        $previousTaskProperty = $manifest.PSObject.Properties['previous_task']
+        if ($null -ne $previousTaskProperty) {
+            $previousTaskPath = Join-Path $pathFull 'previous-task.xml'
+            if ([bool]$previousTaskProperty.Value.Present) {
+                if (Test-Path -LiteralPath $previousTaskPath -PathType Leaf) {
+                    $previousTaskHash = Get-SynapseFileSha256 -Path $previousTaskPath
+                    if ($previousTaskHash -ine [string]$previousTaskProperty.Value.XmlSha256) {
+                        throw "SYNAPSE_DEPLOYMENT_TRANSACTION_PREVIOUS_TASK_SNAPSHOT_MISMATCH manifest=$manifestPath path=$previousTaskPath expected_sha256=$($previousTaskProperty.Value.XmlSha256) actual_sha256=$previousTaskHash"
+                    }
+                }
+            } elseif (Test-Path -LiteralPath $previousTaskPath) {
+                throw "SYNAPSE_DEPLOYMENT_TRANSACTION_UNEXPECTED_PREVIOUS_TASK_SNAPSHOT manifest=$manifestPath path=$previousTaskPath"
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Path = $pathFull
+        Exists = $true
+        OwnerPid = $ownerPid
+        Entries = $entries
+        ManifestPath = $manifestPath
+    }
+}
+
+function Remove-SynapseDeploymentTransactionArtifact {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][ValidateSet('unarmed','rolled_back','committed')][string]$ExpectedState,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 20
+    )
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempt = 0
+    $lastNativeError = 0
+    $lastError = '<none>'
+    $terminalManifestRemovedByThisCall = $false
+    while ($true) {
+        $attempt++
+        # Removing the final manifest and its now-empty parent cannot be one
+        # atomic filesystem operation. If only the directory removal hit a
+        # transient sharing violation, revalidate the exact path as an empty
+        # no-manifest artifact instead of making the same bounded call unable to
+        # finish. This state is reachable only after this invocation validated
+        # and removed the requested terminal manifest itself.
+        $descriptorState = if ($terminalManifestRemovedByThisCall) { 'unarmed' } else { $ExpectedState }
+        $descriptor = Get-SynapseDeploymentTransactionArtifactDescriptor `
+            -Path $Path `
+            -ExpectedRoot $ExpectedRoot `
+            -ExpectedState $descriptorState
+        if (-not $descriptor.Exists) {
+            Info "Deployment transaction artifact absence verified reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds)"
+            return $descriptor
+        }
+        if ($terminalManifestRemovedByThisCall -and $descriptor.Entries.Count -ne 0) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_PARTIAL_CLEANUP_CONTENT_REAPPEARED reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) entries=$(@($descriptor.Entries | ForEach-Object { $_.Name }) -join ',') remediation=do not delete new content that appeared after the verified terminal manifest was removed"
+        }
+        try {
+            # Keep transaction.json until every potentially large backup has
+            # been removed. A sharing violation therefore leaves the durable
+            # terminal verdict intact for the next bounded retry/setup run.
+            foreach ($entry in @($descriptor.Entries | Where-Object { $_.Name -cne 'transaction.json' })) {
+                Remove-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $descriptor.ManifestPath -PathType Leaf) {
+                Remove-Item -LiteralPath $descriptor.ManifestPath -Force -ErrorAction Stop
+            }
+            if ($ExpectedState -ne 'unarmed' -and -not (Test-Path -LiteralPath $descriptor.ManifestPath)) {
+                $terminalManifestRemovedByThisCall = $true
+            }
+            Remove-Item -LiteralPath $descriptor.Path -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $descriptor.Path)) {
+                Info "Deployment transaction artifact cleanup verified reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds)"
+                return $descriptor
+            }
+            $lastNativeError = 0
+            $lastError = 'Remove-Item returned but the transaction directory remains present'
+        } catch {
+            $lastNativeError = Get-SynapseCandidateCleanupNativeErrorCode -Exception $_.Exception
+            $lastError = $_.Exception.Message
+            if ($lastNativeError -notin @(5, 32, 33)) {
+                throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ARTIFACT_CLEANUP_FAILED reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) attempt=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) native_error=$lastNativeError error=$lastError remediation=inspect the exact non-transient filesystem failure; cleanup never broadens outside the verified deployment namespace"
+            }
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            throw "SYNAPSE_DEPLOYMENT_TRANSACTION_ARTIFACT_CLEANUP_TIMEOUT reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) attempts=$attempt timeout_seconds=$TimeoutSeconds native_error=$lastNativeError error=$lastError remediation=identify the exact handle retaining a verified transaction backup and rerun setup"
+        }
+        Info "Deployment transaction artifact cleanup waiting reason=$Reason expected_state=$ExpectedState path=$($descriptor.Path) attempt=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) native_error=$lastNativeError error=$lastError"
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Resume-SynapseCandidateCleanupIntents {
     param([Parameter(Mandatory=$true)][string]$Root)
 
@@ -9965,6 +13177,195 @@ function Write-SynapseCandidateJsonEvidence {
     }
 }
 
+function Test-SynapseCpuOnlyRuntimeHealth {
+    param([Parameter(Mandatory=$true)]$Health)
+
+    $calyx = $Health.subsystems.calyx_vault
+    if ($null -eq $calyx) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = 'SYNAPSE_CPU_ONLY_HEALTH_MISSING: health.subsystems.calyx_vault is absent; remediation=repair Calyx startup health before accepting the daemon'
+        }
+    }
+    $requiredFields = @(
+        'calyx_math_backend_requested',
+        'calyx_math_backend',
+        'calyx_assay_compute_backend',
+        'calyx_math_cuda_compiled',
+        'calyx_registry_embedding_runtimes_compiled',
+        'calyx_ward_model_lenses_compiled',
+        'calyx_sextant_cuvs_compiled',
+        'calyx_sextant_cuda_pq_compiled',
+        'calyx_vram_budget_bytes',
+        'calyx_vram_budget_enforced'
+    )
+    $missingFields = @($requiredFields | Where-Object {
+        $null -eq $calyx.PSObject.Properties[$_] -or
+        $null -eq $calyx.PSObject.Properties[$_].Value
+    })
+    if ($missingFields.Count -gt 0) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = "SYNAPSE_CPU_ONLY_HEALTH_FIELD_MISSING: fields=$($missingFields -join ','); remediation=run the current CPU-only binary whose health schema explicitly attests every accelerator compile/runtime field"
+        }
+    }
+    $requested = $calyx.calyx_math_backend_requested
+    $selected = $calyx.calyx_math_backend
+    $assay = $calyx.calyx_assay_compute_backend
+    $cudaCompiled = $calyx.calyx_math_cuda_compiled
+    $registryEmbeddingRuntimesCompiled = $calyx.calyx_registry_embedding_runtimes_compiled
+    $wardModelLensesCompiled = $calyx.calyx_ward_model_lenses_compiled
+    $sextantCuvsCompiled = $calyx.calyx_sextant_cuvs_compiled
+    $sextantCudaPqCompiled = $calyx.calyx_sextant_cuda_pq_compiled
+    $vramBudgetEnforced = $calyx.calyx_vram_budget_enforced
+    $reservationId = [string]$calyx.calyx_gpu_reservation_id
+    $booleanFields = @(
+        $cudaCompiled,
+        $registryEmbeddingRuntimesCompiled,
+        $wardModelLensesCompiled,
+        $sextantCuvsCompiled,
+        $sextantCudaPqCompiled,
+        $vramBudgetEnforced
+    )
+    # These five Rust Option fields use skip_serializing_if=None. Their JSON
+    # property absence is therefore the authoritative CPU-only `None`, not a
+    # schema omission: the required false VRAM-enforcement and accelerator
+    # compile flags above establish this health contract. PowerShell reads both
+    # an absent property and an explicit null as $null; any non-null dispatch
+    # value remains rejected by $dispatchAbsent below.
+    $dispatchFields = @(
+        $calyx.calyx_vram_dispatch_soft_cap_bytes,
+        $calyx.calyx_vram_dispatch_allocated_bytes,
+        $calyx.calyx_vram_dispatch_serving_allocated_bytes,
+        $calyx.calyx_vram_dispatch_anneal_allocated_bytes,
+        $calyx.calyx_vram_dispatch_device_free_bytes
+    )
+    if (@($booleanFields | Where-Object { $_ -isnot [bool] }).Count -gt 0 -or
+        $requested -isnot [string] -or $selected -isnot [string] -or $assay -isnot [string] -or
+        $calyx.calyx_vram_budget_bytes -is [string] -or
+        $calyx.calyx_vram_budget_bytes -is [bool]) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = 'SYNAPSE_CPU_ONLY_HEALTH_TYPE_INVALID: backend fields must be JSON strings, compile fields JSON booleans, and VRAM fields JSON numbers; remediation=repair the typed health schema instead of relying on PowerShell null/string coercion'
+        }
+    }
+    try {
+        $vramBudget = [uint64]$calyx.calyx_vram_budget_bytes
+    } catch {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = "SYNAPSE_CPU_ONLY_HEALTH_NUMERIC_INVALID: vram_budget=$($calyx.calyx_vram_budget_bytes) error=$($_.Exception.Message); remediation=repair typed Calyx health serialization"
+        }
+    }
+    $dispatchAbsent = @($dispatchFields | Where-Object { $null -ne $_ }).Count -eq 0
+    $ok = (
+        $requested -ceq 'cpu' -and
+        $selected -ceq 'cpu' -and
+        $assay -ceq 'cpu' -and
+        $cudaCompiled -eq $false -and
+        $registryEmbeddingRuntimesCompiled -eq $false -and
+        $wardModelLensesCompiled -eq $false -and
+        $sextantCuvsCompiled -eq $false -and
+        $sextantCudaPqCompiled -eq $false -and
+        $vramBudget -eq 0 -and
+        $vramBudgetEnforced -eq $false -and
+        $dispatchAbsent -and
+        [string]::IsNullOrWhiteSpace($reservationId))
+    return [pscustomobject]@{
+        Ok = $ok
+        Detail = $(if ($ok) {
+            "requested=cpu selected=cpu assay=cpu cuda_compiled=false registry_embedding_runtimes_compiled=false ward_model_lenses_compiled=false sextant_cuvs_compiled=false sextant_cuda_pq_compiled=false vram_budget_bytes=0 vram_budget_enforced=false vram_dispatch=<absent> gpu_reservation_id=<none>"
+        } else {
+            "SYNAPSE_CPU_ONLY_HEALTH_CONTRACT_FAILED requested=$requested selected=$selected assay=$assay cuda_compiled=$cudaCompiled registry_embedding_runtimes_compiled=$registryEmbeddingRuntimesCompiled ward_model_lenses_compiled=$wardModelLensesCompiled sextant_cuvs_compiled=$sextantCuvsCompiled sextant_cuda_pq_compiled=$sextantCudaPqCompiled vram_budget_bytes=$vramBudget vram_budget_enforced=$vramBudgetEnforced vram_dispatch_absent=$dispatchAbsent gpu_reservation_id=$(if ($reservationId) { $reservationId } else { '<none>' }); remediation=use the setup-managed CPU-only Calyx config and rebuild synapse-mcp without Calyx/model accelerator or heavyweight embedding/model-lens features"
+        })
+    }
+}
+
+function Assert-SynapseNoExplicitGpuRuntimeHealth {
+    param(
+        [Parameter(Mandatory=$true)]$Health,
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    if ([int]$Health.pid -ne $ProcessId) {
+        Die "SYNAPSE_ACCELERATOR_POLICY_HEALTH_PID_MISMATCH phase=$Phase expected_pid=$ProcessId actual_pid=$($Health.pid) bind=$Bind remediation=refuse health from a different process identity"
+    }
+    $calyxProof = Test-SynapseCpuOnlyRuntimeHealth -Health $Health
+    if (-not $calyxProof.Ok) {
+        Die "$($calyxProof.Detail) phase=$Phase pid=$ProcessId bind=$Bind"
+    }
+
+    $perception = $Health.subsystems.perception
+    $detection = if ($null -eq $perception) { $null } else { $perception.perception_detection }
+    $capture = if ($null -eq $perception) { $null } else { $perception.capture_runtime }
+    $captureRequested = if ($null -eq $perception) { '<missing>' } else { [string]$perception.capture_backend_requested }
+    $captureEffective = if ($null -eq $perception) { '<missing>' } else { [string]$perception.capture_backend_effective }
+    $captureCompiled = if ($null -eq $perception -or $null -eq $perception.PSObject.Properties['capture_gpu_backends_compiled']) { $null } else { $perception.capture_gpu_backends_compiled }
+    $detectionCudaCompiled = if ($null -eq $perception -or $null -eq $perception.PSObject.Properties['detection_cuda_execution_provider_compiled']) { $null } else { $perception.detection_cuda_execution_provider_compiled }
+    $captureSelected = if ($null -eq $capture) { '<missing>' } else { [string]$capture.selected_backend }
+    $captureActiveBackend = if ($null -eq $capture) { '<missing>' } else { [string]$capture.backend }
+    $bundledDetectionProvider = if ($null -eq $detection) { '<missing>' } else { [string]$detection.bundled_provider }
+    $persistentDetectionBackend = if ($null -eq $detection) { '<missing>' } else { [string]$detection.persistent_worker_backend }
+    $captureOk = (
+        $null -ne $perception -and
+        $captureRequested -ceq 'gdi_bitblt_no_explicit_gpu_api' -and
+        $captureEffective -ceq 'gdi_bitblt_no_explicit_gpu_api' -and
+        $captureCompiled -is [bool] -and $captureCompiled -eq $false -and
+        $detectionCudaCompiled -is [bool] -and $detectionCudaCompiled -eq $false -and
+        $null -ne $capture -and
+        $captureSelected -ceq 'gdi_bitblt_no_explicit_gpu_api' -and
+        ([string]::IsNullOrWhiteSpace($captureActiveBackend) -or $captureActiveBackend -ceq 'gdi_bitblt_no_explicit_gpu_api') -and
+        $null -ne $detection -and
+        $bundledDetectionProvider -ceq 'cpu' -and
+        ([string]::IsNullOrWhiteSpace($persistentDetectionBackend) -or $persistentDetectionBackend -ceq 'cpu'))
+    if (-not $captureOk) {
+        Die "SYNAPSE_ACCELERATOR_POLICY_PERCEPTION_CONTRACT_FAILED phase=$Phase pid=$ProcessId bind=$Bind capture_requested=$captureRequested capture_effective=$captureEffective capture_selected=$captureSelected capture_active=$(if ($captureActiveBackend) { $captureActiveBackend } else { '<inactive>' }) capture_gpu_backends_compiled=$(if ($null -eq $captureCompiled) { '<missing>' } else { $captureCompiled }) detection_cuda_compiled=$(if ($null -eq $detectionCudaCompiled) { '<missing>' } else { $detectionCudaCompiled }) bundled_detection_provider=$bundledDetectionProvider persistent_detection_backend=$(if ($persistentDetectionBackend) { $persistentDetectionBackend } else { '<not-started>' }) remediation=run the CPU-only build with the exact no-explicit-GPU-API GDI BitBlt backend and no model/capture accelerator features; GDI may still be accelerated internally by Windows or the display driver"
+    }
+
+    $audio = $Health.subsystems.audio
+    $sttPolicy = if ($null -eq $audio) { '<missing>' } else { [string]$audio.stt_backend_policy }
+    $sttSelected = if ($null -eq $audio) { '<missing>' } else { [string]$audio.stt_selected_backend }
+    $sttDeviceMemory = if ($null -eq $audio) { '<missing>' } else { [string]$audio.stt_device_memory_policy }
+    $sttReservationId = if ($null -eq $audio) { '<missing>' } else { [string]$audio.stt_gpu_reservation_id }
+    $sttReservationMib = if ($null -eq $audio -or $null -eq $audio.stt_gpu_reservation_mib) { [uint64]0 } else { [uint64]$audio.stt_gpu_reservation_mib }
+    $sttCudaCompiled = if ($null -eq $audio -or $null -eq $audio.PSObject.Properties['stt_cuda_execution_provider_compiled']) { $null } else { $audio.stt_cuda_execution_provider_compiled }
+    $audioOk = (
+        $null -ne $audio -and
+        $sttPolicy -ceq 'pinned:Cpu' -and
+        $sttCudaCompiled -is [bool] -and $sttCudaCompiled -eq $false -and
+        ([string]::IsNullOrWhiteSpace($sttSelected) -or $sttSelected -ceq 'Cpu') -and
+        ([string]::IsNullOrWhiteSpace($sttDeviceMemory) -or $sttDeviceMemory -ceq 'host_memory') -and
+        [string]::IsNullOrWhiteSpace($sttReservationId) -and
+        $sttReservationMib -eq 0)
+    if (-not $audioOk) {
+        Die "SYNAPSE_ACCELERATOR_POLICY_AUDIO_CONTRACT_FAILED phase=$Phase pid=$ProcessId bind=$Bind stt_policy=$sttPolicy stt_cuda_compiled=$(if ($null -eq $sttCudaCompiled) { '<missing>' } else { $sttCudaCompiled }) selected_backend=$(if ($sttSelected) { $sttSelected } else { '<not-loaded>' }) device_memory_policy=$(if ($sttDeviceMemory) { $sttDeviceMemory } else { '<not-loaded>' }) gpu_reservation_id=$(if ($sttReservationId) { $sttReservationId } else { '<none>' }) gpu_reservation_mib=$sttReservationMib remediation=run the CPU-only audio build with pinned CPU policy and no GPU reservation"
+    }
+
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        $process.Refresh()
+        $cudaModules = @($process.Modules | Where-Object {
+            $_.ModuleName -match '^(?i:onnxruntime_providers_cuda|nvcuda|cudart(?:64.*)?|cublas(?:Lt)?64.*|cudnn.*)\.dll$'
+        } | ForEach-Object { [string]$_.FileName })
+    } catch {
+        Die "SYNAPSE_ACCELERATOR_POLICY_MODULE_READBACK_FAILED phase=$Phase pid=$ProcessId bind=$Bind error=$($_.Exception.Message) remediation=repair same-user module query access; setup will not infer that CUDA modules are absent"
+    }
+    if ($cudaModules.Count -gt 0) {
+        Die "SYNAPSE_ACCELERATOR_POLICY_CUDA_MODULE_LOADED phase=$Phase pid=$ProcessId bind=$Bind modules=$($cudaModules -join ',') remediation=remove every CUDA-linked runtime/provider and rebuild the CPU-only daemon"
+    }
+    Info "SYNAPSE_NO_EXPLICIT_GPU_POLICY_CLOSURE_VERIFIED phase=$Phase pid=$ProcessId bind=$Bind capture_requested=$captureRequested capture_effective=$captureEffective capture_selected=$captureSelected capture_gpu_backends_compiled=false detection_cuda_compiled=false bundled_detection_provider=$bundledDetectionProvider persistent_detection_backend=$(if ($persistentDetectionBackend) { $persistentDetectionBackend } else { '<not-started>' }) stt_policy=$sttPolicy stt_cuda_compiled=false loaded_cuda_module_count=0 $($calyxProof.Detail) note=compile_policy_provider_and_module_closure_only; GDI may be accelerated internally by Windows/the display driver and physical per-process GPU memory is a separate OS Source-of-Truth readback"
+    return [pscustomobject]@{
+        Ok = $true
+        LoadedCudaModuleCount = 0
+        CaptureBackend = $captureEffective
+        DetectionBackend = $bundledDetectionProvider
+        SttBackendPolicy = $sttPolicy
+        Detail = [string]$calyxProof.Detail
+    }
+}
+
 function Format-SynapseCandidateHealthFailures {
     param([Parameter(Mandatory=$true)]$Health)
 
@@ -9987,20 +13388,45 @@ function Format-SynapseCandidateHealthFailures {
 function Test-SynapseCandidateDaemon {
     param(
         [Parameter(Mandatory=$true)][string]$CandidateExePath,
+        [Parameter(Mandatory=$true)][string]$CandidateBootstrapPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCandidateBootstrapSha256,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256,
         [AllowNull()][string]$ReplacementReservationId = $null
     )
 
     if (-not (Test-Path -LiteralPath $CandidateExePath)) {
         Die "SYNAPSE_CANDIDATE_BINARY_MISSING path=$CandidateExePath remediation=build or provide a real synapse-mcp.exe before setup can touch the live daemon"
     }
+    if (-not (Test-Path -LiteralPath $CandidateBootstrapPath -PathType Leaf)) {
+        Die "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_MISSING path=$CandidateBootstrapPath remediation=build or provide the exact native supervisor bootstrap before candidate acceptance"
+    }
+    $candidateBootstrapPath = [System.IO.Path]::GetFullPath($CandidateBootstrapPath)
+    $expectedCandidateBootstrapSha256 = $ExpectedCandidateBootstrapSha256.ToUpperInvariant()
+    $candidateBootstrapHashBefore = Get-SynapseFileSha256 -Path $candidateBootstrapPath
+    if ($candidateBootstrapHashBefore -ine $expectedCandidateBootstrapSha256) {
+        Die "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_IDENTITY_MISMATCH phase=before_launch path=$candidateBootstrapPath expected_sha256=$expectedCandidateBootstrapSha256 actual_sha256=$candidateBootstrapHashBefore remediation=validate the exact setup-built bootstrap generation; candidate acceptance never substitutes a setup-only launcher"
+    }
     if (-not (Test-Path -LiteralPath $ProfilesDir)) {
         Die "SYNAPSE_CANDIDATE_PROFILES_MISSING path=$ProfilesDir remediation=build/deploy profiles before validating the daemon candidate"
+    }
+    if (-not (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf)) {
+        Die "SYNAPSE_CANDIDATE_CALYX_CONFIG_MISSING path=$CalyxConfigPath remediation=preserve the exact setup-validated CPU-only config through candidate validation"
+    }
+    $expectedCalyxConfigSha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+    $candidateConfigHashBefore = Get-SynapseFileSha256 -Path $CalyxConfigPath
+    if ($candidateConfigHashBefore -ine $expectedCalyxConfigSha256) {
+        Die "SYNAPSE_CANDIDATE_CALYX_CONFIG_IDENTITY_MISMATCH phase=before_launch path=$CalyxConfigPath expected_sha256=$expectedCalyxConfigSha256 actual_sha256=$candidateConfigHashBefore remediation=stop the concurrent config writer and rerun setup; candidate validation must consume the exact locked bytes"
+    }
+    $candidateRuntimeDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($CandidateExePath))
+    $cudaProviderPath = Join-Path $candidateRuntimeDir 'onnxruntime_providers_cuda.dll'
+    if (Test-Path -LiteralPath $cudaProviderPath) {
+        Die "SYNAPSE_CANDIDATE_CUDA_PROVIDER_PRESENT path=$cudaProviderPath remediation=remove the CUDA execution-provider artifact and rebuild/package the CPU-only runtime before candidate validation"
     }
     $tokenRead = Read-SynapseSetupTokenForRestartGuard -TokenPath $TokenPath
     if (-not $tokenRead.Ok) {
@@ -10011,50 +13437,108 @@ function Test-SynapseCandidateDaemon {
     $candidateDb = Join-Path $candidateRoot 'db'
     $candidateCalyxVault = $candidateDb
     $candidateShellJobRoot = Join-Path $candidateRoot 'shell-jobs'
+    $candidateLauncher = Join-Path $candidateRoot 'candidate-launch-hidden.vbs'
+    $candidateSupervisorPath = Join-Path $candidateRoot 'synapse-daemon-supervisor.ps1'
+    $candidateSupervisorStatePath = Join-Path $candidateRoot 'daemon-supervisor-current.json'
+    $candidateBootstrapLogPath = Join-Path $candidateRoot 'daemon-supervisor-bootstrap.log'
+    $candidateBootstrapStdoutPath = Join-Path $candidateRoot 'daemon-supervisor-bootstrap-stdout.log'
+    $candidateBootstrapStderrPath = Join-Path $candidateRoot 'daemon-supervisor-bootstrap-stderr.log'
+    $candidateMaintenanceLockPath = Join-Path $candidateRoot 'candidate-maintenance.lock'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
     $candidateStdout = Join-Path $candidateRoot 'candidate-stdout.log'
     $candidateStderr = Join-Path $candidateRoot 'candidate-stderr.log'
-    $candidateCalyxConfig = if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) { '<defaults>' } else { $CalyxConfigPath }
-    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault calyx_config=$candidateCalyxConfig shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
+    $candidateCalyxConfig = $CalyxConfigPath
+    $installedOverlapListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    $installedOverlapProcesses = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+    $installedSupervisorPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'))
+    $installedOverlapSupervisors = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $installedSupervisorPath)
+    $installedBootstrapPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))
+    $installedOverlapBootstraps = @(Get-CimInstance Win32_Process -Filter "Name='synapse-supervisor-bootstrap.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+        [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $installedBootstrapPath
+    })
+    if ($installedOverlapListeners.Count -ne 0 -or
+        $installedOverlapProcesses.Count -ne 0 -or
+        $installedOverlapSupervisors.Count -ne 0 -or
+        $installedOverlapBootstraps.Count -ne 0) {
+        Die "SYNAPSE_CANDIDATE_LIVE_RUNTIME_OVERLAP bind=$Bind listener_count=$($installedOverlapListeners.Count) daemon_count=$($installedOverlapProcesses.Count) supervisor_count=$($installedOverlapSupervisors.Count) bootstrap_count=$($installedOverlapBootstraps.Count) remediation=transactionally revoke and drain the prior runtime authority before candidate launch; two concurrent 950MB runtime trees are forbidden"
+    }
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bootstrap=$candidateBootstrapPath bootstrap_sha256=$expectedCandidateBootstrapSha256 bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault calyx_config=$candidateCalyxConfig calyx_config_sha256=$expectedCalyxConfigSha256 shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir budget_scope=candidate_supervisor_tree parent_job_memory_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$SynapseSupervisorCpuRate daemon_process_memory_limit_bytes=$SynapseDaemonProcessMemoryLimitBytes daemon_job_memory_limit_bytes=$SynapseDaemonProcessMemoryLimitBytes working_set_policy=measured_only daemon_nested_cpu_rate=$SynapseDaemonCpuRate installed_runtime_overlap_present=false"
 
     $candidate = $null
+    $candidateBootstrap = $null
+    $candidateSupervisor = $null
     $health = $null
     $lastHealthError = $null
     $surface = $null
     $candidateSucceeded = $false
     $candidateFailureMessage = $null
+    $candidateResult = $null
+    $candidateKernelJob = $null
+    $candidateParentKernelJob = $null
     try {
         $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
         $replacementEnvName = 'SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID'
         $previousReplacementId = Get-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
+        $cpuOnlyEnv = [ordered]@{
+            SYNAPSE_DETECTION_BACKEND = 'cpu'
+            SYNAPSE_STT_BACKEND = 'cpu'
+            SYNAPSE_CAPTURE_BACKEND = 'gdi_bitblt'
+            SYNAPSE_CAPTURE_FORCE_DXGI = 'false'
+            CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES = '1'
+        }
+        $previousCpuOnlyEnv = @{}
+        foreach ($name in $cpuOnlyEnv.Keys) {
+            $previousCpuOnlyEnv[$name] = Get-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
         try {
             $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
+            foreach ($name in $cpuOnlyEnv.Keys) {
+                Set-Item "Env:$name" -Value $cpuOnlyEnv[$name]
+            }
             if ([string]::IsNullOrWhiteSpace($ReplacementReservationId)) {
                 Remove-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
             } else {
                 Set-Item "Env:$replacementEnvName" -Value $ReplacementReservationId
             }
-            $candidateArgs = @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info')
-            if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
-                $candidateArgs += @('--calyx-config', $CalyxConfigPath)
+            New-HiddenDaemonLauncher `
+                -OutputPath $candidateLauncher `
+                -ExePath $CandidateExePath `
+                -Bind $candidateBind `
+                -DbPath $candidateDb `
+                -ProfilesDir $ProfilesDir `
+                -LogDir $candidateRoot `
+                -TokenPath $TokenPath `
+                -MaintenanceLockPath $candidateMaintenanceLockPath `
+                -EnableAudio $EnableAudio `
+                -AllowedPermissions $AllowedPermissions `
+                -CalyxConfigPath $CalyxConfigPath `
+                -ExpectedCalyxConfigSha256 $expectedCalyxConfigSha256 `
+                -OneShot $true
+            $candidateSupervisorExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $candidateBootstrapArgumentText = Get-SynapseSupervisorBootstrapTaskArgumentText `
+                -PowerShellPath $candidateSupervisorExe `
+                -SupervisorPath $candidateSupervisorPath `
+                -WorkingDirectory $candidateRoot `
+                -LogPath $candidateBootstrapLogPath
+            try {
+                $candidateBootstrap = Start-Process `
+                    -FilePath $candidateBootstrapPath `
+                    -ArgumentList $candidateBootstrapArgumentText `
+                    -WorkingDirectory $candidateRoot `
+                    -WindowStyle Hidden `
+                    -RedirectStandardOutput $candidateBootstrapStdoutPath `
+                    -RedirectStandardError $candidateBootstrapStderrPath `
+                    -PassThru `
+                    -ErrorAction Stop
+                [void]$candidateBootstrap.Handle
+                $candidateExpectedParentJobName = 'Local\SynapseOwned-{0}' -f $candidateBootstrap.Id
+            } catch {
+                throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_LAUNCH_FAILED path=$candidateBootstrapPath sha256=$expectedCandidateBootstrapSha256 error=$($_.Exception.Message) remediation=inspect the exact production bootstrap and its four absolute setup-owned arguments; candidate acceptance never substitutes a setup-only launcher"
             }
-            if ($EnableAudio) {
-                $candidateArgs += '--enable-audio'
-            }
-            $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
-            if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
-                $candidateArgs += @('--allowed-permissions', $allowedPermissionsArgument)
-            }
-            $candidate = Start-Process `
-                -FilePath $CandidateExePath `
-                -ArgumentList $candidateArgs `
-                -WindowStyle Hidden `
-                -RedirectStandardOutput $candidateStdout `
-                -RedirectStandardError $candidateStderr `
-                -PassThru
         } finally {
             if ($previousShellJobRoot) {
                 $env:SYNAPSE_SHELL_JOB_ROOT = $previousShellJobRoot.Value
@@ -10066,6 +13550,187 @@ function Test-SynapseCandidateDaemon {
             } else {
                 Remove-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
             }
+            foreach ($name in $cpuOnlyEnv.Keys) {
+                if ($previousCpuOnlyEnv[$name]) {
+                    Set-Item "Env:$name" -Value $previousCpuOnlyEnv[$name].Value
+                } else {
+                    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        $candidateLaunchDeadline = (Get-Date).AddSeconds(60)
+        $candidateSupervisorState = $null
+        $candidateSupervisorStateError = $null
+        while ($null -eq $candidate) {
+            $candidateSupervisorState = $null
+            $candidateSupervisorStateError = $null
+            if (Test-Path -LiteralPath $candidateSupervisorStatePath -PathType Leaf) {
+                try {
+                    $candidateSupervisorState = Get-Content -Raw -LiteralPath $candidateSupervisorStatePath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                } catch {
+                    $candidateSupervisorStateError = (($_.Exception.Message -replace '\s+', ' ').Trim())
+                }
+            }
+            $candidateChildPid = if ($null -eq $candidateSupervisorState -or $null -eq $candidateSupervisorState.child_pid) { 0 } else { [int]$candidateSupervisorState.child_pid }
+            if ($candidateChildPid -gt 0) {
+                $candidateSupervisorPid = if ($null -eq $candidateSupervisorState.supervisor_pid) { 0 } else { [int]$candidateSupervisorState.supervisor_pid }
+                if ($candidateSupervisorPid -le 0) {
+                    Die "SYNAPSE_CANDIDATE_SUPERVISOR_IDENTITY_MISSING bootstrap_pid=$($candidateBootstrap.Id) candidate_pid=$candidateChildPid state_path=$candidateSupervisorStatePath remediation=the production bootstrap candidate must publish its exact managed supervisor identity before acceptance"
+                }
+                try {
+                    $candidateSupervisor = [System.Diagnostics.Process]::GetProcessById($candidateSupervisorPid)
+                    [void]$candidateSupervisor.Handle
+                } catch {
+                    Die "SYNAPSE_CANDIDATE_SUPERVISOR_PROCESS_LOOKUP_FAILED bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$candidateSupervisorPid candidate_pid=$candidateChildPid state_path=$candidateSupervisorStatePath error=$($_.Exception.Message) remediation=inspect the exact native-bootstrap log and supervisor state; candidate acceptance requires the live production process lineage"
+                }
+                $candidateResourceExpectations = [ordered]@{
+                    calyx_config_sha256 = $expectedCalyxConfigSha256
+                    math_backend = 'cpu'
+                    vram_budget_bytes = '0'
+                    detection_backend = 'cpu'
+                    stt_backend = 'cpu'
+                    capture_backend = 'gdi_bitblt'
+                    capture_force_dxgi = 'False'
+                    search_open_generation_cache_entries = '1'
+                    job_limit_flags_expected_hex = '0x00002300'
+                    job_cpu_rate_control_flags_expected_hex = '0x00000005'
+                    daemon_cpu_rate = [string]$SynapseDaemonCpuRate
+                    working_set_policy = 'measured_only'
+                    job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+                    job_limit_flags_hex = '0x00002300'
+                    process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                    job_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                    job_process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                    job_cpu_rate_control_flags_hex = '0x00000005'
+                    job_cpu_rate = [string]$SynapseDaemonCpuRate
+                    supervisor_job_limit_flags_expected_hex = '0x00002300'
+                    supervisor_job_lifetime_owner = 'native_bootstrap_only'
+                    supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+                    supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+                    supervisor_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                    supervisor_job_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                    supervisor_cpu_rate = [string]$SynapseSupervisorCpuRate
+                    supervisor_job_limit_flags_hex = '0x00002300'
+                    supervisor_job_cpu_rate_control_flags_hex = '0x00000005'
+                    supervisor_job_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                    supervisor_job_memory_limit_bytes_actual = [string]$SynapseOwnedMemoryLimitBytes
+                    supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
+                    owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                    bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
+                    owned_committed_private_ceiling_bytes = '1000000000'
+                }
+                $candidateResourceDrift = [System.Collections.Generic.List[string]]::new()
+                foreach ($resourceName in $candidateResourceExpectations.Keys) {
+                    $actualResourceValue = [string]$candidateSupervisorState.$resourceName
+                    $expectedResourceValue = [string]$candidateResourceExpectations[$resourceName]
+                    if ($actualResourceValue -cne $expectedResourceValue) {
+                        $candidateResourceDrift.Add("$resourceName expected=$expectedResourceValue actual=$(if ($actualResourceValue) { $actualResourceValue } else { '<missing>' })")
+                    }
+                }
+                if ([int]$candidateSupervisorState.supervisor_pid -ne [int]$candidateSupervisor.Id) {
+                    $candidateResourceDrift.Add("supervisor_pid expected=$($candidateSupervisor.Id) actual=$($candidateSupervisorState.supervisor_pid)")
+                }
+                $candidateSupervisorCim = Get-CimInstance Win32_Process -Filter "ProcessId=$($candidateSupervisor.Id)" -ErrorAction SilentlyContinue
+                if (-not $candidateSupervisorCim -or [int]$candidateSupervisorCim.ParentProcessId -ne [int]$candidateBootstrap.Id) {
+                    $candidateResourceDrift.Add("supervisor_bootstrap_lineage expected_parent_pid=$($candidateBootstrap.Id) actual_parent_pid=$(if ($candidateSupervisorCim) { $candidateSupervisorCim.ParentProcessId } else { '<missing>' })")
+                }
+                $candidateJobName = [string]$candidateSupervisorState.job_name
+                if ([string]::IsNullOrWhiteSpace($candidateJobName)) {
+                    $candidateResourceDrift.Add('job_name expected=nonempty actual=<missing>')
+                } else {
+                    $expectedCandidateJobName = 'Local\SynapseDaemon-{0}-{1}' -f $candidateSupervisor.Id, ([int]$candidateSupervisorState.generation)
+                    if ($candidateJobName -cne $expectedCandidateJobName) {
+                        $candidateResourceDrift.Add("job_name expected=$expectedCandidateJobName actual=$candidateJobName")
+                    }
+                    $candidateKernelJob = Get-SynapseDaemonJobKernelReadback -JobName $candidateJobName
+                    $candidateKernelFlagsHex = '0x{0:X8}' -f $candidateKernelJob.LimitFlags
+                    if ($candidateKernelFlagsHex -cne '0x00002300') {
+                        $candidateResourceDrift.Add("kernel_job_limit_flags expected=0x00002300 actual=$candidateKernelFlagsHex")
+                    }
+                    if ([uint64]$candidateKernelJob.ProcessMemoryLimitBytes -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("kernel_process_memory_limit_bytes expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($candidateKernelJob.ProcessMemoryLimitBytes)")
+                    }
+                    if ([uint64]$candidateKernelJob.JobMemoryLimitBytes -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("kernel_job_memory_limit_bytes expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($candidateKernelJob.JobMemoryLimitBytes)")
+                    }
+                    $candidateKernelCpuFlagsHex = '0x{0:X8}' -f $candidateKernelJob.CpuRateControlFlags
+                    if ($candidateKernelCpuFlagsHex -cne '0x00000005' -or
+                        [uint32]$candidateKernelJob.CpuRate -ne $SynapseDaemonCpuRate) {
+                        $candidateResourceDrift.Add("kernel_job_cpu_rate expected_flags=0x00000005 expected_rate=$SynapseDaemonCpuRate actual_flags=$candidateKernelCpuFlagsHex actual_rate=$($candidateKernelJob.CpuRate)")
+                    }
+                    if (@($candidateKernelJob.ProcessIds | Where-Object { [uint64]$_ -eq [uint64]$candidateChildPid }).Count -ne 1) {
+                        $candidateResourceDrift.Add("kernel_job_child_membership expected_pid=$candidateChildPid actual_pids=$(@($candidateKernelJob.ProcessIds) -join ',')")
+                    }
+                    if ([uint64]$candidateKernelJob.CurrentJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes -or
+                        [uint64]$candidateKernelJob.PeakJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("kernel_job_memory_usage limit=$SynapseDaemonProcessMemoryLimitBytes current=$($candidateKernelJob.CurrentJobMemoryUsedBytes) peak=$($candidateKernelJob.PeakJobMemoryUsedBytes)")
+                    }
+                }
+                $candidateParentJobName = [string]$candidateSupervisorState.supervisor_job_name
+                $expectedCandidateParentJobName = $candidateExpectedParentJobName
+                if ($candidateParentJobName -cne $expectedCandidateParentJobName) {
+                    $candidateResourceDrift.Add("supervisor_job_name expected=$expectedCandidateParentJobName actual=$(if ($candidateParentJobName) { $candidateParentJobName } else { '<missing>' })")
+                } else {
+                    $candidateParentKernelJob = Get-SynapseDaemonJobKernelReadback -JobName $candidateParentJobName
+                    $candidateParentFlagsHex = '0x{0:X8}' -f $candidateParentKernelJob.LimitFlags
+                    $candidateParentCpuFlagsHex = '0x{0:X8}' -f $candidateParentKernelJob.CpuRateControlFlags
+                    if ($candidateParentFlagsHex -cne '0x00002300') {
+                        $candidateResourceDrift.Add("supervisor_kernel_job_limit_flags expected=0x00002300 actual=$candidateParentFlagsHex")
+                    }
+                    if ([uint64]$candidateParentKernelJob.ProcessMemoryLimitBytes -ne $SynapseOwnedMemoryLimitBytes -or
+                        [uint64]$candidateParentKernelJob.JobMemoryLimitBytes -ne $SynapseOwnedMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("supervisor_kernel_memory_limits expected_process_and_job=$SynapseOwnedMemoryLimitBytes actual_process=$($candidateParentKernelJob.ProcessMemoryLimitBytes) actual_job=$($candidateParentKernelJob.JobMemoryLimitBytes) working_set_policy=measured_only")
+                    }
+                    if ($candidateParentCpuFlagsHex -cne '0x00000005' -or
+                        [uint32]$candidateParentKernelJob.CpuRate -ne $SynapseSupervisorCpuRate) {
+                        $candidateResourceDrift.Add("supervisor_kernel_cpu_rate expected_flags=0x00000005 expected_rate=$SynapseSupervisorCpuRate actual_flags=$candidateParentCpuFlagsHex actual_rate=$($candidateParentKernelJob.CpuRate)")
+                    }
+                    foreach ($expectedCandidateParentPid in @([int]$candidateBootstrap.Id, [int]$candidateSupervisor.Id, $candidateChildPid)) {
+                        if (@($candidateParentKernelJob.ProcessIds | Where-Object { [uint64]$_ -eq [uint64]$expectedCandidateParentPid }).Count -ne 1) {
+                            $candidateResourceDrift.Add("supervisor_kernel_membership expected_pid=$expectedCandidateParentPid actual_pids=$(@($candidateParentKernelJob.ProcessIds) -join ',')")
+                        }
+                    }
+                    if ([uint64]$candidateParentKernelJob.CurrentJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes -or
+                        [uint64]$candidateParentKernelJob.PeakJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("supervisor_kernel_job_memory_usage limit=$SynapseOwnedMemoryLimitBytes current=$($candidateParentKernelJob.CurrentJobMemoryUsedBytes) peak=$($candidateParentKernelJob.PeakJobMemoryUsedBytes)")
+                    }
+                }
+                try {
+                    $candidatePrivateBytes = [uint64]$candidateSupervisorState.private_bytes
+                    $candidatePrivateHeadroomBytes = [uint64]$candidateSupervisorState.private_headroom_bytes
+                    $candidateWorkingSetBytes = [uint64]$candidateSupervisorState.working_set_bytes
+                    if (($candidatePrivateBytes + $candidatePrivateHeadroomBytes) -ne $SynapseDaemonProcessMemoryLimitBytes) {
+                        $candidateResourceDrift.Add("private_headroom_reconciliation expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($candidatePrivateBytes + $candidatePrivateHeadroomBytes)")
+                    }
+                } catch {
+                    $candidateResourceDrift.Add("memory_readback_invalid error=$($_.Exception.Message)")
+                }
+                if ($candidateResourceDrift.Count -gt 0) {
+                    Die "SYNAPSE_CANDIDATE_RESOURCE_CONTRACT_DRIFT supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$candidateChildPid state_path=$candidateSupervisorStatePath drift=$($candidateResourceDrift -join '; ') remediation=repair the setup-owned suspended Job launch/readback; no unbounded candidate can be accepted"
+                }
+                try {
+                    $candidate = [System.Diagnostics.Process]::GetProcessById($candidateChildPid)
+                    [void]$candidate.Handle
+                } catch {
+                    Die "SYNAPSE_CANDIDATE_BOUNDED_PROCESS_LOOKUP_FAILED supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$candidateChildPid state_path=$candidateSupervisorStatePath error=$($_.Exception.Message) remediation=inspect the one-shot supervisor events/stderr; the exact Job-assigned candidate exited before validation retained its process identity"
+                }
+                $candidateStderrReadback = @(Get-ChildItem -LiteralPath $candidateRoot -Filter 'daemon-stderr-gen*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+                if ($candidateStderrReadback.Count -eq 1) {
+                    $candidateStderr = $candidateStderrReadback[0].FullName
+                }
+                $candidateKernelHeadroom = if ([uint64]$candidateKernelJob.CurrentJobMemoryUsedBytes -ge $SynapseDaemonProcessMemoryLimitBytes) { [uint64]0 } else { [uint64]($SynapseDaemonProcessMemoryLimitBytes - [uint64]$candidateKernelJob.CurrentJobMemoryUsedBytes) }
+                $candidateParentHeadroom = if ([uint64]$candidateParentKernelJob.CurrentJobMemoryUsedBytes -ge $SynapseOwnedMemoryLimitBytes) { [uint64]0 } else { [uint64]($SynapseOwnedMemoryLimitBytes - [uint64]$candidateParentKernelJob.CurrentJobMemoryUsedBytes) }
+                Info "Candidate native-bootstrap Job launch verified bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath bootstrap_sha256=$expectedCandidateBootstrapSha256 supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) state_path=$candidateSupervisorStatePath parent_job_name=$candidateParentJobName parent_job_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$($candidateParentKernelJob.CpuRate) parent_current_job_memory_used_bytes=$($candidateParentKernelJob.CurrentJobMemoryUsedBytes) parent_job_memory_headroom_bytes=$candidateParentHeadroom parent_peak_job_memory_used_bytes=$($candidateParentKernelJob.PeakJobMemoryUsedBytes) daemon_job_name=$candidateJobName daemon_job_limit_flags=$($candidateSupervisorState.job_limit_flags_hex) daemon_cpu_rate=$($candidateKernelJob.CpuRate) daemon_process_memory_limit_bytes=$($candidateSupervisorState.job_process_memory_limit_bytes) daemon_job_memory_limit_bytes=$($candidateSupervisorState.job_memory_limit_bytes) working_set_policy=measured_only daemon_working_set_bytes=$candidateWorkingSetBytes daemon_current_job_memory_used_bytes=$($candidateKernelJob.CurrentJobMemoryUsedBytes) daemon_job_memory_headroom_bytes=$candidateKernelHeadroom daemon_peak_job_memory_used_bytes=$($candidateKernelJob.PeakJobMemoryUsedBytes)"
+                break
+            }
+            $candidateBootstrap.Refresh()
+            if ($candidateBootstrap.HasExited) {
+                Die "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_EXITED_BEFORE_CHILD bootstrap_pid=$($candidateBootstrap.Id) exit_code=$($candidateBootstrap.ExitCode) bootstrap_log=$candidateBootstrapLogPath state_path=$candidateSupervisorStatePath state_error=$(if ($candidateSupervisorStateError) { $candidateSupervisorStateError } else { '<none>' }) remediation=inspect the exact native-bootstrap log/state evidence; the production candidate topology was never published"
+            }
+            if ((Get-Date) -ge $candidateLaunchDeadline) {
+                Die "SYNAPSE_CANDIDATE_SUPERVISOR_CHILD_TIMEOUT supervisor_pid=$($candidateSupervisor.Id) timeout_seconds=60 state_path=$candidateSupervisorStatePath state=$(if ($candidateSupervisorState) { $candidateSupervisorState | ConvertTo-Json -Depth 8 -Compress } else { '<missing>' }) state_error=$(if ($candidateSupervisorStateError) { $candidateSupervisorStateError } else { '<none>' }) remediation=inspect candidate supervisor events and daemon stderr; setup refuses an unproven Job assignment"
+            }
+            Start-Sleep -Milliseconds 100
         }
         $candidateWatchdog = New-SynapseDaemonStartupWatchdog `
             -Phase 'candidate' `
@@ -10149,6 +13814,44 @@ function Test-SynapseCandidateDaemon {
             -LeafName 'candidate-health-before.json' `
             -Value $health
         Info "Candidate initial health evidence written path=$($initialHealthEvidence.Path) sha256=$($initialHealthEvidence.Sha256) length=$($initialHealthEvidence.Length) ok=$($health.ok)"
+        [void](Assert-SynapseNoExplicitGpuRuntimeHealth -Health $health -ProcessId $healthPid -Bind $candidateBind -Phase 'candidate_initial')
+        $candidateCpuOnly = Test-SynapseCpuOnlyRuntimeHealth -Health $health
+        if (-not $candidateCpuOnly.Ok) {
+            Die "$($candidateCpuOnly.Detail) pid=$healthPid bind=$candidateBind health_evidence=$($initialHealthEvidence.Path) health_evidence_sha256=$($initialHealthEvidence.Sha256)"
+        }
+        $perceptionDetection = $health.subsystems.perception.perception_detection
+        $bundledDetectionProvider = if ($null -eq $perceptionDetection) { '<missing>' } else { [string]$perceptionDetection.bundled_provider }
+        $persistentDetectionBackend = if ($null -eq $perceptionDetection) { '' } else { [string]$perceptionDetection.persistent_worker_backend }
+        if ($null -eq $perceptionDetection -or
+            $bundledDetectionProvider -cne 'cpu' -or
+            (-not [string]::IsNullOrWhiteSpace($persistentDetectionBackend) -and $persistentDetectionBackend -cne 'cpu')) {
+            Die "SYNAPSE_CANDIDATE_PERCEPTION_BACKEND_NOT_CPU pid=$healthPid bind=$candidateBind bundled_provider=$(if ($bundledDetectionProvider) { $bundledDetectionProvider } else { '<missing>' }) persistent_worker_backend=$(if ($persistentDetectionBackend) { $persistentDetectionBackend } else { '<not-started>' }) remediation=package the CPU-only ONNX Runtime and launch the detector with SYNAPSE_DETECTION_BACKEND=cpu"
+        }
+        $audioHealth = $health.subsystems.audio
+        $audioBackendPolicy = if ($null -eq $audioHealth) { '' } else { [string]$audioHealth.stt_backend_policy }
+        $audioSelectedBackend = if ($null -eq $audioHealth) { '' } else { [string]$audioHealth.stt_selected_backend }
+        $audioDeviceMemoryPolicy = if ($null -eq $audioHealth) { '' } else { [string]$audioHealth.stt_device_memory_policy }
+        $audioReservationId = if ($null -eq $audioHealth) { '' } else { [string]$audioHealth.stt_gpu_reservation_id }
+        $audioReservationMib = if ($null -eq $audioHealth -or $null -eq $audioHealth.stt_gpu_reservation_mib) { [uint64]0 } else { [uint64]$audioHealth.stt_gpu_reservation_mib }
+        if ((-not [string]::IsNullOrWhiteSpace($audioBackendPolicy) -and $audioBackendPolicy -cne 'pinned:Cpu') -or
+            (-not [string]::IsNullOrWhiteSpace($audioSelectedBackend) -and $audioSelectedBackend -cne 'Cpu') -or
+            (-not [string]::IsNullOrWhiteSpace($audioDeviceMemoryPolicy) -and $audioDeviceMemoryPolicy -cne 'host_memory') -or
+            (-not [string]::IsNullOrWhiteSpace($audioReservationId)) -or
+            $audioReservationMib -ne 0) {
+            Die "SYNAPSE_CANDIDATE_AUDIO_BACKEND_NOT_CPU pid=$healthPid bind=$candidateBind policy=$(if ($audioBackendPolicy) { $audioBackendPolicy } else { '<not-loaded>' }) selected=$(if ($audioSelectedBackend) { $audioSelectedBackend } else { '<not-loaded>' }) device_memory_policy=$(if ($audioDeviceMemoryPolicy) { $audioDeviceMemoryPolicy } else { '<not-loaded>' }) gpu_reservation_id=$(if ($audioReservationId) { $audioReservationId } else { '<none>' }) gpu_reservation_mib=$audioReservationMib remediation=launch STT with SYNAPSE_STT_BACKEND=cpu and remove every CUDA execution-provider feature/artifact"
+        }
+        try {
+            $candidate.Refresh()
+            $candidateCudaModules = @($candidate.Modules | Where-Object {
+                $_.ModuleName -match '^(?i:onnxruntime_providers_cuda|nvcuda|cudart(?:64.*)?|cublas(?:Lt)?64.*|cudnn.*)\.dll$'
+            } | ForEach-Object { [string]$_.FileName })
+        } catch {
+            Die "SYNAPSE_CANDIDATE_MODULE_READBACK_FAILED pid=$healthPid bind=$candidateBind error=$($_.Exception.Message) remediation=repair same-user process module read access; setup cannot prove the CPU-only binary loaded no CUDA runtime/provider"
+        }
+        if ($candidateCudaModules.Count -gt 0) {
+            Die "SYNAPSE_CANDIDATE_CUDA_MODULE_LOADED pid=$healthPid bind=$candidateBind modules=$($candidateCudaModules -join ',') remediation=remove the CUDA-linked dependency/provider and rebuild the CPU-only candidate"
+        }
+        Info "Candidate CPU-only/no-explicit-GPU-provider-or-API health contract verified pid=$healthPid bind=$candidateBind bundled_detection_provider=$bundledDetectionProvider persistent_detection_backend=$(if ($persistentDetectionBackend) { $persistentDetectionBackend } else { '<not-started>' }) stt_backend_policy=$(if ($audioBackendPolicy) { $audioBackendPolicy } else { '<not-loaded>' }) loaded_cuda_module_count=$($candidateCudaModules.Count) $($candidateCpuOnly.Detail) note=GDI may be accelerated internally and is not a physical zero-VRAM attestation"
 
         # #2196: global health deliberately treats a known dirty build as
         # degraded rather than operationally dead, but a production installer
@@ -10257,16 +13960,61 @@ function Test-SynapseCandidateDaemon {
         if ($surface.tool_count -lt 1) {
             Die "SYNAPSE_CANDIDATE_TOOL_SURFACE_EMPTY pid=$healthPid bind=$candidateBind remediation=tools/list returned no tools; refusing handoff"
         }
-        Info "Candidate daemon health preflight passed pid=$healthPid bind=$candidateBind tool_count=$($surface.tool_count) tool_surface_sha256=$($surface.tool_surface_sha256)"
+        $finalCandidateHealthRead = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token -TimeoutSec 30
+        if (-not $finalCandidateHealthRead.Ok) {
+            Die "SYNAPSE_CANDIDATE_FINAL_ACCELERATOR_POLICY_HEALTH_UNREADABLE pid=$healthPid bind=$candidateBind error=$($finalCandidateHealthRead.Error) remediation=the lazily exercised candidate must return authenticated health before CPU/no-explicit-GPU-provider-or-API acceptance"
+        }
+        $health = $finalCandidateHealthRead.Health
+        $finalCandidateHealthEvidence = Write-SynapseCandidateJsonEvidence `
+            -CandidateRoot $candidateRoot `
+            -LeafName 'candidate-health-final.json' `
+            -Value $health
+        [void](Assert-SynapseNoExplicitGpuRuntimeHealth -Health $health -ProcessId $healthPid -Bind $candidateBind -Phase 'candidate_after_search_and_tools_list')
+        # Independently query both live kernel Jobs after every lazy workload
+        # and before the one-shot tree exits. The terminal supervisor JSON is
+        # durable evidence, but it cannot replace class-28 kernel state read
+        # while the bootstrap still owns the authoritative Job handle.
+        $candidateTerminalKernelJob = Get-SynapseDaemonJobKernelReadback -JobName $candidateJobName
+        $candidateTerminalParentKernelJob = Get-SynapseDaemonJobKernelReadback -JobName $candidateParentJobName
+        $candidateTerminalKernelDrift = [System.Collections.Generic.List[string]]::new()
+        foreach ($terminalMembership in @(
+            [pscustomobject]@{ Name = 'daemon'; Job = $candidateTerminalKernelJob; Pids = @([int]$candidate.Id) },
+            [pscustomobject]@{ Name = 'parent'; Job = $candidateTerminalParentKernelJob; Pids = @([int]$candidateBootstrap.Id, [int]$candidateSupervisor.Id, [int]$candidate.Id) }
+        )) {
+            foreach ($expectedTerminalPid in $terminalMembership.Pids) {
+                if (@($terminalMembership.Job.ProcessIds | Where-Object { [uint64]$_ -eq [uint64]$expectedTerminalPid }).Count -ne 1) {
+                    $candidateTerminalKernelDrift.Add("$($terminalMembership.Name)_membership expected_pid=$expectedTerminalPid actual_pids=$(@($terminalMembership.Job.ProcessIds) -join ',')")
+                }
+            }
+        }
+        if ([uint64]$candidateTerminalKernelJob.CurrentJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes -or
+            [uint64]$candidateTerminalKernelJob.PeakJobMemoryUsedBytes -gt $SynapseDaemonProcessMemoryLimitBytes) {
+            $candidateTerminalKernelDrift.Add("daemon_memory limit=$SynapseDaemonProcessMemoryLimitBytes current=$($candidateTerminalKernelJob.CurrentJobMemoryUsedBytes) peak=$($candidateTerminalKernelJob.PeakJobMemoryUsedBytes)")
+        }
+        if ([uint64]$candidateTerminalParentKernelJob.CurrentJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes -or
+            [uint64]$candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes -gt $SynapseOwnedMemoryLimitBytes) {
+            $candidateTerminalKernelDrift.Add("parent_memory limit=$SynapseOwnedMemoryLimitBytes current=$($candidateTerminalParentKernelJob.CurrentJobMemoryUsedBytes) peak=$($candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes)")
+        }
+        if ($candidateTerminalKernelDrift.Count -gt 0) {
+            Die "SYNAPSE_CANDIDATE_TERMINAL_KERNEL_JOB_CONTRACT_DRIFT bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) drift=$($candidateTerminalKernelDrift -join '; ') remediation=the exact production bootstrap tree failed its post-workload class-28 kernel readback and cannot be accepted"
+        }
+        Info "SYNAPSE_CANDIDATE_TERMINAL_KERNEL_JOB_VERIFIED bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) daemon_job_name=$candidateJobName daemon_current_job_memory_used_bytes=$($candidateTerminalKernelJob.CurrentJobMemoryUsedBytes) daemon_peak_job_memory_used_bytes=$($candidateTerminalKernelJob.PeakJobMemoryUsedBytes) parent_job_name=$candidateParentJobName parent_current_job_memory_used_bytes=$($candidateTerminalParentKernelJob.CurrentJobMemoryUsedBytes) parent_peak_job_memory_used_bytes=$($candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes) source=QueryInformationJobObject_class28_live_before_bootstrap_exit"
+        $candidateConfigHashAfter = Get-SynapseFileSha256 -Path $CalyxConfigPath
+        if ($candidateConfigHashAfter -ine $expectedCalyxConfigSha256) {
+            Die "SYNAPSE_CANDIDATE_CALYX_CONFIG_IDENTITY_MISMATCH phase=after_validation path=$CalyxConfigPath expected_sha256=$expectedCalyxConfigSha256 actual_sha256=$candidateConfigHashAfter pid=$healthPid bind=$candidateBind remediation=stop the concurrent config writer and rerun setup; no launcher may inherit config bytes different from the candidate-validated identity"
+        }
+        Info "Candidate daemon health preflight passed pid=$healthPid bind=$candidateBind tool_count=$($surface.tool_count) tool_surface_sha256=$($surface.tool_surface_sha256) final_health_evidence=$($finalCandidateHealthEvidence.Path) final_health_sha256=$($finalCandidateHealthEvidence.Sha256)"
         $candidateSucceeded = $true
-        return [pscustomobject]@{
+        $candidateResult = [pscustomobject]@{
             Ok = $true
             Pid = $healthPid
+            HealthPid = $healthPid
             Bind = $candidateBind
             DbPath = $candidateDb
             ShellJobRoot = $candidateShellJobRoot
             ExePath = $CandidateExePath
             Sha256 = $candidateHash
+            CalyxConfigSha256 = $expectedCalyxConfigSha256
             ToolCount = $surface.tool_count
             ToolSurfaceSha256 = $surface.tool_surface_sha256
             ToolNames = $surface.tool_names
@@ -10277,15 +14025,208 @@ function Test-SynapseCandidateDaemon {
             tool_names = $surface.tool_names
             tool_schemas = $surface.tool_schemas
             daemon_pid = $healthPid
+            terminal_daemon_job_current_memory_used_bytes = [uint64]$candidateTerminalKernelJob.CurrentJobMemoryUsedBytes
+            terminal_daemon_job_peak_memory_used_bytes = [uint64]$candidateTerminalKernelJob.PeakJobMemoryUsedBytes
+            terminal_parent_job_current_memory_used_bytes = [uint64]$candidateTerminalParentKernelJob.CurrentJobMemoryUsedBytes
+            terminal_parent_job_peak_memory_used_bytes = [uint64]$candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes
         }
     } catch {
         $candidateFailureMessage = $_.Exception.Message
         throw
     } finally {
+        $candidateCleanupErrors = [System.Collections.Generic.List[string]]::new()
         if ($candidate -and (Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)) {
-            Stop-SynapseExactCandidateProcess -ProcessId ([int]$candidate.Id) -Bind $candidateBind -Token $tokenRead.Token -Reason 'candidate_health'
-        } elseif ($candidateBind) {
-            Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
+            try {
+                Stop-SynapseExactCandidateProcess -ProcessId ([int]$candidate.Id) -Bind $candidateBind -Token $tokenRead.Token -Reason 'candidate_health'
+            } catch {
+                $candidateCleanupErrors.Add("candidate_stop:$($_.Exception.Message)")
+            }
+        }
+        # The native bootstrap is the sole KILL_ON_JOB_CLOSE lifetime owner for
+        # the whole isolated candidate tree. Quiesce that exact authority before
+        # waiting on the candidate bind or touching the managed supervisor. An
+        # early contract/readback failure can occur after the daemon binds but
+        # before `$candidate` is assigned; waiting on the bind first would then
+        # prevent this finally block from ever reaching its owning authority.
+        if ($candidateBootstrap) {
+            $candidateBootstrapForcedStop = $false
+            try {
+                $candidateBootstrap.Refresh()
+                if (-not $candidateBootstrap.HasExited) {
+                    [void]$candidateBootstrap.WaitForExit(15000)
+                    $candidateBootstrap.Refresh()
+                }
+                if (-not $candidateBootstrap.HasExited) {
+                    $candidateBootstrapForcedStop = $true
+                    Stop-Process -Id $candidateBootstrap.Id -Force -ErrorAction Stop
+                    [void]$candidateBootstrap.WaitForExit(15000)
+                    $candidateBootstrap.Refresh()
+                }
+                if (-not $candidateBootstrap.HasExited) {
+                    throw 'exact native candidate bootstrap remained alive after its owned one-shot supervisor exited'
+                }
+                if ($candidateSucceeded -and ($candidateBootstrapForcedStop -or [int]$candidateBootstrap.ExitCode -ne 0)) {
+                    throw "native bootstrap did not exit naturally with code zero forced_stop=$candidateBootstrapForcedStop exit_code=$($candidateBootstrap.ExitCode)"
+                }
+            } catch {
+                $candidateCleanupErrors.Add("bootstrap_cleanup bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath error=$($_.Exception.Message)")
+            }
+        }
+        if ($candidateSupervisor) {
+            try {
+                $candidateSupervisor.Refresh()
+                if (-not $candidateSupervisor.HasExited) {
+                    [void]$candidateSupervisor.WaitForExit(15000)
+                    $candidateSupervisor.Refresh()
+                }
+                if (-not $candidateSupervisor.HasExited) {
+                    Stop-Process -Id $candidateSupervisor.Id -Force -ErrorAction Stop
+                    [void]$candidateSupervisor.WaitForExit(15000)
+                    $candidateSupervisor.Refresh()
+                }
+                if (-not $candidateSupervisor.HasExited) {
+                    throw "exact candidate supervisor remained alive after bounded stop"
+                }
+            } catch {
+                $candidateCleanupErrors.Add("supervisor_cleanup supervisor_pid=$($candidateSupervisor.Id) error=$($_.Exception.Message)")
+            }
+        }
+        if ($candidateBind) {
+            try {
+                Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
+            } catch {
+                $candidateCleanupErrors.Add("bind_release bind=$candidateBind error=$($_.Exception.Message)")
+            }
+        }
+        if ($candidateCleanupErrors.Count -gt 0) {
+            throw "SYNAPSE_CANDIDATE_TREE_CLEANUP_FAILED errors=$($candidateCleanupErrors -join '; ') bootstrap_log=$candidateBootstrapLogPath state_path=$candidateSupervisorStatePath remediation=inspect only the exact setup-owned candidate PIDs/Job and bind; setup attempted every cleanup stage and will not claim quiescence until all read back absent"
+        }
+        if ($candidateSucceeded) {
+            $candidateBootstrapHashAfter = Get-SynapseFileSha256 -Path $candidateBootstrapPath
+            if ($candidateBootstrapHashAfter -ine $expectedCandidateBootstrapSha256) {
+                throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_IDENTITY_MISMATCH phase=after_validation path=$candidateBootstrapPath expected_sha256=$expectedCandidateBootstrapSha256 actual_sha256=$candidateBootstrapHashAfter remediation=refuse handoff because the native bootstrap bytes changed during candidate execution"
+            }
+            try {
+                $candidateBootstrapLog = Get-Content -Raw -LiteralPath $candidateBootstrapLogPath -ErrorAction Stop
+            } catch {
+                throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_LOG_UNREADABLE path=$candidateBootstrapLogPath error=$($_.Exception.Message) remediation=the exact production bootstrap must persist its bound/start/exit evidence before candidate acceptance"
+            }
+            $candidateBootstrapLogExpectations = @(
+                "SYNAPSE_SUPERVISOR_BOOTSTRAP_PARENT_JOB_BOUND bootstrap_pid=$($candidateBootstrap.Id) job_name=$candidateExpectedParentJobName",
+                "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_STARTED bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) job_name=$candidateExpectedParentJobName",
+                "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_EXIT bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) exit_code=0"
+            )
+            foreach ($expectedBootstrapLogEntry in $candidateBootstrapLogExpectations) {
+                if (-not $candidateBootstrapLog.Contains($expectedBootstrapLogEntry)) {
+                    throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_LOG_CONTRACT_MISSING path=$candidateBootstrapLogPath expected=[$expectedBootstrapLogEntry] remediation=the exact production bootstrap must prove parent-Job binding, child identity, and terminal exit"
+                }
+            }
+            $candidateBootstrapLogSha256 = Get-SynapseFileSha256 -Path $candidateBootstrapLogPath
+            try {
+                $candidateFinalState = Get-Content -Raw -LiteralPath $candidateSupervisorStatePath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                throw "SYNAPSE_CANDIDATE_FINAL_JOB_STATE_UNREADABLE path=$candidateSupervisorStatePath error=$($_.Exception.Message) remediation=preserve candidate evidence and repair the one-shot supervisor terminal-state write before accepting the candidate"
+            }
+            $candidateFinalDrift = [System.Collections.Generic.List[string]]::new()
+            $candidateFinalExpectations = [ordered]@{
+                state = 'stopped'
+                supervisor_pid = [string]$candidateSupervisor.Id
+                child_pid = [string]$candidate.Id
+                exit_code = '0'
+                calyx_config_sha256 = $expectedCalyxConfigSha256
+                math_backend = 'cpu'
+                vram_budget_bytes = '0'
+                detection_backend = 'cpu'
+                stt_backend = 'cpu'
+                capture_backend = 'gdi_bitblt'
+                capture_force_dxgi = 'False'
+                search_open_generation_cache_entries = '1'
+                job_limit_flags_expected_hex = '0x00002300'
+                job_cpu_rate_control_flags_expected_hex = '0x00000005'
+                daemon_cpu_rate = [string]$SynapseDaemonCpuRate
+                working_set_policy = 'measured_only'
+                job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+                job_limit_flags_hex = '0x00002300'
+                process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                job_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                job_process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+                job_cpu_rate_control_flags_hex = '0x00000005'
+                job_cpu_rate = [string]$SynapseDaemonCpuRate
+                supervisor_job_name = $candidateExpectedParentJobName
+                supervisor_job_limit_flags_expected_hex = '0x00002300'
+                supervisor_job_lifetime_owner = 'native_bootstrap_only'
+                supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+                supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+                supervisor_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                supervisor_job_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                supervisor_cpu_rate = [string]$SynapseSupervisorCpuRate
+                supervisor_job_limit_flags_hex = '0x00002300'
+                supervisor_job_cpu_rate_control_flags_hex = '0x00000005'
+                supervisor_job_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                supervisor_job_memory_limit_bytes_actual = [string]$SynapseOwnedMemoryLimitBytes
+                supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
+                owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+                bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
+                owned_committed_private_ceiling_bytes = '1000000000'
+            }
+            foreach ($name in $candidateFinalExpectations.Keys) {
+                $actual = [string]$candidateFinalState.$name
+                $expected = [string]$candidateFinalExpectations[$name]
+                if ($actual -cne $expected) {
+                    $candidateFinalDrift.Add("$name expected=$expected actual=$(if ($actual) { $actual } else { '<missing>' })")
+                }
+            }
+            try {
+                $candidatePeakProcessBytes = [uint64]$candidateFinalState.peak_process_memory_used_bytes
+                $candidatePeakJobBytes = [uint64]$candidateFinalState.peak_job_memory_used_bytes
+                $candidateParentCurrentBytes = [uint64]$candidateFinalState.supervisor_job_current_memory_used_bytes
+                $candidateParentHeadroomBytes = [uint64]$candidateFinalState.supervisor_job_memory_headroom_bytes
+                $candidateParentPeakProcessBytes = [uint64]$candidateFinalState.supervisor_job_peak_process_memory_used_bytes
+                $candidateParentPeakJobBytes = [uint64]$candidateFinalState.supervisor_job_peak_memory_used_bytes
+                if ($candidatePeakProcessBytes -gt $SynapseDaemonProcessMemoryLimitBytes) {
+                    $candidateFinalDrift.Add("peak_process_memory_used_bytes limit=$SynapseDaemonProcessMemoryLimitBytes actual=$candidatePeakProcessBytes")
+                }
+                if ($candidatePeakJobBytes -gt $SynapseDaemonProcessMemoryLimitBytes) {
+                    $candidateFinalDrift.Add("peak_job_memory_used_bytes limit=$SynapseDaemonProcessMemoryLimitBytes actual=$candidatePeakJobBytes")
+                }
+                if ($candidatePeakJobBytes -lt [uint64]$candidateTerminalKernelJob.PeakJobMemoryUsedBytes) {
+                    $candidateFinalDrift.Add("peak_job_memory_monotonicity terminal_kernel=$($candidateTerminalKernelJob.PeakJobMemoryUsedBytes) final_state=$candidatePeakJobBytes")
+                }
+                if ($candidateParentCurrentBytes -gt $SynapseOwnedMemoryLimitBytes -or
+                    $candidateParentPeakProcessBytes -gt $SynapseOwnedMemoryLimitBytes -or
+                    $candidateParentPeakJobBytes -gt $SynapseOwnedMemoryLimitBytes) {
+                    $candidateFinalDrift.Add("supervisor_job_memory_usage limit=$SynapseOwnedMemoryLimitBytes current=$candidateParentCurrentBytes peak_process=$candidateParentPeakProcessBytes peak_job=$candidateParentPeakJobBytes")
+                }
+                if ($candidateParentPeakJobBytes -lt [uint64]$candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes) {
+                    $candidateFinalDrift.Add("supervisor_job_peak_memory_monotonicity terminal_kernel=$($candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes) final_state=$candidateParentPeakJobBytes")
+                }
+                if (($candidateParentCurrentBytes + $candidateParentHeadroomBytes) -ne $SynapseOwnedMemoryLimitBytes) {
+                    $candidateFinalDrift.Add("supervisor_job_memory_headroom_reconciliation expected=$SynapseOwnedMemoryLimitBytes actual=$($candidateParentCurrentBytes + $candidateParentHeadroomBytes)")
+                }
+            } catch {
+                $candidateFinalDrift.Add("peak_memory_readback_invalid error=$($_.Exception.Message)")
+            }
+            if ($candidateFinalDrift.Count -gt 0) {
+                throw "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_DRIFT path=$candidateSupervisorStatePath drift=$($candidateFinalDrift -join '; ') remediation=preserve the terminal Job evidence and repair the bounded supervisor before accepting or installing this candidate"
+            }
+            $candidateFinalStateSha256 = Get-SynapseFileSha256 -Path $candidateSupervisorStatePath
+            Info "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_VERIFIED bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath bootstrap_sha256=$candidateBootstrapHashAfter bootstrap_log=$candidateBootstrapLogPath bootstrap_log_sha256=$candidateBootstrapLogSha256 supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) state=stopped exit_code=0 state_path=$candidateSupervisorStatePath state_sha256=$candidateFinalStateSha256 parent_job_name=$($candidateFinalState.supervisor_job_name) parent_job_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$($candidateFinalState.supervisor_job_cpu_rate) parent_current_job_memory_used_bytes=$candidateParentCurrentBytes parent_job_memory_headroom_bytes=$candidateParentHeadroomBytes parent_peak_process_memory_used_bytes=$candidateParentPeakProcessBytes parent_peak_job_memory_used_bytes=$candidateParentPeakJobBytes daemon_job_limit_flags=$($candidateFinalState.job_limit_flags_hex) daemon_cpu_rate=$($candidateFinalState.job_cpu_rate) daemon_process_memory_limit_bytes=$($candidateFinalState.job_process_memory_limit_bytes) daemon_job_memory_limit_bytes=$($candidateFinalState.job_memory_limit_bytes) working_set_policy=measured_only daemon_peak_process_memory_used_bytes=$candidatePeakProcessBytes daemon_peak_job_memory_used_bytes=$candidatePeakJobBytes"
+            $candidateResult | Add-Member -NotePropertyName JobLimitFlagsHex -NotePropertyValue ([string]$candidateFinalState.job_limit_flags_hex) -Force
+            $candidateResult | Add-Member -NotePropertyName ProcessMemoryLimitBytes -NotePropertyValue ([uint64]$candidateFinalState.job_process_memory_limit_bytes) -Force
+            $candidateResult | Add-Member -NotePropertyName JobMemoryLimitBytes -NotePropertyValue ([uint64]$candidateFinalState.job_memory_limit_bytes) -Force
+            $candidateResult | Add-Member -NotePropertyName PeakProcessMemoryUsedBytes -NotePropertyValue $candidatePeakProcessBytes -Force
+            $candidateResult | Add-Member -NotePropertyName PeakJobMemoryUsedBytes -NotePropertyValue $candidatePeakJobBytes -Force
+            $candidateResult | Add-Member -NotePropertyName ParentJobName -NotePropertyValue ([string]$candidateFinalState.supervisor_job_name) -Force
+            $candidateResult | Add-Member -NotePropertyName ParentJobMemoryLimitBytes -NotePropertyValue ([uint64]$SynapseOwnedMemoryLimitBytes) -Force
+            $candidateResult | Add-Member -NotePropertyName ParentCurrentJobMemoryUsedBytes -NotePropertyValue $candidateParentCurrentBytes -Force
+            $candidateResult | Add-Member -NotePropertyName ParentJobMemoryHeadroomBytes -NotePropertyValue $candidateParentHeadroomBytes -Force
+            $candidateResult | Add-Member -NotePropertyName ParentPeakProcessMemoryUsedBytes -NotePropertyValue $candidateParentPeakProcessBytes -Force
+            $candidateResult | Add-Member -NotePropertyName ParentPeakJobMemoryUsedBytes -NotePropertyValue $candidateParentPeakJobBytes -Force
+            $candidateResult | Add-Member -NotePropertyName ParentCpuRate -NotePropertyValue ([uint32]$SynapseSupervisorCpuRate) -Force
+            $candidateResult | Add-Member -NotePropertyName DaemonCpuRate -NotePropertyValue ([uint32]$SynapseDaemonCpuRate) -Force
+            $candidateResult | Add-Member -NotePropertyName SupervisorBootstrapSha256 -NotePropertyValue $candidateBootstrapHashAfter -Force
+            $candidateResult | Add-Member -NotePropertyName SupervisorBootstrapLogSha256 -NotePropertyValue $candidateBootstrapLogSha256 -Force
+            $candidateResult | Add-Member -NotePropertyName FinalJobStateSha256 -NotePropertyValue $candidateFinalStateSha256 -Force
         }
         if ((Test-Path -LiteralPath $candidateRoot) -and -not $candidateSucceeded) {
             try {
@@ -10310,6 +14251,7 @@ function Test-SynapseCandidateDaemon {
                 -Reason 'validated_candidate_success')
         }
     }
+    return $candidateResult
 }
 
 function Write-SynapseCodexToolSurfaceSnapshot {
@@ -11432,8 +15374,7 @@ function Start-SynapsePostExitSetupContinuation {
         'dead_owner_bind_after_install',
         '-PostExitManifestPath',
         $manifestPath,
-        '-ForceRestart',
-        '-SkipBuild'
+        '-ForceRestart'
     )
     if (-not [string]::IsNullOrWhiteSpace($ActiveIssue)) {
         $args += @('-ActiveIssue', $ActiveIssue)
@@ -11442,9 +15383,9 @@ function Start-SynapsePostExitSetupContinuation {
         $args += @('-CalyxConfigPath', $CalyxConfigPath)
     }
     # Relay the resolved build tree only when one was actually resolved. The
-    # continuation always runs -SkipBuild, so this is provenance for the child's
-    # readbacks, not a build instruction; relaying an empty value would bind a
-    # blank -CargoTarget and relaying a resolved alternate must carry its
+    # continuation rebuilds from this exact source checkout after the
+    # parent transaction has rolled back and exited. Relaying an empty value
+    # would bind a blank -CargoTarget, while a resolved alternate must carry its
     # authorization with it (#1857).
     if (-not [string]::IsNullOrWhiteSpace($CargoTarget)) {
         $args += @('-CargoTarget', $CargoTarget)
@@ -11459,6 +15400,11 @@ function Start-SynapsePostExitSetupContinuation {
     $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-WindowsCommandArgument -Value $wrapperPath)"
     $argLiteralLines = @($args | ForEach-Object { "    $(Quote-PowerShellSingleQuotedString -Value $_)" })
     $wrapperLines = @(
+        # Task Scheduler can inherit a pwsh-first PSModulePath even though this
+        # wrapper runs Windows PowerShell 5.1. Pin the trusted OS module root as
+        # the first executable statement so neither the wrapper nor the full
+        # setup child can auto-load Core-only Utility/CimCmdlets/NetTCPIP bytes.
+        '$env:PSModulePath = [IO.Path]::Combine($PSHOME, ''Modules'')',
         '$ErrorActionPreference = ''Stop''',
         "`$taskName = $(Quote-PowerShellSingleQuotedString -Value $continuationTaskName)",
         "`$launcherPath = $(Quote-PowerShellSingleQuotedString -Value $launcherPath)",
@@ -11509,7 +15455,7 @@ function Start-SynapsePostExitSetupContinuation {
         active_issue = $ActiveIssue
         dead_owner_detail = $DeadOwnerDetail
         created_at_utc = (Get-Date).ToUniversalTime().ToString('o')
-        remediation = 'continuation waits for parent setup process exit, reacquires setup maintenance lock, then reruns setup with -SkipBuild against the installed verified daemon bytes'
+        remediation = 'continuation waits for parent rollback and process exit, reacquires setup maintenance lock, then rebuilds and deploys the exact source checkout as a new transaction'
     }
     Write-SynapseUtf8NoBomFile -Path $manifestPath -Text (($manifest | ConvertTo-Json -Depth 24) + "`n")
 
@@ -13386,15 +17332,21 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
         return $null
     }
 
-    # The launcher directory follows the supervisor. #1862 moved both out of the
-    # log directory, so a machine installed before that change still has a task
-    # registered against the LEGACY log-dir launcher. That legacy layout is a
-    # recognized setup-owned identity during upgrade -- refusing it would make
-    # the fix un-installable on exactly the machines that need it. It is accepted
-    # for ownership purposes only; section 7 then re-registers the task at the
-    # new location and deletes the legacy copies.
+    # The canonical task starts the setup-built native bootstrap. The bootstrap
+    # establishes the lifetime parent Job before any managed supervisor code is
+    # launched. Pre-migration installs used direct PowerShell or a resident
+    # WScript wrapper; accept those exact shapes only to prove ownership during
+    # a repair handoff, never for live adoption.
     $launcherDir = Split-Path -Parent $SupervisorPath
-    $expectedExecutablePath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $expectedBootstrapPath = Join-Path $launcherDir 'synapse-supervisor-bootstrap.exe'
+    $expectedPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $expectedDirectArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f ([System.IO.Path]::GetFullPath($SupervisorPath))
+    $expectedBootstrapArguments = Get-SynapseSupervisorBootstrapTaskArgumentText `
+        -PowerShellPath $expectedPowerShellPath `
+        -SupervisorPath $SupervisorPath `
+        -WorkingDirectory $launcherDir `
+        -LogPath (Join-Path $LogDir 'daemon-supervisor-bootstrap.log')
+    $expectedWscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
     $candidateLauncherDirs = @($launcherDir)
     $legacyLauncherDir = $LogDir
     if (-not [string]::IsNullOrWhiteSpace($legacyLauncherDir) -and
@@ -13420,11 +17372,21 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
     }
 
     $matchedLauncherDir = $null
+    $isNativeBootstrap = $actualExecutablePath -ieq [System.IO.Path]::GetFullPath($expectedBootstrapPath) -and
+        ([string]$action.Arguments -ceq $expectedBootstrapArguments) -and
+        $actualWorkingDirectory -ieq [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\')
+    $isDirectSupervisor = $actualExecutablePath -ieq [System.IO.Path]::GetFullPath($expectedPowerShellPath) -and
+        ([string]$action.Arguments -ceq $expectedDirectArguments) -and
+        $actualWorkingDirectory -ieq [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\')
+    if ($isNativeBootstrap -or $isDirectSupervisor) {
+        $matchedLauncherDir = [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\')
+    }
     foreach ($candidateDir in $candidateLauncherDirs) {
+        if ($isNativeBootstrap -or $isDirectSupervisor) { break }
         $candidateLauncher = Join-Path $candidateDir 'synapse-daemon-launch-hidden.vbs'
         $candidateArguments = '//B //Nologo "{0}"' -f $candidateLauncher
         $candidateWorkingDirectory = [System.IO.Path]::GetFullPath($candidateDir).TrimEnd('\')
-        if ($actualExecutablePath -ieq [System.IO.Path]::GetFullPath($expectedExecutablePath) -and
+        if ($actualExecutablePath -ieq [System.IO.Path]::GetFullPath($expectedWscriptPath) -and
             ([string]$action.Arguments -ceq $candidateArguments) -and
             $actualWorkingDirectory -ieq $candidateWorkingDirectory) {
             $matchedLauncherDir = $candidateWorkingDirectory
@@ -13433,23 +17395,29 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
     }
 
     if (-not $matchedLauncherDir) {
-        $expectedRendering = (@($candidateLauncherDirs | ForEach-Object { '//B //Nologo "{0}"' -f (Join-Path $_ 'synapse-daemon-launch-hidden.vbs') }) -join ' | ')
-        Die ("SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task={0} reason={1} expected_execute={2} actual_execute={3} accepted_arguments={4} actual_arguments={5} accepted_working_directories={6} actual_working_directory={7} remediation=the named task action is not the exact setup-owned Synapse hidden launcher (current or pre-#1862 legacy layout); inspect Task Scheduler and refuse to stop or unregister an unverified task" -f `
+        $legacyArgumentRendering = (@($candidateLauncherDirs | ForEach-Object { '//B //Nologo "{0}"' -f (Join-Path $_ 'synapse-daemon-launch-hidden.vbs') }) -join ' | ')
+        Die ("SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task={0} reason={1} expected_bootstrap_execute={2} expected_bootstrap_arguments={3} legacy_powershell_execute={4} legacy_powershell_arguments={5} legacy_wscript_execute={6} accepted_legacy_wscript_arguments={7} actual_execute={8} actual_arguments={9} accepted_working_directories={10} actual_working_directory={11} remediation=the named task action is neither the exact setup-owned native bootstrap nor an exact pre-migration launcher; inspect Task Scheduler and refuse to stop or unregister an unverified task" -f `
             $TaskName,
             $Reason,
-            $expectedExecutablePath,
-            $action.Execute,
-            $expectedRendering,
-            $action.Arguments,
+            $expectedBootstrapPath,
+            $expectedBootstrapArguments,
+            $expectedPowerShellPath,
+            $expectedDirectArguments,
+            $expectedWscriptPath,
+            $legacyArgumentRendering,
+            $actualExecutablePath,
+            [string]$action.Arguments,
             (@($candidateLauncherDirs) -join ' | '),
             $action.WorkingDirectory)
     }
 
-    $isLegacyLayout = ($matchedLauncherDir -ine [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\'))
+    $isLegacyLayout = -not $isNativeBootstrap
     if ($isLegacyLayout) {
         Warn "SYNAPSE_TASK_HANDOFF_LEGACY_LAUNCHER_LAYOUT task=$TaskName reason=$Reason matched_launcher_dir=$matchedLauncherDir current_launcher_dir=$([System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\')) effect=ownership accepted for this upgrade; the task will be re-registered against the runtime bin directory so log cleanup can no longer break autostart (#1862)"
     }
-    Info "Synapse daemon scheduled task identity preflight verified: task=$TaskName state=$($task.State) reason=$Reason matched_launcher_dir=$matchedLauncherDir legacy_layout=$isLegacyLayout"
+    $task | Add-Member -NotePropertyName SynapseNativeBootstrapAction -NotePropertyValue ([bool]$isNativeBootstrap) -Force
+    $task | Add-Member -NotePropertyName SynapseLegacyDirectPowerShellAction -NotePropertyValue ([bool]$isDirectSupervisor) -Force
+    Info "Synapse daemon scheduled task identity preflight verified: task=$TaskName state=$($task.State) reason=$Reason native_prebound_bootstrap=$isNativeBootstrap legacy_direct_powershell_supervisor=$isDirectSupervisor matched_launcher_dir=$matchedLauncherDir legacy_layout=$isLegacyLayout"
     return $task
 }
 
@@ -13467,9 +17435,19 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
-        [AllowNull()][string]$CalyxConfigPath
+        [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256
     )
 
+    $expectedCalyxConfigSha256 = $ExpectedCalyxConfigSha256.ToUpperInvariant()
+    $actualCalyxConfigSha256 = if (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf) {
+        Get-SynapseFileSha256 -Path $CalyxConfigPath
+    } else {
+        '<missing>'
+    }
+    if ($actualCalyxConfigSha256 -ine $expectedCalyxConfigSha256) {
+        Die "SYNAPSE_LIVE_ADOPTION_CALYX_CONFIG_IDENTITY_MISMATCH path=$CalyxConfigPath expected_sha256=$expectedCalyxConfigSha256 actual_sha256=$actualCalyxConfigSha256 remediation=stop the concurrent config writer and rerun setup; adoption cannot preserve unvalidated config bytes"
+    }
     $task = Assert-SynapseDaemonTaskRestartAuthorityIdentity `
         -TaskName $TaskName `
         -SupervisorPath $SupervisorPath `
@@ -13480,32 +17458,37 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
     if ([string]$task.State -ne 'Running') {
         Die "SYNAPSE_LIVE_ADOPTION_TASK_STATE_INVALID task=$TaskName expected=Running actual=$($task.State) remediation=the unchanged daemon is not owned by a running setup task; use an explicit handoff to restore one authoritative supervisor"
     }
-    foreach ($requiredFile in @($HiddenLauncherPath, $SupervisorPath)) {
-        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
-            Die "SYNAPSE_LIVE_ADOPTION_LAUNCHER_FILE_MISSING task=$TaskName path=$requiredFile remediation=the running task launcher chain is incomplete; use an explicit handoff to regenerate it safely"
-        }
+    if (-not [bool]$task.SynapseNativeBootstrapAction) {
+        Die "SYNAPSE_LIVE_ADOPTION_PREBOUND_BOOTSTRAP_MISSING task=$TaskName remediation=legacy direct-PowerShell/WScript supervisors are resource-contract drift and must be repaired by an explicit handoff before adoption"
+    }
+    if (-not (Test-Path -LiteralPath $SupervisorPath -PathType Leaf)) {
+        Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_FILE_MISSING task=$TaskName path=$SupervisorPath remediation=the running task supervisor is missing; use an explicit handoff to regenerate it safely"
     }
 
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
-    $supervisorCommand = @(
-        (Quote-WindowsCommandArgument $powerShellExe),
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', (Quote-WindowsCommandArgument $SupervisorPath)
-    ) -join ' '
-    $expectedWrapperAssignments = @(
-        "launcherLog = $(Vbs-Literal $launcherLog)",
-        "supervisorCommand = $(Vbs-Literal $supervisorCommand)"
-    )
-    $wrapperLines = @(Get-Content -LiteralPath $HiddenLauncherPath -ErrorAction Stop)
-    foreach ($expectedLine in $expectedWrapperAssignments) {
-        $assignmentName = ($expectedLine -split '\s*=\s*', 2)[0]
-        $actualLines = @($wrapperLines | Where-Object { $_ -match "^$([regex]::Escape($assignmentName))\s*=" })
-        if ($actualLines.Count -ne 1 -or [string]$actualLines[0] -cne $expectedLine) {
-            Die "SYNAPSE_LIVE_ADOPTION_WRAPPER_DRIFT task=$TaskName path=$HiddenLauncherPath assignment=$assignmentName expected=[$expectedLine] actual=[$($actualLines -join ' || ')] remediation=the running task wrapper does not name the exact expected supervisor/log; use an explicit handoff instead of overwriting a live launcher"
-        }
+    $bootstrapPath = Join-Path (Split-Path -Parent $SupervisorPath) 'synapse-supervisor-bootstrap.exe'
+    $bootstrapLog = Join-Path $LogDir 'daemon-supervisor-bootstrap.log'
+    $taskAction = @($task.Actions)[0]
+    $taskExecute = try {
+        [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$taskAction.Execute))
+    } catch {
+        [string]$taskAction.Execute
     }
+    $expectedTaskArguments = Get-SynapseSupervisorBootstrapTaskArgumentText `
+        -PowerShellPath $powerShellExe `
+        -SupervisorPath $SupervisorPath `
+        -WorkingDirectory (Split-Path -Parent $SupervisorPath) `
+        -LogPath $bootstrapLog
+    $isNativeBootstrapAction = $taskExecute -ieq [System.IO.Path]::GetFullPath($bootstrapPath) -and
+        [string]$taskAction.Arguments -ceq $expectedTaskArguments
+    if (-not $isNativeBootstrapAction) {
+        Die "SYNAPSE_LIVE_ADOPTION_BOOTSTRAP_ACTION_DRIFT task=$TaskName expected_execute=$bootstrapPath expected_arguments=$expectedTaskArguments actual_execute=$taskExecute actual_arguments=$($taskAction.Arguments) remediation=perform an explicit handoff; live adoption requires the exact native prebound bootstrap action"
+    }
+    if (-not (Test-Path -LiteralPath $bootstrapPath -PathType Leaf)) {
+        Die "SYNAPSE_LIVE_ADOPTION_BOOTSTRAP_MISSING task=$TaskName path=$bootstrapPath remediation=perform an explicit handoff to install the exact setup-built native bootstrap"
+    }
+    $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
+    $hiddenLauncherSha256 = Get-SynapseFileSha256 -Path $bootstrapPath
 
     $requiredAssignments = @(
         'ExePath',
@@ -13519,6 +17502,7 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         'SupervisorEvents',
         'MaintenanceLockPath',
         'ExpectedCalyxConfigPath',
+        'ExpectedCalyxConfigSha256',
         'DaemonArgumentText',
         'ExpectedAllowedPermissions',
         'ExpectedEnableAudio'
@@ -13550,7 +17534,8 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         SupervisorEvents = $supervisorEventsPath
         MaintenanceLockPath = $MaintenanceLockPath
         ExpectedCalyxConfigPath = $expectedCalyxConfig
-        DaemonArgumentText = Get-SynapseDaemonArgumentText -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath
+        ExpectedCalyxConfigSha256 = $expectedCalyxConfigSha256
+        DaemonArgumentText = Get-SynapseDaemonArgumentText -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $expectedCalyxConfigSha256
         ExpectedAllowedPermissions = $expectedAllowed
         ExpectedEnableAudio = [string]$EnableAudio
     }
@@ -13576,9 +17561,62 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         Die "SYNAPSE_LIVE_ADOPTION_LISTENER_AMBIGUOUS task=$TaskName bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=live adoption requires exactly one listener owned by the persisted supervisor child"
     }
     $listenerPid = [int]$listeners[0].OwningProcess
-    if ([string]$supervisorState.state -notin @('running', 'adopted_existing') -or
+    if ([string]$supervisorState.state -ne 'running' -or
         [int]$supervisorState.child_pid -ne $listenerPid) {
         Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_STATE_MISMATCH task=$TaskName state=$($supervisorState.state) supervisor_child_pid=$($supervisorState.child_pid) listener_pid=$listenerPid remediation=repair supervisor/daemon ownership before live adoption"
+    }
+    $liveResourceExpectations = [ordered]@{
+        calyx_config_sha256 = $expectedCalyxConfigSha256
+        math_backend = 'cpu'
+        vram_budget_bytes = '0'
+        detection_backend = 'cpu'
+        stt_backend = 'cpu'
+        capture_backend = 'gdi_bitblt'
+        capture_force_dxgi = 'False'
+        search_open_generation_cache_entries = '1'
+        job_limit_flags_expected_hex = '0x00002300'
+        job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        daemon_cpu_rate = [string]$SynapseDaemonCpuRate
+        working_set_policy = 'measured_only'
+        job_security_descriptor_sddl = 'D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)'
+        job_limit_flags_hex = '0x00002300'
+        process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_process_memory_limit_bytes = [string]$SynapseDaemonProcessMemoryLimitBytes
+        job_cpu_rate_control_flags_hex = '0x00000005'
+        job_cpu_rate = [string]$SynapseDaemonCpuRate
+        supervisor_job_limit_flags_expected_hex = '0x00002300'
+        supervisor_job_lifetime_owner = 'native_bootstrap_only'
+        supervisor_job_accounting_source = 'QueryInformationJobObject(NULL/immediate)'
+        supervisor_job_cpu_rate_control_flags_expected_hex = '0x00000005'
+        supervisor_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_cpu_rate = [string]$SynapseSupervisorCpuRate
+        supervisor_job_limit_flags_hex = '0x00002300'
+        supervisor_job_cpu_rate_control_flags_hex = '0x00000005'
+        supervisor_job_process_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_memory_limit_bytes_actual = [string]$SynapseOwnedMemoryLimitBytes
+        supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
+        owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
+        bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
+        owned_committed_private_ceiling_bytes = '1000000000'
+    }
+    $liveResourceDrift = [System.Collections.Generic.List[string]]::new()
+    foreach ($resourceName in $liveResourceExpectations.Keys) {
+        $actualResourceValue = [string]$supervisorState.$resourceName
+        $expectedResourceValue = [string]$liveResourceExpectations[$resourceName]
+        if ($actualResourceValue -cne $expectedResourceValue) {
+            $liveResourceDrift.Add("$resourceName expected=$expectedResourceValue actual=$actualResourceValue")
+        }
+    }
+    if ($liveResourceDrift.Count -gt 0) {
+        Die "SYNAPSE_LIVE_ADOPTION_RESOURCE_CONTRACT_DRIFT task=$TaskName daemon_pid=$listenerPid drift=$($liveResourceDrift -join '; ') remediation=use an explicit handoff; setup will not preserve a daemon whose CPU/VRAM/cache/Job limits are absent or differ"
+    }
+    $liveKernelResourceReadback = Get-SynapseLiveSupervisorResourceContractDrift `
+        -LogDir $LogDir `
+        -ExpectedCalyxConfigSha256 $expectedCalyxConfigSha256
+    if ($liveKernelResourceReadback.HasDrift) {
+        Die "SYNAPSE_LIVE_ADOPTION_KERNEL_RESOURCE_CONTRACT_DRIFT task=$TaskName daemon_pid=$listenerPid job_name=$($liveKernelResourceReadback.KernelJobName) drift=$($liveKernelResourceReadback.Drifts -join '; ') remediation=use an explicit handoff; adoption requires OpenJobObject/QueryInformationJobObject proof of the hard kernel limits and exact child membership"
     }
     $supervisors = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
     if ($supervisors.Count -ne 1 -or [int]$supervisors[0].ProcessId -ne [int]$supervisorState.supervisor_pid) {
@@ -13593,19 +17631,37 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
     return [pscustomobject]@{
         TaskState = [string]$task.State
         TaskDefinitionSha256 = Get-SynapseSha256Hex -Text ([string]$taskXml)
-        HiddenLauncherSha256 = Get-SynapseFileSha256 -Path $HiddenLauncherPath
+        NativePreboundBootstrap = $isNativeBootstrapAction
+        DirectPowerShellSupervisor = $false
+        HiddenLauncherSha256 = $hiddenLauncherSha256
+        BootstrapSha256 = $hiddenLauncherSha256
         SupervisorSha256 = Get-SynapseFileSha256 -Path $SupervisorPath
         SupervisorPid = [int]$supervisorState.supervisor_pid
         DaemonPid = $listenerPid
         SupervisorState = [string]$supervisorState.state
         DaemonArgumentText = [string]$expectedAssignments.DaemonArgumentText
+        JobName = $liveKernelResourceReadback.KernelJobName
+        CurrentJobMemoryUsedBytes = $liveKernelResourceReadback.KernelCurrentJobMemoryUsedBytes
+        JobMemoryHeadroomBytes = $liveKernelResourceReadback.KernelJobMemoryHeadroomBytes
+        ParentJobName = $liveKernelResourceReadback.ParentJobName
+        ParentCurrentJobMemoryUsedBytes = $liveKernelResourceReadback.ParentCurrentJobMemoryUsedBytes
+        ParentPeakJobMemoryUsedBytes = $liveKernelResourceReadback.ParentPeakJobMemoryUsedBytes
+        ParentJobMemoryHeadroomBytes = $liveKernelResourceReadback.ParentJobMemoryHeadroomBytes
+        ParentCpuRateControlFlags = $liveKernelResourceReadback.ParentCpuRateControlFlags
+        ParentCpuRate = $liveKernelResourceReadback.ParentCpuRate
+        BootstrapPid = $liveKernelResourceReadback.BootstrapPid
+        BootstrapPrivateBytes = $liveKernelResourceReadback.BootstrapPrivateBytes
+        BootstrapPeakCommitBytes = $liveKernelResourceReadback.BootstrapPeakCommitBytes
+        BootstrapWorkingSetBytes = $liveKernelResourceReadback.BootstrapWorkingSetBytes
+        BootstrapPeakWorkingSetBytes = $liveKernelResourceReadback.BootstrapPeakWorkingSetBytes
+        BootstrapReserveBytes = $liveKernelResourceReadback.BootstrapReserveBytes
     }
 }
 
 # Task Scheduler's default Priority is 7, which Windows maps to
 # BELOW_NORMAL_PRIORITY_CLASS + THREAD_PRIORITY_BELOW_NORMAL, and priority class
-# is inherited all the way down the launch chain (task -> wscript wrapper ->
-# supervisor -> synapse-mcp.exe). The daemon serves interactive MCP tool calls,
+# is inherited all the way down the launch chain (task -> native bootstrap ->
+# PowerShell supervisor -> synapse-mcp.exe). The daemon serves interactive MCP tool calls,
 # so it belongs in the band Microsoft designates for interactive tasks:
 #
 #   4, 5, 6 -> NORMAL_PRIORITY_CLASS      "used for interactive tasks"
@@ -13713,17 +17769,11 @@ function Remove-SynapseDaemonTaskRestartAuthority {
 # source checkout. Disable+Stop is the reversible form of the same revocation,
 # and it is verified by the same identity assertion.
 #
-# Why the disable is required at all, and why `Stop-ScheduledTask` on its own is
-# not: Task Scheduler stops the task *instance* it launched (wscript.exe); it
-# does not walk the descendant tree, so the wscript -> powershell supervisor ->
-# synapse-mcp.exe chain is only partially torn down and the supervisor is
-# orphaned with its restart loop intact. This is documented Windows behaviour,
-# not a Synapse quirk -- see the Stop-ScheduledTask reference ("Stops all
-# running instances of a task") and Microsoft's own Q&A answer that Task
-# Scheduler "stops the task container, but it does not forcibly terminate child
-# processes". The only in-box mechanism that would give tree semantics is a Job
-# Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and Synapse cannot use it here
-# because Task Scheduler owns the task's job, not setup.
+# Why the disable is required at all: it revokes the logon trigger and restart
+# policy before any process drain begins. The native bootstrap owns a lifetime
+# parent Job with KILL_ON_JOB_CLOSE, so stopping that exact task closes the
+# parent-Job handle and tears down its inherited supervisor/daemon descendants.
+# Explicit process/kernel readbacks remain required.
 # ---------------------------------------------------------------------------
 function Suspend-SynapseDaemonTaskRestartAuthority {
     param(
@@ -13787,6 +17837,9 @@ function Resume-SynapseDaemonTaskRestartAuthority {
         -Reason $Reason
     if (-not $task) {
         Die "SYNAPSE_TASK_RESUME_TASK_MISSING task=$TaskName reason=$Reason remediation=there is no setup-owned Synapse daemon task to resume; run full setup (scripts/synapse-setup.ps1 -SourceDir <checkout>) to register autostart"
+    }
+    if (-not [bool]$task.SynapseNativeBootstrapAction) {
+        Die "SYNAPSE_TASK_RESUME_PREBOUND_BOOTSTRAP_MISSING task=$TaskName reason=$Reason remediation=the registered task is a recognized legacy PowerShell/WScript action but cannot be resumed under the strict resource contract; run full setup to replace it with the native prebound bootstrap"
     }
 
     Info "Restoring Synapse daemon Task Scheduler restart authority: task=$TaskName state_before=$($task.State) reason=$Reason"
@@ -14296,9 +18349,9 @@ function Invoke-SynapseDaemonStart {
 
     Step "Starting the Synapse daemon task=$TaskName bind=$Bind"
 
-    foreach ($requiredFile in @($supervisorPath, (Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'))) {
+    foreach ($requiredFile in @($supervisorPath, (Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
-            Die "SYNAPSE_DAEMON_START_LAUNCHER_MISSING path=$requiredFile reason=$reason remediation=autostart artifacts are missing; run full setup (scripts/synapse-setup.ps1 -SourceDir <checkout>) to regenerate the hidden launcher and supervisor"
+            Die "SYNAPSE_DAEMON_START_LAUNCHER_MISSING path=$requiredFile reason=$reason remediation=autostart artifacts are missing; run full setup to reinstall the native prebound bootstrap and supervisor"
         }
     }
 
@@ -14721,7 +18774,11 @@ if ($maintenanceReason -eq 'setup') {
     }
 
     if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
-        $CalyxConfigPath = $null
+        $script:SynapseManagedCalyxConfig = $true
+        $managedCalyxIdentity = Get-SynapseManagedCpuOnlyCalyxConfigIdentity
+        $CalyxConfigPath = [System.IO.Path]::GetFullPath(
+            (Join-Path $RuntimeBinDir ("synapse-calyx-cpu-only-{0}.toml" -f $managedCalyxIdentity.sha256)))
+        Info "Managed Calyx tuning identity selected path=$CalyxConfigPath sha256=$($managedCalyxIdentity.sha256) policy=content_addressed_immutable"
     } else {
         try {
             $CalyxConfigPath = [System.IO.Path]::GetFullPath($CalyxConfigPath)
@@ -14737,6 +18794,7 @@ if ($maintenanceReason -eq 'setup') {
         } catch {
             Die "SYNAPSE_CALYX_CONFIG_FILE_UNREADABLE path=$CalyxConfigPath error=$($_.Exception.Message) remediation=repair the exact file permissions before setup builds or touches the live daemon"
         }
+        $script:SynapseCalyxConfigSha256 = Get-SynapseFileSha256 -Path $CalyxConfigPath
         Info "Explicit Calyx tuning source verified path=$CalyxConfigPath; candidate and installed daemon will both receive --calyx-config."
     }
 
@@ -14818,6 +18876,17 @@ if ($maintenanceReason -eq 'setup') {
 
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
+if ($maintenanceReason -eq 'setup') {
+    if ($script:SynapseManagedCalyxConfig) {
+        $managedCalyxConfig = Write-SynapseManagedCpuOnlyCalyxConfig -Path $CalyxConfigPath
+        $script:SynapseCalyxConfigSha256 = $managedCalyxConfig.sha256
+    } else {
+        $lockedConfigSha256 = Get-SynapseFileSha256 -Path $CalyxConfigPath
+        if ($lockedConfigSha256 -ine $script:SynapseCalyxConfigSha256) {
+            Die "SYNAPSE_CALYX_CONFIG_CHANGED_DURING_PREFLIGHT path=$CalyxConfigPath expected_sha256=$($script:SynapseCalyxConfigSha256) actual_sha256=$lockedConfigSha256 remediation=stop the concurrent config writer and rerun setup from one stable CPU-only config"
+        }
+    }
+}
 Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
 Resume-SynapseCandidateCleanupIntents -Root (Join-Path $LogDir 'setup-candidates')
 Remove-SynapseStaleSuccessfulCandidateArtifacts -Root (Join-Path $LogDir 'setup-candidates')
@@ -14955,8 +19024,9 @@ if (-not $SkipBuild) {
 # ---------------------------------------------------------------------------
 # 2. Build (local source -> persistent target) and verify the binary
 # ---------------------------------------------------------------------------
-Set-SynapseCudaBuildEnvironment
-$ortRuntimeRoot = Join-Path $env:LOCALAPPDATA 'synapse\runtime\onnxruntime-gpu'
+# The shipping feature set is CPU-only. Do not probe or mutate nvcc/MSVC state:
+# no CUDA build script is eligible to run under this deployment contract.
+$ortRuntimeRoot = Join-Path $env:LOCALAPPDATA 'synapse\runtime\onnxruntime-cpu'
 $embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
 $acquisitionCleanup = Remove-SynapseStaleAcquisitionArtifacts -Roots @($ortRuntimeRoot, $embeddedModelRoot)
 $acquisitionCleanupPath = Join-Path $LogDir 'setup-acquisition-cleanup.json'
@@ -14972,7 +19042,7 @@ if ([int64]$acquisitionCleanupReadback.reclaimed_bytes -ne [int64]$acquisitionCl
 }
 $acquisitionCleanupSha = Get-SynapseFileSha256 -Path $acquisitionCleanupPath
 Info "Acquisition cleanup readback -> $acquisitionCleanupPath sha256=$acquisitionCleanupSha reaped_count=$($acquisitionCleanupReadback.reaped_count) reclaimed_bytes=$($acquisitionCleanupReadback.reclaimed_bytes) retained_live_count=$($acquisitionCleanupReadback.retained_live_count)"
-$ortRuntime = Install-SynapsePinnedOrtGpuRuntime -Root $ortRuntimeRoot
+$ortRuntime = Install-SynapsePinnedOrtCpuRuntime -Root $ortRuntimeRoot
 $env:ORT_LIB_LOCATION = $ortRuntime.NativeDir
 $env:ORT_PREFER_DYNAMIC_LINK = '1'
 Info "ONNX Runtime build linkage configured mode=dynamic ORT_LIB_LOCATION=$($env:ORT_LIB_LOCATION) version=$($ortRuntime.Version)"
@@ -15098,6 +19168,7 @@ if (-not $SkipBuild) {
     # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     $builtNativeHost = Join-Path $CargoTarget 'release\synapse-chrome-native-host.exe'
+    $builtSupervisorBootstrap = Join-Path $CargoTarget 'release\synapse-supervisor-bootstrap.exe'
     Info "Build process tree is job-owned; log: $buildLog"
     $buildInvocationDiagnostics = $null
     $cargoBuildArgs = @('build','--release','-p','synapse-mcp')
@@ -15350,8 +19421,12 @@ if (-not $SkipBuild) {
     if (-not (Test-Path -LiteralPath $builtNativeHost -PathType Leaf)) {
         Die "SYNAPSE_BUILD_NATIVE_HOST_MISSING path=$builtNativeHost remediation=cargo build -p synapse-mcp must emit every declared package binary; inspect the Cargo target inventory and setup-build.log"
     }
+    if (-not (Test-Path -LiteralPath $builtSupervisorBootstrap -PathType Leaf)) {
+        Die "SYNAPSE_BUILD_SUPERVISOR_BOOTSTRAP_MISSING path=$builtSupervisorBootstrap remediation=cargo build -p synapse-mcp must emit the declared native prebound supervisor bootstrap; inspect the Cargo target inventory and setup-build.log"
+    }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
     Info "Built Chrome native host: $builtNativeHost ($([math]::Round((Get-Item $builtNativeHost).Length/1MB,1)) MB)"
+    Info "Built native supervisor bootstrap: $builtSupervisorBootstrap ($([math]::Round((Get-Item $builtSupervisorBootstrap).Length/1MB,1)) MB)"
 
     # Durable readback naming the EXACT build tree and feature set used, so an
     # operator can prove after the fact where artifacts landed (#1857) and which
@@ -15359,6 +19434,7 @@ if (-not $SkipBuild) {
     $buildTargetReadbackPath = Join-Path $LogDir 'setup-build-target.json'
     $builtArtifact = Get-Item -LiteralPath $built
     $builtNativeHostArtifact = Get-Item -LiteralPath $builtNativeHost
+    $builtSupervisorBootstrapArtifact = Get-Item -LiteralPath $builtSupervisorBootstrap
     $buildTargetReadback = [ordered]@{
         schema = 'synapse_setup_build_target_readback/v2'
         observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
@@ -15380,6 +19456,10 @@ if (-not $SkipBuild) {
         chrome_native_host_artifact_byte_len = $builtNativeHostArtifact.Length
         chrome_native_host_artifact_sha256 = (Get-SynapseFileSha256 -Path $builtNativeHost)
         chrome_native_host_artifact_last_write_utc = $builtNativeHostArtifact.LastWriteTimeUtc.ToString('o')
+        supervisor_bootstrap_artifact_path = $builtSupervisorBootstrap
+        supervisor_bootstrap_artifact_byte_len = $builtSupervisorBootstrapArtifact.Length
+        supervisor_bootstrap_artifact_sha256 = (Get-SynapseFileSha256 -Path $builtSupervisorBootstrap)
+        supervisor_bootstrap_artifact_last_write_utc = $builtSupervisorBootstrapArtifact.LastWriteTimeUtc.ToString('o')
     }
     $buildTargetReadback | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $buildTargetReadbackPath -Encoding UTF8
     Info ("Build target readback -> {0} (cargo_target_dir={1} kind={2} cuda_kernels={3} artifact_sha256={4} chrome_native_host_sha256={5})" -f `
@@ -15468,6 +19548,8 @@ $installSourcePath = $ExePath
 $installSourceHash = $null
 $nativeHostInstallSourcePath = $ChromeNativeHostExePath
 $nativeHostInstallSourceHash = $null
+$supervisorBootstrapInstallSourcePath = Join-Path (Split-Path -Parent $ExePath) 'synapse-supervisor-bootstrap.exe'
+$supervisorBootstrapInstallSourceHash = $null
 if ($SkipBuild) {
     if (-not (Test-Path -LiteralPath $ExePath)) {
         Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
@@ -15493,27 +19575,373 @@ if ($SkipBuild) {
     }
     $nativeHostInstallSourceHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
     Info "SkipBuild Chrome native host path=$ChromeNativeHostExePath sha256=$nativeHostInstallSourceHash"
+    if (-not (Test-Path -LiteralPath $supervisorBootstrapInstallSourcePath -PathType Leaf)) {
+        Die "SYNAPSE_SKIP_BUILD_SUPERVISOR_BOOTSTRAP_MISSING path=$supervisorBootstrapInstallSourcePath remediation=-SkipBuild requires the native prebound supervisor bootstrap installed beside synapse-mcp.exe; run setup without -SkipBuild to build/install the current generation"
+    }
+    $supervisorBootstrapInstallSourceHash = Get-SynapseFileSha256 -Path $supervisorBootstrapInstallSourcePath
+    Info "SkipBuild native supervisor bootstrap path=$supervisorBootstrapInstallSourcePath sha256=$supervisorBootstrapInstallSourceHash"
+    $skipBuildCudaProviderPath = Join-Path (Split-Path -Parent $ExePath) 'onnxruntime_providers_cuda.dll'
+    if (Test-Path -LiteralPath $skipBuildCudaProviderPath -PathType Leaf) {
+        $legacyCudaProviderSha256 = Get-SynapseFileSha256 -Path $skipBuildCudaProviderPath
+        $stagedSkipBuildBinary = New-SynapseStagedDaemonBinary `
+            -BuiltPath $ExePath `
+            -LogDir $LogDir `
+            -RuntimeDir (Split-Path -Parent $ExePath)
+        $installSourcePath = $stagedSkipBuildBinary.Path
+        $installSourceHash = $stagedSkipBuildBinary.Sha256
+        Info "SkipBuild isolated CPU-only candidate bundle staged away from legacy CUDA provider source_provider=$skipBuildCudaProviderPath source_provider_sha256=$legacyCudaProviderSha256 candidate=$installSourcePath candidate_sha256=$installSourceHash effect=the live runtime is not mutated before candidate acceptance; verified handoff later retires the stale provider"
+    }
 } else {
     $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir -RuntimeDir $ortRuntime.NativeDir
     $installSourcePath = $stagedBinary.Path
     $installSourceHash = $stagedBinary.Sha256
     $nativeHostInstallSourcePath = $builtNativeHost
     $nativeHostInstallSourceHash = Get-SynapseFileSha256 -Path $nativeHostInstallSourcePath
+    $supervisorBootstrapInstallSourcePath = $builtSupervisorBootstrap
+    $supervisorBootstrapInstallSourceHash = Get-SynapseFileSha256 -Path $supervisorBootstrapInstallSourcePath
 }
 if ([string]::IsNullOrWhiteSpace($nativeHostInstallSourceHash)) {
     Die "SYNAPSE_NATIVE_HOST_CANDIDATE_HASH_MISSING path=$nativeHostInstallSourcePath remediation=setup requires a physical SHA-256 identity for the Chrome native host before handoff"
 }
+if ([string]::IsNullOrWhiteSpace($supervisorBootstrapInstallSourceHash) -or
+    -not (Test-Path -LiteralPath $supervisorBootstrapInstallSourcePath -PathType Leaf)) {
+    Die "SYNAPSE_SUPERVISOR_BOOTSTRAP_CANDIDATE_MISSING path=$supervisorBootstrapInstallSourcePath sha256=$(if ($supervisorBootstrapInstallSourceHash) { $supervisorBootstrapInstallSourceHash } else { '<absent>' }) remediation=the exact native prebound bootstrap built alongside the daemon must exist before candidate handoff"
+}
 $candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $installSourcePath)
+$candidateRuntimeFiles += [pscustomobject]@{
+    Name = 'synapse-supervisor-bootstrap.exe'
+    Path = [System.IO.Path]::GetFullPath($supervisorBootstrapInstallSourcePath)
+    Sha256 = $supervisorBootstrapInstallSourceHash
+}
 $candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
 Info "Candidate ONNX Runtime bundle verified files=$candidateRuntimeSummary"
 $replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind -Token $token
-$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ReplacementReservationId $replacementReservationId
+
+# Recover an interrupted armed transaction before taking a new snapshot. The
+# manifest is accepted only when every identity is inside this setup's exact
+# managed path set; an ambiguous or foreign path fails closed.
+$deploymentTransactionParent = Join-Path $LogDir 'setup-transactions'
+$deploymentRecoveryAllowedPaths = @(
+    $ExePath,
+    $ChromeNativeHostExePath,
+    $CalyxConfigPath,
+    (Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'),
+    (Join-Path $LogDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'),
+    (Join-Path (Split-Path -Parent $ExePath) 'onnxruntime_providers_cuda.dll'),
+    (Join-Path (Split-Path -Parent $ExePath) 'synapse-fsv-toast-history.exe'),
+    (Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir)
+)
+$deploymentRecoveryAllowedPaths += @($candidateRuntimeFiles | ForEach-Object { Join-Path (Split-Path -Parent $ExePath) $_.Name })
+$deploymentRecoveryAllowedPaths = @($deploymentRecoveryAllowedPaths | ForEach-Object { [System.IO.Path]::GetFullPath([string]$_) } | Sort-Object -Unique)
+if (Test-Path -LiteralPath $deploymentTransactionParent -PathType Container) {
+    $armedRecoveryTransactions = @()
+    foreach ($recoveryDirectory in @(Get-ChildItem -LiteralPath $deploymentTransactionParent -Directory -Force -ErrorAction Stop | Sort-Object Name)) {
+        $recoveryManifestPath = Join-Path $recoveryDirectory.FullName 'transaction.json'
+        if (-not (Test-Path -LiteralPath $recoveryManifestPath -PathType Leaf)) {
+            [void](Remove-SynapseDeploymentTransactionArtifact -Path $recoveryDirectory.FullName -ExpectedRoot $deploymentTransactionParent -ExpectedState 'unarmed' -Reason 'orphan_unarmed_deployment_transaction_cleanup')
+            continue
+        }
+        $recoveryManifestItem = Get-Item -LiteralPath $recoveryManifestPath -Force -ErrorAction Stop
+        if (($recoveryManifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $recoveryManifestItem.Length -gt 1MB) {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_MANIFEST_INVALID path=$recoveryManifestPath length=$($recoveryManifestItem.Length) attributes=$($recoveryManifestItem.Attributes) remediation=preserve and inspect the bounded regular transaction manifest before setup continues"
+        }
+        try { $recoveryManifest = Get-Content -Raw -LiteralPath $recoveryManifestPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_MANIFEST_UNREADABLE path=$recoveryManifestPath error=$($_.Exception.Message) remediation=preserve the transaction directory and repair its manifest before setup continues"
+        }
+        if ([string]$recoveryManifest.schema -ne 'synapse_deployment_transaction/v1') {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_SCHEMA_INVALID path=$recoveryManifestPath schema=$($recoveryManifest.schema) remediation=do not guess how to restore an unknown deployment transaction schema"
+        }
+        if ([string]$recoveryManifest.state -eq 'committed' -or [string]$recoveryManifest.state -eq 'rolled_back') {
+            [void](Remove-SynapseDeploymentTransactionArtifact -Path $recoveryDirectory.FullName -ExpectedRoot $deploymentTransactionParent -ExpectedState ([string]$recoveryManifest.state) -Reason 'terminal_deployment_transaction_cleanup')
+            continue
+        }
+        if ([string]$recoveryManifest.state -ne 'armed') {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_STATE_INVALID path=$recoveryManifestPath state=$($recoveryManifest.state) remediation=preserve the transaction directory and resolve its exact terminal state"
+        }
+        $armedRecoveryTransactions += [pscustomobject]@{ Directory = $recoveryDirectory; ManifestPath = $recoveryManifestPath; Manifest = $recoveryManifest }
+    }
+    if ($armedRecoveryTransactions.Count -gt 1) {
+        Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_AMBIGUOUS root=$deploymentTransactionParent armed_count=$($armedRecoveryTransactions.Count) remediation=preserve every manifest and determine which exact task/file generation owns restart authority before setup continues"
+    }
+    if ($armedRecoveryTransactions.Count -eq 1) {
+        $recovery = $armedRecoveryTransactions[0]
+        $manifest = $recovery.Manifest
+        if ([string]$manifest.task_name -cne $TaskName -or
+            [string]$manifest.bind -cne $Bind -or
+            [System.IO.Path]::GetFullPath([string]$manifest.db_path) -ine [System.IO.Path]::GetFullPath($DbPath) -or
+            [System.IO.Path]::GetFullPath([string]$manifest.token_path) -ine [System.IO.Path]::GetFullPath($TokenPath) -or
+            [System.IO.Path]::GetFullPath([string]$manifest.transaction_root) -ine [System.IO.Path]::GetFullPath($recovery.Directory.FullName)) {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_IDENTITY_MISMATCH manifest=$($recovery.ManifestPath) remediation=the interrupted transaction does not belong to this exact task/bind/db/token/root identity"
+        }
+        foreach ($recoveryFile in @($manifest.file_snapshots)) {
+            $recoveryPath = [System.IO.Path]::GetFullPath([string]$recoveryFile.Path)
+            if ($deploymentRecoveryAllowedPaths -inotcontains $recoveryPath) {
+                Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_PATH_OUT_OF_SCOPE manifest=$($recovery.ManifestPath) path=$recoveryPath remediation=rollback refuses any path outside the exact setup-managed runtime generation"
+            }
+            if ([bool]$recoveryFile.Existed) {
+                $recoveryBackupPath = [System.IO.Path]::GetFullPath([string]$recoveryFile.BackupPath)
+                if ((Split-Path -Parent $recoveryBackupPath) -ine [System.IO.Path]::GetFullPath($recovery.Directory.FullName)) {
+                    Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_BACKUP_OUT_OF_SCOPE manifest=$($recovery.ManifestPath) backup=$recoveryBackupPath remediation=rollback backup bytes must reside directly in their transaction directory"
+                }
+            }
+        }
+        $script:SynapseDeploymentTransaction = [pscustomobject][ordered]@{
+            Armed = $true
+            Committed = $false
+            RollbackInProgress = $false
+            RolledBack = $false
+            Root = [string]$manifest.transaction_root
+            ManifestPath = $recovery.ManifestPath
+            ManifestSha256 = Get-SynapseFileSha256 -Path $recovery.ManifestPath
+            TaskName = [string]$manifest.task_name
+            Bind = [string]$manifest.bind
+            DbPath = [string]$manifest.db_path
+            TokenPath = [string]$manifest.token_path
+            PreviousTask = $manifest.previous_task
+            FileSnapshots = @($manifest.file_snapshots)
+        }
+        $recoveryResult = Invoke-SynapseDeploymentTransactionRollbackBestEffort -PrimaryFailure 'interrupted_prior_setup_recovery'
+        if (-not $recoveryResult.Ok) {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERY_FAILED manifest=$($recovery.ManifestPath) detail=$($recoveryResult.Detail) remediation=restart authority remains absent; repair only the exact snapshotted paths before retrying"
+        }
+        # Invoke-SynapseDeploymentTransactionRollbackBestEffort already wrote,
+        # hashed, and semantically re-read the terminal manifest. Do not
+        # reserialize the stale pre-rollback object here: that would discard its
+        # operational proof fields and invalidate the hash in recoveryResult.
+        [void](Remove-SynapseDeploymentTransactionArtifact -Path $recovery.Directory.FullName -ExpectedRoot $deploymentTransactionParent -ExpectedState 'rolled_back' -Reason 'recovered_deployment_transaction_cleanup')
+        $script:SynapseDeploymentTransaction = $null
+        Info "SYNAPSE_DEPLOYMENT_TRANSACTION_RECOVERED manifest=$($recovery.ManifestPath) detail=$($recoveryResult.Detail)"
+    }
+}
+
+# Arm one durable deployment transaction before the first runtime drain. Its
+# file/task snapshots are the rollback Source of Truth for candidate failure,
+# first install, same-binary restart, and every later pre-commit exception.
+$deploymentTransactionRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-transactions') -Purpose 'deployment'
+$script:SynapseDeploymentTransactionPreparingRoot = $deploymentTransactionRoot
+$transactionTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$transactionPreviousTask = [pscustomobject][ordered]@{
+    Present = [bool]($null -ne $transactionTask)
+    Xml = $null
+    XmlSha256 = $null
+    Execute = $null
+    Arguments = $null
+    WorkingDirectory = $null
+    Enabled = $false
+    WasRunning = $false
+    NativePreboundBootstrap = $false
+}
+if ($transactionTask) {
+    $transactionTaskActions = @($transactionTask.Actions)
+    if ($transactionTaskActions.Count -ne 1) {
+        Die "SYNAPSE_DEPLOYMENT_TRANSACTION_TASK_ACTION_COUNT_INVALID task=$TaskName count=$($transactionTaskActions.Count) remediation=setup will not drain a task definition it cannot snapshot and restore exactly"
+    }
+    $transactionTaskXml = [string](Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop)
+    $transactionTaskXmlWrite = Write-SynapseAtomicUtf8TextFile -Path (Join-Path $deploymentTransactionRoot 'previous-task.xml') -Content $transactionTaskXml -Purpose 'deployment_transaction_task_xml'
+    $transactionTaskAction = $transactionTaskActions[0]
+    $transactionExpectedBootstrapPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))
+    $transactionExpectedPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $transactionExpectedSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
+    $transactionExpectedBootstrapArguments = Get-SynapseSupervisorBootstrapTaskArgumentText `
+        -PowerShellPath $transactionExpectedPowerShellPath `
+        -SupervisorPath $transactionExpectedSupervisorPath `
+        -WorkingDirectory $RuntimeBinDir `
+        -LogPath (Join-Path $LogDir 'daemon-supervisor-bootstrap.log')
+    $transactionActionPath = try { [System.IO.Path]::GetFullPath([string]$transactionTaskAction.Execute) } catch { '' }
+    $transactionPreviousTask.Xml = $transactionTaskXml
+    $transactionPreviousTask.XmlSha256 = $transactionTaskXmlWrite.sha256
+    $transactionPreviousTask.Execute = [string]$transactionTaskAction.Execute
+    $transactionPreviousTask.Arguments = [string]$transactionTaskAction.Arguments
+    $transactionPreviousTask.WorkingDirectory = [string]$transactionTaskAction.WorkingDirectory
+    $transactionPreviousTask.Enabled = ([string]$transactionTask.State -ne 'Disabled')
+    $transactionPreviousTask.WasRunning = ([string]$transactionTask.State -eq 'Running')
+    $transactionPreviousTask.NativePreboundBootstrap = (
+        $transactionActionPath -ieq $transactionExpectedBootstrapPath -and
+        [string]$transactionTaskAction.Arguments -ceq $transactionExpectedBootstrapArguments -and
+        [System.IO.Path]::GetFullPath([string]$transactionTaskAction.WorkingDirectory) -ieq [System.IO.Path]::GetFullPath($RuntimeBinDir)
+    )
+}
+$transactionManagedPaths = @(
+    $ExePath,
+    $ChromeNativeHostExePath,
+    $CalyxConfigPath,
+    (Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'),
+    (Join-Path $LogDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'),
+    (Join-Path (Split-Path -Parent $ExePath) 'onnxruntime_providers_cuda.dll'),
+    (Join-Path (Split-Path -Parent $ExePath) 'synapse-fsv-toast-history.exe'),
+    (Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir)
+)
+$transactionManagedPaths += @($candidateRuntimeFiles | ForEach-Object { Join-Path (Split-Path -Parent $ExePath) $_.Name })
+$transactionCanonicalPaths = @($transactionManagedPaths | ForEach-Object { [System.IO.Path]::GetFullPath([string]$_) } | Sort-Object -Unique)
+$transactionFileSnapshots = @()
+$transactionFileIndex = 0
+foreach ($transactionPath in $transactionCanonicalPaths) {
+    $transactionFileIndex++
+    $transactionExists = Test-Path -LiteralPath $transactionPath
+    if ($transactionExists -and -not (Test-Path -LiteralPath $transactionPath -PathType Leaf)) {
+        Die "SYNAPSE_DEPLOYMENT_TRANSACTION_SNAPSHOT_NOT_FILE path=$transactionPath remediation=setup refuses to drain or mutate a generation containing a non-file managed object"
+    }
+    $transactionSha256 = $null
+    $transactionBackupPath = $null
+    if ($transactionExists) {
+        $transactionItem = Get-Item -LiteralPath $transactionPath -Force -ErrorAction Stop
+        if ($transactionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_SNAPSHOT_REPARSE_POINT path=$transactionPath attributes=$($transactionItem.Attributes) remediation=setup will not follow a managed-path reparse point during snapshot"
+        }
+        $transactionSha256 = Get-SynapseFileSha256 -Path $transactionPath
+        $transactionBackupPath = Join-Path $deploymentTransactionRoot ('file-{0:D4}.bin' -f $transactionFileIndex)
+        Copy-Item -LiteralPath $transactionPath -Destination $transactionBackupPath -ErrorAction Stop
+        $transactionBackupStream = [System.IO.File]::Open($transactionBackupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try { $transactionBackupStream.Flush($true) } finally { $transactionBackupStream.Dispose() }
+        $transactionBackupSha256 = Get-SynapseFileSha256 -Path $transactionBackupPath
+        if ($transactionBackupSha256 -ine $transactionSha256) {
+            Die "SYNAPSE_DEPLOYMENT_TRANSACTION_BACKUP_HASH_MISMATCH path=$transactionPath backup=$transactionBackupPath expected_sha256=$transactionSha256 actual_sha256=$transactionBackupSha256 remediation=refuse drain because the durable rollback copy differs from the prior Source of Truth"
+        }
+    }
+    $transactionFileSnapshots += [pscustomobject][ordered]@{
+        Path = $transactionPath
+        Existed = [bool]$transactionExists
+        Sha256 = $transactionSha256
+        BackupPath = $transactionBackupPath
+    }
+}
+$transactionManifest = [ordered]@{
+    schema = 'synapse_deployment_transaction/v1'
+    state = 'armed'
+    invocation_id = $script:SynapseSetupInvocationId
+    armed_at_utc = [DateTime]::UtcNow.ToString('o')
+    task_name = $TaskName
+    bind = $Bind
+    db_path = [System.IO.Path]::GetFullPath($DbPath)
+    token_path = [System.IO.Path]::GetFullPath($TokenPath)
+    transaction_root = $deploymentTransactionRoot
+    previous_task = $transactionPreviousTask
+    file_snapshots = $transactionFileSnapshots
+}
+$transactionManifestWrite = Write-SynapseAtomicUtf8TextFile -Path (Join-Path $deploymentTransactionRoot 'transaction.json') -Content ($transactionManifest | ConvertTo-Json -Depth 10) -Purpose 'deployment_transaction_manifest'
+$script:SynapseDeploymentTransaction = [pscustomobject][ordered]@{
+    Armed = $true
+    Committed = $false
+    RollbackInProgress = $false
+    RolledBack = $false
+    Root = $deploymentTransactionRoot
+    ManifestPath = $transactionManifestWrite.path
+    ManifestSha256 = $transactionManifestWrite.sha256
+    TaskName = $TaskName
+    Bind = $Bind
+    DbPath = $DbPath
+    TokenPath = $TokenPath
+    PreviousTask = $transactionPreviousTask
+    FileSnapshots = $transactionFileSnapshots
+}
+$script:SynapseDeploymentTransactionPreparingRoot = $null
+Info "SYNAPSE_DEPLOYMENT_TRANSACTION_ARMED root=$deploymentTransactionRoot manifest=$($transactionManifestWrite.path) manifest_sha256=$($transactionManifestWrite.sha256) task_present=$($transactionPreviousTask.Present) task_state=$(if ($transactionTask) { $transactionTask.State } else { '<absent>' }) file_count=$($transactionFileSnapshots.Count)"
+
+$script:SynapseCandidatePreflightDrainedLive = $false
+$preCandidateListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+$preCandidateProcesses = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+if ($preCandidateListeners.Count -gt 0 -or $preCandidateProcesses.Count -gt 0) {
+    $preCandidateDrainReason = 'deploy'
+    $preCandidateSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
+    Assert-SynapseRestartAllowed -Reason $preCandidateDrainReason -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
+    $preCandidateTaskIdentity = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $preCandidateSupervisorPath -Reason 'pre_candidate_no_overlap'
+    $script:SynapseDeployPriorTaskResumeAllowed = [bool]$preCandidateTaskIdentity.SynapseNativeBootstrapAction
+    if ($script:SynapseDeployPriorTaskResumeAllowed) {
+        if (-not (Test-Path -LiteralPath $preCandidateSupervisorPath -PathType Leaf)) {
+            Die "SYNAPSE_PRE_CANDIDATE_PRIOR_SUPERVISOR_MISSING path=$preCandidateSupervisorPath remediation=the bounded prior task cannot be drained until its exact supervisor/config generation is rollback-verifiable"
+        }
+        $preCandidateConfigAssignments = @{}
+        $preCandidateConfigPattern = '^\$(?<name>ExpectedCalyxConfigPath|ExpectedCalyxConfigSha256)\s*=\s*''(?<value>(?:''''|[^''])*)''\s*$'
+        foreach ($preCandidateSupervisorLine in @(Get-Content -LiteralPath $preCandidateSupervisorPath -ErrorAction Stop)) {
+            if ($preCandidateSupervisorLine -match $preCandidateConfigPattern) {
+                if ($preCandidateConfigAssignments.ContainsKey($Matches.name)) {
+                    Die "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_ASSIGNMENT_DUPLICATE supervisor=$preCandidateSupervisorPath assignment=$($Matches.name) remediation=repair the ambiguous prior generation before drain"
+                }
+                $preCandidateConfigAssignments[$Matches.name] = $Matches.value.Replace("''", "'")
+            }
+        }
+        $preCandidatePriorConfigPath = [string]$preCandidateConfigAssignments.ExpectedCalyxConfigPath
+        $preCandidatePriorConfigSha256 = [string]$preCandidateConfigAssignments.ExpectedCalyxConfigSha256
+        if ([string]::IsNullOrWhiteSpace($preCandidatePriorConfigPath) -or $preCandidatePriorConfigSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            Die "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_IDENTITY_MISSING supervisor=$preCandidateSupervisorPath remediation=the exact prior pinned Calyx config path/SHA must be readable before drain"
+        }
+        $preCandidatePriorConfigPath = [System.IO.Path]::GetFullPath($preCandidatePriorConfigPath)
+        if (-not (Test-Path -LiteralPath $preCandidatePriorConfigPath -PathType Leaf)) {
+            Die "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_MISSING path=$preCandidatePriorConfigPath expected_sha256=$preCandidatePriorConfigSha256 remediation=restore the exact immutable prior config before drain"
+        }
+        $preCandidatePriorConfigItem = Get-Item -LiteralPath $preCandidatePriorConfigPath -Force -ErrorAction Stop
+        if ($preCandidatePriorConfigItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Die "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_REPARSE_POINT path=$preCandidatePriorConfigPath attributes=$($preCandidatePriorConfigItem.Attributes) remediation=the rollback dependency must be a regular file"
+        }
+        $preCandidatePriorConfigActualSha256 = Get-SynapseFileSha256 -Path $preCandidatePriorConfigPath
+        if ($preCandidatePriorConfigActualSha256 -ine $preCandidatePriorConfigSha256) {
+            Die "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_HASH_MISMATCH path=$preCandidatePriorConfigPath expected_sha256=$preCandidatePriorConfigSha256 actual_sha256=$preCandidatePriorConfigActualSha256 remediation=repair the prior supervisor/config generation before drain"
+        }
+        Info "SYNAPSE_PRE_CANDIDATE_PRIOR_CONFIG_VERIFIED supervisor=$preCandidateSupervisorPath config=$preCandidatePriorConfigPath sha256=$preCandidatePriorConfigActualSha256"
+    }
+    if ($ForceRestart) {
+        $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason $preCandidateDrainReason
+    }
+    $preCandidateDrain = Invoke-SynapseDaemonRevokedDrain `
+        -Reason $preCandidateDrainReason `
+        -TaskName $TaskName `
+        -RuntimeBinDir $RuntimeBinDir `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -TokenPath $TokenPath `
+        -LogDir $LogDir `
+        -ForceRestart:$ForceRestart `
+        -EscalateAfterGracefulTimeout `
+        -AllowParkEscalation `
+        -TimeoutSeconds 120
+    Stop-SynapseMcpProcessesForInstallHandoff `
+        -Reason $preCandidateDrainReason `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -TokenPath $TokenPath `
+        -LogDir $LogDir `
+        -StopRequestPath $preCandidateDrain.StopRequestPath `
+        -SupervisorPath $preCandidateDrain.SupervisorPath `
+        -ForceRestart:$ForceRestart `
+        -TimeoutSeconds 300
+    $script:SynapseChromeBridgeMaintenancePausePrepared = $false
+    $script:SynapseChromeBridgeMaintenancePausePreparedBind = $null
+    $script:SynapseChromeBridgeMaintenancePausePreparedReason = $null
+    $script:SynapseChromeBridgeMaintenancePausePreparedResult = $null
+    Assert-SynapseInstallPathUnlocked -Path $ExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
+    $remainingPreCandidateListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    $remainingPreCandidateProcesses = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+    if ($remainingPreCandidateListeners.Count -ne 0 -or $remainingPreCandidateProcesses.Count -ne 0) {
+        Die "SYNAPSE_PRE_CANDIDATE_RUNTIME_OVERLAP_REMAINS bind=$Bind listener_count=$($remainingPreCandidateListeners.Count) process_count=$($remainingPreCandidateProcesses.Count) remediation=the prior owned runtime tree must be physically absent before the 950MB candidate Job is launched"
+    }
+    $script:SynapseCandidatePreflightDrainedLive = $true
+    Info "SYNAPSE_PRE_CANDIDATE_RUNTIME_DRAIN_VERIFIED bind=$Bind prior_daemon_count=$($preCandidateProcesses.Count) prior_listener_count=$($preCandidateListeners.Count) task=$TaskName prior_native_bootstrap=$($script:SynapseDeployPriorTaskResumeAllowed) effect=no_live_candidate_runtime_overlap"
+}
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -CandidateBootstrapPath $supervisorBootstrapInstallSourcePath -ExpectedCandidateBootstrapSha256 $supervisorBootstrapInstallSourceHash -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $script:SynapseCalyxConfigSha256 -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }
-Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
+if ($candidatePreflight.SupervisorBootstrapSha256 -ine $supervisorBootstrapInstallSourceHash) {
+    Die "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_HASH_MISMATCH expected_sha256=$supervisorBootstrapInstallSourceHash actual_sha256=$($candidatePreflight.SupervisorBootstrapSha256) path=$supervisorBootstrapInstallSourcePath remediation=candidate preflight must execute and preserve the exact native bootstrap generation that will be installed"
+}
+$validatedCalyxConfigSha256 = [string]$candidatePreflight.CalyxConfigSha256
+if ($validatedCalyxConfigSha256 -ine $script:SynapseCalyxConfigSha256) {
+    Die "SYNAPSE_CANDIDATE_CALYX_CONFIG_HASH_MISMATCH expected_sha256=$($script:SynapseCalyxConfigSha256) candidate_sha256=$validatedCalyxConfigSha256 path=$CalyxConfigPath remediation=refuse handoff because candidate validation did not preserve the locked config identity"
+}
+$handoffCalyxConfigSha256 = Get-SynapseFileSha256 -Path $CalyxConfigPath
+if ($handoffCalyxConfigSha256 -ine $validatedCalyxConfigSha256) {
+    Die "SYNAPSE_CALYX_CONFIG_CHANGED_AFTER_CANDIDATE path=$CalyxConfigPath expected_sha256=$validatedCalyxConfigSha256 actual_sha256=$handoffCalyxConfigSha256 remediation=stop the concurrent config writer and rerun setup; no live launcher will be generated from bytes the candidate did not validate"
+}
+Info "Candidate daemon accepted for handoff sha256=$installSourceHash supervisor_bootstrap_sha256=$($candidatePreflight.SupervisorBootstrapSha256) supervisor_bootstrap_log_sha256=$($candidatePreflight.SupervisorBootstrapLogSha256) calyx_config_sha256=$validatedCalyxConfigSha256 tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256) job_limit_flags=$($candidatePreflight.JobLimitFlagsHex) process_memory_limit_bytes=$($candidatePreflight.ProcessMemoryLimitBytes) job_memory_limit_bytes=$($candidatePreflight.JobMemoryLimitBytes) working_set_policy=measured_only daemon_cpu_rate=$($candidatePreflight.DaemonCpuRate) peak_process_memory_used_bytes=$($candidatePreflight.PeakProcessMemoryUsedBytes) peak_job_memory_used_bytes=$($candidatePreflight.PeakJobMemoryUsedBytes) parent_job_name=$($candidatePreflight.ParentJobName) parent_job_memory_limit_bytes=$($candidatePreflight.ParentJobMemoryLimitBytes) parent_cpu_rate=$($candidatePreflight.ParentCpuRate) parent_current_job_memory_used_bytes=$($candidatePreflight.ParentCurrentJobMemoryUsedBytes) parent_job_memory_headroom_bytes=$($candidatePreflight.ParentJobMemoryHeadroomBytes) parent_peak_process_memory_used_bytes=$($candidatePreflight.ParentPeakProcessMemoryUsedBytes) parent_peak_job_memory_used_bytes=$($candidatePreflight.ParentPeakJobMemoryUsedBytes) final_job_state_sha256=$($candidatePreflight.FinalJobStateSha256)"
 $installedBinaryAlreadyVerified = $false
 $liveDaemonArgumentDrift = $null
+$liveSupervisorResourceDrift = $null
 if ($SkipBuild) {
     $resolvedInstallSourcePath = [System.IO.Path]::GetFullPath($installSourcePath)
     $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
@@ -15531,7 +19959,11 @@ if ($SkipBuild) {
             -ExpectedSha256 $installSourceHash `
             -EnableAudio $EnableAudio `
             -AllowedPermissions $AllowedPermissions `
-            -CalyxConfigPath $CalyxConfigPath
+            -CalyxConfigPath $CalyxConfigPath `
+            -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
+        $liveSupervisorResourceDrift = Get-SynapseLiveSupervisorResourceContractDrift `
+            -LogDir $LogDir `
+            -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
         if ($liveDaemonArgumentDrift.HasDrift) {
             Info ("SkipBuild candidate is already installed, but live daemon launch arguments drifted; setup will perform a daemon handoff. path={0} sha256={1} desired_allowed_permissions={2} desired_calyx_config={3} drift={4}" -f `
                 $ExePath,
@@ -15539,8 +19971,10 @@ if ($SkipBuild) {
                 $liveDaemonArgumentDrift.DesiredAllowedPermissions,
                 $liveDaemonArgumentDrift.DesiredCalyxConfigPath,
                 ($liveDaemonArgumentDrift.Drifts | ConvertTo-Json -Depth 6 -Compress))
+        } elseif ($liveSupervisorResourceDrift.HasDrift) {
+            Info "SYNAPSE_LIVE_SUPERVISOR_RESOURCE_CONTRACT_DRIFT path=$($liveSupervisorResourceDrift.StatePath) drift=$($liveSupervisorResourceDrift.Drifts -join '; ') effect=setup will perform a verified repair handoff before adoption; legacy or unbounded supervisor state is not preserved"
         } else {
-            Info "SkipBuild candidate is already installed and live daemon launch arguments match; setup may let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash desired_allowed_permissions=$($liveDaemonArgumentDrift.DesiredAllowedPermissions) desired_calyx_config=$($liveDaemonArgumentDrift.DesiredCalyxConfigPath)"
+            Info "SkipBuild candidate is already installed and live daemon launch/resource contracts match; setup may preserve the verified bounded supervisor. path=$ExePath sha256=$installSourceHash desired_allowed_permissions=$($liveDaemonArgumentDrift.DesiredAllowedPermissions) desired_calyx_config=$($liveDaemonArgumentDrift.DesiredCalyxConfigPath) calyx_config_sha256=$validatedCalyxConfigSha256"
         }
     }
 }
@@ -15583,18 +20017,133 @@ if ($script:SynapsePostExitStartOnly) {
         (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgePreflight))
 }
 
+# Snapshot the complete prior restart generation in memory before any drain or
+# launcher rewrite. Binary-only rollback is not coherent: an older daemon may
+# not understand the new supervisor's CLI, and a legacy task may not have had a
+# native bootstrap at all. The rollback path restores these exact task/action
+# and launcher bytes together with the daemon/runtime companions.
+$previousDaemonTaskSnapshot = [pscustomobject]@{
+    Present = $false
+    Xml = $null
+    XmlSha256 = $null
+    Execute = $null
+    Arguments = $null
+    WorkingDirectory = $null
+    Enabled = $null
+    NativePreboundBootstrap = $false
+}
+$previousDaemonTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($previousDaemonTask) {
+    $previousSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
+    $verifiedPreviousTask = Assert-SynapseDaemonTaskRestartAuthorityIdentity `
+        -TaskName $TaskName `
+        -SupervisorPath $previousSupervisorPath `
+        -Reason 'pre_handoff_generation_snapshot'
+    $previousTaskActions = @($verifiedPreviousTask.Actions)
+    if ($previousTaskActions.Count -ne 1) {
+        Die "SYNAPSE_PREVIOUS_TASK_SNAPSHOT_ACTION_COUNT_INVALID task=$TaskName count=$($previousTaskActions.Count) remediation=rollback requires one exact setup-owned task action"
+    }
+    try {
+        $previousTaskXml = [string](Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop)
+    } catch {
+        Die "SYNAPSE_PREVIOUS_TASK_SNAPSHOT_EXPORT_FAILED task=$TaskName error=$($_.Exception.Message) remediation=setup will not mutate a prior generation it cannot restore coherently"
+    }
+    $previousTaskAction = $previousTaskActions[0]
+    $previousDaemonTaskSnapshot = [pscustomobject]@{
+        Present = $true
+        Xml = $previousTaskXml
+        XmlSha256 = Get-SynapseSha256Hex -Text $previousTaskXml
+        Execute = [string]$previousTaskAction.Execute
+        Arguments = [string]$previousTaskAction.Arguments
+        WorkingDirectory = [string]$previousTaskAction.WorkingDirectory
+        Enabled = ([string]$verifiedPreviousTask.State -ne 'Disabled')
+        NativePreboundBootstrap = [bool]$verifiedPreviousTask.SynapseNativeBootstrapAction
+    }
+    Info "SYNAPSE_PREVIOUS_TASK_GENERATION_SNAPSHOTTED task=$TaskName xml_sha256=$($previousDaemonTaskSnapshot.XmlSha256) execute=$($previousDaemonTaskSnapshot.Execute) arguments=$($previousDaemonTaskSnapshot.Arguments) working_directory=$($previousDaemonTaskSnapshot.WorkingDirectory) enabled=$($previousDaemonTaskSnapshot.Enabled)"
+}
+$previousDaemonLauncherSnapshots = @()
+$previousLauncherPaths = @(
+    (Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'),
+    (Join-Path $LogDir 'synapse-daemon-supervisor.ps1'),
+    (Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs')
+)
+foreach ($previousLauncherPath in @($previousLauncherPaths | Select-Object -Unique)) {
+    $resolvedPreviousLauncherPath = [System.IO.Path]::GetFullPath($previousLauncherPath)
+    $previousLauncherExists = Test-Path -LiteralPath $resolvedPreviousLauncherPath
+    if ($previousLauncherExists -and -not (Test-Path -LiteralPath $resolvedPreviousLauncherPath -PathType Leaf)) {
+        Die "SYNAPSE_PREVIOUS_LAUNCHER_SNAPSHOT_NOT_FILE path=$resolvedPreviousLauncherPath remediation=setup refuses to mutate a generation containing a non-file launcher object"
+    }
+    $previousLauncherBytes = if ($previousLauncherExists) { [System.IO.File]::ReadAllBytes($resolvedPreviousLauncherPath) } else { $null }
+    $previousLauncherHash = if ($previousLauncherExists) { Get-SynapseFileSha256 -Path $resolvedPreviousLauncherPath } else { $null }
+    $previousDaemonLauncherSnapshots += [pscustomobject]@{
+        Path = $resolvedPreviousLauncherPath
+        Existed = [bool]$previousLauncherExists
+        Bytes = $previousLauncherBytes
+        Sha256 = $previousLauncherHash
+    }
+}
+Info "SYNAPSE_PREVIOUS_LAUNCHER_GENERATION_SNAPSHOTTED files=$(@($previousDaemonLauncherSnapshots | ForEach-Object { '{0}:existed={1}:sha256={2}' -f $_.Path, $_.Existed, $(if ($_.Sha256) { $_.Sha256 } else { '<absent>' }) }) -join ',')"
+
+# A native prior task pins an immutable Calyx config identity inside its exact
+# supervisor bytes. Prove that dependency before the first drain: discovering
+# a missing/drifted prior config only after mutation would make rollback an
+# unverifiable promise rather than a coherent previous generation.
+if ([bool]$previousDaemonTaskSnapshot.NativePreboundBootstrap) {
+    $previousSupervisorPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'))
+    if (-not (Test-Path -LiteralPath $previousSupervisorPath -PathType Leaf)) {
+        Die "SYNAPSE_PREVIOUS_GENERATION_SUPERVISOR_MISSING path=$previousSupervisorPath remediation=the current native task cannot be drained until its exact supervisor/config generation is snapshot-verifiable"
+    }
+    $previousConfigAssignments = @{}
+    $previousConfigAssignmentPattern = '^\$(?<name>ExpectedCalyxConfigPath|ExpectedCalyxConfigSha256)\s*=\s*''(?<value>(?:''''|[^''])*)''\s*$'
+    foreach ($previousSupervisorLine in @(Get-Content -LiteralPath $previousSupervisorPath -ErrorAction Stop)) {
+        if ($previousSupervisorLine -match $previousConfigAssignmentPattern) {
+            if ($previousConfigAssignments.ContainsKey($Matches.name)) {
+                Die "SYNAPSE_PREVIOUS_GENERATION_CONFIG_ASSIGNMENT_DUPLICATE supervisor=$previousSupervisorPath assignment=$($Matches.name) remediation=repair the ambiguous prior supervisor before drain"
+            }
+            $previousConfigAssignments[$Matches.name] = $Matches.value.Replace("''", "'")
+        }
+    }
+    $previousConfigPath = [string]$previousConfigAssignments.ExpectedCalyxConfigPath
+    $previousConfigSha256 = [string]$previousConfigAssignments.ExpectedCalyxConfigSha256
+    if ([string]::IsNullOrWhiteSpace($previousConfigPath) -or $previousConfigSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        Die "SYNAPSE_PREVIOUS_GENERATION_CONFIG_IDENTITY_MISSING supervisor=$previousSupervisorPath config_path=$(if ($previousConfigPath) { $previousConfigPath } else { '<missing>' }) config_sha256=$(if ($previousConfigSha256) { $previousConfigSha256 } else { '<missing>' }) remediation=repair the prior supervisor's single pinned config identity before drain"
+    }
+    $previousConfigPath = [System.IO.Path]::GetFullPath($previousConfigPath)
+    if (-not (Test-Path -LiteralPath $previousConfigPath -PathType Leaf)) {
+        Die "SYNAPSE_PREVIOUS_GENERATION_CONFIG_MISSING path=$previousConfigPath expected_sha256=$previousConfigSha256 remediation=restore the exact prior immutable config before drain"
+    }
+    $previousConfigItem = Get-Item -LiteralPath $previousConfigPath -Force -ErrorAction Stop
+    if ($previousConfigItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Die "SYNAPSE_PREVIOUS_GENERATION_CONFIG_REPARSE_POINT path=$previousConfigPath attributes=$($previousConfigItem.Attributes) remediation=the rollback dependency must be a regular non-reparse file"
+    }
+    $previousConfigActualSha256 = Get-SynapseFileSha256 -Path $previousConfigPath
+    if ($previousConfigActualSha256 -ine $previousConfigSha256) {
+        Die "SYNAPSE_PREVIOUS_GENERATION_CONFIG_HASH_MISMATCH path=$previousConfigPath expected_sha256=$previousConfigSha256 actual_sha256=$previousConfigActualSha256 remediation=repair the prior supervisor/config generation before drain"
+    }
+    $previousDaemonTaskSnapshot | Add-Member -NotePropertyName CalyxConfigPath -NotePropertyValue $previousConfigPath -Force
+    $previousDaemonTaskSnapshot | Add-Member -NotePropertyName CalyxConfigSha256 -NotePropertyValue $previousConfigActualSha256 -Force
+    Info "SYNAPSE_PREVIOUS_GENERATION_CONFIG_VERIFIED supervisor=$previousSupervisorPath config=$previousConfigPath sha256=$previousConfigActualSha256 phase=before_drain"
+}
+
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon when binary bytes or launch arguments changed
 # ---------------------------------------------------------------------------
 $liveDaemonHandoffRequired = (
+    [bool]$script:SynapseCandidatePreflightDrainedLive -or
     (-not $installedBinaryAlreadyVerified) -or
     ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift) -or
+    ($liveSupervisorResourceDrift -and $liveSupervisorResourceDrift.HasDrift) -or
     [bool]$ForceRestart
 )
 if ($ForceRestart -and $installedBinaryAlreadyVerified -and (-not ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift))) {
     Info "Explicit -ForceRestart requires a verified live daemon drain even though the installed binary and launch arguments are unchanged."
 }
-if (-not $liveDaemonHandoffRequired) {
+if ($script:SynapseCandidatePreflightDrainedLive) {
+    Step "Live daemon already transactionally drained before candidate preflight -> $ExePath"
+    Info "SYNAPSE_DEPLOY_DRAIN_REUSED phase=install_handoff bind=$Bind task=$TaskName effect=the candidate and prior live runtime never overlapped"
+} elseif (-not $liveDaemonHandoffRequired) {
     Step "Verified installed daemon binary without live drain -> $ExePath"
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
@@ -15789,9 +20338,7 @@ foreach ($companion in $candidateRuntimeFiles) {
     }
     Info "Installed ONNX Runtime companion verified path=$destination sha256=$runtimeReadback"
 }
-$ver = (& $ExePath --version) 2>&1
-Info "Installed binary reports: $ver"
-Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
+Info "Installed binary verified without an unbounded post-install execution path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash candidate_health_pid=$($candidatePreflight.HealthPid) candidate_tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256) candidate_parent_job_name=$($candidatePreflight.ParentJobName)"
 Remove-SynapseCurrentDaemonStagingArtifact
 
 $installDir = Split-Path -Parent $ExePath
@@ -15859,14 +20406,13 @@ if ($profileDeploy.BundledProfileCount -lt 1) {
 Info "Deployed $($profileDeploy.BundledProfileCount) bundled profiles from manifest $($profileDeploy.ManifestPath)."
 
 if ($script:SynapseBindPostExitContinuationRequired) {
-    # #2092: this branch hands off to a separate process and then Dies, so the
-    # deploy's durable restart-authority revocation must be released here and not
-    # left to the trap. The continuation reacquires everything it needs from
-    # scratch (it re-runs the whole deploy with -SkipBuild), and if it never runs
-    # at all, an enabled task with no stop-request still restores the daemon at
-    # the next logon. Nothing can start a daemon in the gap: the task trigger is
-    # AtLogOn and the supervisor is already parked.
-    Restore-SynapseDeployRestartAuthorityBestEffort -Reason 'post_exit_continuation_handoff'
+    # #2092: the protected dead-owner bind cannot become reusable until this
+    # process exits. Keep the deployment transaction armed, launch a continuation
+    # that waits for this parent, and then throw through the normal trap. The trap
+    # restores and proves the exact prior generation before this process exits;
+    # the child subsequently rebuilds from the exact source checkout and starts
+    # a fresh transaction. Never enable a mixed task/candidate generation here,
+    # and never let a -SkipBuild child validate bytes the rollback just restored.
     $continuation = Start-SynapsePostExitSetupContinuation `
         -Reason 'install_binary' `
         -Bind $Bind `
@@ -15884,7 +20430,7 @@ if ($script:SynapseBindPostExitContinuationRequired) {
         -CalyxConfigPath $CalyxConfigPath `
         -ActiveIssue $ActiveIssue `
         -DeadOwnerDetail $script:SynapseBindPostExitContinuationDetail
-    Die ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED reason=install_binary bind={0} child_pid={1} manifest={2} stdout={3} stderr={4} remediation=the verified daemon bytes and profiles were installed, but Windows kept the dead-owner listener unavailable until this setup process exits. A hidden continuation has been launched and will wait for parent_pid={5}, reacquire the maintenance lock, start the daemon through the normal setup path, and write its own stdout/stderr/readbacks. Inspect the continuation manifest/logs and final process/socket SoT before accepting repair." -f `
+    Die ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED reason=install_binary bind={0} child_pid={1} manifest={2} stdout={3} stderr={4} remediation=Windows kept the dead-owner listener unavailable until this setup process exits. The armed transaction will first restore and prove the prior generation; a hidden continuation then waits for parent_pid={5}, reacquires the maintenance lock, rebuilds the exact source checkout, and deploys through a fresh transaction. Inspect the continuation manifest/logs and final process/socket SoT before accepting repair." -f `
         $Bind,
         $continuation.ChildPid,
         $continuation.ManifestPath,
@@ -15910,11 +20456,8 @@ function Assert-SynapseAutostartLauncherIntegrity {
         [Parameter(Mandatory=$true)][string]$ExpectedLauncherPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$Phase,
-        # Adoption preserves a live daemon's restart authority and does not
-        # re-register the task, so a machine still on the pre-#1862 layout must
-        # not be blocked from installing -- the defect is reported loudly and
-        # repaired by the next handoff run. On the post-register path the task
-        # was just written by this script, so the layout is enforced strictly.
+        # Only repair/handoff ownership checks may accept a pre-bootstrap task.
+        # Live adoption and post-registration verification are always strict.
         [switch]$AllowLegacyLayout
     )
 
@@ -15926,47 +20469,85 @@ function Assert-SynapseAutostartLauncherIntegrity {
     if ($actions.Count -ne 1) {
         Die "SYNAPSE_AUTOSTART_TASK_ACTION_AMBIGUOUS task=$TaskName phase=$Phase action_count=$($actions.Count) remediation=the autostart task must have exactly one setup-owned action; inspect Task Scheduler"
     }
-    $arguments = [string]$actions[0].Arguments
-    $match = [regex]::Match($arguments, '"(?<path>[^"]+\.vbs)"')
-    if (-not $match.Success) {
-        Die "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task=$TaskName phase=$Phase arguments=$arguments remediation=the registered action does not name a quoted .vbs launcher; re-run setup to re-register the task"
+    $action = $actions[0]
+    $arguments = [string]$action.Arguments
+    $expectedSupervisor = [System.IO.Path]::GetFullPath($ExpectedLauncherPath)
+    $runtimeDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $expectedSupervisor)).TrimEnd('\')
+    $expectedBootstrap = Join-Path $runtimeDir 'synapse-supervisor-bootstrap.exe'
+    $expectedBootstrapLog = Join-Path ([System.IO.Path]::GetFullPath($LogDir)) 'daemon-supervisor-bootstrap.log'
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $actualExecute = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$action.Execute))
+    $actualWorkingDirectory = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$action.WorkingDirectory)).TrimEnd('\')
+    $bootstrapArguments = Get-SynapseSupervisorBootstrapTaskArgumentText `
+        -PowerShellPath $powerShellExe `
+        -SupervisorPath $expectedSupervisor `
+        -WorkingDirectory $runtimeDir `
+        -LogPath $expectedBootstrapLog
+    $directArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $expectedSupervisor
+    $isNativeBootstrap = ($actualExecute -ieq $expectedBootstrap -and
+        $arguments -ceq $bootstrapArguments -and
+        $actualWorkingDirectory -ieq $runtimeDir)
+    $isDirectSupervisor = ($actualExecute -ieq [System.IO.Path]::GetFullPath($powerShellExe) -and
+        $arguments -ceq $directArguments -and
+        $actualWorkingDirectory -ieq $runtimeDir)
+    $registeredLauncher = $null
+    if ($isNativeBootstrap) {
+        $registeredLauncher = $expectedBootstrap
+    } elseif ($AllowLegacyLayout -and $isDirectSupervisor) {
+        $registeredLauncher = $expectedSupervisor
+    } elseif ($AllowLegacyLayout) {
+        $legacyMatch = [regex]::Match($arguments, '"(?<path>[^"]+\.vbs)"')
+        if ($legacyMatch.Success) {
+            $registeredLauncher = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($legacyMatch.Groups['path'].Value))
+        }
     }
-    $registeredLauncher = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($match.Groups['path'].Value))
-    $expected = [System.IO.Path]::GetFullPath($ExpectedLauncherPath)
+    if ([string]::IsNullOrWhiteSpace($registeredLauncher)) {
+        Die "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task=$TaskName phase=$Phase execute=$actualExecute arguments=$arguments working_directory=$actualWorkingDirectory expected_execute=$expectedBootstrap expected_arguments=$bootstrapArguments expected_working_directory=$runtimeDir remediation=register the exact setup-built native prebound bootstrap; direct PowerShell and resident WScript actions are not bounded startup authority"
+    }
     $resolvedLogDir = [System.IO.Path]::GetFullPath($LogDir).TrimEnd('\')
     $launcherDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $registeredLauncher)).TrimEnd('\')
     $inLogDir = ($launcherDir -ieq $resolvedLogDir -or $launcherDir.StartsWith($resolvedLogDir + '\', [System.StringComparison]::OrdinalIgnoreCase))
-    $isLegacyLayout = ($registeredLauncher -ine $expected -and $inLogDir)
+    $isLegacyLayout = (-not $isNativeBootstrap)
 
     # Report the most specific defect. A registration that differs from what
     # setup owns is either the known pre-#1862 log-dir layout -- in which case
     # the useful message names that root cause -- or an unknown third-party
     # action, which is an ownership problem.
-    if ($registeredLauncher -ine $expected -and -not $isLegacyLayout) {
-        Die "SYNAPSE_AUTOSTART_LAUNCHER_PATH_MISMATCH task=$TaskName phase=$Phase registered=$registeredLauncher expected=$expected remediation=the registered task launches a different file than the one setup owns; re-run setup to re-register the task"
+    if ($registeredLauncher -ine $expectedBootstrap -and -not $isLegacyLayout) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_PATH_MISMATCH task=$TaskName phase=$Phase registered=$registeredLauncher expected=$expectedBootstrap remediation=the registered task launches a different file than the native bootstrap setup owns; re-run setup to re-register the task"
     }
     # A launcher that does not exist is the more urgent fact than where it lives:
     # autostart is dead right now, not merely fragile.
     if (-not (Test-Path -LiteralPath $registeredLauncher -PathType Leaf)) {
         Die "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task=$TaskName phase=$Phase task_state=$($task.State) registered_launcher=$registeredLauncher launcher_in_log_dir=$inLogDir remediation=the autostart task is registered and reports State=$($task.State) but its launcher file does not exist, so it can never start the daemon; re-run setup to regenerate the launcher"
     }
-    if ($inLogDir -and -not $AllowLegacyLayout) {
-        Die "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher expected=$expected log_dir=$resolvedLogDir remediation=the daemon launcher must not live inside the log directory, where routine log cleanup silently deletes it; re-run setup so the launcher is written to the runtime bin directory"
+    if (($inLogDir -or $isLegacyLayout) -and -not $AllowLegacyLayout) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher expected=$expectedBootstrap log_dir=$resolvedLogDir remediation=the native daemon bootstrap must live in the runtime bin directory, where log cleanup cannot delete it"
     }
     if ($inLogDir) {
         # Adoption path on a pre-#1862 machine: the defect is real and must be
         # visible, but blocking the install would leave it unfixable.
         Warn "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher log_dir=$resolvedLogDir effect=autostart still lives in the log directory and remains vulnerable to log cleanup; it is repaired the next time setup performs a daemon handoff (run with -ForceRestart to repair now)"
     }
+    if ($isNativeBootstrap -and -not (Test-Path -LiteralPath $expectedSupervisor -PathType Leaf)) {
+        Die "SYNAPSE_AUTOSTART_SUPERVISOR_MISSING task=$TaskName phase=$Phase path=$expectedSupervisor remediation=the native bootstrap exists but its exact managed supervisor payload is missing"
+    }
     $launcherHash = Get-SynapseFileSha256 -Path $registeredLauncher
     $launcherLength = (Get-Item -LiteralPath $registeredLauncher).Length
-    Info "SYNAPSE_AUTOSTART_LAUNCHER_VERIFIED task=$TaskName phase=$Phase task_state=$($task.State) launcher=$registeredLauncher length=$launcherLength sha256=$launcherHash launcher_dir=$launcherDir log_dir=$resolvedLogDir"
+    if ($isNativeBootstrap -and
+        -not [string]::IsNullOrWhiteSpace([string]$supervisorBootstrapInstallSourceHash) -and
+        $launcherHash -ine [string]$supervisorBootstrapInstallSourceHash) {
+        Die "SYNAPSE_AUTOSTART_BOOTSTRAP_HASH_MISMATCH task=$TaskName phase=$Phase path=$registeredLauncher expected_sha256=$supervisorBootstrapInstallSourceHash actual_sha256=$launcherHash remediation=the registered task target is not the exact candidate bootstrap generation"
+    }
+    Info "SYNAPSE_AUTOSTART_LAUNCHER_VERIFIED task=$TaskName phase=$Phase task_state=$($task.State) native_prebound_bootstrap=$isNativeBootstrap legacy_direct_powershell_supervisor=$isDirectSupervisor launcher=$registeredLauncher length=$launcherLength sha256=$launcherHash launcher_dir=$launcherDir supervisor=$expectedSupervisor arguments=$arguments working_directory=$actualWorkingDirectory log_dir=$resolvedLogDir"
     return [pscustomobject]@{
         TaskName = $TaskName
         TaskState = [string]$task.State
         LauncherPath = $registeredLauncher
         LauncherSha256 = $launcherHash
         LauncherLength = [int64]$launcherLength
+        NativePreboundBootstrap = [bool]$isNativeBootstrap
+        SupervisorPath = $expectedSupervisor
     }
 }
 
@@ -16043,15 +20624,25 @@ function Remove-SynapseLegacyEnsureDaemonSupervisor {
 # ---------------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $RuntimeBinDir | Out-Null
 $legacyLauncher = Join-Path $LogDir 'synapse-daemon-launch.cmd'
-# Launcher and supervisor are executable program artifacts, so they live in the
-# runtime bin directory. $launcherLog stays in $LogDir because it genuinely is a
-# log (#1862).
+# The native bootstrap and managed supervisor are executable program artifacts,
+# so they live in the runtime bin directory. `$hiddenLauncher` names only the
+# obsolete VBS path that generator/hygiene code must prove absent. Logs remain
+# in $LogDir (#1862).
 $hiddenLauncher = Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'
 $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
 $daemonSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
-$wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
-if (-not (Test-Path $wscriptExe)) {
-    Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
+$daemonSupervisorBootstrapPath = Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'
+$daemonSupervisorBootstrapLog = Join-Path $LogDir 'daemon-supervisor-bootstrap.log'
+$daemonPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $daemonPowerShellExe -PathType Leaf)) {
+    Die "SYNAPSE_HIDDEN_SUPERVISOR_POWERSHELL_MISSING path=$daemonPowerShellExe remediation=repair Windows PowerShell before registering the native prebound daemon supervisor"
+}
+if (-not (Test-Path -LiteralPath $daemonSupervisorBootstrapPath -PathType Leaf)) {
+    Die "SYNAPSE_SUPERVISOR_BOOTSTRAP_INSTALL_MISSING path=$daemonSupervisorBootstrapPath remediation=the verified runtime companion handoff must install the native resource-policy bootstrap before Task Scheduler registration"
+}
+$installedSupervisorBootstrapHash = Get-SynapseFileSha256 -Path $daemonSupervisorBootstrapPath
+if ($installedSupervisorBootstrapHash -ine $supervisorBootstrapInstallSourceHash) {
+    Die "SYNAPSE_SUPERVISOR_BOOTSTRAP_INSTALL_HASH_MISMATCH path=$daemonSupervisorBootstrapPath expected_sha256=$supervisorBootstrapInstallSourceHash actual_sha256=$installedSupervisorBootstrapHash remediation=the scheduled task will not run bootstrap bytes different from the candidate generation"
 }
 # #2083: a full deploy is an explicit "make the daemon live" instruction, so it
 # clears any durable stop-request left by a previous -Stop. Without this an
@@ -16063,23 +20654,30 @@ if (-not (Test-Path $wscriptExe)) {
 [void](Clear-SynapseDaemonSupervisorStopRequest -Path (Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir) -Reason 'setup_deploy')
 $deployTaskBeforeStart = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($deployTaskBeforeStart -and [string]$deployTaskBeforeStart.State -eq 'Disabled') {
-    Info "Synapse daemon scheduled task is Disabled before deploy start (a previous -Stop parked it); re-enabling task=$TaskName"
-    try {
-        Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
-    } catch {
-        Die "SYNAPSE_TASK_ENABLE_FAILED task=$TaskName reason=setup_deploy error=$($_.Exception.Message) remediation=a previous -Stop disabled the daemon task; setup cannot restore autostart while Enable-ScheduledTask fails"
+    if ($liveDaemonHandoffRequired) {
+        Info "Synapse daemon scheduled task remains Disabled before verified handoff task=$TaskName reason=the existing action may be legacy/unbounded and section 7 replaces it atomically; setup never re-enables known resource-contract drift"
+    } else {
+        $deployTaskIdentity = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'setup_deploy_enable'
+        if (-not $deployTaskIdentity -or -not [bool]$deployTaskIdentity.SynapseNativeBootstrapAction) {
+            Die "SYNAPSE_TASK_ENABLE_PREBOUND_BOOTSTRAP_MISSING task=$TaskName remediation=setup refuses to enable a disabled task unless its action is the exact native prebound bootstrap"
+        }
+        Info "Synapse daemon scheduled task is Disabled before deploy adoption (a previous -Stop parked it); re-enabling verified native bootstrap task=$TaskName"
+        try {
+            Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        } catch {
+            Die "SYNAPSE_TASK_ENABLE_FAILED task=$TaskName reason=setup_deploy error=$($_.Exception.Message) remediation=a previous -Stop disabled the native bootstrap task; setup cannot restore autostart while Enable-ScheduledTask fails"
+        }
+        $deployTaskEnabledReadback = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $deployTaskEnabledReadback -or [string]$deployTaskEnabledReadback.State -eq 'Disabled') {
+            Die "SYNAPSE_TASK_ENABLE_READBACK_FAILED task=$TaskName reason=setup_deploy state=$($deployTaskEnabledReadback.State) remediation=the native bootstrap task is still disabled after Enable-ScheduledTask"
+        }
+        Info "Synapse daemon scheduled task re-enabled before deploy adoption: task=$TaskName state=$($deployTaskEnabledReadback.State)"
     }
-    $deployTaskEnabledReadback = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $deployTaskEnabledReadback -or [string]$deployTaskEnabledReadback.State -eq 'Disabled') {
-        Die "SYNAPSE_TASK_ENABLE_READBACK_FAILED task=$TaskName reason=setup_deploy state=$($deployTaskEnabledReadback.State) remediation=the daemon task is still disabled after Enable-ScheduledTask"
-    }
-    Info "Synapse daemon scheduled task re-enabled before deploy start: task=$TaskName state=$($deployTaskEnabledReadback.State)"
 }
-# #2092: restart authority is now restored for real, so the trap / post-exit
-# handoff must stop trying to restore it. Everything after this point either
-# starts the daemon or adopts a live one; a failure from here on is not a failure
-# that stranded autostart.
-Clear-SynapseDeployRestartAuthorityRevocation
+# Restart authority is live, but the deployment transaction remains armed until
+# the final post-tools/post-Chrome health and kernel-resource readback commits.
+# Clearing trap ownership here would let a later failure preserve a mixed or
+# unverified generation.
 $deployAuthorityRestoreTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $deployAuthorityStopRequestPresent = Test-Path -LiteralPath (Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir) -PathType Leaf
 Info ("SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORE_COMPLETE reason=setup_deploy stop_request_present={0} task={1} task_state={2}" -f `
@@ -16091,7 +20689,7 @@ if (-not $liveDaemonHandoffRequired) {
     # Adoption preserves the running task, so its launcher must be proven intact
     # here too -- a Ready task with a deleted launcher would otherwise be adopted
     # as healthy and never start again after the next reboot (#1862).
-    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'adoption' -AllowLegacyLayout)
+    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $daemonSupervisorPath -LogDir $LogDir -Phase 'adoption')
     $liveAdoption = Assert-SynapseLiveDaemonAdoptionIdentity `
         -TaskName $TaskName `
         -HiddenLauncherPath $hiddenLauncher `
@@ -16105,17 +20703,28 @@ if (-not $liveDaemonHandoffRequired) {
         -MaintenanceLockPath $MaintenanceLockPath `
         -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
-        -CalyxConfigPath $CalyxConfigPath
-    Info ("SYNAPSE_LIVE_DAEMON_ADOPTION_VERIFIED task={0} task_state={1} task_definition_sha256={2} hidden_launcher_sha256={3} supervisor_sha256={4} supervisor_pid={5} daemon_pid={6} supervisor_state={7} daemon_arguments=[{8}] remediation=none; setup preserved the exact running task/supervisor/daemon instead of re-registering live restart authority" -f `
+        -CalyxConfigPath $CalyxConfigPath `
+        -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
+    Info ("SYNAPSE_LIVE_DAEMON_ADOPTION_VERIFIED task={0} task_state={1} task_definition_sha256={2} native_prebound_bootstrap={3} bootstrap_sha256={4} supervisor_sha256={5} supervisor_pid={6} daemon_pid={7} supervisor_state={8} daemon_arguments=[{9}] job_name={10} kernel_current_job_memory_used_bytes={11} kernel_job_memory_headroom_bytes={12} parent_job_name={13} parent_current_job_memory_used_bytes={14} parent_job_memory_headroom_bytes={15} parent_peak_job_memory_used_bytes={16} parent_cpu_rate={17} daemon_cpu_rate={18} remediation=none; setup preserved the exact running task/bootstrap/supervisor/daemon and re-opened both kernel Jobs instead of trusting mutable JSON" -f `
         $TaskName,
         $liveAdoption.TaskState,
         $liveAdoption.TaskDefinitionSha256,
-        $liveAdoption.HiddenLauncherSha256,
+        $liveAdoption.NativePreboundBootstrap,
+        $liveAdoption.BootstrapSha256,
         $liveAdoption.SupervisorSha256,
         $liveAdoption.SupervisorPid,
         $liveAdoption.DaemonPid,
         $liveAdoption.SupervisorState,
-        $liveAdoption.DaemonArgumentText)
+        $liveAdoption.DaemonArgumentText,
+        $liveAdoption.JobName,
+        $liveAdoption.CurrentJobMemoryUsedBytes,
+        $liveAdoption.JobMemoryHeadroomBytes,
+        $liveAdoption.ParentJobName,
+        $liveAdoption.ParentCurrentJobMemoryUsedBytes,
+        $liveAdoption.ParentJobMemoryHeadroomBytes,
+        $liveAdoption.ParentPeakJobMemoryUsedBytes,
+        $liveAdoption.ParentCpuRate,
+        $SynapseDaemonCpuRate)
     # Adoption keeps the task exactly as it was, so a host installed before the
     # priority invariant existed would never converge without this (#1910).
     Assert-SynapseDaemonTaskPriority -TaskName $TaskName -Phase 'adoption'
@@ -16136,9 +20745,15 @@ if (-not $liveDaemonHandoffRequired) {
         -MaintenanceLockPath $MaintenanceLockPath `
         -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
-        -CalyxConfigPath $CalyxConfigPath
+        -CalyxConfigPath $CalyxConfigPath `
+        -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
 
-    $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $RuntimeBinDir
+    $daemonSupervisorTaskArguments = Get-SynapseSupervisorBootstrapTaskArgumentText `
+        -PowerShellPath $daemonPowerShellExe `
+        -SupervisorPath $daemonSupervisorPath `
+        -WorkingDirectory $RuntimeBinDir `
+        -LogPath $daemonSupervisorBootstrapLog
+    $action  = New-ScheduledTaskAction -Execute $daemonSupervisorBootstrapPath -Argument $daemonSupervisorTaskArguments -WorkingDirectory $RuntimeBinDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -16157,7 +20772,7 @@ if (-not $liveDaemonHandoffRequired) {
     Assert-SynapseDaemonTaskPriority -TaskName $TaskName -Phase 'post_register'
     Start-ScheduledTask -TaskName $TaskName
     Info "Task registered and started."
-    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'post_register')
+    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $daemonSupervisorPath -LogDir $LogDir -Phase 'post_register')
     Remove-SynapseLegacyEnsureDaemonSupervisor -RuntimeBinDir $RuntimeBinDir -CanonicalSupervisorPath $daemonSupervisorPath
     Remove-SynapseLegacyLogDirLauncherArtifacts -LogDir $LogDir -RuntimeBinDir $RuntimeBinDir
 }
@@ -16206,7 +20821,16 @@ while ($true) {
         $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $healthTimeoutSec
         $lastHealthSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $h
         $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
-        if ($criticalReady.Ok) {
+        $allNonChromeReady = Test-SynapseHealthAllNonChromeSubsystemsReady -Health $h
+        if ($criticalReady.Ok -and $allNonChromeReady.Ok) {
+            $installedCpuOnly = Test-SynapseCpuOnlyRuntimeHealth -Health $h
+            if (-not $installedCpuOnly.Ok) {
+                $terminalDaemonIdentityFailure = $installedCpuOnly.Detail
+                $installHealthGateVerdict = 'cpu_only_resource_contract_mismatch'
+                $lastHealthError = $installedCpuOnly.Detail
+                Info "ERROR: $lastHealthError"
+                break
+            }
             $daemonIdentityReadback = Get-SynapseInstalledDaemonIdentityReadback `
                 -HealthPid ([int]$h.pid) `
                 -Bind $Bind `
@@ -16216,7 +20840,8 @@ while ($true) {
                 -ExpectedSha256 $installedHash `
                 -LogDir $LogDir `
                 -AllowedPermissions $AllowedPermissions `
-                -CalyxConfigPath $CalyxConfigPath
+                -CalyxConfigPath $CalyxConfigPath `
+                -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
             if (-not $daemonIdentityReadback.Ok) {
                 $terminalDaemonIdentityFailure = $daemonIdentityReadback.Detail
                 $installHealthGateVerdict = 'daemon_identity_mismatch'
@@ -16224,7 +20849,20 @@ while ($true) {
                 Info "ERROR: $lastHealthError"
                 break
             }
-            Info ("Daemon OK: pid={0} version={1} db={2} exe={3} sha256={4} supervisor_state={5} supervisor_child_pid={6} supervisor_settle_reads={7} supervisor_settle_wait_ms={8}" -f $h.pid, $h.version, $h.subsystems.storage.db_path, $daemonIdentityReadback.ExecutablePath, $daemonIdentityReadback.ExecutableSha256, $daemonIdentityReadback.SupervisorState, $daemonIdentityReadback.SupervisorChildPid, $daemonIdentityReadback.SupervisorSettleReads, $daemonIdentityReadback.SupervisorSettleWaitMs)
+            try {
+                $installedAcceleratorPolicy = Assert-SynapseNoExplicitGpuRuntimeHealth `
+                    -Health $h `
+                    -ProcessId ([int]$h.pid) `
+                    -Bind $Bind `
+                    -Phase 'installed_initial'
+            } catch {
+                $terminalDaemonIdentityFailure = $_.Exception.Message
+                $installHealthGateVerdict = 'accelerator_runtime_contract_mismatch'
+                $lastHealthError = $terminalDaemonIdentityFailure
+                Info "ERROR: $lastHealthError"
+                break
+            }
+            Info ("Daemon OK: pid={0} version={1} db={2} exe={3} sha256={4} supervisor_state={5} supervisor_child_pid={6} supervisor_settle_reads={7} supervisor_settle_wait_ms={8} job_name={9} kernel_current_job_memory_used_bytes={10} kernel_job_memory_headroom_bytes={11} parent_job_name={12} parent_kernel_current_job_memory_used_bytes={13} parent_kernel_job_memory_headroom_bytes={14} parent_kernel_peak_job_memory_used_bytes={15} parent_cpu_rate={16} daemon_cpu_rate={17} accelerator_policy_contract=[{18}] non_chrome_contract=[{19}]" -f $h.pid, $h.version, $h.subsystems.storage.db_path, $daemonIdentityReadback.ExecutablePath, $daemonIdentityReadback.ExecutableSha256, $daemonIdentityReadback.SupervisorState, $daemonIdentityReadback.SupervisorChildPid, $daemonIdentityReadback.SupervisorSettleReads, $daemonIdentityReadback.SupervisorSettleWaitMs, $daemonIdentityReadback.JobName, $daemonIdentityReadback.CurrentJobMemoryUsedBytes, $daemonIdentityReadback.JobMemoryHeadroomBytes, $daemonIdentityReadback.ParentJobName, $daemonIdentityReadback.ParentCurrentJobMemoryUsedBytes, $daemonIdentityReadback.ParentJobMemoryHeadroomBytes, $daemonIdentityReadback.ParentPeakJobMemoryUsedBytes, $daemonIdentityReadback.ParentCpuRate, $SynapseDaemonCpuRate, $installedAcceleratorPolicy.Detail, $allNonChromeReady.Detail)
             if ($ManualInstallHealthRollbackProbe) {
                 if ($ManualInstallHealthRollbackPauseMode -eq 'require_active_ack') {
                     $candidateChromeBridge = $h.subsystems.chrome_bridge
@@ -16255,13 +20893,13 @@ while ($true) {
                 break
             }
             if ($h.ok -ne $true) {
-                Info "WARN: daemon /health returned ok=false after install, but critical non-Chrome subsystems are ready; continuing to Chrome bridge repair/readback. subsystem_statuses=$lastHealthSubsystemStatuses"
+                Info "WARN: daemon /health returned ok=false after install, but every non-Chrome subsystem is non-error; continuing only to the explicit Chrome bridge repair/readback transaction. subsystem_statuses=$lastHealthSubsystemStatuses"
             }
             $healthPid = [int]$h.pid
             $ok = $true; break
         } else {
-            $lastHealthError = $criticalReady.Detail
-            Info "WARN: daemon /health responded but critical subsystems are not ready yet attempt=$installHealthAttempt detail=$($criticalReady.Detail) subsystem_statuses=$lastHealthSubsystemStatuses"
+            $lastHealthError = "critical=[$($criticalReady.Detail)] all_non_chrome=[$($allNonChromeReady.Detail)]"
+            Info "WARN: daemon /health responded but the full non-Chrome subsystem contract is not ready yet attempt=$installHealthAttempt detail=$lastHealthError subsystem_statuses=$lastHealthSubsystemStatuses"
         }
     } catch {
         $lastHealthError = $_.Exception.Message
@@ -16319,25 +20957,33 @@ if (-not $ok) {
     if ($backupPath -and (Test-Path -LiteralPath $backupPath) -and $oldInstalledHash) {
         Info "WARN: $failureDetail"
         Info "Attempting rollback to previous daemon binary backup=$backupPath sha256=$oldInstalledHash"
-        if ($ManualInstallHealthRollbackProbe) {
-            New-HiddenDaemonLauncher `
-                -OutputPath $hiddenLauncher `
-                -ExePath $ExePath `
-                -Bind $Bind `
-                -DbPath $DbPath `
-                -ProfilesDir $ProfilesDir `
-                -LogDir $LogDir `
-                -TokenPath $TokenPath `
-                -MaintenanceLockPath $MaintenanceLockPath `
-                -EnableAudio $EnableAudio `
-                -AllowedPermissions $AllowedPermissions `
-                -CalyxConfigPath $CalyxConfigPath
-            Info "Manual install-health rollback probe restored normal daemon launcher before rollback stop path=$hiddenLauncher"
-        }
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         }
         Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -AllowUnacknowledgedChromeBridgePauseForRollback -TimeoutSeconds 300
+        $rollbackSupervisorPark = Wait-SynapseDaemonSupervisorParked -SupervisorPath $daemonSupervisorPath -Reason 'install_health_failed_rollback' -TimeoutSeconds 30
+        if (-not $rollbackSupervisorPark.Parked) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_STILL_RUNNING path=$daemonSupervisorPath pids=$(@($rollbackSupervisorPark.Remaining | ForEach-Object { $_.ProcessId }) -join ',') original_failure=[$failureDetail] remediation=the native bootstrap Job must close and terminate its supervisor tree before prior-generation bytes are restored"
+        }
+        $rollbackBootstrapPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))
+        $rollbackBootstrapDeadline = (Get-Date).AddSeconds(30)
+        do {
+            $rollbackBootstrapProcesses = @(Get-CimInstance Win32_Process -Filter "Name='synapse-supervisor-bootstrap.exe'" -ErrorAction SilentlyContinue | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+                [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $rollbackBootstrapPath
+            })
+            if ($rollbackBootstrapProcesses.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $rollbackBootstrapDeadline)
+        if ($rollbackBootstrapProcesses.Count -ne 0) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_BOOTSTRAP_STILL_RUNNING path=$rollbackBootstrapPath pids=$(@($rollbackBootstrapProcesses | ForEach-Object { $_.ProcessId }) -join ',') original_failure=[$failureDetail] remediation=the exact task-owned native bootstrap must exit before its executable generation can be restored"
+        }
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_UNREGISTER_READBACK_FAILED task=$TaskName original_failure=[$failureDetail] remediation=the failed-generation task still owns restart authority; prior-generation files will not be restored under a live action"
+            }
+        }
         Copy-Item -LiteralPath $backupPath -Destination $ExePath -Force
         $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
         if ($rollbackHash -ne $oldInstalledHash) {
@@ -16372,20 +21018,169 @@ if (-not $ok) {
                 }
             }
         }
-        if ($ManualInstallHealthRollbackProbe) {
-            New-HiddenDaemonLauncher `
-                -OutputPath $hiddenLauncher `
-                -ExePath $ExePath `
-                -Bind $Bind `
-                -DbPath $DbPath `
-                -ProfilesDir $ProfilesDir `
-                -LogDir $LogDir `
-                -TokenPath $TokenPath `
-                -MaintenanceLockPath $MaintenanceLockPath `
-                -EnableAudio $EnableAudio `
-                -AllowedPermissions $AllowedPermissions `
-                -CalyxConfigPath $CalyxConfigPath
-            Info "Manual install-health rollback probe restored normal daemon launcher before rollback start path=$hiddenLauncher"
+
+        # Restore the prior launcher generation from the immutable in-memory
+        # snapshot. Regenerating it with the new setup logic is not rollback: an
+        # older daemon may not understand the new supervisor arguments, and a
+        # legacy task may depend on the VBS generation that this install retired.
+        # Each existing file is durably replaced from a same-directory unique
+        # temp, then independently re-hashed before any restart authority exists.
+        Ensure-SynapseAtomicFileType
+        foreach ($launcherSnapshot in $previousDaemonLauncherSnapshots) {
+            $launcherPath = [System.IO.Path]::GetFullPath([string]$launcherSnapshot.Path)
+            if ([bool]$launcherSnapshot.Existed) {
+                $launcherParent = Split-Path -Parent $launcherPath
+                $launcherParentItem = Get-Item -LiteralPath $launcherParent -Force -ErrorAction Stop
+                if (-not $launcherParentItem.PSIsContainer -or
+                    ($launcherParentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_PARENT_INVALID path=$launcherParent attributes=$($launcherParentItem.Attributes) original_failure=[$failureDetail] remediation=rollback will not restore executable authority through a directory reparse point"
+                }
+                if (Test-Path -LiteralPath $launcherPath) {
+                    $launcherItem = Get-Item -LiteralPath $launcherPath -Force -ErrorAction Stop
+                    if ($launcherItem.PSIsContainer -or
+                        ($launcherItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                        Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_DESTINATION_INVALID path=$launcherPath attributes=$($launcherItem.Attributes) original_failure=[$failureDetail] remediation=rollback refuses to overwrite a non-file or reparse-point launcher"
+                    }
+                }
+                $launcherTempPath = Join-Path $launcherParent (".{0}.rollback-{1}-{2}" -f ([System.IO.Path]::GetFileName($launcherPath)), $PID, ([Guid]::NewGuid().ToString('N')))
+                $launcherStream = $null
+                try {
+                    $launcherBytes = [byte[]]$launcherSnapshot.Bytes
+                    $launcherStream = [System.IO.FileStream]::new(
+                        $launcherTempPath,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None,
+                        4096,
+                        [System.IO.FileOptions]::WriteThrough)
+                    $launcherStream.Write($launcherBytes, 0, $launcherBytes.Length)
+                    $launcherStream.Flush($true)
+                    $launcherStream.Dispose()
+                    $launcherStream = $null
+                    [SynapseSetup.AtomicFile]::ReplaceWriteThrough($launcherTempPath, $launcherPath)
+                } catch {
+                    if ($null -ne $launcherStream) { $launcherStream.Dispose() }
+                    try { Remove-Item -LiteralPath $launcherTempPath -Force -ErrorAction SilentlyContinue } catch { }
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_RESTORE_FAILED path=$launcherPath expected_sha256=$($launcherSnapshot.Sha256) error=$($_.Exception.Message) original_failure=[$failureDetail] remediation=repair the exact runtime/log directory permissions and retry; no non-atomic launcher restore is permitted"
+                }
+                if (Test-Path -LiteralPath $launcherTempPath) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_TEMP_RETAINED path=$launcherTempPath destination=$launcherPath original_failure=[$failureDetail] remediation=repair atomic replacement semantics before restart authority is restored"
+                }
+                $launcherRollbackHash = Get-SynapseFileSha256 -Path $launcherPath
+                if ($launcherRollbackHash -ine [string]$launcherSnapshot.Sha256) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_HASH_MISMATCH path=$launcherPath expected_sha256=$($launcherSnapshot.Sha256) actual_sha256=$launcherRollbackHash original_failure=[$failureDetail] remediation=the restored launcher bytes differ from the pre-handoff Source of Truth; do not start the task"
+                }
+                Info "SYNAPSE_ROLLBACK_LAUNCHER_RESTORED path=$launcherPath sha256=$launcherRollbackHash"
+            } elseif (Test-Path -LiteralPath $launcherPath) {
+                $unexpectedLauncherItem = Get-Item -LiteralPath $launcherPath -Force -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf) -or
+                    ($unexpectedLauncherItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_REMOVE_IDENTITY_INVALID path=$launcherPath attributes=$($unexpectedLauncherItem.Attributes) original_failure=[$failureDetail] remediation=rollback refuses to remove an unexpected non-file or reparse-point object"
+                }
+                $unexpectedLauncherHash = Get-SynapseFileSha256 -Path $launcherPath
+                Remove-Item -LiteralPath $launcherPath -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $launcherPath) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_LAUNCHER_REMOVE_FAILED path=$launcherPath removed_sha256=$unexpectedLauncherHash original_failure=[$failureDetail] remediation=repair exact file permissions before retrying rollback"
+                }
+                Info "SYNAPSE_ROLLBACK_LAUNCHER_ABSENCE_RESTORED path=$launcherPath removed_sha256=$unexpectedLauncherHash"
+            }
+        }
+
+        if ([bool]$previousDaemonTaskSnapshot.NativePreboundBootstrap) {
+            $restoredSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
+            if (-not (Test-Path -LiteralPath $restoredSupervisorPath -PathType Leaf)) {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_MISSING path=$restoredSupervisorPath original_failure=[$failureDetail] remediation=a native prior task is not coherent without its exact restored supervisor payload"
+            }
+            $priorConfigAssignments = @{}
+            $priorConfigAssignmentPattern = '^\$(?<name>ExpectedCalyxConfigPath|ExpectedCalyxConfigSha256)\s*=\s*''(?<value>(?:''''|[^''])*)''\s*$'
+            foreach ($priorSupervisorLine in @(Get-Content -LiteralPath $restoredSupervisorPath -ErrorAction Stop)) {
+                if ($priorSupervisorLine -match $priorConfigAssignmentPattern) {
+                    if ($priorConfigAssignments.ContainsKey($Matches.name)) {
+                        Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_ASSIGNMENT_DUPLICATE path=$restoredSupervisorPath assignment=$($Matches.name) original_failure=[$failureDetail] remediation=the restored prior supervisor is structurally ambiguous and must remain stopped"
+                    }
+                    $priorConfigAssignments[$Matches.name] = $Matches.value.Replace("''", "'")
+                }
+            }
+            $priorConfigPath = [string]$priorConfigAssignments.ExpectedCalyxConfigPath
+            $priorConfigSha256 = [string]$priorConfigAssignments.ExpectedCalyxConfigSha256
+            if ([string]::IsNullOrWhiteSpace($priorConfigPath) -or
+                $priorConfigSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_IDENTITY_MISSING path=$restoredSupervisorPath config_path=$(if ($priorConfigPath) { $priorConfigPath } else { '<missing>' }) config_sha256=$(if ($priorConfigSha256) { $priorConfigSha256 } else { '<missing>' }) original_failure=[$failureDetail] remediation=only a supervisor with one exact pinned Calyx config path/SHA may be restarted"
+            }
+            try {
+                $resolvedPriorConfigPath = [System.IO.Path]::GetFullPath($priorConfigPath)
+            } catch {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_PATH_INVALID path=$priorConfigPath error=$($_.Exception.Message) original_failure=[$failureDetail] remediation=the restored prior supervisor config path is not a concrete local filesystem identity"
+            }
+            if (-not (Test-Path -LiteralPath $resolvedPriorConfigPath -PathType Leaf)) {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_MISSING path=$resolvedPriorConfigPath expected_sha256=$priorConfigSha256 original_failure=[$failureDetail] remediation=restore the exact prior config bytes before native restart authority is enabled"
+            }
+            $priorConfigItem = Get-Item -LiteralPath $resolvedPriorConfigPath -Force -ErrorAction Stop
+            if ($priorConfigItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_REPARSE_POINT path=$resolvedPriorConfigPath attributes=$($priorConfigItem.Attributes) original_failure=[$failureDetail] remediation=the prior supervisor config must be a regular non-reparse file"
+            }
+            $priorConfigActualSha256 = Get-SynapseFileSha256 -Path $resolvedPriorConfigPath
+            if ($priorConfigActualSha256 -ine $priorConfigSha256) {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_SUPERVISOR_CONFIG_HASH_MISMATCH path=$resolvedPriorConfigPath expected_sha256=$priorConfigSha256 actual_sha256=$priorConfigActualSha256 original_failure=[$failureDetail] remediation=the restored supervisor and its pinned config are not one coherent prior generation; leave task authority absent"
+            }
+            Info "SYNAPSE_ROLLBACK_SUPERVISOR_CONFIG_GENERATION_VERIFIED supervisor=$restoredSupervisorPath config=$resolvedPriorConfigPath sha256=$priorConfigActualSha256"
+        }
+
+        # The task definition is part of the same generation as its launcher
+        # bytes. Restore the exported XML only after every file readback matches,
+        # then independently prove Task Scheduler materialized the exact action.
+        if (-not [bool]$previousDaemonTaskSnapshot.Present) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK_NO_PRIOR_TASK candidate_sha256=$installSourceHash rollback_sha256=$rollbackHash original_failure=[$failureDetail] remediation=the prior binary and launcher-file absence were restored, but there was no prior Scheduled Task to restart; diagnose the candidate failure before installing again"
+        }
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Xml ([string]$previousDaemonTaskSnapshot.Xml) -Force -ErrorAction Stop | Out-Null
+        } catch {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_RESTORE_FAILED task=$TaskName xml_sha256=$($previousDaemonTaskSnapshot.XmlSha256) error=$($_.Exception.Message) original_failure=[$failureDetail] remediation=repair Task Scheduler registration access; prior binary/launcher bytes are restored but restart authority remains absent"
+        }
+        $restoredTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $restoredTask) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_READBACK_MISSING task=$TaskName xml_sha256=$($previousDaemonTaskSnapshot.XmlSha256) original_failure=[$failureDetail] remediation=Task Scheduler did not persist the restored prior-generation definition"
+        }
+        $restoredTaskActions = @($restoredTask.Actions)
+        if ($restoredTaskActions.Count -ne 1 -or
+            [string]$restoredTaskActions[0].Execute -cne [string]$previousDaemonTaskSnapshot.Execute -or
+            [string]$restoredTaskActions[0].Arguments -cne [string]$previousDaemonTaskSnapshot.Arguments -or
+            [string]$restoredTaskActions[0].WorkingDirectory -cne [string]$previousDaemonTaskSnapshot.WorkingDirectory) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_ACTION_MISMATCH task=$TaskName expected_execute=$($previousDaemonTaskSnapshot.Execute) actual_execute=$($restoredTaskActions[0].Execute) expected_arguments=$($previousDaemonTaskSnapshot.Arguments) actual_arguments=$($restoredTaskActions[0].Arguments) expected_working_directory=$($previousDaemonTaskSnapshot.WorkingDirectory) actual_working_directory=$($restoredTaskActions[0].WorkingDirectory) original_failure=[$failureDetail] remediation=the restored Task Scheduler Source of Truth is not the snapshotted prior action; leave it stopped and inspect the task definition"
+        }
+        try {
+            $restoredTaskXml = [string](Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop)
+        } catch {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_EXPORT_READBACK_FAILED task=$TaskName error=$($_.Exception.Message) original_failure=[$failureDetail] remediation=rollback cannot prove the registered prior task definition"
+        }
+        $restoredTaskXmlHash = Get-SynapseSha256Hex -Text $restoredTaskXml
+        if ($restoredTaskXmlHash -ine [string]$previousDaemonTaskSnapshot.XmlSha256) {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_XML_MISMATCH task=$TaskName expected_sha256=$($previousDaemonTaskSnapshot.XmlSha256) actual_sha256=$restoredTaskXmlHash original_failure=[$failureDetail] remediation=Task Scheduler did not round-trip the exact prior-generation XML; leave the task stopped and inspect its definition"
+        }
+        $restoredTaskIdentity = Assert-SynapseDaemonTaskRestartAuthorityIdentity `
+            -TaskName $TaskName `
+            -SupervisorPath (Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1') `
+            -Reason 'install_health_failed_rollback_generation_restore'
+        Info "SYNAPSE_ROLLBACK_TASK_GENERATION_RESTORED task=$TaskName xml_sha256=$restoredTaskXmlHash execute=$($restoredTaskActions[0].Execute) arguments=$($restoredTaskActions[0].Arguments) working_directory=$($restoredTaskActions[0].WorkingDirectory) native_prebound_bootstrap=$([bool]$restoredTaskIdentity.SynapseNativeBootstrapAction) prior_enabled=$($previousDaemonTaskSnapshot.Enabled)"
+
+        # Never relaunch a pre-bootstrap or previously disabled generation merely
+        # to make rollback look healthy. Its exact state is restored and parked;
+        # only a previously enabled native prebound generation may regain live
+        # restart authority automatically.
+        if (-not [bool]$previousDaemonTaskSnapshot.NativePreboundBootstrap -or
+            -not [bool]$restoredTaskIdentity.SynapseNativeBootstrapAction -or
+            -not [bool]$previousDaemonTaskSnapshot.Enabled) {
+            Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+            $parkedRollbackTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if (-not $parkedRollbackTask -or [string]$parkedRollbackTask.State -ne 'Disabled') {
+                Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_PARK_READBACK_FAILED task=$TaskName state=$($parkedRollbackTask.State) original_failure=[$failureDetail] remediation=the restored unsafe/inactive prior generation could not be durably disabled"
+            }
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK_PRIOR_TASK_PARKED candidate_sha256=$installSourceHash rollback_sha256=$rollbackHash task=$TaskName task_xml_sha256=$restoredTaskXmlHash native_prebound_bootstrap=$([bool]$restoredTaskIdentity.SynapseNativeBootstrapAction) prior_enabled=$($previousDaemonTaskSnapshot.Enabled) original_failure=[$failureDetail] remediation=the exact prior binary, launcher bytes, and task XML were restored, but setup deliberately did not launch a legacy/unbounded or previously disabled generation; diagnose the candidate failure before retrying"
+        }
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        $rollbackTaskEnabledReadback = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $rollbackTaskEnabledReadback -or [string]$rollbackTaskEnabledReadback.State -eq 'Disabled') {
+            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_TASK_ENABLE_READBACK_FAILED task=$TaskName state=$($rollbackTaskEnabledReadback.State) original_failure=[$failureDetail] remediation=the exact restored native generation did not regain restart authority"
         }
         Start-ScheduledTask -TaskName $TaskName
         $rollbackOk = $false
@@ -16512,13 +21307,141 @@ if (-not $ok) {
     Die $failureDetail
 }
 
+# The live candidate has now proven that its compiled feature set and selected
+# execution providers are CPU-only. Retire the exact setup-owned CUDA provider
+# from older installations only after that handoff is committed, so a failed
+# candidate can still use the normal coherent runtime rollback above.
+$retiredCudaProviderPath = Join-Path (Split-Path -Parent $ExePath) 'onnxruntime_providers_cuda.dll'
+if (Test-Path -LiteralPath $retiredCudaProviderPath) {
+    if (-not (Test-Path -LiteralPath $retiredCudaProviderPath -PathType Leaf)) {
+        Die "SYNAPSE_RETIRED_CUDA_PROVIDER_TYPE_INVALID path=$retiredCudaProviderPath remediation=inspect the exact runtime entry; setup only removes the known regular CUDA provider file"
+    }
+    $retiredCudaProviderItem = Get-Item -LiteralPath $retiredCudaProviderPath -Force -ErrorAction Stop
+    if ($retiredCudaProviderItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Die "SYNAPSE_RETIRED_CUDA_PROVIDER_REPARSE_POINT path=$retiredCudaProviderPath attributes=$($retiredCudaProviderItem.Attributes) remediation=remove the unexpected link manually only after proving its target; setup will not follow it"
+    }
+    $retiredCudaProviderSha256 = Get-SynapseFileSha256 -Path $retiredCudaProviderPath
+    Remove-Item -LiteralPath $retiredCudaProviderPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $retiredCudaProviderPath) {
+        Die "SYNAPSE_RETIRED_CUDA_PROVIDER_REMOVE_READBACK_FAILED path=$retiredCudaProviderPath sha256=$retiredCudaProviderSha256 remediation=stop the exact process locking the stale provider and rerun setup; the installed runtime is not accepted while CUDA provider bytes remain"
+    }
+    Info "Retired installed CUDA execution provider path=$retiredCudaProviderPath removed_sha256=$retiredCudaProviderSha256 readback=absent cpu_only_runtime=true"
+} else {
+    Info "Installed CUDA execution provider readback path=$retiredCudaProviderPath state=absent cpu_only_runtime=true"
+}
+
 # The daemon handoff and strict MCP surface are committed before Chrome bridge
 # activation begins. Persist that independently verified surface now: a
 # background-only Chrome activation may legitimately checkpoint as pending, and
 # withholding the daemon snapshot until after that separate transaction traps
 # every freshly restarted MCP client on the previous tools/list hash.
 $toolSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $token -Health $h
+
+# Chrome activation is a separately resumable external-browser transaction.
+# Before it can checkpoint or throw, independently re-read and commit the exact
+# daemon/tool/resource generation. Global health may still be false here only
+# because Chrome is pending; every non-Chrome subsystem must already be ready.
+try {
+    $daemonCommitHealth = Invoke-RestMethod `
+        -Uri "http://$Bind/health" `
+        -Headers @{ Authorization = "Bearer $token" } `
+        -TimeoutSec 30
+} catch {
+    Die "SYNAPSE_DAEMON_COMMIT_HEALTH_UNREADABLE bind=$Bind expected_pid=$healthPid error=$($_.Exception.Message) remediation=the deployment remains rollback-armed until the exact installed daemon can be re-read"
+}
+$daemonCommitNonChromeReady = Test-SynapseHealthAllNonChromeSubsystemsReady -Health $daemonCommitHealth
+if (-not $daemonCommitNonChromeReady.Ok) {
+    Die "SYNAPSE_DAEMON_COMMIT_NON_CHROME_HEALTH_FAILED bind=$Bind expected_pid=$healthPid detail=$($daemonCommitNonChromeReady.Detail) subsystem_statuses=$(Format-SynapseHealthSubsystemStatuses -Health $daemonCommitHealth) remediation=repair every non-Chrome subsystem before committing the daemon generation"
+}
+$daemonCommitAcceleratorPolicy = Assert-SynapseNoExplicitGpuRuntimeHealth `
+    -Health $daemonCommitHealth `
+    -ProcessId $healthPid `
+    -Bind $Bind `
+    -Phase 'daemon_commit_before_chrome_activation'
+$daemonCommitIdentityReadback = Get-SynapseInstalledDaemonIdentityReadback `
+    -HealthPid $healthPid `
+    -Bind $Bind `
+    -DbPath $DbPath `
+    -ProfilesDir $ProfilesDir `
+    -ExpectedExePath $ExePath `
+    -ExpectedSha256 $installedHash `
+    -LogDir $LogDir `
+    -AllowedPermissions $AllowedPermissions `
+    -CalyxConfigPath $CalyxConfigPath `
+    -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
+if (-not $daemonCommitIdentityReadback.Ok) {
+    Die "SYNAPSE_DAEMON_COMMIT_RESOURCE_IDENTITY_MISMATCH bind=$Bind expected_pid=$healthPid detail=$($daemonCommitIdentityReadback.Detail) remediation=repair the exact task/supervisor/kernel Job/config identity before committing the daemon generation"
+}
+$daemonCommitLineage = Get-ProcessLineage -StartPid $healthPid
+$daemonCommitCmdAncestor = $daemonCommitLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
+if ($daemonCommitCmdAncestor) {
+    $daemonCommitLineageText = ($daemonCommitLineage | ForEach-Object { "{0}:{1}" -f $_.ProcessId, $_.Name }) -join ' <- '
+    Die "SYNAPSE_DAEMON_COMMIT_CMD_ANCESTOR_FORBIDDEN pid=$healthPid cmd_pid=$($daemonCommitCmdAncestor.ProcessId) lineage=$daemonCommitLineageText remediation=rerun setup after removing legacy daemon launchers; daemon must not be launched through cmd.exe."
+}
+Info "SYNAPSE_DAEMON_COMMIT_ACCEPTANCE_VERIFIED pid=$healthPid bind=$Bind health_ok_at_commit=$([bool]$daemonCommitHealth.ok) non_chrome_contract=[$($daemonCommitNonChromeReady.Detail)] tool_count=$($toolSurface.tool_count) tool_surface_sha256=$($toolSurface.tool_surface_sha256) no_explicit_gpu_policy_closure=[$($daemonCommitAcceleratorPolicy.Detail)] daemon_job_name=$($daemonCommitIdentityReadback.JobName) daemon_job_current_memory_used_bytes=$($daemonCommitIdentityReadback.CurrentJobMemoryUsedBytes) parent_job_name=$($daemonCommitIdentityReadback.ParentJobName) parent_job_current_memory_used_bytes=$($daemonCommitIdentityReadback.ParentCurrentJobMemoryUsedBytes) parent_cpu_rate=$($daemonCommitIdentityReadback.ParentCpuRate)"
+
+if ($null -eq $script:SynapseDeploymentTransaction -or -not [bool]$script:SynapseDeploymentTransaction.Armed) {
+    Die "SYNAPSE_DEPLOYMENT_TRANSACTION_NOT_ARMED phase=daemon_commit_before_chrome_activation remediation=every daemon generation must retain its durable pre-drain rollback snapshot until daemon/tool/resource acceptance"
+}
+$chromeStatusAtDaemonCommit = if ($null -eq $daemonCommitHealth.subsystems.chrome_bridge) { '<missing>' } else { [string]$daemonCommitHealth.subsystems.chrome_bridge.status }
+$deploymentCommitManifest = [ordered]@{
+    schema = 'synapse_deployment_transaction/v1'
+    state = 'committed'
+    invocation_id = $script:SynapseSetupInvocationId
+    committed_at_utc = [DateTime]::UtcNow.ToString('o')
+    daemon_pid = $healthPid
+    bind = $Bind
+    installed_binary_path = [System.IO.Path]::GetFullPath($ExePath)
+    installed_binary_sha256 = $installedHash
+    task_name = $TaskName
+    health_ok_at_daemon_commit = [bool]$daemonCommitHealth.ok
+    daemon_non_chrome_health_ok = $true
+    chrome_bridge_status_at_daemon_commit = $chromeStatusAtDaemonCommit
+    daemon_resource_identity_ok = [bool]$daemonCommitIdentityReadback.Ok
+    tool_count = [int]$toolSurface.tool_count
+    tool_surface_sha256 = [string]$toolSurface.tool_surface_sha256
+    candidate_bootstrap_sha256 = $candidatePreflight.SupervisorBootstrapSha256
+    candidate_bootstrap_log_sha256 = $candidatePreflight.SupervisorBootstrapLogSha256
+}
+$deploymentCommitWrite = Write-SynapseAtomicUtf8TextFile `
+    -Path $script:SynapseDeploymentTransaction.ManifestPath `
+    -Content ($deploymentCommitManifest | ConvertTo-Json -Depth 8) `
+    -Purpose 'deployment_transaction_commit'
+$script:SynapseDeploymentTransaction.Committed = $true
+Clear-SynapseDeployRestartAuthorityRevocation
+Info "SYNAPSE_DEPLOYMENT_TRANSACTION_COMMITTED root=$($script:SynapseDeploymentTransaction.Root) manifest=$($deploymentCommitWrite.path) manifest_sha256=$($deploymentCommitWrite.sha256) pid=$healthPid installed_sha256=$installedHash task=$TaskName health_ok_at_daemon_commit=$([bool]$daemonCommitHealth.ok) daemon_non_chrome_health_ok=true chrome_bridge_status_at_daemon_commit=$chromeStatusAtDaemonCommit daemon_resource_identity_ok=true tool_surface_sha256=$($toolSurface.tool_surface_sha256)"
+try {
+    [void](Remove-SynapseDeploymentTransactionArtifact `
+        -Path $script:SynapseDeploymentTransaction.Root `
+        -ExpectedRoot (Join-Path $LogDir 'setup-transactions') `
+        -ExpectedState 'committed' `
+        -Reason 'committed_deployment_transaction_cleanup')
+} catch {
+    Die "SYNAPSE_DEPLOYMENT_TRANSACTION_COMMITTED_BACKUP_CLEANUP_FAILED root=$($script:SynapseDeploymentTransaction.Root) error=$($_.Exception.Message) remediation=the daemon generation is committed and live; rerun setup cleanup for this exact transaction directory without touching the installed runtime"
+}
+$committedLegacyBackupPaths = @()
+if (-not [string]::IsNullOrWhiteSpace([string]$backupPath)) { $committedLegacyBackupPaths += $backupPath }
+if (-not $nativeHostInstalledAlreadyVerified -and [bool]$nativeHostBackup.Existed) { $committedLegacyBackupPaths += $nativeHostBackup.BackupPath }
+$committedLegacyBackupPaths += @($runtimeCompanionBackups | ForEach-Object { $_.BackupPath })
+foreach ($committedLegacyBackupPath in @($committedLegacyBackupPaths | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $committedLegacyBackupPath)) { continue }
+    $committedLegacyBackupItem = Get-Item -LiteralPath $committedLegacyBackupPath -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $committedLegacyBackupPath -PathType Leaf) -or ($committedLegacyBackupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Die "SYNAPSE_COMMITTED_LEGACY_BACKUP_CLEANUP_IDENTITY_INVALID path=$committedLegacyBackupPath attributes=$($committedLegacyBackupItem.Attributes) remediation=the deployment is committed; inspect this exact backup path without following or deleting an unexpected object"
+    }
+    $committedLegacyBackupHash = Get-SynapseFileSha256 -Path $committedLegacyBackupPath
+    Remove-Item -LiteralPath $committedLegacyBackupPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $committedLegacyBackupPath) {
+        Die "SYNAPSE_COMMITTED_LEGACY_BACKUP_CLEANUP_FAILED path=$committedLegacyBackupPath sha256=$committedLegacyBackupHash remediation=the deployment is committed; repair permissions and remove only this exact obsolete setup backup"
+    }
+    Info "SYNAPSE_COMMITTED_LEGACY_BACKUP_CLEANUP_VERIFIED path=$committedLegacyBackupPath sha256=$committedLegacyBackupHash state=absent"
+}
+
+# Publish the already-validated strict MCP surface only after the generation's
+# durable commit. A failure here is loud but must not roll the healthy daemon
+# back to bytes whose tools/list differs from the accepted surface.
 Write-SynapseCodexToolSurfaceSnapshot -Path $CodexToolSurfaceSnapshotPath -Surface $toolSurface
+$h = $daemonCommitHealth
 
 try {
     $h = Assert-SynapseChromeBridgeLiveAfterSetup `
@@ -16549,6 +21472,9 @@ try {
         checkpoint_generation_id = $script:SynapseSetupInvocationId
         resume_attempt_count = 0
         daemon_handoff = 'committed'
+        deployment_commit_manifest_sha256 = $deploymentCommitWrite.sha256
+        accepted_tool_count = [int]$toolSurface.tool_count
+        accepted_tool_surface_sha256 = [string]$toolSurface.tool_surface_sha256
         daemon_pid = $pendingDaemonPid
         bind = $Bind
         db_path = $DbPath
@@ -16580,7 +21506,43 @@ try {
         -Message "SYNAPSE_CHROME_BRIDGE_ACTIVATION_PENDING daemon_pid=$pendingDaemonPid bind=$Bind checkpoint=$($script:SynapseChromeBridgePendingPath) bridge_error=$bridgeActivationError remediation=do not activate, restore, navigate, click, type into, or restart a human Chrome window; wait for a natural Chrome lifecycle transition, then run -ResumeChromeBridgePending" `
         -Readback $pendingReadback
 }
+try {
+    $finalInstalledHealth = Invoke-RestMethod `
+        -Uri "http://$Bind/health" `
+        -Headers @{ Authorization = "Bearer $token" } `
+        -TimeoutSec 30
+} catch {
+    Die "SYNAPSE_FINAL_INSTALLED_HEALTH_UNREADABLE bind=$Bind expected_pid=$healthPid error=$($_.Exception.Message) remediation=inspect the exact installed daemon after Chrome repair and tools/list; setup will not infer the final runtime contract from an earlier response"
+}
+$finalNonChromeReady = Test-SynapseHealthAllNonChromeSubsystemsReady -Health $finalInstalledHealth
+if (-not $finalNonChromeReady.Ok) {
+    Die "SYNAPSE_FINAL_INSTALLED_NON_CHROME_HEALTH_FAILED bind=$Bind expected_pid=$healthPid detail=$($finalNonChromeReady.Detail) subsystem_statuses=$(Format-SynapseHealthSubsystemStatuses -Health $finalInstalledHealth) remediation=repair every non-Chrome subsystem reporting error and rerun setup"
+}
+if ($finalInstalledHealth.ok -ne $true) {
+    Die "SYNAPSE_FINAL_INSTALLED_HEALTH_NOT_OK bind=$Bind expected_pid=$healthPid actual_pid=$($finalInstalledHealth.pid) subsystem_statuses=$(Format-SynapseHealthSubsystemStatuses -Health $finalInstalledHealth) remediation=the explicit Chrome transition has ended, so final global health must be true; repair the named error subsystem and rerun setup"
+}
+$finalAcceleratorPolicy = Assert-SynapseNoExplicitGpuRuntimeHealth `
+    -Health $finalInstalledHealth `
+    -ProcessId $healthPid `
+    -Bind $Bind `
+    -Phase 'installed_after_tools_list_and_chrome_repair'
+$daemonIdentityReadback = Get-SynapseInstalledDaemonIdentityReadback `
+    -HealthPid $healthPid `
+    -Bind $Bind `
+    -DbPath $DbPath `
+    -ProfilesDir $ProfilesDir `
+    -ExpectedExePath $ExePath `
+    -ExpectedSha256 $installedHash `
+    -LogDir $LogDir `
+    -AllowedPermissions $AllowedPermissions `
+    -CalyxConfigPath $CalyxConfigPath `
+    -ExpectedCalyxConfigSha256 $validatedCalyxConfigSha256
+if (-not $daemonIdentityReadback.Ok) {
+    Die "SYNAPSE_FINAL_INSTALLED_RESOURCE_IDENTITY_MISMATCH bind=$Bind expected_pid=$healthPid detail=$($daemonIdentityReadback.Detail) remediation=repair the exact task/supervisor/kernel Job/config identity; final acceptance does not trust earlier mutable state"
+}
+$h = $finalInstalledHealth
 $healthPid = [int]$h.pid
+Info "SYNAPSE_FINAL_INSTALLED_POLICY_AND_RESOURCE_CONTRACT_VERIFIED pid=$healthPid bind=$Bind health_ok=true non_chrome_contract=[$($finalNonChromeReady.Detail)] no_explicit_gpu_policy_closure=[$($finalAcceleratorPolicy.Detail)] daemon_job_name=$($daemonIdentityReadback.JobName) daemon_job_current_memory_used_bytes=$($daemonIdentityReadback.CurrentJobMemoryUsedBytes) daemon_job_memory_headroom_bytes=$($daemonIdentityReadback.JobMemoryHeadroomBytes) parent_job_name=$($daemonIdentityReadback.ParentJobName) parent_job_current_memory_used_bytes=$($daemonIdentityReadback.ParentCurrentJobMemoryUsedBytes) parent_job_memory_headroom_bytes=$($daemonIdentityReadback.ParentJobMemoryHeadroomBytes) parent_job_peak_memory_used_bytes=$($daemonIdentityReadback.ParentPeakJobMemoryUsedBytes) bootstrap_pid=$($daemonIdentityReadback.BootstrapPid) bootstrap_private_bytes=$($daemonIdentityReadback.BootstrapPrivateBytes) bootstrap_peak_commit_bytes=$($daemonIdentityReadback.BootstrapPeakCommitBytes) bootstrap_working_set_bytes=$($daemonIdentityReadback.BootstrapWorkingSetBytes) bootstrap_peak_working_set_bytes=$($daemonIdentityReadback.BootstrapPeakWorkingSetBytes) bootstrap_preassociation_reserve_bytes=$($daemonIdentityReadback.BootstrapReserveBytes) owned_committed_private_ceiling_bytes=1000000000 parent_cpu_rate=$($daemonIdentityReadback.ParentCpuRate) daemon_cpu_rate=$SynapseDaemonCpuRate note=Windows Job Objects hard-bound aggregate committed/private bytes; aggregate resident working set has no equivalent Job hard limit, and GDI may be accelerated internally, so resident working set and physical per-process GPU memory remain separate OS Sources of Truth"
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
 if ($cmdAncestor) {

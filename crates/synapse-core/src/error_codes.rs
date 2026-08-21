@@ -6,6 +6,7 @@ pub const CAPTURE_PRINTWINDOW_DISABLED: &str = "CAPTURE_PRINTWINDOW_DISABLED";
 pub const CAPTURE_PRINTWINDOW_BLACK: &str = "CAPTURE_PRINTWINDOW_BLACK";
 pub const CAPTURE_TARGET_LOST: &str = "CAPTURE_TARGET_LOST";
 pub const CAPTURE_NO_DIRTY_REGIONS: &str = "CAPTURE_NO_DIRTY_REGIONS";
+pub const CAPTURE_UNSUPPORTED_SEMANTICS: &str = "CAPTURE_UNSUPPORTED_SEMANTICS";
 /// A screenshot request's independently calculated capture/composition/message
 /// plan cannot fit the hard pipeline budget. This is rejected before any page
 /// mutation or Chrome capture begins (#2170).
@@ -117,8 +118,8 @@ pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
 /// Bound-tab OCR refused because the window renders a different tab (#1823).
 ///
-/// The MCP session is bound to a specific browser tab, but window capture (WGC)
-/// can only observe whichever tab is currently rendered in that window.
+/// The MCP session is bound to a specific browser tab, but visible-surface GDI
+/// capture can only observe whichever tab is currently rendered in that window.
 /// Returning OCR of the rendered tab under a different tab's binding is
 /// confidently-wrong perception, so the read fails closed with this code naming
 /// both the bound tab and the tab actually rendered.
@@ -177,6 +178,9 @@ pub const ACTION_AGENT_SPAWN_FAILED: &str = "ACTION_AGENT_SPAWN_FAILED";
 pub const ACTION_AGENT_SPAWN_SESSION_TIMEOUT: &str = "ACTION_AGENT_SPAWN_SESSION_TIMEOUT";
 pub const ACTION_AGENT_SPAWN_TASK_NOT_STARTED: &str = "ACTION_AGENT_SPAWN_TASK_NOT_STARTED";
 pub const ACTION_BUDGET_EXPIRED: &str = "ACTION_BUDGET_EXPIRED";
+/// A point-in-time action precondition proved that the Synapse daemon has no
+/// remaining memory headroom under its process-wide hard limit.
+pub const ACTION_RESOURCE_BUDGET_EXCEEDED: &str = "ACTION_RESOURCE_BUDGET_EXCEEDED";
 pub const ACTION_WINDOW_NOT_FOUND: &str = "ACTION_WINDOW_NOT_FOUND";
 pub const ACTION_WINDOW_AMBIGUOUS: &str = "ACTION_WINDOW_AMBIGUOUS";
 pub const ACTION_FOCUS_WINDOW_FAILED: &str = "ACTION_FOCUS_WINDOW_FAILED";

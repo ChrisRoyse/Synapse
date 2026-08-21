@@ -2736,12 +2736,32 @@ pub const SYNAPSE_SYNERGY_MAX_RECORDS: usize = 2_000;
 /// Lens cap for one synergy pass: the lenses with the highest marginal bits are
 /// paired, and the truncation is reported (`n_lenses` vs `lenses_paired`).
 pub const SYNAPSE_SYNERGY_MAX_LENSES: usize = 8;
-/// Record cap for one ensemble capability-card pass. Each of the `C(N,2)` pairs
+/// Record cap for one ensemble capability-card pass.
+///
+/// Each of the `C(N,2)` pairs
 /// costs two multi-seed logistic probes (the estimate and its power control),
 /// so the budget is tighter still than the synergy pass.
+///
+/// Registry callers report both requested and effective bounds.
 pub const SYNAPSE_ENSEMBLE_MAX_RECORDS: usize = 1_000;
 
 const ASSAY_CORPUS_SHARD: &str = "synapse-intelligence";
+
+/// Exact physical identity of a code-declared lens and its extractor.
+///
+/// The identity
+/// feeds it.  The panel-owning storage crate supplies this to Registry
+/// measurement so a causal `view_id` binds real frozen bytes/semantics rather
+/// than only a human-readable lens name.
+///
+/// Every producing contract must carry this identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynapseCalyxPhysicalLensBinding {
+    pub lens_id: String,
+    pub lens_spec_sha256: String,
+    pub extractor_schema_sha256: String,
+}
 
 /// Bounded request describing one Assay bits/sufficiency/redundancy pass.
 #[derive(Clone, Debug)]
@@ -2767,6 +2787,18 @@ pub struct SynapseCalyxAssayParams {
     /// localisation failure #1897 was filed about. An empty map is honest: every
     /// slot is then reported as unnamed rather than guessed at.
     pub lens_names: BTreeMap<u16, String>,
+    /// Physical content/projection contracts keyed by slot. Required by the
+    /// causal-view Registry for every producing view.
+    pub physical_lens_bindings: BTreeMap<u16, SynapseCalyxPhysicalLensBinding>,
+    /// Physical slots every record must carry before it may enter this assay's
+    /// anchored cohort.
+    ///
+    /// This is a row-population predicate, not a feature selection knob.  The
+    /// action Oracle uses the writer-sealed complete-cause slot so historical
+    /// or non-shell outcomes cannot dilute a causal assay whose compact views
+    /// do not apply to them.  Required slots remain available to measurement
+    /// unless they are also explicitly listed in `excluded_slots`.
+    pub required_record_slots: BTreeSet<u16>,
     /// Physical slot ids withheld from this measurement (issue #1953).
     ///
     /// A panel that contains its own label reports `sufficient=true` circularly:
@@ -2800,6 +2832,8 @@ impl SynapseCalyxAssayParams {
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             ksg_k: SYNAPSE_KSG_DEFAULT_K,
             lens_names: BTreeMap::new(),
+            physical_lens_bindings: BTreeMap::new(),
+            required_record_slots: BTreeSet::new(),
             excluded_slots: BTreeSet::new(),
         }
     }
@@ -2821,8 +2855,28 @@ impl SynapseCalyxAssayParams {
     }
 
     #[must_use]
+    pub fn with_physical_lens_bindings(
+        mut self,
+        bindings: BTreeMap<u16, SynapseCalyxPhysicalLensBinding>,
+    ) -> Self {
+        self.physical_lens_bindings = bindings;
+        self
+    }
+
+    #[must_use]
     pub fn with_corpus_shard(mut self, corpus_shard: String) -> Self {
         self.corpus_shard = corpus_shard;
+        self
+    }
+
+    /// Restricts the measured population to records carrying every named
+    /// physical slot. Missingness is never converted into a zero vector.
+    #[must_use]
+    pub fn with_required_record_slots(
+        mut self,
+        required_record_slots: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        self.required_record_slots = required_record_slots.into_iter().collect();
         self
     }
 
@@ -3665,7 +3719,12 @@ impl SynapseCalyxVault {
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
+        let gathered = gather_anchored_slot_samples(
+            &corpus,
+            &anchor_kind,
+            &params.excluded_slots,
+            &params.required_record_slots,
+        );
 
         // #1959 ask 1: `bits` ANNOTATES where `sufficiency` refuses. A per-lens
         // report is the legitimate way to inspect a carrier — refusing it would
@@ -3903,7 +3962,12 @@ impl SynapseCalyxVault {
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
+        let gathered = gather_anchored_slot_samples(
+            &corpus,
+            &anchor_kind,
+            &params.excluded_slots,
+            &params.required_record_slots,
+        );
 
         // #1958: refuse a circular measurement STRUCTURALLY, before spending a
         // single estimator call on it. `detect_anchor_leakage` below is a
@@ -3977,7 +4041,12 @@ impl SynapseCalyxVault {
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
 
         let usable_slots: BTreeSet<SlotId> = slot_bits.iter().map(|(slot, _)| *slot).collect();
-        let joint = build_joint_samples(&corpus, &anchor_kind, &usable_slots);
+        let joint = build_joint_samples(
+            &corpus,
+            &anchor_kind,
+            &usable_slots,
+            &params.required_record_slots,
+        );
         let anchor_entropy_bits = entropy_bits(&joint.labels);
         let joint_records = joint.labels.len();
         // #1953: a lens whose marginal bits sit exactly at H(anchor), with the
@@ -4558,7 +4627,12 @@ impl SynapseCalyxVault {
         let max_records = params.max_records.clamp(1, SYNAPSE_SYNERGY_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
+        let gathered = gather_anchored_slot_samples(
+            &corpus,
+            &anchor_kind,
+            &params.excluded_slots,
+            &params.required_record_slots,
+        );
         if gathered.anchored_records == 0 {
             return Err(SynapseCalyxError::new(
                 SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS,
@@ -4806,12 +4880,43 @@ impl SynapseCalyxVault {
         let mut interner: BTreeMap<String, usize> = BTreeMap::new();
         let mut anchored: Vec<(&BTreeMap<SlotId, Vec<f32>>, usize)> = Vec::new();
         for record in &corpus.records {
-            let Some(anchor) = anchor_of_kind(&record.anchors, &anchor_kind) else {
+            if !params
+                .required_record_slots
+                .iter()
+                .all(|slot| record.slots.contains_key(&SlotId::new(*slot)))
+            {
                 continue;
-            };
-            let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
+            }
+            let matching = record
+                .anchors
+                .iter()
+                .filter(|anchor| anchor.kind == anchor_kind && anchor.confidence > 0.0)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
                 continue;
-            };
+            }
+            if matching.len() != 1 {
+                return Err(SynapseCalyxError::new(
+                    SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY,
+                    format!(
+                        "record {} carries {} grounded anchors of kind {}; the paired ensemble requires exactly one canonical outcome per record",
+                        record.cx_id,
+                        matching.len(),
+                        params.anchor_kind,
+                    ),
+                    "repair the anchor population so every included record has exactly one grounded outcome; duplicates are never selected by insertion order",
+                ));
+            }
+            let label = discrete_anchor_label(&matching[0].value, &mut interner).ok_or_else(|| {
+                SynapseCalyxError::new(
+                    SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY,
+                    format!(
+                        "record {} carries a non-discrete grounded anchor of kind {}; the binary ensemble never skips or coerces it",
+                        record.cx_id, params.anchor_kind,
+                    ),
+                    "use a declared Bool/Enum binary outcome or commission a distinct estimator for the exact anchor type",
+                )
+            })?;
             anchored.push((&record.slots, label));
         }
         if anchored.is_empty() {
@@ -4844,6 +4949,19 @@ impl SynapseCalyxVault {
                  so the collapse is a declared measurement rather than an implicit one",
             ));
         }
+        let slot_anchored_coverage = corpus
+            .panel_slots
+            .keys()
+            .map(|slot| {
+                (
+                    slot.get(),
+                    anchored
+                        .iter()
+                        .filter(|(slots, _)| slots.contains_key(slot))
+                        .count(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
         // The panel vector is the intersection: a lens missing from an anchored
         // record cannot be zero-filled, because `Absent` is an explicit absence
@@ -4856,16 +4974,7 @@ impl SynapseCalyxVault {
                 None => present,
             });
         }
-        // `excluded_slots` is honoured here, not only by the corpus loader.
-        //
-        // Manual FSV found that this path ignored the parameter entirely, so
-        // withheld slots still entered the card. That is worse than
-        // a missing feature — `excluded_slots` is the documented remediation for
-        // the structural anchor-leakage refusal above, so a caller could lift the
-        // refusal and still be measuring the label. The refusal and the way to
-        // satisfy it have to act on the same set.
-        let mut copresent = copresent.unwrap_or_default();
-        copresent.retain(|slot| !params.excluded_slots.contains(&slot.get()));
+        let copresent = copresent.unwrap_or_default();
 
         // Every declared slot the card will not carry is named with the reason
         // it cannot be carried. A lens that vanishes from a capability card is
@@ -4880,18 +4989,6 @@ impl SynapseCalyxVault {
             if copresent.contains(slot) || corpus.unusable_slots.contains_key(slot) {
                 continue;
             }
-            // A slot the caller withheld says so in its own words. Describing it
-            // as "not co-present" would attribute a caller's decision to the
-            // corpus, and a withheld label carrier is the one exclusion a reader
-            // most needs to see stated.
-            if params.excluded_slots.contains(&slot.get()) {
-                excluded.push(SynapseCalyxExcludedLens {
-                    slot: slot.get(),
-                    name: params.lens_name(slot.get()),
-                    reason: "withheld by excluded_slots on this request".to_owned(),
-                });
-                continue;
-            }
             let carried = anchored
                 .iter()
                 .filter(|(slots, _)| slots.contains_key(slot))
@@ -4899,6 +4996,7 @@ impl SynapseCalyxVault {
             excluded.push(SynapseCalyxExcludedLens {
                 slot: slot.get(),
                 name: params.lens_name(slot.get()),
+                code: SynapseCalyxExcludedLensCode::MissingAnchoredCoverage,
                 reason: format!(
                     "carried by {carried} of the {} anchored record(s) (kind {kind:?}); a lens \
                      absent from an anchored record cannot be zero-filled into the panel vector, \
@@ -4911,6 +5009,7 @@ impl SynapseCalyxVault {
             excluded.push(SynapseCalyxExcludedLens {
                 slot: slot.get(),
                 name: params.lens_name(slot.get()),
+                code: SynapseCalyxExcludedLensCode::UnusableRepresentation,
                 reason: reason.clone(),
             });
         }
@@ -4921,8 +5020,12 @@ impl SynapseCalyxVault {
         // probe are all undefined on it. Both are named, never padded and never
         // allowed to abort the pass: one degenerate lens must cost its own row,
         // not the whole card (#1915's discipline, on this path).
+        let mut physically_available_slots = Vec::new();
         let mut lenses: Vec<EnsembleLensInput> = Vec::new();
         for slot in &copresent {
+            if corpus.unusable_slots.contains_key(slot) {
+                continue;
+            }
             let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(anchored.len());
             let mut widths: BTreeSet<usize> = BTreeSet::new();
             for (slots, _) in &anchored {
@@ -4935,6 +5038,7 @@ impl SynapseCalyxVault {
                 excluded.push(SynapseCalyxExcludedLens {
                     slot: slot.get(),
                     name: params.lens_name(slot.get()),
+                    code: SynapseCalyxExcludedLensCode::RaggedColumn,
                     reason: format!(
                         "ragged column: widths {:?} across {} anchored record(s); a capability \
                          card needs one rectangular column per lens and padding one would \
@@ -4945,16 +5049,43 @@ impl SynapseCalyxVault {
                 });
                 continue;
             }
-            let energy = centered_energy(&vectors);
-            if !energy.is_finite() || energy <= 0.0 {
+            physically_available_slots.push(slot.get());
+            // Caller withholding changes estimator membership, never physical
+            // availability. Keep both facts so downstream serving gates do not
+            // confuse a policy choice with a missing lens.
+            if params.excluded_slots.contains(&slot.get()) {
                 excluded.push(SynapseCalyxExcludedLens {
                     slot: slot.get(),
                     name: params.lens_name(slot.get()),
+                    code: SynapseCalyxExcludedLensCode::WithheldByCaller,
+                    reason: "withheld by excluded_slots on this request".to_owned(),
+                });
+                continue;
+            }
+            let energy = centered_energy(&vectors);
+            if !energy.is_finite() {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_ENSEMBLE_NUMERICAL_INVARIANT",
+                    format!(
+                        "slot {} ({}) centered energy is non-finite over {} anchored records",
+                        slot.get(),
+                        params.lens_name(slot.get()),
+                        vectors.len(),
+                    ),
+                    "repair the finite bounded lens column; numerical corruption is never classified as a constant lens",
+                ));
+            }
+            if energy <= 0.0 {
+                excluded.push(SynapseCalyxExcludedLens {
+                    slot: slot.get(),
+                    name: params.lens_name(slot.get()),
+                    code: SynapseCalyxExcludedLensCode::ObservedCohortConstant,
                     reason: format!(
                         "constant column: centered energy {energy} over {} anchored record(s). \
                          Every row is the same vector, so this lens separates nothing about the \
                          outcome; linear CKA, normalized MI and the logistic probe are all \
-                         undefined on it. Park or retire the lens",
+                         undefined on it. It remains a valid code-frozen serving cause and is not \
+                         treated as missing or automatically parked",
                         vectors.len()
                     ),
                 });
@@ -4975,6 +5106,7 @@ impl SynapseCalyxVault {
                 excluded.push(SynapseCalyxExcludedLens {
                     slot: slot.get(),
                     name: params.lens_name(slot.get()),
+                    code: SynapseCalyxExcludedLensCode::DegenerateRedundancySketch,
                     reason: format!(
                         "degenerate redundancy sketch: the 1-D NMI signature takes {} distinct \
                          value(s) over {} anchored record(s), so the pairwise normalized-MI term \
@@ -5022,16 +5154,23 @@ impl SynapseCalyxVault {
             max_redundancy: SYNAPSE_ASSAY_CORRELATION_CEILING,
             nmi_bins: SYNAPSE_REDUNDANCY_NMI_BINS,
         };
-        let measured_slots = lenses
+        let estimable_slots = lenses
             .iter()
             .map(|lens| lens.slot.get())
+            .collect::<Vec<_>>();
+        let declared_slot_ids = corpus
+            .panel_slots
+            .keys()
+            .map(|slot| slot.get())
             .collect::<Vec<_>>();
         let card = ensemble_card(&lenses, &labels, None, &config)
             .map_err(|error| loom_math_error("measure the ensemble capability card", &error))?;
 
-        // Persist the complete calibrated evidence contract consumed by the
-        // Oracle honesty gate, plus the card itself. Storing only the card made
-        // its measured panel/lens evidence invisible to downstream consumers.
+        // The logistic card is an admission/diagnostic surrogate, not the
+        // Oracle's grounded sufficiency estimator. Persist it only in its
+        // dedicated subject. Writing its values into Panel/Lens/OutcomeEntropy
+        // would overwrite the canonical KSG/PanelSufficiency rows because the
+        // Assay key intentionally does not include estimator kind.
         let mut store = AssayStore::default();
         let cache_key = AssayCacheKey::scoped(
             params.panel_version,
@@ -5039,16 +5178,8 @@ impl SynapseCalyxVault {
             self.vault_id_value(),
             anchor_kind,
         );
-        let calibration = card.sufficiency.power_calibration.clone().ok_or_else(|| {
-            SynapseCalyxError::new(
-                "SYNAPSE_ASSAY_CALIBRATION_ABSENT",
-                "ensemble card returned no planted-signal power calibration",
-                "preserve the corpus and inspect the calibrated logistic estimator",
-            )
-        })?;
-        let trust = card.sufficiency.trust;
         store.put(
-            cache_key.clone(),
+            cache_key,
             AssaySubject::EnsembleCard,
             MiEstimate::new(
                 card.panel_bits,
@@ -5061,49 +5192,6 @@ impl SynapseCalyxVault {
             "synapse-assay-ensemble",
             self.read_snapshot(),
         );
-        store.put(
-            cache_key.clone(),
-            AssaySubject::Panel,
-            MiEstimate::new(
-                card.panel_bits,
-                card.panel_ci[0],
-                card.panel_ci[1],
-                card.n_samples,
-                EstimatorKind::LogisticProbe,
-                trust,
-            )
-            .with_power_calibration(calibration),
-            "synapse-assay-ensemble",
-            self.read_snapshot(),
-        );
-        store.put(
-            cache_key.clone(),
-            AssaySubject::OutcomeEntropy,
-            MiEstimate::point(
-                card.anchor_entropy_bits,
-                card.n_samples,
-                EstimatorKind::OutcomeEntropy,
-                trust,
-            ),
-            "synapse-assay-ensemble",
-            self.read_snapshot(),
-        );
-        for lens in &card.lenses {
-            store.put(
-                cache_key.clone(),
-                AssaySubject::Lens { slot: lens.slot },
-                MiEstimate::new(
-                    lens.solo_bits,
-                    lens.solo_ci[0],
-                    lens.solo_ci[1],
-                    card.n_samples,
-                    EstimatorKind::LogisticProbe,
-                    trust,
-                ),
-                "synapse-assay-ensemble",
-                self.read_snapshot(),
-            );
-        }
         let assay_rows = self.persist_assay_store(&store)?;
         Ok(SynapseCalyxEnsembleCardReport {
             card,
@@ -5112,7 +5200,10 @@ impl SynapseCalyxVault {
             records_scanned: corpus.records_scanned,
             anchored_records: anchored.len(),
             declared_slots: corpus.panel_slots.len(),
-            measured_slots,
+            declared_slot_ids,
+            physically_available_slots,
+            estimable_slots,
+            slot_anchored_coverage,
             excluded_lenses: excluded,
             anchor_source_declared: source_provenance.anchor_declared,
             assay_cf_rows: assay_rows,
@@ -5150,8 +5241,18 @@ pub struct SynapseCalyxEnsembleCardReport {
     pub anchored_records: usize,
     /// Slots the corpus declares for this panel.
     pub declared_slots: usize,
-    /// Slots that entered the card as lenses.
-    pub measured_slots: Vec<u16>,
+    /// Exact declared physical slot identities, sorted and unique.
+    pub declared_slot_ids: Vec<u16>,
+    /// Finite, non-empty, rectangular columns physically carried by every
+    /// anchored record in this assay's explicit cohort. Caller withholding and
+    /// estimator variance do not change physical availability.
+    pub physically_available_slots: Vec<u16>,
+    /// Slots that actually entered the logistic ensemble estimator. This is an
+    /// estimator-input roster, not a serving-availability roster.
+    pub estimable_slots: Vec<u16>,
+    /// Complete anchored-record carrier count for every declared physical
+    /// slot, captured during the same bounded corpus pass as the card.
+    pub slot_anchored_coverage: BTreeMap<u16, usize>,
     pub excluded_lenses: Vec<SynapseCalyxExcludedLens>,
     /// Whether this (anchor kind, panel version) pair declares which record
     /// fields determine the anchor, so the structural leakage check could run
@@ -5169,7 +5270,25 @@ pub struct SynapseCalyxEnsembleCardReport {
 pub struct SynapseCalyxExcludedLens {
     pub slot: u16,
     pub name: String,
+    pub code: SynapseCalyxExcludedLensCode,
     pub reason: String,
+}
+
+/// Why a physically declared lens did not enter the ensemble estimator.
+///
+/// `ObservedCohortConstant`, `DegenerateRedundancySketch`, and
+/// `WithheldByCaller` remain physically available; the other states do not.
+/// Keeping this typed prevents downstream serving gates from parsing prose or
+/// confusing a valid constant cause with a missing measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxExcludedLensCode {
+    WithheldByCaller,
+    MissingAnchoredCoverage,
+    UnusableRepresentation,
+    RaggedColumn,
+    ObservedCohortConstant,
+    DegenerateRedundancySketch,
 }
 
 /// Total centered energy `Σ_r ||x_r - mean||²` of a lens column.
@@ -5502,6 +5621,7 @@ fn gather_anchored_slot_samples(
     corpus: &DenseCorpus,
     anchor_kind: &AnchorKind,
     excluded_slots: &BTreeSet<u16>,
+    required_record_slots: &BTreeSet<u16>,
 ) -> GatheredAnchoredSamples {
     let mut by_slot: BTreeMap<SlotId, AnchoredSlotSamples> = BTreeMap::new();
     let mut interner: BTreeMap<String, usize> = BTreeMap::new();
@@ -5511,6 +5631,12 @@ fn gather_anchored_slot_samples(
         let Some(anchor) = anchor_of_kind(&record.anchors, anchor_kind) else {
             continue;
         };
+        if !required_record_slots
+            .iter()
+            .all(|slot| record.slots.contains_key(&SlotId::new(*slot)))
+        {
+            continue;
+        }
         let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
             continue;
         };
@@ -5582,6 +5708,7 @@ fn build_joint_samples(
     corpus: &DenseCorpus,
     anchor_kind: &AnchorKind,
     usable_slots: &BTreeSet<SlotId>,
+    required_record_slots: &BTreeSet<u16>,
 ) -> JointAnchoredSamples {
     let mut interner: BTreeMap<String, usize> = BTreeMap::new();
     let mut anchored: Vec<(&BTreeMap<SlotId, Vec<f32>>, usize)> = Vec::new();
@@ -5589,6 +5716,12 @@ fn build_joint_samples(
         let Some(anchor) = anchor_of_kind(&record.anchors, anchor_kind) else {
             continue;
         };
+        if !required_record_slots
+            .iter()
+            .all(|slot| record.slots.contains_key(&SlotId::new(*slot)))
+        {
+            continue;
+        }
         let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
             continue;
         };

@@ -14,7 +14,8 @@ pub enum ReadTextCaptureSource {
         hwnd: i64,
         window_region: Rect,
     },
-    /// OCR the entire window using the captured WGC frame's native dimensions.
+    /// OCR the entire physically visible window using DWM frame bounds and
+    /// CPU/GDI desktop pixels.
     /// Used when `window_hwnd` is supplied with no region/element target.
     WholeWindow {
         hwnd: i64,
@@ -327,7 +328,7 @@ fn fail_if_minimized_target_needs_window_capture(hwnd: i64) -> Result<(), ErrorD
         return Err(mcp_error(
             error_codes::A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
             format!(
-                "read_text target hwnd {hwnd:#x} is minimized and no explicit window-relative OCR region was supplied; whole-window WGC OCR requires a live non-minimized target window"
+                "read_text target hwnd {hwnd:#x} is minimized and no explicit window-relative OCR region was supplied; CPU/GDI whole-window OCR requires a live window fully visible on the physical desktop"
             ),
         ));
     }

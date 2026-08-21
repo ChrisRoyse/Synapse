@@ -449,7 +449,7 @@ fn worker_capture_region(
     client_region: bool,
 ) -> Result<Rect, WorkerEnvelope> {
     let Some(region) = region else {
-        return synapse_capture::window_capture_region(hwnd)
+        return synapse_capture::window_printwindow_capture_region(hwnd)
             .map_err(|error| worker_error(error.code(), error.to_string()));
     };
     if client_region {

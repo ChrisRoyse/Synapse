@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use synapse_core::DetectionBatch;
 
+/// Whether this crate was compiled with ONNX Runtime's CUDA execution
+/// provider. The installed daemon asserts this is false at compile time.
+pub const CUDA_EXECUTION_PROVIDER_COMPILED: bool = cfg!(feature = "cuda");
+
 mod download;
 mod ep;
 mod error;

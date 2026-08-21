@@ -20,7 +20,7 @@ const MODEL_TOOL: &str = "model";
 const HYGIENE_TOOL: &str = "hygiene";
 const SETUP_TOOL: &str = "setup";
 const TELEMETRY_TOOL: &str = "telemetry";
-const STORAGE_SOT: &str = "storage backend CF metadata + exact row readbacks";
+const STORAGE_SOT: &str = "storage backend physical CF metadata + exact row readbacks, including causal-view Registry rows and their referenced Assay Ledger entries";
 /// Source of truth for the fused-memory half of `find` (#1676): the persisted
 /// per-slot search generation and the Base ledger rows its provenance comes from.
 const FIND_SIMILAR_SOT: &str = "Calyx vault persisted search generation manifest (per-slot DiskANN/BM25 indexes) + Base rows + Ledger provenance entries";

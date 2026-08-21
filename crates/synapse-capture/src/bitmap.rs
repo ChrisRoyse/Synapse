@@ -13,7 +13,7 @@ use crate::{CapturedFrame, CapturedSoftwareBitmap};
 /// # Errors
 ///
 /// Returns [`CaptureError`] when the region is empty/outside the frame, the
-/// frame format is unsupported, or the D3D/WinRT copy fails.
+/// frame format is unsupported, or the owned-buffer/WinRT copy fails.
 pub fn captured_frame_region_to_software_bitmap(
     frame: &CapturedFrame,
     region: Rect,
@@ -27,7 +27,7 @@ pub fn captured_frame_region_to_software_bitmap(
 /// # Errors
 ///
 /// Returns [`CaptureError`] when the region is empty/outside the frame, the
-/// frame format is unsupported, or the D3D copy fails.
+/// frame format is unsupported, or the owned-buffer copy fails.
 pub fn captured_frame_region_to_bgra_bitmap(
     frame: &CapturedFrame,
     region: Rect,
@@ -63,16 +63,17 @@ pub fn screen_region_to_bgra_bitmap(region: Rect) -> Result<CapturedBgraBitmap, 
     platform::screen_region_to_bgra_bitmap(region)
 }
 
-/// Captures a window-relative region into raw BGRA bytes. Windows uses passive
-/// WGC `CreateForWindow` capture and reports that backend in the result.
-/// Non-Windows builds fail loudly.
+/// Captures a physically visible window-relative desktop region.
+///
+/// Raw BGRA pixels are copied using CPU/GDI `BitBlt`. The backend is reported in the result;
+/// occluding windows remain visible because this is a reality snapshot, not a
+/// reconstruction of a hidden surface. Non-Windows builds fail loudly.
 ///
 /// # Errors
 ///
-/// Returns [`CaptureError`] when the HWND/region is invalid, no WGC frame
-/// arrives, WGC returns blank output, or the bitmap copy fails. Synapse does
-/// not automatically call `PrintWindow`, because Windows re-enters target
-/// process `WM_PRINT`/`WM_PRINTCLIENT` handlers for that API.
+/// Returns [`CaptureError`] when the HWND/region is invalid, the window is
+/// hidden/minimized/cloaked/off-screen, the bounded bitmap envelope would be
+/// exceeded, or the GDI copy fails. There is no GPU or `PrintWindow` fallback.
 pub fn window_region_to_bgra_bitmap(
     hwnd: i64,
     region: Rect,
@@ -81,18 +82,18 @@ pub fn window_region_to_bgra_bitmap(
     platform::window_region_to_bgra_bitmap(hwnd, region, timeout_ms)
 }
 
-/// Captures the entire window using the WGC frame's native dimensions, with no
-/// client/window coordinate conversion.
+/// Captures the entire physically visible window using DWM extended-frame
+/// bounds and CPU/GDI desktop pixels, with no client/window conversion.
 ///
 /// This is the exact path for "capture/read the whole target window" because
-/// it is immune to the `GetWindowRect` vs WGC-frame mismatch caused by
-/// invisible DWM resize borders (#1203).
+/// it avoids the `GetWindowRect` mismatch caused by invisible DWM resize
+/// borders (#1203).
 ///
 /// # Errors
 ///
-/// Returns [`CaptureError`] when the HWND is invalid, no WGC frame arrives, WGC
-/// returns blank output, or the bitmap copy fails (Windows), or
-/// `GraphicsApiUnsupported` on non-Windows builds.
+/// Returns [`CaptureError`] when the HWND is invalid or not fully visible on the
+/// physical desktop, the bounded bitmap envelope would be exceeded, or the GDI
+/// copy fails (Windows), or `GraphicsApiUnsupported` on non-Windows builds.
 pub fn window_full_frame_to_bgra_bitmap(
     hwnd: i64,
     timeout_ms: u64,
@@ -118,8 +119,7 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 /// Returns the full window bitmap region used by `window_region_to_bgra_bitmap`.
-/// For minimized Windows targets this uses the restored placement extent rather
-/// than the minimized icon rectangle.
+/// Minimized, hidden, cloaked, and partly off-screen targets fail closed.
 ///
 /// # Errors
 ///
@@ -129,8 +129,20 @@ pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
     platform::window_capture_region(hwnd)
 }
 
-/// Converts a client-relative region to the full-window coordinate space used
-/// by per-window WGC frames for this HWND.
+/// Returns the full window bitmap region for the explicit bounded-worker
+/// `PrintWindow` path. Normal desktop capture must use
+/// [`window_capture_region`] and its physical-visibility checks.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the HWND is invalid, minimized, or its DWM
+/// frame bounds are empty.
+pub fn window_printwindow_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
+    platform::window_printwindow_capture_region(hwnd)
+}
+
+/// Converts a client-relative region to the DWM extended-frame coordinate space
+/// used by visible-window CPU/GDI capture for this HWND.
 ///
 /// # Errors
 ///

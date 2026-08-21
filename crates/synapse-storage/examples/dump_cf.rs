@@ -2345,11 +2345,12 @@ fn ensemble_card_report(
     write_stdout_line(
         &mut stdout,
         format_args!(
-            "corpus records_scanned={} anchored_records={} declared_slots={} measured_slots={:?} excluded_lenses={} assay_cf_rows={}",
+            "corpus records_scanned={} anchored_records={} declared_slots={} physically_available_slots={:?} estimable_slots={:?} excluded_lenses={} assay_cf_rows={}",
             report.records_scanned,
             report.anchored_records,
             report.declared_slots,
-            report.measured_slots,
+            report.physically_available_slots,
+            report.estimable_slots,
             report.excluded_lenses.len(),
             report.assay_cf_rows,
         ),
@@ -2358,8 +2359,8 @@ fn ensemble_card_report(
         write_stdout_line(
             &mut stdout,
             format_args!(
-                "excluded slot={} name={} reason={}",
-                lens.slot, lens.name, lens.reason
+                "excluded slot={} name={} code={:?} reason={}",
+                lens.slot, lens.name, lens.code, lens.reason
             ),
         )?;
     }

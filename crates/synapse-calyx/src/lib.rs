@@ -8,10 +8,14 @@ pub use anneal::{
 mod autonomy;
 pub use autonomy::SynapseCalyxAutonomyDecisionReadback;
 mod action_validation;
-pub use action_validation::SynapseCalyxActionValidationEvidence;
+pub use action_validation::{
+    ACTION_CAUSAL_GUARD_SLOTS, ACTION_CAUSAL_PREDICTOR_SLOTS, SynapseCalyxActionValidationEvidence,
+    SynapseCalyxTypedActionPrediction,
+};
 mod async_vault;
 pub mod backup;
 mod causal_map;
+mod causal_view_registry;
 mod drift;
 mod error_bridge;
 
@@ -31,6 +35,7 @@ mod search_commission;
 pub mod timeseries;
 pub use readiness::{
     SynapseCalyxReadinessEvidence, SynapseCalyxReadinessPredicate, SynapseCalyxReadinessSnapshot,
+    SynapseCalyxReadinessSourceSignals, ensure_action_readiness_serving_admitted,
 };
 pub mod panel_lifecycle;
 pub mod vault_runtime;
@@ -145,6 +150,23 @@ pub use causal_map::{
     SynapseCalyxCausalResourceAccounting, SynapseCalyxCausalStream, SynapseCalyxFdrDecision,
     SynapseCalyxFdrFamily,
 };
+pub use causal_view_registry::{
+    SYNAPSE_CAUSAL_VIEW_REGISTRY_MAX_BYTES, SYNAPSE_CAUSAL_VIEW_REGISTRY_MAX_VIEWS_PER_PARENT,
+    SYNAPSE_CAUSAL_VIEW_REGISTRY_MIN_VIEWS_PER_PARENT, SYNAPSE_CAUSAL_VIEW_REGISTRY_SCHEMA_VERSION,
+    SYNAPSE_CAUSAL_VIEW_REQUIRED_RECORD_SLOT, SYNAPSE_CAUSAL_VIEW_SELECTION_REQUIRED_SAMPLES,
+    SynapseCalyxCausalViewAssociationPolicy, SynapseCalyxCausalViewAssociationScope,
+    SynapseCalyxCausalViewAvailableUnmeasuredCode, SynapseCalyxCausalViewContract,
+    SynapseCalyxCausalViewCpuCostClass, SynapseCalyxCausalViewDecision,
+    SynapseCalyxCausalViewEstimatorCompatibility, SynapseCalyxCausalViewExclusionCode,
+    SynapseCalyxCausalViewFamily, SynapseCalyxCausalViewLifecycle,
+    SynapseCalyxCausalViewMeasurement, SynapseCalyxCausalViewMeasurementContract,
+    SynapseCalyxCausalViewOutputContract, SynapseCalyxCausalViewOutputKind,
+    SynapseCalyxCausalViewRegistry, SynapseCalyxCausalViewRegistryEvidence,
+    SynapseCalyxCausalViewRegistryReadback, SynapseCalyxCausalViewRegistryScope,
+    SynapseCalyxCausalViewResourceAccounting, SynapseCalyxCausalViewResult,
+    SynapseCalyxCausalViewRuntime, SynapseCalyxCausalViewSelectionPowerState,
+    SynapseCalyxCausalViewTransformSpec,
+};
 pub use drift::{
     SYNAPSE_BLIND_SPOT_ALPHA, SYNAPSE_BLIND_SPOT_MAX_ALERTS, SYNAPSE_BLIND_SPOT_MIN_SAMPLES,
     SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION, SYNAPSE_DRIFT_MAX_WINDOW, SYNAPSE_DRIFT_MIN_WINDOW,
@@ -169,7 +191,7 @@ pub use grounding::{
 };
 pub use intelligence::{
     SYNAPSE_ASSAY_ANCHOR_SOURCE_LEAKAGE, SYNAPSE_ASSAY_BIT_FLOOR,
-    SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,
+    SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES, SYNAPSE_ENSEMBLE_MAX_RECORDS,
     SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED, SYNAPSE_INTELLIGENCE_MAX_RECORDS,
     SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID, SYNAPSE_INTELLIGENCE_TIME_RANGE_UNINDEXED,
     SYNAPSE_KERNEL_DEFAULT_EDGE_COS, SYNAPSE_KERNEL_DEFAULT_KNN, SYNAPSE_KERNEL_DEFAULT_MAX_HOPS,
@@ -181,12 +203,13 @@ pub use intelligence::{
     SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport,
     SynapseCalyxCausalityLag, SynapseCalyxCausalityReport, SynapseCalyxCorpusSlotState,
     SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxExcludedLens,
-    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop, SynapseCalyxKernelAnswerReport,
-    SynapseCalyxKernelParams, SynapseCalyxKernelReport, SynapseCalyxLensCoverageStatus,
-    SynapseCalyxLowSignalLens, SynapseCalyxMathExecutionClass, SynapseCalyxNeffEstimate,
-    SynapseCalyxPanelLensCoverage, SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak,
-    SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport, SynapseCalyxRedundancySkip,
-    SynapseCalyxSlotBits, SynapseCalyxSlotKind, SynapseCalyxSufficiencyDeficit,
+    SynapseCalyxExcludedLensCode, SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop,
+    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelParams, SynapseCalyxKernelReport,
+    SynapseCalyxLensCoverageStatus, SynapseCalyxLowSignalLens, SynapseCalyxMathExecutionClass,
+    SynapseCalyxNeffEstimate, SynapseCalyxPanelLensCoverage, SynapseCalyxPeriodicityReport,
+    SynapseCalyxPeriodogramPeak, SynapseCalyxPhysicalLensBinding, SynapseCalyxRedundancyPair,
+    SynapseCalyxRedundancyReport, SynapseCalyxRedundancySkip, SynapseCalyxSlotBits,
+    SynapseCalyxSlotBitsState, SynapseCalyxSlotKind, SynapseCalyxSufficiencyDeficit,
     SynapseCalyxSufficiencyReport, SynapseCalyxSynergyReport, SynapseCalyxTemporalParams,
     SynapseCalyxWeaveBlindSpotPair, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
@@ -2200,6 +2223,14 @@ const OPEN_REMEDIATION: &str =
 const CLOSE_REMEDIATION: &str = "inspect the vault directory and shutdown logs; do not start a successor until the lock and PID readback are clean";
 const CONFIG_REMEDIATION: &str =
     "fix the [calyx] configuration file or unset SYNAPSE_CALYX_CONFIG to use handbook defaults";
+/// Versioned maximum for the setup-owned Calyx tuning document.
+///
+/// The file is read through a single handle into at most this many bytes plus
+/// one sentinel byte. Hashing and TOML parsing consume that exact bounded
+/// buffer, so neither size checks nor identity checks introduce a second-open
+/// race.
+pub const SYNAPSE_CALYX_CONFIG_MAX_BYTES_V1: u64 = 64 * 1024;
+const SYNAPSE_CALYX_CONFIG_READ_BYTES_V1: usize = 64 * 1024 + 1;
 
 const DEFAULT_GUARD_FAR_IDENTITY: f32 = 0.01;
 const DEFAULT_GUARD_FAR_CONTENT: f32 = 0.03;
@@ -2212,8 +2243,16 @@ const DEFAULT_INDEX_EF_CONSTRUCTION: usize = 64;
 const DEFAULT_INDEX_BEAMWIDTH: usize = 32;
 const DEFAULT_INDEX_EF_SEARCH: usize = 64;
 const DEFAULT_INDEX_ALPHA: f32 = 1.2;
-const DEFAULT_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// CPU-only is the shipped default. A zero budget is an explicit assertion
+/// that no Calyx caller may acquire a CUDA context or reserve device memory.
+const DEFAULT_VRAM_BUDGET_BYTES: u64 = 0;
 const DEFAULT_RNG_SEED: u64 = 0x5A17_5EED_CA1A_1696;
+
+/// Compile-time accelerator closure exported for executable policy guards.
+///
+/// The installed daemon asserts this is false even if a caller attempts to
+/// inject a namespaced dependency feature outside its closed feature surface.
+pub const SYNAPSE_CALYX_CUDA_COMPILED: bool = calyx_forge::CUDA_COMPILED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2287,7 +2326,7 @@ impl Default for SynapseCalyxTuningConfig {
             index_alpha: DEFAULT_INDEX_ALPHA,
             index_quant_bits_by_slot: BTreeMap::new(),
             vram_budget_bytes: DEFAULT_VRAM_BUDGET_BYTES,
-            math_backend: SynapseCalyxMathBackend::Auto,
+            math_backend: SynapseCalyxMathBackend::Cpu,
             clock_mode: SynapseCalyxClockMode::System,
             fixed_clock_unix_ms: None,
             rng_seed: DEFAULT_RNG_SEED,
@@ -2345,8 +2384,11 @@ impl SynapseCalyxTuningConfig {
                 f32::INFINITY,
             )?;
         }
-        if self.vram_budget_bytes == 0 {
-            return Err(invalid_config("vram_budget_bytes must be positive"));
+        if self.math_backend != SynapseCalyxMathBackend::Cpu || self.vram_budget_bytes != 0 {
+            return Err(invalid_config(format!(
+                "the installed Synapse Calyx runtime requires math_backend = \"cpu\" and vram_budget_bytes = 0; got math_backend = {:?}, vram_budget_bytes = {}; accelerator/auto selection and nonzero device budgets are forbidden",
+                self.math_backend, self.vram_budget_bytes
+            )));
         }
         match (self.clock_mode, self.fixed_clock_unix_ms) {
             (SynapseCalyxClockMode::System, Some(_)) => {
@@ -2477,10 +2519,44 @@ impl SynapseCalyxConfig {
         vault_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
     ) -> Result<Self, SynapseCalyxError> {
+        Self::from_optional_vault_dir_and_config_path_with_expected_sha256(
+            vault_dir,
+            config_path,
+            None,
+        )
+    }
+
+    /// Resolves the configured vault directory and parses the exact config
+    /// bytes whose SHA-256 identity was supplied by the launcher.
+    ///
+    /// The hash and TOML parse consume one in-memory byte buffer, closing the
+    /// check/use race that exists when a launcher hashes a path before the
+    /// daemon opens it independently.
+    /// Opens the configured vault after bounded, hash-pinned config decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an absent/mismatched config hash,
+    /// oversized or malformed config bytes, invalid resource policy, or vault
+    /// lifecycle failure.
+    pub fn from_optional_vault_dir_and_config_path_with_expected_sha256(
+        vault_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        expected_config_sha256: Option<&str>,
+    ) -> Result<Self, SynapseCalyxError> {
         error_bridge::validate_calyx_error_bridge()?;
         let tuning = match config_path {
-            Some(path) => read_tuning_config(&path)?,
-            None => SynapseCalyxTuningConfig::default().validate()?,
+            Some(path) => read_tuning_config(&path, expected_config_sha256)?,
+            None if expected_config_sha256.is_none() => {
+                SynapseCalyxTuningConfig::default().validate()?
+            }
+            None => {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_CONFIG_IDENTITY_WITHOUT_PATH",
+                    "an expected Calyx config SHA-256 was supplied without a config path",
+                    "supply both --calyx-config and --calyx-config-sha256, or omit both",
+                ));
+            }
         };
         match vault_dir {
             Some(path) if path.as_os_str().is_empty() => Err(SynapseCalyxError::new(
@@ -2514,17 +2590,75 @@ impl SynapseCalyxConfig {
     }
 }
 
-fn read_tuning_config(path: &Path) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
-    let text = fs::read_to_string(path).map_err(|error| {
+fn read_tuning_config(
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
+    let file = File::open(path).map_err(|error| {
         SynapseCalyxError::with_io(
             "SYNAPSE_CALYX_CONFIG_READ_FAILED",
-            "read Calyx config",
+            "open Calyx config",
             path,
             &error,
             CONFIG_REMEDIATION,
         )
     })?;
-    let file: SynapseCalyxConfigFile = toml::from_str(&text).map_err(|error| {
+    let mut bytes = Vec::with_capacity(SYNAPSE_CALYX_CONFIG_READ_BYTES_V1);
+    file.take(SYNAPSE_CALYX_CONFIG_MAX_BYTES_V1 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_CONFIG_READ_FAILED",
+                "read bounded Calyx config",
+                path,
+                &error,
+                CONFIG_REMEDIATION,
+            )
+        })?;
+    if bytes.len() == SYNAPSE_CALYX_CONFIG_READ_BYTES_V1 {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CONFIG_TOO_LARGE",
+            format!(
+                "Calyx config {} exceeds the v1 limit of {} bytes (read at least {} bytes from one open handle)",
+                path.display(),
+                SYNAPSE_CALYX_CONFIG_MAX_BYTES_V1,
+                bytes.len()
+            ),
+            "replace the setup-owned tuning document with a canonical [calyx] config no larger than 65536 bytes",
+        ));
+    }
+    if let Some(expected) = expected_sha256 {
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CONFIG_EXPECTED_SHA256_INVALID",
+                format!(
+                    "expected Calyx config SHA-256 is not 64 hexadecimal characters: {expected:?}"
+                ),
+                "pass the exact 64-hex SHA-256 emitted by setup candidate validation",
+            ));
+        }
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CONFIG_SHA256_MISMATCH",
+                format!(
+                    "Calyx config {} expected SHA-256 {} but the single read buffer hashes to {}",
+                    path.display(),
+                    expected.to_ascii_uppercase(),
+                    actual
+                ),
+                "stop the concurrent config writer and relaunch through setup with one candidate-validated config identity",
+            ));
+        }
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CONFIG_UTF8_INVALID",
+            format!("decode Calyx config {} as UTF-8: {error}", path.display()),
+            CONFIG_REMEDIATION,
+        )
+    })?;
+    let file: SynapseCalyxConfigFile = toml::from_str(text).map_err(|error| {
         SynapseCalyxError::new(
             "SYNAPSE_CALYX_CONFIG_PARSE_FAILED",
             format!("parse Calyx config {}: {error}", path.display()),
@@ -2970,6 +3104,20 @@ impl From<SnapshotVersionGcPass> for SynapseCalyxSnapshotVersionGcPass {
 pub fn process_private_bytes() -> Result<u64, SynapseCalyxError> {
     calyx_aster::resource::process_private_bytes()
         .map_err(|error| SynapseCalyxError::from_calyx("read process private commit", &error))
+}
+
+/// This process's resident working set in bytes.
+///
+/// This is an observation surface only. Admission and pressure decisions remain
+/// keyed to [`process_private_bytes`], because the operating system may trim a
+/// working set without releasing committed private memory.
+///
+/// # Errors
+///
+/// Fails closed when the operating-system resident-set counter cannot be read.
+pub fn process_working_set_bytes() -> Result<u64, SynapseCalyxError> {
+    calyx_aster::resource::heap_rss_bytes()
+        .map_err(|error| SynapseCalyxError::from_calyx("read process resident working set", &error))
 }
 
 /// Process allocator hook used to return dead transient rebuild pages to the OS.

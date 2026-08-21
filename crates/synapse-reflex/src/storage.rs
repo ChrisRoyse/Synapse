@@ -458,15 +458,20 @@ impl ReflexRuntime {
     ///
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
-    pub fn storage_put_action_log_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
+    pub fn storage_put_action_log_rows(
+        &self,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
         let decoded = rows
             .iter()
             .map(|(_key, value)| decode_json::<serde_json::Value>(value))
             .collect::<StorageResult<Vec<_>>>()?;
         let measured_rows = rows.clone();
         self.db.put_batch(cf::CF_ACTION_LOG, rows)?;
+        let mut reports = Vec::with_capacity(measured_rows.len());
         for ((key, value), record) in measured_rows.iter().zip(decoded.iter()) {
-            self.db
+            let report = self
+                .db
                 .put_action_constellation(key, value, record)
                 .inspect_err(|error| {
                     tracing::error!(
@@ -476,8 +481,10 @@ impl ReflexRuntime {
                         "action audit row was written but native Calyx constellation measurement failed"
                     );
                 })?;
+            reports.push(report);
         }
-        self.db.flush()
+        self.db.flush()?;
+        Ok(reports)
     }
 
     /// Atomically publishes one terminal action audit row, its measured

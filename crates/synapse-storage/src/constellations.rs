@@ -226,7 +226,17 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// `synapse.shell_admission_facts.v1` point-in-time snapshot and composes it
 /// with request semantics and immutable preconditions. Rows predating that
 /// snapshot are explicitly Absent; terminal errors are never used to infer it.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_008;
+///
+/// Generation `2_260_001` exposes the bounded writer-sealed predicates as
+/// compact typed views instead of asking the estimator to recover them from
+/// slot 125's 512-dimensional signed projection. It also adds the first
+/// resource-headroom view from the immutable pre-trigger resource snapshot.
+/// The opaque request/precondition/context slots remain readable history, but
+/// the causal predictor no longer treats nested aliases as independent causes.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_260_001;
+/// The complete writer-sealed admission-context generation superseded by the
+/// compact typed causal views and resource-headroom lane.
+pub const SYN_ACTION_PANEL_VERSION_PRE_CAUSAL_VIEWS: u32 = 2_185_008;
 /// The value-aware request/precondition generation superseded by the complete
 /// writer-sealed admission-facts context.
 pub const SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT_V3: u32 = 2_185_007;
@@ -400,7 +410,7 @@ const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100
 /// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
 /// headroom. Raise it when a new panel block needs room; the compile-time
 /// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 125;
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 136;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -808,6 +818,86 @@ const ACT_ADMISSION_CONTEXT_V2_DIM: u32 = 512;
 /// snapshot, so 512 dimensions retains the frozen projection-noise scale while
 /// preserving no-flatten storage at the panel boundary.
 const ACT_ADMISSION_CONTEXT_V3_DIM: u32 = 512;
+const ACT_COMMAND_SHAPE_LEVELS: u32 = 6;
+const ACT_ENVIRONMENT_STATE_LEVELS: u32 = 4;
+/// Four independent boolean writer predicates encoded as one lossless 4-bit
+/// categorical state. The compact causal-view registry retains each predicate's
+/// atom ownership; this materialized sufficient statistic prevents four sibling
+/// lanes from multiplying the association frontier at the current sample size.
+const ACT_POLICY_HAZARD_MASK_LEVELS: u32 = 16;
+/// Regular timeout has four boundary regimes; durable-start timeout has three
+/// (`absent`, invalid zero, positive).
+const ACT_TIMEOUT_POLICY_LEVELS: u32 = 7;
+/// `execution_mode` (three states) crossed with `durable_timeout_state` (three).
+const ACT_EXECUTION_ROUTE_LEVELS: u32 = 9;
+/// Four idempotency-key states on regular shell requests plus five job-id
+/// states on the mutually exclusive durable-start surface.
+const ACT_REQUEST_IDENTITY_POLICY_LEVELS: u32 = 9;
+const ACT_ALLOW_SHELL_POLICY_LEVELS: u32 = 4;
+const ACT_EXECUTABLE_RESOLUTION_LEVELS: u32 = 3;
+const ACT_WORKING_DIRECTORY_STATE_LEVELS: u32 = 3;
+/// Missing-required-environment (two states) crossed with the maximum
+/// configured-host diagnostic severity (none/info/warning/error).
+const ACT_HOST_PRECONDITION_STATE_LEVELS: u32 = 8;
+/// Eleven bounded fields enter a dense16 signed unit-field projection. Any
+/// field-hash collision is deterministic and part of this frozen v1 lens; the
+/// small dimension keeps each durable row and every cosine comparison cheap.
+const ACT_RESOURCE_HEADROOM_DIM: u32 = 16;
+const ACT_PRECONDITION_SOURCE_OF_TRUTH_V2: &str = "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata";
+const ACT_PRECONDITION_SOURCE_OF_TRUTH_V3: &str = "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata + queried immediate Windows Job aggregate committed memory + OS process-private commit/working-set telemetry/system-memory/target-volume counters";
+const ACT_RESOURCE_SOURCE_OF_TRUTH_V1: &str = "queried immediate Windows Job class-28 current/peak committed memory + exact kill-on-close/process-memory/job-memory extended-limit contract + OS process-private commit and working-set telemetry counters + OS system-memory counter + target-volume filesystem capacity counter";
+/// Exact v1 Job flags: kill-on-close (`0x2000`), process committed/private
+/// memory (`0x0100`), and aggregate Job committed/private memory (`0x0200`).
+/// The slot-136 extractor identity below binds the same hexadecimal value.
+const ACT_RESOURCE_JOB_LIMIT_FLAGS_V1: u64 = 0x2300;
+/// Must match the queried Windows Job `ProcessMemoryLimit` and
+/// `JobMemoryLimit` installed by `scripts/synapse-setup.ps1`. Working set is a
+/// measured feature only; it has no Job-enforced limit.
+const ACT_PROCESS_HARD_LIMIT_BYTES: u64 = synapse_core::SYNAPSE_PROCESS_HARD_LIMIT_BYTES;
+const ACT_PRECONDITION_FIELDS: &[&str] = &[
+    "schema_version",
+    "source_of_truth",
+    "platform",
+    "delivered_environment_count",
+    "required_environment_count",
+    "required_environment_missing",
+    "requested_environment_key_count",
+    "working_directory_present",
+    "working_directory_exists",
+    "configured_host_diagnostics",
+    "requested_command_path_class",
+    "spawn_command_path_class",
+    "executable_resolution",
+    "executable_resolution_source",
+    "resolved_path_sha256",
+    "secret_values_persisted",
+];
+const ACT_CONFIGURED_HOST_DIAGNOSTIC_FIELDS: &[&str] = &[
+    "variable",
+    "diagnostic_code",
+    "severity",
+    "explicit_override",
+    "source_of_truth",
+];
+const ACT_RESOURCE_FIELDS_V1: &[&str] = &[
+    "schema_version",
+    "source_of_truth",
+    "job_memory_bytes",
+    "job_memory_limit_bytes",
+    "job_memory_headroom_bytes",
+    "job_peak_memory_bytes",
+    "job_limit_flags",
+    "process_private_bytes",
+    "process_working_set_bytes",
+    "process_private_limit_bytes",
+    "process_private_headroom_bytes",
+    "system_total_memory_bytes",
+    "system_available_memory_bytes",
+    "target_volume_total_bytes",
+    "target_volume_available_bytes",
+    "target_volume_probe_class",
+    "gpu_measurement_required",
+];
 /// Frozen byte-length scale for the pre-action request lane.
 ///
 /// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
@@ -932,6 +1022,20 @@ const ACT_SLOT_ADMISSION_CONTEXT_V2: SlotId = SlotId::new(124);
 /// admission facts, and immutable preconditions. Slot 125 has never carried
 /// another meaning.
 const ACT_SLOT_ADMISSION_CONTEXT_V3: SlotId = SlotId::new(125);
+/// Compact, finite views of the writer-sealed admission predicates (#2260).
+/// Each is a new immutable lens; none changes the meaning of slots 118..=125.
+const ACT_SLOT_COMMAND_SHAPE: SlotId = SlotId::new(126);
+const ACT_SLOT_ENVIRONMENT_STATE: SlotId = SlotId::new(127);
+const ACT_SLOT_POLICY_HAZARD_MASK: SlotId = SlotId::new(128);
+const ACT_SLOT_TIMEOUT_POLICY: SlotId = SlotId::new(129);
+const ACT_SLOT_EXECUTION_ROUTE: SlotId = SlotId::new(130);
+const ACT_SLOT_REQUEST_IDENTITY_POLICY: SlotId = SlotId::new(131);
+const ACT_SLOT_ALLOW_SHELL_POLICY: SlotId = SlotId::new(132);
+const ACT_SLOT_EXECUTABLE_RESOLUTION: SlotId = SlotId::new(133);
+const ACT_SLOT_WORKING_DIRECTORY_STATE: SlotId = SlotId::new(134);
+const ACT_SLOT_HOST_PRECONDITION_STATE: SlotId = SlotId::new(135);
+/// Bounded ratios derived from the writer's immutable resource prestate.
+const ACT_SLOT_RESOURCE_HEADROOM: SlotId = SlotId::new(136);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -1093,14 +1197,14 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         last: 52,
     },
     // The action panel's second block (#2050/#1690). Holds the dense target,
-    // exact request, bounded request-size/request-shape, semantic request and
-    // precondition and admission-context lanes (117..=125). `48..=52` could not be
-    // extended because 53 belongs to the reflex panel and a block is contiguous
-    // by construction.
+    // exact request, bounded request-size/request-shape, semantic request,
+    // precondition/admission contexts, compact causal views and resource
+    // headroom lanes (117..=136). `48..=52` could not be extended because 53
+    // belongs to the reflex panel and a block is contiguous by construction.
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
         first: 117,
-        last: 125,
+        last: 136,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2608,6 +2712,47 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         ACT_SLOT_ADMISSION_CONTEXT_V3,
         "syn.action.admission_context.v3",
     ),
+    (ACT_SLOT_COMMAND_SHAPE, "syn.action.command_shape_onehot.v1"),
+    (
+        ACT_SLOT_ENVIRONMENT_STATE,
+        "syn.action.environment_state_onehot.v1",
+    ),
+    (
+        ACT_SLOT_POLICY_HAZARD_MASK,
+        "syn.action.policy_hazard_mask_onehot.v1",
+    ),
+    (
+        ACT_SLOT_TIMEOUT_POLICY,
+        "syn.action.timeout_policy_onehot.v1",
+    ),
+    (
+        ACT_SLOT_EXECUTION_ROUTE,
+        "syn.action.execution_route_onehot.v1",
+    ),
+    (
+        ACT_SLOT_REQUEST_IDENTITY_POLICY,
+        "syn.action.request_identity_policy_onehot.v1",
+    ),
+    (
+        ACT_SLOT_ALLOW_SHELL_POLICY,
+        "syn.action.allow_shell_policy_onehot.v1",
+    ),
+    (
+        ACT_SLOT_EXECUTABLE_RESOLUTION,
+        "syn.action.executable_resolution_onehot.v1",
+    ),
+    (
+        ACT_SLOT_WORKING_DIRECTORY_STATE,
+        "syn.action.working_directory_state_onehot.v1",
+    ),
+    (
+        ACT_SLOT_HOST_PRECONDITION_STATE,
+        "syn.action.host_precondition_state_onehot.v1",
+    ),
+    (
+        ACT_SLOT_RESOURCE_HEADROOM,
+        "syn.action.resource_headroom.v1",
+    ),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -3050,6 +3195,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT,
                 SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT_V2,
                 SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT_V3,
+                SYN_ACTION_PANEL_VERSION_PRE_CAUSAL_VIEWS,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5444,6 +5590,10 @@ pub fn build_agent_transcript_constellation(
 ///
 /// Returns an error when lens measurement, JSON encoding, or exact scalar
 /// conversion fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the action constellation retains each frozen no-flatten slot insertion at one audited publication boundary"
+)]
 pub fn build_action_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -5500,6 +5650,30 @@ pub fn build_action_constellation(
         ACT_SLOT_ADMISSION_CONTEXT_V3,
         action_admission_context_v3_slot(source_key, record)?,
     );
+    let [
+        command_shape,
+        environment_state,
+        policy_hazard_mask,
+        timeout_policy,
+        execution_route,
+        request_identity_policy,
+        allow_shell_policy,
+        executable_resolution,
+        working_directory_state,
+        host_precondition_state,
+        resource_headroom,
+    ] = action_compact_causal_view_slots(source_key, record)?;
+    slots.insert(ACT_SLOT_COMMAND_SHAPE, command_shape);
+    slots.insert(ACT_SLOT_ENVIRONMENT_STATE, environment_state);
+    slots.insert(ACT_SLOT_POLICY_HAZARD_MASK, policy_hazard_mask);
+    slots.insert(ACT_SLOT_TIMEOUT_POLICY, timeout_policy);
+    slots.insert(ACT_SLOT_EXECUTION_ROUTE, execution_route);
+    slots.insert(ACT_SLOT_REQUEST_IDENTITY_POLICY, request_identity_policy);
+    slots.insert(ACT_SLOT_ALLOW_SHELL_POLICY, allow_shell_policy);
+    slots.insert(ACT_SLOT_EXECUTABLE_RESOLUTION, executable_resolution);
+    slots.insert(ACT_SLOT_WORKING_DIRECTORY_STATE, working_directory_state);
+    slots.insert(ACT_SLOT_HOST_PRECONDITION_STATE, host_precondition_state);
+    slots.insert(ACT_SLOT_RESOURCE_HEADROOM, resource_headroom);
     slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
@@ -7097,6 +7271,16 @@ fn action_metadata(
     metadata.insert("oracle.action".to_owned(), action_identity(record));
     insert_optional_metadata(
         &mut metadata,
+        "action_row_kind",
+        json_string(record, &["row_kind"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "action_phase",
+        json_string(record, &["phase"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
         "action_tool",
         json_string(record, &["tool"]).as_deref(),
     );
@@ -7150,11 +7334,12 @@ pub fn action_outcome_anchor(
             Some("final") => match json_string(record, &["outcome"]).as_deref() {
                 Some("ok") => ("reward", true),
                 Some("error") => ("reward", false),
+                Some("causal_refused_unobserved") => return Ok(None),
                 value => {
                     return Err(StorageError::ReadFailed {
                         cf_name: cf::CF_ACTION_LOG.to_owned(),
                         detail: format!(
-                            "terminal command_audit row has unsupported outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error or extend the versioned adjudication contract"
+                            "terminal command_audit row has unsupported outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error|causal_refused_unobserved or extend the versioned adjudication contract"
                         ),
                     });
                 }
@@ -7208,6 +7393,7 @@ fn action_guard_region_anchor(
     }
     let outcome = match json_string(record, &["outcome"]).as_deref() {
         Some("ok") => true,
+        Some("causal_refused_unobserved") => return Ok(None),
         Some("error") => {
             let Some(code) = json_string(record, &["error_code"]) else {
                 return Ok(None);
@@ -7228,7 +7414,7 @@ fn action_guard_region_anchor(
             return Err(StorageError::ReadFailed {
                 cf_name: cf::CF_ACTION_LOG.to_owned(),
                 detail: format!(
-                    "terminal command_audit row has unsupported guard-region outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error or extend the versioned guard-region adjudication contract"
+                    "terminal command_audit row has unsupported guard-region outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error|causal_refused_unobserved or extend the versioned guard-region adjudication contract"
                 ),
             });
         }
@@ -8568,7 +8754,200 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         registry,
     )?);
     slots.extend(action_causal_context_panel_slots(panel_version, registry)?);
+    slots.extend(action_compact_causal_view_panel_slots(
+        panel_version,
+        registry,
+    )?);
     Ok(slots)
+}
+
+fn action_compact_causal_view_panel_slots(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<[Slot; 11]> {
+    let onehot = |slot_id, name, levels, registry: &mut Registry| {
+        syn_content_slot(
+            slot_id,
+            name,
+            RegistryAlgorithmicLens::syn_one_hot_index(name, Modality::Structured, levels),
+            panel_version,
+            registry,
+        )
+    };
+    Ok([
+        onehot(
+            ACT_SLOT_COMMAND_SHAPE,
+            "syn.action.command_shape_onehot.v1",
+            ACT_COMMAND_SHAPE_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_ENVIRONMENT_STATE,
+            "syn.action.environment_state_onehot.v1",
+            ACT_ENVIRONMENT_STATE_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_POLICY_HAZARD_MASK,
+            "syn.action.policy_hazard_mask_onehot.v1",
+            ACT_POLICY_HAZARD_MASK_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_TIMEOUT_POLICY,
+            "syn.action.timeout_policy_onehot.v1",
+            ACT_TIMEOUT_POLICY_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_EXECUTION_ROUTE,
+            "syn.action.execution_route_onehot.v1",
+            ACT_EXECUTION_ROUTE_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_REQUEST_IDENTITY_POLICY,
+            "syn.action.request_identity_policy_onehot.v1",
+            ACT_REQUEST_IDENTITY_POLICY_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_ALLOW_SHELL_POLICY,
+            "syn.action.allow_shell_policy_onehot.v1",
+            ACT_ALLOW_SHELL_POLICY_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_EXECUTABLE_RESOLUTION,
+            "syn.action.executable_resolution_onehot.v1",
+            ACT_EXECUTABLE_RESOLUTION_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_WORKING_DIRECTORY_STATE,
+            "syn.action.working_directory_state_onehot.v1",
+            ACT_WORKING_DIRECTORY_STATE_LEVELS,
+            registry,
+        )?,
+        onehot(
+            ACT_SLOT_HOST_PRECONDITION_STATE,
+            "syn.action.host_precondition_state_onehot.v1",
+            ACT_HOST_PRECONDITION_STATE_LEVELS,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_RESOURCE_HEADROOM,
+            "syn.action.resource_headroom.v1",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.action.resource_headroom.v1",
+                Modality::Structured,
+                ACT_RESOURCE_HEADROOM_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ])
+}
+
+/// Returns the exact physical LensId/LensSpec/extractor identities consumed by
+/// the compact causal-view Registry.  The extractor strings are frozen schema
+/// contracts: changing an ordered vocabulary, arithmetic invariant, hash
+/// namespace, or source boundary requires changing the corresponding string
+/// and action panel generation.
+pub(crate) fn syn_action_causal_physical_lens_bindings()
+-> StorageResult<BTreeMap<u16, synapse_calyx::SynapseCalyxPhysicalLensBinding>> {
+    const EXTRACTORS: &[(u16, &str)] = &[
+        (
+            126,
+            "action-command-shape/v1;source=shell_admission_facts.v1+payload.command;vocab=[empty,outer_whitespace,wrapped_in_quotes,unclosed_quote,contains_arguments,executable_name_or_path];invariant=utf8_byte_lengths_exact+shape_consistent",
+        ),
+        (
+            127,
+            "action-environment-state/v1;source=shell_admission_facts.v1+payload.env_keys;vocab=[invalid_entry,reserved_session_key,empty,valid];invariant=environment_entries==env_keys.len+empty_iff_zero",
+        ),
+        (
+            128,
+            "action-policy-hazard-mask/v1;source=shell_admission_facts.v1;bits=chromium_debug_policy_state[clear,violation]|global_input_state[clear,detected]<<1|reserved_variable_assignment_state[clear,detected]<<2|uncontained_recursive_delete_state[clear,detected]<<3",
+        ),
+        (
+            129,
+            "action-timeout-policy/v1;source=shell_admission_facts.v1+payload;inline=[zero,le_inline_limit,le_client_budget,above_client_budget];durable_start=[absent,zero,positive];invariant=timeout_states_exact+positive_limits+inline_limit<=client_budget",
+        ),
+        (
+            130,
+            "action-execution-route/v1;source=shell_admission_facts.v1;index=execution_mode[auto,inline,durable]*3+durable_timeout_state[absent,zero,positive]",
+        ),
+        (
+            131,
+            "action-request-identity-policy/v1;source=shell_admission_facts.v1;normal=idempotency[absent,blank,within_256_byte_bound,above_256_byte_bound];durable=4+job_id[absent,empty,above_128_byte_bound,valid,invalid_characters];byte_bounds_exact",
+        ),
+        (
+            132,
+            "action-allow-shell-policy/v1;source=shell_admission_facts.v1;vocab=[permissive_any,allowlist_match,no_allowlist_policy,allowlist_miss];invariant=permissive_any_any_count|no_policy_zero|match_or_miss_positive",
+        ),
+        (
+            133,
+            "action-executable-resolution/v1;source=run_shell_preconditions.schema[2,3];vocab=[invalid,not_found,resolved];resolved_requires_sha256+source[explicit_absolute_path,effective_working_directory,child_path,current_executable_directory,system_directory,windows_directory,parent_path,os_default_path]",
+        ),
+        (
+            134,
+            "action-working-directory-state/v1;source=run_shell_preconditions.schema[2,3];mapping=(present,exists):[(false,false)=absent,(true,false)=missing,(true,true)=exists];false_true_refused",
+        ),
+        (
+            135,
+            "action-host-precondition-state/v1;source=run_shell_preconditions.schema[2,3];index=4*required_env_missing+max_diagnostic_severity[none,info,warning,error];diagnostic_schema_exact+environment_counts_consistent",
+        ),
+        (
+            136,
+            "action-resource-headroom/v1;source=run_shell_preconditions.schema3.resource_prestate.v1;features=[clamp(job_memory/job_limit),job_headroom/job_limit,clamp(job_peak/job_limit),clamp(private/private_limit=789999616),clamp(working_set_telemetry/private_limit_scale=789999616),private_headroom/private_limit=789999616,system_available/system_total,log1p(system_total)/log1p(2^53),volume_available/volume_total,log1p(volume_total)/log1p(2^53),onehot(probe_class[effective_working_directory,daemon_current_directory])];all_u64<=2^53;job_flags=0x2300;working_set_limit=absent;l2_unit_signed_field_hash_dense16",
+        ),
+    ];
+    let contract = syn_reconstructable_panel_contract(SYN_ACTION_PANEL_VERSION, 0)?
+        .ok_or_else(|| panel_lifecycle_error(
+            "CALYX_ACTION_CAUSAL_PHYSICAL_CONTRACT_MISSING",
+            "current action panel has no reconstructable physical contract",
+            "restore the complete immutable action panel before measuring its causal-view Registry",
+        ))?;
+    let slots = contract
+        .panel
+        .slots
+        .iter()
+        .map(|slot| (slot.slot_id.get(), slot))
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = BTreeMap::new();
+    for (slot_id, extractor_contract) in EXTRACTORS {
+        let slot = slots.get(slot_id).ok_or_else(|| panel_lifecycle_error(
+            "CALYX_ACTION_CAUSAL_PHYSICAL_CONTRACT_MISSING",
+            &format!("action causal slot {slot_id} is absent from panel {SYN_ACTION_PANEL_VERSION}"),
+            "restore the complete immutable action panel and allocate a new generation for any layout change",
+        ))?;
+        let spec = contract.registry.lens_spec(slot.lens_id).ok_or_else(|| {
+            panel_lifecycle_error(
+                "CALYX_ACTION_CAUSAL_PHYSICAL_CONTRACT_MISSING",
+                &format!(
+                    "action causal slot {slot_id} lens {} has no Registry LensSpec",
+                    slot.lens_id
+                ),
+                "register every physical causal lens through the frozen panel Registry",
+            )
+        })?;
+        let spec_bytes = serde_json::to_vec(spec).map_err(|error| {
+            panel_lifecycle_error(
+                "CALYX_ACTION_CAUSAL_PHYSICAL_CONTRACT_ENCODE_FAILED",
+                &format!("encode slot {slot_id} LensSpec: {error}"),
+                "repair the deterministic LensSpec serializer before publishing causal identities",
+            )
+        })?;
+        bindings.insert(
+            *slot_id,
+            synapse_calyx::SynapseCalyxPhysicalLensBinding {
+                lens_id: slot.lens_id.to_string(),
+                lens_spec_sha256: sha256_hex(&spec_bytes),
+                extractor_schema_sha256: sha256_hex(extractor_contract.as_bytes()),
+            },
+        );
+    }
+    Ok(bindings)
 }
 
 fn action_causal_context_panel_slots(
@@ -10907,10 +11286,14 @@ fn action_admission_context_v2_slot(
 /// malformed or partial snapshots are corruption and fail closed. The schema
 /// is intentionally enumerated here so a writer cannot add a validation
 /// predicate without also publishing a new immutable lens generation.
-fn action_admission_fact_features(
+#[expect(
+    clippy::too_many_lines,
+    reason = "the writer-sealed admission schema is enumerated and cross-field validated in one fail-closed decoder"
+)]
+fn action_admission_facts_object<'a>(
     source_key: &[u8],
-    request: &ActionRequestSource<'_>,
-) -> StorageResult<Option<serde_json::Map<String, Value>>> {
+    request: &ActionRequestSource<'a>,
+) -> StorageResult<Option<&'a serde_json::Map<String, Value>>> {
     const SCHEMA: &str = "synapse.shell_admission_facts.v1";
     const REQUIRED_FIELDS: &[&str] = &[
         "schema",
@@ -10981,9 +11364,58 @@ fn action_admission_fact_features(
         ));
     }
 
+    let has_job_state = object.contains_key("job_id_state");
+    let has_job_bytes = object.contains_key("job_id_bytes");
+    if has_job_state != has_job_bytes {
+        return Err(measurement_error(
+            "action admission context v3",
+            format!(
+                "source_cf={} source_key_hex={} admission_facts schema={SCHEMA} carries only one of job_id_state/job_id_bytes; remediation=repair or quarantine the partial durable-start writer snapshot",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key)
+            ),
+        ));
+    }
+    let unknown = object
+        .keys()
+        .filter(|field| {
+            !REQUIRED_FIELDS.contains(&field.as_str())
+                && field.as_str() != "job_id_state"
+                && field.as_str() != "job_id_bytes"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(measurement_error(
+            "action admission context v3",
+            format!(
+                "source_cf={} source_key_hex={} admission_facts schema={SCHEMA} carries undeclared fields {}; remediation=allocate a new immutable writer schema and action-panel generation instead of silently dropping a new predicate",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                unknown.join(",")
+            ),
+        ));
+    }
+    Ok(Some(object))
+}
+
+fn action_admission_fact_features(
+    source_key: &[u8],
+    request: &ActionRequestSource<'_>,
+) -> StorageResult<Option<serde_json::Map<String, Value>>> {
+    let Some(object) = action_admission_facts_object(source_key, request)? else {
+        return Ok(None);
+    };
+
     let mut features = serde_json::Map::new();
     let mut budget = ActionRequestAtomBudget::default();
-    collect_action_request_atoms(facts, "$admission", 0, &mut features, &mut budget);
+    collect_action_request_atoms(
+        &Value::Object(object.clone()),
+        "$admission",
+        0,
+        &mut features,
+        &mut budget,
+    );
     if budget.overflowed {
         return Err(measurement_error(
             "action admission context v3",
@@ -10995,6 +11427,918 @@ fn action_admission_fact_features(
         ));
     }
     Ok(Some(features))
+}
+
+fn action_compact_view_error(source_key: &[u8], detail: impl std::fmt::Display) -> StorageError {
+    measurement_error(
+        "action compact causal views",
+        format!(
+            "source_cf={} source_key_hex={}: {detail}; remediation=repair or quarantine the malformed writer-sealed pre-trigger snapshot",
+            cf::CF_ACTION_LOG,
+            hex_encode(source_key)
+        ),
+    )
+}
+
+fn action_required_value<'a>(
+    source_key: &[u8],
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> StorageResult<&'a Value> {
+    object
+        .get(field)
+        .ok_or_else(|| action_compact_view_error(source_key, format!("missing field {field}")))
+}
+
+fn action_required_u64(
+    source_key: &[u8],
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> StorageResult<u64> {
+    action_required_value(source_key, object, field)?
+        .as_u64()
+        .ok_or_else(|| action_compact_view_error(source_key, format!("field {field} is not a u64")))
+}
+
+fn action_optional_u64(
+    source_key: &[u8],
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> StorageResult<Option<u64>> {
+    match action_required_value(source_key, object, field)? {
+        Value::Null => Ok(None),
+        Value::Number(value) => value.as_u64().map(Some).ok_or_else(|| {
+            action_compact_view_error(source_key, format!("field {field} is not null or a u64"))
+        }),
+        _ => Err(action_compact_view_error(
+            source_key,
+            format!("field {field} is not null or a u64"),
+        )),
+    }
+}
+
+fn action_required_bool(
+    source_key: &[u8],
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> StorageResult<bool> {
+    action_required_value(source_key, object, field)?
+        .as_bool()
+        .ok_or_else(|| {
+            action_compact_view_error(source_key, format!("field {field} is not a boolean"))
+        })
+}
+
+fn action_required_string<'a>(
+    source_key: &[u8],
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> StorageResult<&'a str> {
+    action_required_value(source_key, object, field)?
+        .as_str()
+        .ok_or_else(|| {
+            action_compact_view_error(source_key, format!("field {field} is not a string"))
+        })
+}
+
+fn action_enum_index(
+    source_key: &[u8],
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    vocabulary: &[&str],
+) -> StorageResult<u32> {
+    let value = action_required_string(source_key, object, field)?;
+    vocabulary
+        .iter()
+        .position(|candidate| *candidate == value)
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| {
+            action_compact_view_error(
+                source_key,
+                format!(
+                    "field {field} value {value:?} is outside frozen vocabulary {vocabulary:?}"
+                ),
+            )
+        })
+}
+
+fn action_compact_onehot(name: &'static str, index: u32, levels: u32) -> StorageResult<SlotVector> {
+    measure_number(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_one_hot_index(name, Modality::Structured, levels),
+        index,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one frozen facts-schema validator must keep every cross-field invariant adjacent to the seven compact outputs"
+)]
+fn action_admission_compact_indices(
+    source_key: &[u8],
+    request: &ActionRequestSource<'_>,
+    facts: &serde_json::Map<String, Value>,
+) -> StorageResult<[u32; 7]> {
+    let payload = request
+        .payload
+        .as_object()
+        .ok_or_else(|| action_compact_view_error(source_key, "payload_bounded is not an object"))?;
+
+    let command_shape = action_enum_index(
+        source_key,
+        facts,
+        "command_shape",
+        &[
+            "empty",
+            "outer_whitespace",
+            "wrapped_in_quotes",
+            "unclosed_quote",
+            "contains_arguments",
+            "executable_name_or_path",
+        ],
+    )?;
+    let command = action_required_string(source_key, payload, "command")?;
+    let command_bytes = action_required_u64(source_key, facts, "command_bytes")?;
+    let command_trimmed_bytes = action_required_u64(source_key, facts, "command_trimmed_bytes")?;
+    let actual_command_bytes = u64::try_from(command.len())
+        .map_err(|_| action_compact_view_error(source_key, "command byte length exceeds u64"))?;
+    let actual_trimmed_bytes = u64::try_from(command.trim().len()).map_err(|_| {
+        action_compact_view_error(source_key, "trimmed command byte length exceeds u64")
+    })?;
+    let shape_lengths_valid = command_bytes == actual_command_bytes
+        && command_trimmed_bytes == actual_trimmed_bytes
+        && match command_shape {
+            0 => command_trimmed_bytes == 0,
+            1 => command_trimmed_bytes > 0 && command_trimmed_bytes < command_bytes,
+            _ => command_bytes > 0 && command_trimmed_bytes == command_bytes,
+        };
+    if !shape_lengths_valid {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "command shape/length contradiction: shape_index={command_shape} command_bytes={command_bytes} command_trimmed_bytes={command_trimmed_bytes} actual=({actual_command_bytes},{actual_trimmed_bytes})"
+            ),
+        ));
+    }
+
+    let environment_state = action_enum_index(
+        source_key,
+        facts,
+        "environment_state",
+        &["invalid_entry", "reserved_session_key", "empty", "valid"],
+    )?;
+    let environment_entries = action_required_u64(source_key, facts, "environment_entries")?;
+    let env_keys = action_required_value(source_key, payload, "env_keys")?
+        .as_array()
+        .ok_or_else(|| action_compact_view_error(source_key, "field env_keys is not an array"))?;
+    let actual_environment_entries = u64::try_from(env_keys.len())
+        .map_err(|_| action_compact_view_error(source_key, "env_keys length exceeds u64"))?;
+    if environment_entries != actual_environment_entries
+        || (environment_state == 2) != (environment_entries == 0)
+    {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "environment state/count contradiction: state_index={environment_state} entries={environment_entries} env_keys={actual_environment_entries}"
+            ),
+        ));
+    }
+
+    let chromium = action_enum_index(
+        source_key,
+        facts,
+        "chromium_debug_policy_state",
+        &["clear", "violation"],
+    )?;
+    let global_input = action_enum_index(
+        source_key,
+        facts,
+        "global_input_state",
+        &["clear", "detected"],
+    )?;
+    let reserved_assignment = action_enum_index(
+        source_key,
+        facts,
+        "reserved_variable_assignment_state",
+        &["clear", "detected"],
+    )?;
+    let recursive_delete = action_enum_index(
+        source_key,
+        facts,
+        "uncontained_recursive_delete_state",
+        &["clear", "detected"],
+    )?;
+    let policy_hazard_mask =
+        chromium | (global_input << 1) | (reserved_assignment << 2) | (recursive_delete << 3);
+
+    let timeout_state =
+        action_enum_index(source_key, facts, "timeout_state", &["zero", "positive"])?;
+    let durable_timeout_state = action_enum_index(
+        source_key,
+        facts,
+        "durable_timeout_state",
+        &["absent", "zero", "positive"],
+    )?;
+    let execution_mode = action_enum_index(
+        source_key,
+        facts,
+        "execution_mode",
+        &["auto", "inline", "durable"],
+    )?;
+    let is_durable_start = facts.contains_key("job_id_state");
+    let timeout_policy = if is_durable_start {
+        if execution_mode != 2 {
+            return Err(action_compact_view_error(
+                source_key,
+                "durable-start admission facts do not declare execution_mode=durable",
+            ));
+        }
+        match action_optional_u64(source_key, payload, "timeout_ms")? {
+            None if timeout_state == 1 && durable_timeout_state == 0 => 4,
+            Some(0) if timeout_state == 0 && durable_timeout_state == 1 => 5,
+            Some(_) if timeout_state == 1 && durable_timeout_state == 2 => 6,
+            timeout => {
+                return Err(action_compact_view_error(
+                    source_key,
+                    format!(
+                        "durable-start timeout contradiction: timeout_ms={timeout:?} timeout_state={timeout_state} durable_timeout_state={durable_timeout_state}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        let timeout_ms = action_required_u64(source_key, payload, "timeout_ms")?;
+        let inline_limit = action_required_u64(source_key, payload, "inline_await_limit_ms")?;
+        let client_budget =
+            action_required_u64(source_key, payload, "inline_client_call_budget_ms")?;
+        if inline_limit == 0 || client_budget == 0 || inline_limit > client_budget {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "invalid timeout policy bounds: inline_await_limit_ms={inline_limit} inline_client_call_budget_ms={client_budget}"
+                ),
+            ));
+        }
+        if (timeout_ms == 0) != (timeout_state == 0) {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "timeout state/value contradiction: timeout_ms={timeout_ms} timeout_state={timeout_state}"
+                ),
+            ));
+        }
+        let durable_timeout = action_optional_u64(source_key, payload, "durable_timeout_ms")?;
+        let expected_durable_state = match durable_timeout {
+            None => 0,
+            Some(0) => 1,
+            Some(_) => 2,
+        };
+        if durable_timeout_state != expected_durable_state {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "durable timeout state/value contradiction: durable_timeout_ms={durable_timeout:?} durable_timeout_state={durable_timeout_state}"
+                ),
+            ));
+        }
+        match timeout_ms {
+            0 => 0,
+            value if value <= inline_limit => 1,
+            value if value <= client_budget => 2,
+            _ => 3,
+        }
+    };
+    let execution_route = execution_mode * 3 + durable_timeout_state;
+
+    let idempotency_state = action_enum_index(
+        source_key,
+        facts,
+        "idempotency_key_state",
+        &[
+            "absent",
+            "blank",
+            "within_256_byte_bound",
+            "above_256_byte_bound",
+        ],
+    )?;
+    let idempotency_bytes = action_optional_u64(source_key, facts, "idempotency_key_bytes")?;
+    let idempotency_consistent = match (idempotency_state, idempotency_bytes) {
+        // The writer classifies blankness before applying the byte bound, so
+        // an arbitrarily long all-whitespace key is still exactly `blank`.
+        (0, None) | (1, Some(_)) => true,
+        (2, Some(bytes)) => (1..=256).contains(&bytes),
+        (3, Some(bytes)) => bytes > 256,
+        _ => false,
+    };
+    if !idempotency_consistent {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "idempotency state/length contradiction: state_index={idempotency_state} bytes={idempotency_bytes:?}"
+            ),
+        ));
+    }
+    let request_identity_policy = if is_durable_start {
+        if idempotency_state != 0 || idempotency_bytes.is_some() {
+            return Err(action_compact_view_error(
+                source_key,
+                "durable-start facts unexpectedly carry an idempotency key",
+            ));
+        }
+        let job_state = action_enum_index(
+            source_key,
+            facts,
+            "job_id_state",
+            &[
+                "absent",
+                "empty",
+                "above_128_byte_bound",
+                "valid",
+                "invalid_characters",
+            ],
+        )?;
+        let job_bytes = action_optional_u64(source_key, facts, "job_id_bytes")?;
+        let job_consistent = match (job_state, job_bytes) {
+            (0, None) | (1, Some(0)) => true,
+            (2, Some(bytes)) => bytes > 128,
+            (3 | 4, Some(bytes)) => (1..=128).contains(&bytes),
+            _ => false,
+        };
+        if !job_consistent {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "job-id state/length contradiction: state_index={job_state} bytes={job_bytes:?}"
+                ),
+            ));
+        }
+        4 + job_state
+    } else {
+        idempotency_state
+    };
+
+    let allow_shell_policy = action_enum_index(
+        source_key,
+        facts,
+        "allow_shell_policy_state",
+        &[
+            "permissive_any",
+            "allowlist_match",
+            "no_allowlist_policy",
+            "allowlist_miss",
+        ],
+    )?;
+    let allow_shell_patterns = action_required_u64(source_key, facts, "allow_shell_patterns")?;
+    let allow_consistent = match allow_shell_policy {
+        // `permissive_any` is the ANY sentinel. It is valid with zero concrete
+        // patterns because no allow-list is consulted in that mode.
+        0 => true,
+        2 => allow_shell_patterns == 0,
+        1 | 3 => allow_shell_patterns > 0,
+        _ => false,
+    };
+    if !allow_consistent {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "allow-shell policy/count contradiction: state_index={allow_shell_policy} patterns={allow_shell_patterns}"
+            ),
+        ));
+    }
+
+    Ok([
+        command_shape,
+        environment_state,
+        policy_hazard_mask,
+        timeout_policy,
+        execution_route,
+        request_identity_policy,
+        allow_shell_policy,
+    ])
+}
+
+fn action_precondition_object<'a>(
+    source_key: &[u8],
+    record: &'a Value,
+) -> StorageResult<Option<(u64, &'a serde_json::Map<String, Value>)>> {
+    let Some(before) = record.get("before") else {
+        return Ok(None);
+    };
+    if before.is_null() {
+        return Ok(None);
+    }
+    let before = before.as_object().ok_or_else(|| {
+        action_compact_view_error(source_key, "command before state is not an object")
+    })?;
+    let Some(preconditions) = before.get("preconditions") else {
+        return Ok(None);
+    };
+    if preconditions.is_null() {
+        return Ok(None);
+    }
+    let preconditions = preconditions.as_object().ok_or_else(|| {
+        action_compact_view_error(source_key, "before.preconditions is not an object")
+    })?;
+    let Some(schema_version) = preconditions.get("schema_version") else {
+        return Ok(None);
+    };
+    let schema_version = schema_version.as_u64().ok_or_else(|| {
+        action_compact_view_error(
+            source_key,
+            "before.preconditions.schema_version is not a u64",
+        )
+    })?;
+    if schema_version < 2 {
+        // Older immutable precondition schemas did not seal the full typed
+        // contract these views require. Preserve that as explicit absence;
+        // never infer it from the current host or a terminal result.
+        return Ok(None);
+    }
+    if schema_version > 3 {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "before.preconditions.schema_version={schema_version} is newer than supported immutable schemas 2..=3"
+            ),
+        ));
+    }
+    if action_required_bool(source_key, preconditions, "secret_values_persisted")? {
+        return Err(action_compact_view_error(
+            source_key,
+            "before.preconditions claims secret_values_persisted=true",
+        ));
+    }
+    let source_of_truth = action_required_string(source_key, preconditions, "source_of_truth")?;
+    let expected_source_of_truth = match schema_version {
+        2 => ACT_PRECONDITION_SOURCE_OF_TRUTH_V2,
+        3 => ACT_PRECONDITION_SOURCE_OF_TRUTH_V3,
+        _ => {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "before.preconditions.schema_version={schema_version} escaped the frozen 2..=3 range"
+                ),
+            ));
+        }
+    };
+    if source_of_truth != expected_source_of_truth {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "before.preconditions schema {schema_version} source_of_truth={source_of_truth:?} expected={expected_source_of_truth:?}; allocate a new immutable schema when probe semantics change"
+            ),
+        ));
+    }
+    let _ = action_enum_index(
+        source_key,
+        preconditions,
+        "platform",
+        &["windows", "non_windows"],
+    )?;
+    let unknown = preconditions
+        .keys()
+        .filter(|field| {
+            !(ACT_PRECONDITION_FIELDS.contains(&field.as_str())
+                || schema_version == 3 && field.as_str() == "resource_prestate")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "before.preconditions schema {schema_version} carries undeclared fields {}; allocate a new immutable precondition schema and action-panel generation instead of silently dropping a new cause",
+                unknown.join(",")
+            ),
+        ));
+    }
+    Ok(Some((schema_version, preconditions)))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pre-trigger schema walk validates correlated executable, directory, environment, and diagnostic invariants"
+)]
+fn action_precondition_compact_indices(
+    source_key: &[u8],
+    preconditions: &serde_json::Map<String, Value>,
+) -> StorageResult<[u32; 3]> {
+    let executable_resolution = action_enum_index(
+        source_key,
+        preconditions,
+        "executable_resolution",
+        &["invalid", "not_found", "resolved"],
+    )?;
+    let resolved_sha = action_required_value(source_key, preconditions, "resolved_path_sha256")?;
+    let resolution_source =
+        action_required_value(source_key, preconditions, "executable_resolution_source")?;
+    let resolved_metadata_valid = if executable_resolution == 2 {
+        resolved_sha.as_str().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) && resolution_source.as_str().is_some_and(|source| {
+            matches!(
+                source,
+                "explicit_absolute_path"
+                    | "effective_working_directory"
+                    | "child_path"
+                    | "current_executable_directory"
+                    | "system_directory"
+                    | "windows_directory"
+                    | "parent_path"
+                    | "os_default_path"
+            )
+        })
+    } else {
+        resolved_sha.is_null() && resolution_source.is_null()
+    };
+    if !resolved_metadata_valid {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "executable resolution metadata contradicts state_index={executable_resolution}"
+            ),
+        ));
+    }
+
+    let working_directory_present =
+        action_required_bool(source_key, preconditions, "working_directory_present")?;
+    let working_directory_exists =
+        action_required_bool(source_key, preconditions, "working_directory_exists")?;
+    let working_directory_state = match (working_directory_present, working_directory_exists) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, true) => {
+            return Err(action_compact_view_error(
+                source_key,
+                "working_directory_exists=true while working_directory_present=false",
+            ));
+        }
+    };
+
+    for field in ["requested_command_path_class", "spawn_command_path_class"] {
+        let _ = action_enum_index(
+            source_key,
+            preconditions,
+            field,
+            &[
+                "empty",
+                "absolute",
+                "drive_relative",
+                "relative_path",
+                "bare_name",
+            ],
+        )?;
+    }
+    let delivered = action_required_u64(source_key, preconditions, "delivered_environment_count")?;
+    let required = action_required_u64(source_key, preconditions, "required_environment_count")?;
+    let _requested =
+        action_required_u64(source_key, preconditions, "requested_environment_key_count")?;
+    let missing = action_required_value(source_key, preconditions, "required_environment_missing")?
+        .as_array()
+        .ok_or_else(|| {
+            action_compact_view_error(source_key, "required_environment_missing is not an array")
+        })?;
+    if missing
+        .iter()
+        .any(|value| value.as_str().is_none_or(|name| name.trim().is_empty()))
+    {
+        return Err(action_compact_view_error(
+            source_key,
+            "required_environment_missing contains a non-string or blank name",
+        ));
+    }
+    let missing_count = u64::try_from(missing.len()).map_err(|_| {
+        action_compact_view_error(
+            source_key,
+            "required_environment_missing length exceeds u64",
+        )
+    })?;
+    if missing_count > required || delivered < required.saturating_sub(missing_count) {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "environment precondition counts contradict: delivered={delivered} required={required} missing={missing_count}"
+            ),
+        ));
+    }
+
+    let diagnostics =
+        action_required_value(source_key, preconditions, "configured_host_diagnostics")?
+            .as_array()
+            .ok_or_else(|| {
+                action_compact_view_error(source_key, "configured_host_diagnostics is not an array")
+            })?;
+    let mut severity_rank = 0_u32;
+    for diagnostic in diagnostics {
+        let diagnostic = diagnostic.as_object().ok_or_else(|| {
+            action_compact_view_error(
+                source_key,
+                "configured_host_diagnostics contains a non-object",
+            )
+        })?;
+        let unknown = diagnostic
+            .keys()
+            .filter(|field| !ACT_CONFIGURED_HOST_DIAGNOSTIC_FIELDS.contains(&field.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(action_compact_view_error(
+                source_key,
+                format!(
+                    "configured-host diagnostic carries undeclared fields {}; allocate a new immutable precondition schema instead of silently dropping diagnostic state",
+                    unknown.join(",")
+                ),
+            ));
+        }
+        for field in ["variable", "diagnostic_code", "source_of_truth"] {
+            if action_required_string(source_key, diagnostic, field)?
+                .trim()
+                .is_empty()
+            {
+                return Err(action_compact_view_error(
+                    source_key,
+                    format!("configured-host diagnostic field {field} is blank"),
+                ));
+            }
+        }
+        let _ = action_required_bool(source_key, diagnostic, "explicit_override")?;
+        let rank = action_enum_index(
+            source_key,
+            diagnostic,
+            "severity",
+            &["info", "warning", "error"],
+        )? + 1;
+        severity_rank = severity_rank.max(rank);
+    }
+    let host_precondition_state = 4 * u32::from(!missing.is_empty()) + severity_rank;
+    Ok([
+        executable_resolution,
+        working_directory_state,
+        host_precondition_state,
+    ])
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the frozen resource snapshot is validated and bounded before any ratio enters its compact dense lens"
+)]
+fn action_resource_headroom_slot(
+    source_key: &[u8],
+    precondition_schema: u64,
+    preconditions: &serde_json::Map<String, Value>,
+) -> StorageResult<SlotVector> {
+    if precondition_schema < 3 {
+        return Ok(absent(AbsentReason::NotApplicable));
+    }
+    let resource = action_required_value(source_key, preconditions, "resource_prestate")?
+        .as_object()
+        .ok_or_else(|| {
+            action_compact_view_error(source_key, "resource_prestate is not an object")
+        })?;
+    if action_required_u64(source_key, resource, "schema_version")? != 1 {
+        return Err(action_compact_view_error(
+            source_key,
+            "resource_prestate.schema_version is not the frozen value 1",
+        ));
+    }
+    let source_of_truth = action_required_string(source_key, resource, "source_of_truth")?;
+    if source_of_truth != ACT_RESOURCE_SOURCE_OF_TRUTH_V1 {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "resource_prestate source_of_truth={source_of_truth:?} expected={ACT_RESOURCE_SOURCE_OF_TRUTH_V1:?}; allocate a new immutable resource schema when probe semantics change"
+            ),
+        ));
+    }
+    if action_required_bool(source_key, resource, "gpu_measurement_required")? {
+        return Err(action_compact_view_error(
+            source_key,
+            "resource_prestate unexpectedly requires GPU measurement",
+        ));
+    }
+    let unknown = resource
+        .keys()
+        .filter(|field| !ACT_RESOURCE_FIELDS_V1.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "resource_prestate schema 1 carries undeclared fields {}; allocate a new immutable resource schema and action-panel generation instead of silently dropping a new cause",
+                unknown.join(",")
+            ),
+        ));
+    }
+    let private = action_required_u64(source_key, resource, "process_private_bytes")?;
+    let working_set = action_required_u64(source_key, resource, "process_working_set_bytes")?;
+    let private_limit = action_required_u64(source_key, resource, "process_private_limit_bytes")?;
+    let job_memory = action_required_u64(source_key, resource, "job_memory_bytes")?;
+    let job_limit = action_required_u64(source_key, resource, "job_memory_limit_bytes")?;
+    let job_headroom = action_required_u64(source_key, resource, "job_memory_headroom_bytes")?;
+    let job_peak = action_required_u64(source_key, resource, "job_peak_memory_bytes")?;
+    let job_limit_flags = action_required_u64(source_key, resource, "job_limit_flags")?;
+    let private_headroom =
+        action_required_u64(source_key, resource, "process_private_headroom_bytes")?;
+    let system_total = action_required_u64(source_key, resource, "system_total_memory_bytes")?;
+    let system_available =
+        action_required_u64(source_key, resource, "system_available_memory_bytes")?;
+    let volume_total = action_required_u64(source_key, resource, "target_volume_total_bytes")?;
+    let volume_available =
+        action_required_u64(source_key, resource, "target_volume_available_bytes")?;
+    let private_headroom_valid = if private < private_limit {
+        private.checked_add(private_headroom) == Some(private_limit)
+    } else {
+        private_headroom == 0
+    };
+    let job_headroom_valid = if job_memory < job_limit {
+        job_memory.checked_add(job_headroom) == Some(job_limit)
+    } else {
+        job_headroom == 0
+    };
+    if private_limit != ACT_PROCESS_HARD_LIMIT_BYTES
+        || job_limit != private_limit
+        || !job_headroom_valid
+        || job_peak < job_memory
+        || job_limit_flags != ACT_RESOURCE_JOB_LIMIT_FLAGS_V1
+        || !private_headroom_valid
+        || system_total == 0
+        || system_available > system_total
+        || volume_total == 0
+        || volume_available > volume_total
+        || [
+            private,
+            working_set,
+            job_memory,
+            job_headroom,
+            job_peak,
+            private_headroom,
+            system_total,
+            system_available,
+            volume_total,
+            volume_available,
+        ]
+        .into_iter()
+        .any(|value| value > MAX_EXACT_F64_INT)
+    {
+        return Err(action_compact_view_error(
+            source_key,
+            format!(
+                "resource_prestate violates frozen arithmetic bounds: job=({job_memory},{job_headroom},{job_peak},{job_limit},flags=0x{job_limit_flags:x}) private={private} private_limit={private_limit} private_headroom={private_headroom} working_set_telemetry={working_set} working_set_limit=absent system=({system_available},{system_total}) volume=({volume_available},{volume_total})"
+            ),
+        ));
+    }
+    let probe_class = action_required_string(source_key, resource, "target_volume_probe_class")?;
+    if !matches!(
+        probe_class,
+        "effective_working_directory" | "daemon_current_directory"
+    ) {
+        return Err(action_compact_view_error(
+            source_key,
+            format!("unknown target_volume_probe_class {probe_class:?}"),
+        ));
+    }
+
+    let ratio = |numerator: u64, denominator: u64| {
+        exact_u64_as_f64(numerator) / exact_u64_as_f64(denominator)
+    };
+    let log_scale =
+        |value: u64| exact_u64_as_f64(value).ln_1p() / exact_u64_as_f64(MAX_EXACT_F64_INT).ln_1p();
+    let mut features = serde_json::Map::new();
+    features.insert(
+        "job_memory_fraction".to_owned(),
+        json!(ratio(job_memory.min(job_limit), job_limit)),
+    );
+    features.insert(
+        "job_memory_headroom_fraction".to_owned(),
+        json!(ratio(job_headroom, job_limit)),
+    );
+    features.insert(
+        "job_peak_memory_fraction".to_owned(),
+        json!(ratio(job_peak.min(job_limit), job_limit)),
+    );
+    features.insert(
+        "process_private_fraction".to_owned(),
+        json!(ratio(private.min(private_limit), private_limit)),
+    );
+    features.insert(
+        "process_working_set_telemetry_fraction_of_private_limit".to_owned(),
+        json!(ratio(working_set.min(private_limit), private_limit)),
+    );
+    features.insert(
+        "process_private_headroom_fraction".to_owned(),
+        json!(ratio(private_headroom, private_limit)),
+    );
+    features.insert(
+        "system_available_fraction".to_owned(),
+        json!(ratio(system_available, system_total)),
+    );
+    features.insert(
+        "system_total_log_scale".to_owned(),
+        json!(log_scale(system_total)),
+    );
+    features.insert(
+        "target_volume_available_fraction".to_owned(),
+        json!(ratio(volume_available, volume_total)),
+    );
+    features.insert(
+        "target_volume_total_log_scale".to_owned(),
+        json!(log_scale(volume_total)),
+    );
+    features.insert(format!("target_volume_probe|{probe_class}"), json!(1.0));
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.resource_headroom.v1",
+            Modality::Structured,
+            ACT_RESOURCE_HEADROOM_DIM,
+        ),
+        &Value::Object(features),
+    )
+}
+
+fn action_compact_causal_view_slots(
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<[SlotVector; 11]> {
+    let mut slots = std::array::from_fn(|_| absent(AbsentReason::NotApplicable));
+    if json_string(record, &["row_kind"]).as_deref() != Some("command_audit") {
+        return Ok(slots);
+    }
+    let Some(request) = action_request_source(record)? else {
+        return Ok(slots);
+    };
+    if let Some(facts) = action_admission_facts_object(source_key, &request)? {
+        let [
+            command_shape,
+            environment_state,
+            policy_hazard_mask,
+            timeout_policy,
+            execution_route,
+            request_identity_policy,
+            allow_shell_policy,
+        ] = action_admission_compact_indices(source_key, &request, facts)?;
+        slots[0] = action_compact_onehot(
+            "syn.action.command_shape_onehot.v1",
+            command_shape,
+            ACT_COMMAND_SHAPE_LEVELS,
+        )?;
+        slots[1] = action_compact_onehot(
+            "syn.action.environment_state_onehot.v1",
+            environment_state,
+            ACT_ENVIRONMENT_STATE_LEVELS,
+        )?;
+        slots[2] = action_compact_onehot(
+            "syn.action.policy_hazard_mask_onehot.v1",
+            policy_hazard_mask,
+            ACT_POLICY_HAZARD_MASK_LEVELS,
+        )?;
+        slots[3] = action_compact_onehot(
+            "syn.action.timeout_policy_onehot.v1",
+            timeout_policy,
+            ACT_TIMEOUT_POLICY_LEVELS,
+        )?;
+        slots[4] = action_compact_onehot(
+            "syn.action.execution_route_onehot.v1",
+            execution_route,
+            ACT_EXECUTION_ROUTE_LEVELS,
+        )?;
+        slots[5] = action_compact_onehot(
+            "syn.action.request_identity_policy_onehot.v1",
+            request_identity_policy,
+            ACT_REQUEST_IDENTITY_POLICY_LEVELS,
+        )?;
+        slots[6] = action_compact_onehot(
+            "syn.action.allow_shell_policy_onehot.v1",
+            allow_shell_policy,
+            ACT_ALLOW_SHELL_POLICY_LEVELS,
+        )?;
+    }
+    if let Some((schema, preconditions)) = action_precondition_object(source_key, record)? {
+        let [
+            executable_resolution,
+            working_directory_state,
+            host_precondition_state,
+        ] = action_precondition_compact_indices(source_key, preconditions)?;
+        slots[7] = action_compact_onehot(
+            "syn.action.executable_resolution_onehot.v1",
+            executable_resolution,
+            ACT_EXECUTABLE_RESOLUTION_LEVELS,
+        )?;
+        slots[8] = action_compact_onehot(
+            "syn.action.working_directory_state_onehot.v1",
+            working_directory_state,
+            ACT_WORKING_DIRECTORY_STATE_LEVELS,
+        )?;
+        slots[9] = action_compact_onehot(
+            "syn.action.host_precondition_state_onehot.v1",
+            host_precondition_state,
+            ACT_HOST_PRECONDITION_STATE_LEVELS,
+        )?;
+        slots[10] = action_resource_headroom_slot(source_key, schema, preconditions)?;
+    }
+    Ok(slots)
 }
 
 /// Measures the complete point-in-time request-admission × precondition

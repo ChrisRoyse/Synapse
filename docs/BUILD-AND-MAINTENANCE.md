@@ -50,17 +50,23 @@ flags, or raise codegen units as a substitute for an architectural seam. Use
 read the generated timing artifact plus the built binary as the Sources of
 Truth.
 
-## CUDA Build Environment
+## Optional Standalone CUDA Compile Probe
 
-The absorbed Calyx workspace has optional CUDA feature builds. On Windows with
-CUDA 13.x, `nvcc` must be able to find MSVC `cl.exe`, and CUDA dependency
-kernels need MSVC's conforming preprocessor. `scripts\synapse-setup.ps1`
-repairs this configured-host state when CUDA is installed:
+The absorbed Calyx workspace retains optional CUDA features for an explicitly
+requested standalone dependency compile/probe. This is not a supported
+installed-daemon configuration: `synapse-mcp` has no feature that forwards
+`calyx-cuda`, and `scripts\synapse-setup.ps1` neither detects nor publishes NVCC
+settings and rejects accelerator requests. Standard setup installs the binding
+CPU-only config (`math_backend="cpu"`, `vram_budget_bytes=0`).
+
+For the isolated compile probe on Windows with CUDA 13.x, configure these
+variables manually so `nvcc` can find MSVC `cl.exe` and dependency kernels use
+MSVC's conforming preprocessor:
 
 - `NVCC_CCBIN` -> Visual Studio `VC\Tools\MSVC\...\bin\Hostx64\x64`
 - `NVCC_APPEND_FLAGS` includes `-Xcompiler=/Zc:preprocessor`
 
-The CUDA compile check is:
+The standalone compile probe is:
 
 ```powershell
 cargo check --manifest-path calyx\Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"

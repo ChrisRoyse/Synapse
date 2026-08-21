@@ -17,10 +17,16 @@ pub use loopback::LoopbackStatus;
 pub use ring::{AudioFormat, AudioRing, AudioWindow};
 pub use stt::{
     STT_BACKEND_ENV, SttBackendPolicy, SttBackendReadback, Transcription,
-    TranscriptionConfidenceSource, WhisperTinyStt, stt_backend_policy, stt_gpu_admission_mib,
-    stt_gpu_reservation_request,
+    TranscriptionConfidenceSource, WhisperTinyStt, stt_backend_policy,
 };
 pub use synapse_core::DirectionEstimate;
+
+/// Whether audio/STT can select a CUDA execution provider.
+///
+/// Exported
+/// so the installed daemon can make dependency feature injection a hard
+/// compile-time error rather than a runtime configuration promise.
+pub const CUDA_EXECUTION_PROVIDER_COMPILED: bool = false;
 
 pub const DEFAULT_RING_SECONDS: u32 = 30;
 pub const MAX_RING_SECONDS: u32 = 30;

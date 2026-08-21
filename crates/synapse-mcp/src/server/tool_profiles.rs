@@ -2713,12 +2713,12 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "intelligence",
                 true,
                 false,
-                "Calyx Base panel rows + the derived XTerm/Graph/Kernel CF rows the substrate math reads and (for weave) writes",
+                "Calyx Base panel rows + the derived XTerm/Graph/Kernel/Assay CF rows + exact causal-view Registry rows and their referenced Assay Ledger entries",
                 Some(
-                    "per-sub-operation physical CF readback: derived row counts after the pass, grounded flags, and the exact panel_version the report was computed for",
+                    "per-sub-operation physical CF readback: derived row counts after the pass, grounded flags, and exact panel_version; causal-view operations also return the Registry key/value hashes and self-verifying Assay Ledger reference",
                 ),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "read-only sub-operations (including causal_map_read) need only READ_STORAGE; measurement-class sub-operations (bits, sufficiency, redundancy, synergy, causality, causal_map, periodicity, drift, hazard, ensemble_card, oracle_predict, oracle_reverse, oracle_validate, oracle_readiness) need READ_STORAGE+WRITE_STORAGE and run under any profile, unattended, with no foreground lease (#2077); control-class sub-operations (weave, kernel, oracle_complete) still require an explicit maintenance profile plus the foreground input lease -- see INTELLIGENCE_OPERATION_CLASSES for the declared classification of every sub-operation",
+                "read-only sub-operations (abundance, causal_map_read, kernel_answer, olap_aggregate, view_registry_read) need only READ_STORAGE; state-changing measurement-class sub-operations (bits, sufficiency, redundancy, synergy, causality, causal_map, periodicity, drift, hazard, oracle_predict, oracle_reverse, oracle_validate, oracle_readiness, search_kernel_commission, ensemble_card, view_registry_measure) need READ_STORAGE+WRITE_STORAGE and run under any profile, unattended, with no foreground lease (#2077); control-class sub-operations (weave, kernel, oracle_complete) still require an explicit maintenance profile plus the foreground input lease -- see INTELLIGENCE_OPERATION_CLASSES for the declared classification of every sub-operation",
             ),
             op(
                 "backup",
@@ -3627,10 +3627,11 @@ pub(crate) fn measure_intelligence_grant() -> crate::m3::permissions::RequiredPe
 /// for the predicate each row was judged against; the third column is the
 /// judgement's stated reason and is carried into the admission audit row.
 ///
-/// Read-only sub-operations (`abundance`, `kernel_answer`, `olap_aggregate`)
-/// never reached a profile gate at all -- `mutates_state()` is false for them --
-/// but they are classified here anyway so the table describes the whole surface
-/// rather than only the part that happens to be gated today.
+/// Read-only sub-operations (`abundance`, `causal_map_read`, `kernel_answer`,
+/// `olap_aggregate`, `view_registry_read`) never reach a profile gate at all --
+/// `mutates_state()` is false for them -- but they are classified here anyway so
+/// the table describes the whole surface rather than only the part that happens
+/// to be gated today.
 pub(crate) const INTELLIGENCE_OPERATION_CLASSES: &[(
     crate::m3::storage::StorageIntelligenceOperation,
     StorageOperationClass,
@@ -3748,6 +3749,16 @@ pub(crate) const INTELLIGENCE_OPERATION_CLASSES: &[(
             Op::EnsembleCard,
             Measurement,
             "reads the panel corpus, writes the derived capability-card Assay row (per-lens marginal value, PID triple, A37 gate verdict). Establishes 'calibrated' (#1684).",
+        ),
+        (
+            Op::ViewRegistryMeasure,
+            Measurement,
+            "runs the existing ensemble assay once and atomically writes only its bounded scalar causal-view projection to Registry with an Assay ledger entry; it changes no panel lifecycle or serving threshold.",
+        ),
+        (
+            Op::ViewRegistryRead,
+            Measurement,
+            "point-reads and integrity-verifies one exact typed causal-view Registry row; writes nothing and never recomputes an estimator.",
         ),
     ]
 };

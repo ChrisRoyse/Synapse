@@ -2034,6 +2034,11 @@ pub enum StorageIntelligenceOperation {
     /// the A37 associational-diversity gate, and a keep/park/retire verdict
     /// (#1668's admission gate; wired for #1944 ask 1).
     EnsembleCard,
+    /// Measures the ensemble card once and atomically publishes the bounded
+    /// scalar-only causal-view projection to Calyx Registry + Ledger.
+    ViewRegistryMeasure,
+    /// Point-reads and integrity-verifies the exact causal-view Registry row.
+    ViewRegistryRead,
 }
 
 impl StorageIntelligenceOperation {
@@ -2043,7 +2048,7 @@ impl StorageIntelligenceOperation {
     /// `server::tool_profiles` can be proven complete at daemon construction
     /// (#2077): a variant added here without a declared classification refuses
     /// to start the daemon instead of silently inheriting a gate.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::Weave,
         Self::Abundance,
         Self::Bits,
@@ -2066,6 +2071,8 @@ impl StorageIntelligenceOperation {
         Self::OlapAggregate,
         Self::SearchKernelCommission,
         Self::EnsembleCard,
+        Self::ViewRegistryMeasure,
+        Self::ViewRegistryRead,
     ];
 
     #[must_use]
@@ -2093,6 +2100,8 @@ impl StorageIntelligenceOperation {
             Self::OlapAggregate => "olap_aggregate",
             Self::SearchKernelCommission => "search_kernel_commission",
             Self::EnsembleCard => "ensemble_card",
+            Self::ViewRegistryMeasure => "view_registry_measure",
+            Self::ViewRegistryRead => "view_registry_read",
         }
     }
 
@@ -2104,7 +2113,11 @@ impl StorageIntelligenceOperation {
         // Kernel CF).
         !matches!(
             self,
-            Self::Abundance | Self::CausalMapRead | Self::KernelAnswer | Self::OlapAggregate
+            Self::Abundance
+                | Self::CausalMapRead
+                | Self::KernelAnswer
+                | Self::OlapAggregate
+                | Self::ViewRegistryRead
         )
     }
 
@@ -2123,7 +2136,7 @@ impl StorageIntelligenceOperation {
     pub const fn is_bounded_read(self) -> bool {
         matches!(
             self,
-            Self::Abundance | Self::CausalMapRead | Self::KernelAnswer
+            Self::Abundance | Self::CausalMapRead | Self::KernelAnswer | Self::ViewRegistryRead
         )
     }
 }
@@ -2203,8 +2216,9 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_slots: Vec<u32>,
     /// Minimum lenses the A37 associational-diversity gate needs before it can
-    /// return a verdict (`ensemble_card` only). Below this the card reports the
-    /// gate as not evaluated rather than guessing from too few lenses.
+    /// return a verdict (`ensemble_card` and `view_registry_measure`). Below
+    /// this the card reports the gate as not evaluated rather than guessing
+    /// from too few lenses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 2, max = 64))]
     pub min_gate_lenses: Option<u32>,
@@ -2266,8 +2280,11 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 1))]
     pub min_recall_ratio: Option<f32>,
-    /// Existing query record cx_id (32-hex) answered through the kernel
-    /// (`kernel_answer`). Required for that operation.
+    /// Existing query record cx_id (32-hex). `kernel_answer` walks from this
+    /// record, `oracle_complete` fills its declared free slots, and
+    /// `oracle_predict` requires the exact persisted, current-generation
+    /// pre-trigger action-intent constellation. A terminal or reward-anchored
+    /// action row is never accepted as a causal prediction query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_cx_id: Option<String>,
     /// Maximum hops walked from an anchored kernel node to the query
@@ -2275,10 +2292,6 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 64))]
     pub max_hops: Option<u32>,
-    /// Stable action/tool identifier whose grounded outcome is predicted
-    /// (`oracle_predict`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<String>,
     /// Grounded outcome whose most likely action cause is requested
     /// (`oracle_reverse`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3103,6 +3116,9 @@ pub struct StorageIntelligenceResponse {
     /// Populated by `operation=ensemble_card`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_card: Option<StorageIntelligenceEnsembleCardReport>,
+    /// Populated by `view_registry_measure` and `view_registry_read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_view_registry: Option<StorageIntelligenceCausalViewRegistryReport>,
     /// Native Aster memory-mapped slot-column aggregate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub olap_aggregate: Option<serde_json::Value>,
@@ -5000,6 +5016,23 @@ pub fn prepare_intelligence_spec(
             validate_excluded_slots(&params)?;
             let _ = assay_params(&params)?;
         }
+        StorageIntelligenceOperation::ViewRegistryMeasure => {
+            require_nonblank(
+                params.anchor_kind.as_deref(),
+                "anchor_kind",
+                params.operation.as_str(),
+            )?;
+            validate_excluded_slots(&params)?;
+            let _ = action_view_registry_assay_params(&params, "view_registry_measure")?;
+        }
+        StorageIntelligenceOperation::ViewRegistryRead => {
+            require_nonblank(
+                params.anchor_kind.as_deref(),
+                "anchor_kind",
+                params.operation.as_str(),
+            )?;
+            let _ = action_view_registry_assay_params(&params, "view_registry_read")?;
+        }
         StorageIntelligenceOperation::Causality => {
             validate_temporal_request(&params, true, true)?;
         }
@@ -5031,7 +5064,7 @@ pub fn prepare_intelligence_spec(
         }
         StorageIntelligenceOperation::OraclePredict => {
             require_action_panel(&params, "oracle_predict")?;
-            require_nonblank(params.action_id.as_deref(), "action_id", "oracle_predict")?;
+            validate_cx_id_field(&params, "oracle_predict")?;
         }
         StorageIntelligenceOperation::OracleReverse => {
             require_action_panel(&params, "oracle_reverse")?;
@@ -5097,7 +5130,6 @@ fn validate_intelligence_field_relevance(
         min_recall_ratio,
         query_cx_id,
         max_hops,
-        action_id,
         outcome,
         free_slots,
         value_column,
@@ -5131,7 +5163,6 @@ fn validate_intelligence_field_relevance(
         ("min_recall_ratio", min_recall_ratio.is_some()),
         ("query_cx_id", query_cx_id.is_some()),
         ("max_hops", max_hops.is_some()),
-        ("action_id", action_id.is_some()),
         ("outcome", outcome.is_some()),
         ("free_slots", !free_slots.is_empty()),
         ("value_column", value_column.is_some()),
@@ -5164,6 +5195,13 @@ fn validate_intelligence_field_relevance(
             "anchor_kind",
             "ksg_k",
         ],
+        StorageIntelligenceOperation::ViewRegistryMeasure => &[
+            "max_records",
+            "excluded_slots",
+            "min_gate_lenses",
+            "anchor_kind",
+        ],
+        StorageIntelligenceOperation::ViewRegistryRead => &["anchor_kind"],
         StorageIntelligenceOperation::Causality => &[
             "max_records",
             "since_ts_ns",
@@ -5220,7 +5258,7 @@ fn validate_intelligence_field_relevance(
             "query_cx_id",
             "max_hops",
         ],
-        StorageIntelligenceOperation::OraclePredict => &["action_id"],
+        StorageIntelligenceOperation::OraclePredict => &["query_cx_id"],
         StorageIntelligenceOperation::OracleReverse => &["outcome"],
         StorageIntelligenceOperation::OracleComplete => &["query_cx_id", "free_slots"],
         StorageIntelligenceOperation::OracleValidate
@@ -5883,7 +5921,19 @@ pub struct StorageIntelligenceEnsembleLens {
 pub struct StorageIntelligenceExcludedLens {
     pub slot: u32,
     pub name: String,
+    pub code: StorageIntelligenceExcludedLensCode,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceExcludedLensCode {
+    WithheldByCaller,
+    MissingAnchoredCoverage,
+    UnusableRepresentation,
+    RaggedColumn,
+    ObservedCohortConstant,
+    DegenerateRedundancySketch,
 }
 
 /// The ensemble capability card for one (panel, anchor) pair.
@@ -5908,8 +5958,10 @@ pub struct StorageIntelligenceEnsembleCardReport {
     pub anchored_records: u64,
     /// Slots the corpus declares for this panel.
     pub declared_slots: u64,
-    /// Slots that entered the card as lenses.
-    pub measured_slots: Vec<u32>,
+    /// Exact physical slot identities declared by the panel.
+    pub declared_slot_ids: Vec<u32>,
+    pub physically_available_slots: Vec<u32>,
+    pub estimable_slots: Vec<u32>,
     pub anchor_entropy_bits: f32,
     pub panel_bits: f32,
     /// Non-redundant lens count implied by the panel's total correlation.
@@ -5954,7 +6006,17 @@ pub fn run_intelligence_ensemble_card(
         records_scanned: report.records_scanned as u64,
         anchored_records: report.anchored_records as u64,
         declared_slots: report.declared_slots as u64,
-        measured_slots: report.measured_slots.into_iter().map(u32::from).collect(),
+        declared_slot_ids: report
+            .declared_slot_ids
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        physically_available_slots: report
+            .physically_available_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        estimable_slots: report.estimable_slots.into_iter().map(u32::from).collect(),
         anchor_entropy_bits: report.card.anchor_entropy_bits,
         panel_bits: report.card.panel_bits,
         n_eff: report.card.n_eff,
@@ -5986,11 +6048,844 @@ pub fn run_intelligence_ensemble_card(
             .map(|lens| StorageIntelligenceExcludedLens {
                 slot: u32::from(lens.slot),
                 name: lens.name,
+                code: match lens.code {
+                    synapse_calyx::SynapseCalyxExcludedLensCode::WithheldByCaller => {
+                        StorageIntelligenceExcludedLensCode::WithheldByCaller
+                    }
+                    synapse_calyx::SynapseCalyxExcludedLensCode::MissingAnchoredCoverage => {
+                        StorageIntelligenceExcludedLensCode::MissingAnchoredCoverage
+                    }
+                    synapse_calyx::SynapseCalyxExcludedLensCode::UnusableRepresentation => {
+                        StorageIntelligenceExcludedLensCode::UnusableRepresentation
+                    }
+                    synapse_calyx::SynapseCalyxExcludedLensCode::RaggedColumn => {
+                        StorageIntelligenceExcludedLensCode::RaggedColumn
+                    }
+                    synapse_calyx::SynapseCalyxExcludedLensCode::ObservedCohortConstant => {
+                        StorageIntelligenceExcludedLensCode::ObservedCohortConstant
+                    }
+                    synapse_calyx::SynapseCalyxExcludedLensCode::DegenerateRedundancySketch => {
+                        StorageIntelligenceExcludedLensCode::DegenerateRedundancySketch
+                    }
+                },
                 reason: lens.reason,
             })
             .collect(),
         assay_cf_rows: report.assay_cf_rows as u64,
     })
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewRegistryAccess {
+    Measure,
+    Read,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewFamily {
+    Level,
+    Change,
+    Position,
+    Dispersion,
+    Shape,
+    CrossSection,
+    Clock,
+    Vintage,
+    Structure,
+    Meaning,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewRuntime {
+    CpuDeterministic,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewLifecycle {
+    ServingCodeFrozen,
+    ParkedUnderpowered,
+    ParkedCandidate,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageIntelligenceCausalViewTransformSpec {
+    FrozenOneHotIndex {
+        cardinality: u32,
+    },
+    FrozenUnitRecordVector {
+        dim: u32,
+        source_feature_count: u16,
+        l2_unit: bool,
+        signed_hash: bool,
+        collisions_possible: bool,
+        collision_evidence_required: bool,
+    },
+    CandidateLevelBins {
+        bins: u16,
+    },
+    CandidateLagDifference {
+        lag: u16,
+    },
+    CandidateQuantilePosition {
+        bins: u16,
+    },
+    CandidateRollingDispersion {
+        window: u16,
+        moments: u16,
+    },
+    CandidateMomentShape {
+        moments: u16,
+    },
+    CandidateCrossSectionBuckets {
+        buckets: u16,
+    },
+    CandidateCyclicClock {
+        period_buckets: u16,
+    },
+    CandidateVintageBuckets {
+        buckets: u16,
+    },
+    CandidateStructuralHash {
+        buckets: u16,
+    },
+    CandidateMeaningHash {
+        buckets: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewOutputKind {
+    DenseF32,
+    DenseSignedHashF32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalViewOutputContract {
+    pub kind: StorageIntelligenceCausalViewOutputKind,
+    pub dim: u32,
+    pub cardinality: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewCpuCostClass {
+    Constant,
+    BoundedWindow,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewEstimatorCompatibility {
+    LogisticProbe,
+    KsgMutualInformation,
+    LinearCorrelation,
+    TransferEntropy,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewDecision {
+    Keep,
+    Park,
+    Retire,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalViewContract {
+    pub view_id: String,
+    pub slot: Option<u32>,
+    pub lens_name: Option<String>,
+    pub lens_id: Option<String>,
+    pub lens_spec_sha256: Option<String>,
+    pub extractor_schema_sha256: Option<String>,
+    pub parent_atom: String,
+    pub family: StorageIntelligenceCausalViewFamily,
+    pub source_fields: Vec<String>,
+    pub transform_id: String,
+    pub transform: StorageIntelligenceCausalViewTransformSpec,
+    pub output: StorageIntelligenceCausalViewOutputContract,
+    pub pre_trigger_only: bool,
+    pub per_row_worst_case_bytes: u32,
+    pub cpu_cost_class: StorageIntelligenceCausalViewCpuCostClass,
+    pub estimator_compatibility: Vec<StorageIntelligenceCausalViewEstimatorCompatibility>,
+    pub equivalence_class: String,
+    pub equivalence_owner: bool,
+    pub producing: bool,
+    pub lifecycle: StorageIntelligenceCausalViewLifecycle,
+    pub refusal: Option<String>,
+    pub runtime: StorageIntelligenceCausalViewRuntime,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewExclusionCode {
+    WithheldByCaller,
+    ParkedUnderpowered,
+    MissingAnchoredCoverage,
+    UnusableRepresentation,
+    RaggedColumn,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewAvailableUnmeasuredCode {
+    ObservedCohortConstant,
+    DegenerateRedundancySketch,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageIntelligenceCausalViewMeasurement {
+    Measured {
+        solo_bits: f32,
+        solo_ci: [f32; 2],
+        panel_without_bits: f32,
+        marginal_bits: f32,
+        marginal_ci: [f32; 2],
+        max_pairwise_corr: f32,
+        max_pairwise_nmi: f32,
+        diagnostic_assay_decision: StorageIntelligenceCausalViewDecision,
+        diagnostic_assay_reason: String,
+    },
+    AvailableUnmeasured {
+        code: StorageIntelligenceCausalViewAvailableUnmeasuredCode,
+        analytical_incremental_bits: Option<f32>,
+        reason: String,
+    },
+    Excluded {
+        code: StorageIntelligenceCausalViewExclusionCode,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalViewResult {
+    pub slot: u32,
+    pub lens_name: String,
+    pub anchored_records_carried: u64,
+    pub anchored_coverage: f32,
+    pub measurement: StorageIntelligenceCausalViewMeasurement,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewSelectionPowerState {
+    Underpowered,
+    Powered,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCausalViewAssociationScope {
+    WithinAtomOnly,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalViewResourceAccounting {
+    pub registry_value_ceiling_bytes: u64,
+    pub contract_count: u64,
+    pub producing_contract_count: u64,
+    pub serving_contract_count: u64,
+    pub parked_underpowered_contract_count: u64,
+    pub metadata_only_candidate_contract_count: u64,
+    pub cpu_runtime_contract_count: u64,
+    pub gpu_runtime_contract_count: u64,
+    pub registry_persisted_vector_bytes: u64,
+    pub registry_persisted_matrix_bytes: u64,
+    pub producing_f32_payload_bytes_per_record: u64,
+    pub producing_f32_payload_bytes_at_max_records: u64,
+    pub candidate_materialized_payload_bytes: u64,
+}
+
+/// Compact scalar-only projection of one frozen panel's causal viewpoints.
+///
+/// The ensemble values are an admission surrogate; Oracle readiness continues
+/// to use the separate KSG sufficiency contract and is never inferred from the
+/// declared view count.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalViewRegistryReport {
+    pub source_of_truth: &'static str,
+    pub access: StorageIntelligenceCausalViewRegistryAccess,
+    pub schema_version: u32,
+    pub generation: u64,
+    pub panel_version: u32,
+    pub corpus_shard: String,
+    pub anchor_kind: String,
+    pub logical_scope_sha256: String,
+    pub assembled_at_seq: u64,
+    pub source_panel_content_seq: u64,
+    pub source_anchors_cf_last_commit_seq: u64,
+    pub source_anchors_cf_out_of_band_epoch: u64,
+    pub requested_max_records: u64,
+    pub effective_max_records: u64,
+    pub required_record_slots: Vec<u32>,
+    pub caller_excluded_slots: Vec<u32>,
+    pub registry_parked_underpowered_slots: Vec<u32>,
+    pub min_gate_lenses: u64,
+    pub estimator: String,
+    pub measurement_contract_sha256: String,
+    pub catalog_sha256: String,
+    pub evidence_sha256: String,
+    pub registry_sha256: String,
+    pub records_scanned: u64,
+    pub scan_limit_reached: bool,
+    pub census_complete: bool,
+    pub anchored_records: u64,
+    pub selection_power_state: StorageIntelligenceCausalViewSelectionPowerState,
+    pub observed_sample_count: u64,
+    pub required_sample_count: u64,
+    pub declared_slots: u64,
+    pub declared_slot_ids: Vec<u32>,
+    pub physically_available_slots: Vec<u32>,
+    pub estimable_slots: Vec<u32>,
+    pub anchor_entropy_bits: f32,
+    pub panel_bits: f32,
+    pub panel_ci: [f32; 2],
+    pub effective_rank_features: f32,
+    pub sufficient: bool,
+    pub deficit_bits: f32,
+    pub pairs_monotonicity_floored: u64,
+    pub anchor_source_declared: bool,
+    pub declared_equivalence_classes: u64,
+    pub admitted_equivalence_classes: u64,
+    pub association_scope: StorageIntelligenceCausalViewAssociationScope,
+    pub views_as_stream_nodes: bool,
+    pub sibling_pairs_generated: u64,
+    pub resource_accounting: StorageIntelligenceCausalViewResourceAccounting,
+    pub catalog: Vec<StorageIntelligenceCausalViewContract>,
+    pub views: Vec<StorageIntelligenceCausalViewResult>,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+    pub physical_key_hex: String,
+    pub stored_value_len_bytes: u64,
+    pub stored_value_sha256: String,
+    pub row_revision_sha256: String,
+    pub ledger_entry_kind: String,
+    pub ledger_entry_payload_sha256: String,
+    pub ledger_entry_self_verifies: bool,
+    pub ledger_reference_verified: bool,
+    pub existing_identical: bool,
+}
+
+/// Measures and atomically publishes the typed causal-view registry.
+pub fn run_intelligence_view_registry_measure(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceCausalViewRegistryReport, ErrorData> {
+    let min_gate_lenses = params.min_gate_lenses.unwrap_or(DEFAULT_MIN_GATE_LENSES) as usize;
+    let assay = action_view_registry_assay_params(params, "view_registry_measure")?;
+    let readback = db
+        .measure_causal_view_registry_intelligence(&assay, min_gate_lenses)
+        .map_err(|error| storage_mcp_error(&error))?;
+    Ok(storage_causal_view_registry(
+        readback,
+        StorageIntelligenceCausalViewRegistryAccess::Measure,
+    ))
+}
+
+/// Independently point-reads and integrity-verifies the physical Registry row.
+pub fn run_intelligence_view_registry_read(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceCausalViewRegistryReport, ErrorData> {
+    let assay = action_view_registry_assay_params(params, "view_registry_read")?;
+    let scope = synapse_calyx::SynapseCalyxCausalViewRegistryScope::from_assay(&assay);
+    let readback = db
+        .read_causal_view_registry_intelligence(&scope)
+        .map_err(|error| storage_mcp_error(&error))?
+        .ok_or_else(|| {
+            mcp_error_with_remediation(
+                "SYNAPSE_CALYX_CAUSAL_VIEW_REGISTRY_ABSENT",
+                format!(
+                    "no causal-view Registry row exists for panel_version={} anchor_kind={:?}",
+                    scope.panel_version, scope.anchor_kind
+                ),
+                "call storage operation=intelligence sub_operation=view_registry_measure for this exact panel and grounded anchor, then retry the independent read",
+            )
+        })?;
+    Ok(storage_causal_view_registry(
+        readback,
+        StorageIntelligenceCausalViewRegistryAccess::Read,
+    ))
+}
+
+fn action_view_registry_assay_params(
+    params: &StorageIntelligenceParams,
+    operation: &str,
+) -> Result<synapse_calyx::SynapseCalyxAssayParams, ErrorData> {
+    require_action_panel(params, operation)?;
+    let assay = assay_params(params)?;
+    if assay.anchor_kind != "reward" {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=intelligence sub_operation={operation} requires canonical action anchor_kind=reward; received {:?}",
+                assay.anchor_kind
+            ),
+            "supply anchor_kind=reward; the compact causal-view Registry is the exact Oracle source of truth and does not create shadow scopes for a different anchor",
+        ));
+    }
+    let undeclared_exclusions = assay
+        .excluded_slots
+        .iter()
+        .copied()
+        .filter(|slot| !assay.lens_names.contains_key(slot))
+        .collect::<Vec<_>>();
+    if !undeclared_exclusions.is_empty() {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=intelligence sub_operation={operation} received excluded_slots absent from panel {}: {undeclared_exclusions:?}",
+                assay.panel_version,
+            ),
+            "supply only physical slot ids declared by panel 2260001; an unknown id cannot withhold evidence and is rejected before resource admission",
+        ));
+    }
+    Ok(assay.with_corpus_shard("synapse.action".to_owned()))
+}
+
+fn storage_causal_view_registry(
+    readback: synapse_calyx::SynapseCalyxCausalViewRegistryReadback,
+    access: StorageIntelligenceCausalViewRegistryAccess,
+) -> StorageIntelligenceCausalViewRegistryReport {
+    let registry = readback.registry;
+    let declared_equivalence_classes = registry
+        .catalog
+        .iter()
+        .map(|view| view.equivalence_class.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    let admitted_equivalence_classes = registry
+        .catalog
+        .iter()
+        .filter(|view| {
+            view.equivalence_owner
+                && view.lifecycle
+                    == synapse_calyx::SynapseCalyxCausalViewLifecycle::ServingCodeFrozen
+        })
+        .map(|view| view.equivalence_class.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    let catalog = registry
+        .catalog
+        .iter()
+        .map(|view| StorageIntelligenceCausalViewContract {
+            view_id: view.view_id.clone(),
+            slot: view.slot.map(u32::from),
+            lens_name: view.lens_name.clone(),
+            lens_id: view.lens_id.clone(),
+            lens_spec_sha256: view.lens_spec_sha256.clone(),
+            extractor_schema_sha256: view.extractor_schema_sha256.clone(),
+            parent_atom: view.parent_atom.clone(),
+            family: storage_causal_view_family(view.family),
+            source_fields: view.source_fields.clone(),
+            transform_id: view.transform_id.clone(),
+            transform: storage_causal_view_transform(&view.transform),
+            output: StorageIntelligenceCausalViewOutputContract {
+                kind: match view.output.kind {
+                    synapse_calyx::SynapseCalyxCausalViewOutputKind::DenseF32 => {
+                        StorageIntelligenceCausalViewOutputKind::DenseF32
+                    }
+                    synapse_calyx::SynapseCalyxCausalViewOutputKind::DenseSignedHashF32 => {
+                        StorageIntelligenceCausalViewOutputKind::DenseSignedHashF32
+                    }
+                },
+                dim: view.output.dim,
+                cardinality: view.output.cardinality,
+            },
+            pre_trigger_only: view.pre_trigger_only,
+            per_row_worst_case_bytes: view.per_row_worst_case_bytes,
+            cpu_cost_class: match view.cpu_cost_class {
+                synapse_calyx::SynapseCalyxCausalViewCpuCostClass::Constant => {
+                    StorageIntelligenceCausalViewCpuCostClass::Constant
+                }
+                synapse_calyx::SynapseCalyxCausalViewCpuCostClass::BoundedWindow => {
+                    StorageIntelligenceCausalViewCpuCostClass::BoundedWindow
+                }
+            },
+            estimator_compatibility: view
+                .estimator_compatibility
+                .iter()
+                .copied()
+                .map(storage_causal_view_estimator_compatibility)
+                .collect(),
+            equivalence_class: view.equivalence_class.clone(),
+            equivalence_owner: view.equivalence_owner,
+            producing: view.producing,
+            lifecycle: match view.lifecycle {
+                synapse_calyx::SynapseCalyxCausalViewLifecycle::ServingCodeFrozen => {
+                    StorageIntelligenceCausalViewLifecycle::ServingCodeFrozen
+                }
+                synapse_calyx::SynapseCalyxCausalViewLifecycle::ParkedUnderpowered => {
+                    StorageIntelligenceCausalViewLifecycle::ParkedUnderpowered
+                }
+                synapse_calyx::SynapseCalyxCausalViewLifecycle::ParkedCandidate => {
+                    StorageIntelligenceCausalViewLifecycle::ParkedCandidate
+                }
+            },
+            refusal: view.refusal.clone(),
+            runtime: match view.runtime {
+                synapse_calyx::SynapseCalyxCausalViewRuntime::CpuDeterministic => {
+                    StorageIntelligenceCausalViewRuntime::CpuDeterministic
+                }
+            },
+        })
+        .collect();
+    let views = registry
+        .evidence
+        .views
+        .iter()
+        .map(|view| StorageIntelligenceCausalViewResult {
+            slot: u32::from(view.slot),
+            lens_name: view.lens_name.clone(),
+            anchored_records_carried: view.anchored_records_carried as u64,
+            anchored_coverage: view.anchored_coverage,
+            measurement: match &view.measurement {
+                synapse_calyx::SynapseCalyxCausalViewMeasurement::Measured {
+                    solo_bits,
+                    solo_ci,
+                    panel_without_bits,
+                    marginal_bits,
+                    marginal_ci,
+                    max_pairwise_corr,
+                    max_pairwise_nmi,
+                    diagnostic_assay_decision,
+                    diagnostic_assay_reason,
+                } => StorageIntelligenceCausalViewMeasurement::Measured {
+                    solo_bits: *solo_bits,
+                    solo_ci: *solo_ci,
+                    panel_without_bits: *panel_without_bits,
+                    marginal_bits: *marginal_bits,
+                    marginal_ci: *marginal_ci,
+                    max_pairwise_corr: *max_pairwise_corr,
+                    max_pairwise_nmi: *max_pairwise_nmi,
+                    diagnostic_assay_decision: match diagnostic_assay_decision {
+                        synapse_calyx::SynapseCalyxCausalViewDecision::Keep => {
+                            StorageIntelligenceCausalViewDecision::Keep
+                        }
+                        synapse_calyx::SynapseCalyxCausalViewDecision::Park => {
+                            StorageIntelligenceCausalViewDecision::Park
+                        }
+                        synapse_calyx::SynapseCalyxCausalViewDecision::Retire => {
+                            StorageIntelligenceCausalViewDecision::Retire
+                        }
+                    },
+                    diagnostic_assay_reason: diagnostic_assay_reason.clone(),
+                },
+                synapse_calyx::SynapseCalyxCausalViewMeasurement::AvailableUnmeasured {
+                    code,
+                    analytical_incremental_bits,
+                    reason,
+                } => StorageIntelligenceCausalViewMeasurement::AvailableUnmeasured {
+                    code: match code {
+                        synapse_calyx::SynapseCalyxCausalViewAvailableUnmeasuredCode::ObservedCohortConstant => {
+                            StorageIntelligenceCausalViewAvailableUnmeasuredCode::ObservedCohortConstant
+                        }
+                        synapse_calyx::SynapseCalyxCausalViewAvailableUnmeasuredCode::DegenerateRedundancySketch => {
+                            StorageIntelligenceCausalViewAvailableUnmeasuredCode::DegenerateRedundancySketch
+                        }
+                    },
+                    analytical_incremental_bits: *analytical_incremental_bits,
+                    reason: reason.clone(),
+                },
+                synapse_calyx::SynapseCalyxCausalViewMeasurement::Excluded { code, reason } => {
+                    StorageIntelligenceCausalViewMeasurement::Excluded {
+                        code: match code {
+                            synapse_calyx::SynapseCalyxCausalViewExclusionCode::WithheldByCaller => {
+                                StorageIntelligenceCausalViewExclusionCode::WithheldByCaller
+                            }
+                            synapse_calyx::SynapseCalyxCausalViewExclusionCode::ParkedUnderpowered => {
+                                StorageIntelligenceCausalViewExclusionCode::ParkedUnderpowered
+                            }
+                            synapse_calyx::SynapseCalyxCausalViewExclusionCode::MissingAnchoredCoverage => {
+                                StorageIntelligenceCausalViewExclusionCode::MissingAnchoredCoverage
+                            }
+                            synapse_calyx::SynapseCalyxCausalViewExclusionCode::UnusableRepresentation => {
+                                StorageIntelligenceCausalViewExclusionCode::UnusableRepresentation
+                            }
+                            synapse_calyx::SynapseCalyxCausalViewExclusionCode::RaggedColumn => {
+                                StorageIntelligenceCausalViewExclusionCode::RaggedColumn
+                            }
+                        },
+                        reason: reason.clone(),
+                    }
+                }
+            },
+        })
+        .collect();
+    StorageIntelligenceCausalViewRegistryReport {
+        source_of_truth: "exact typed Calyx Registry CF row plus atomic Assay Ledger entry",
+        access,
+        schema_version: registry.schema_version,
+        generation: registry.generation,
+        panel_version: registry.scope.panel_version,
+        corpus_shard: registry.scope.corpus_shard,
+        anchor_kind: registry.scope.anchor_kind,
+        logical_scope_sha256: registry.logical_scope_sha256,
+        assembled_at_seq: registry.assembled_at_seq,
+        source_panel_content_seq: registry.source_panel_content_seq,
+        source_anchors_cf_last_commit_seq: registry.source_anchors_cf_last_commit_seq,
+        source_anchors_cf_out_of_band_epoch: registry.source_anchors_cf_out_of_band_epoch,
+        requested_max_records: registry.measurement_contract.requested_max_records as u64,
+        effective_max_records: registry.measurement_contract.effective_max_records as u64,
+        required_record_slots: registry
+            .measurement_contract
+            .required_record_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        caller_excluded_slots: registry
+            .measurement_contract
+            .caller_excluded_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        registry_parked_underpowered_slots: registry
+            .measurement_contract
+            .registry_parked_underpowered_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        min_gate_lenses: registry.measurement_contract.min_gate_lenses as u64,
+        estimator: registry.measurement_contract.estimator,
+        measurement_contract_sha256: registry.measurement_contract_sha256,
+        catalog_sha256: registry.catalog_sha256,
+        evidence_sha256: registry.evidence_sha256,
+        registry_sha256: readback.registry_sha256,
+        records_scanned: registry.evidence.records_scanned as u64,
+        scan_limit_reached: registry.evidence.scan_limit_reached,
+        census_complete: registry.evidence.census_complete,
+        anchored_records: registry.evidence.anchored_records as u64,
+        selection_power_state: match registry.evidence.selection_power_state {
+            synapse_calyx::SynapseCalyxCausalViewSelectionPowerState::Underpowered => {
+                StorageIntelligenceCausalViewSelectionPowerState::Underpowered
+            }
+            synapse_calyx::SynapseCalyxCausalViewSelectionPowerState::Powered => {
+                StorageIntelligenceCausalViewSelectionPowerState::Powered
+            }
+        },
+        observed_sample_count: registry.evidence.observed_sample_count as u64,
+        required_sample_count: registry.evidence.required_sample_count as u64,
+        declared_slots: registry.evidence.declared_slots as u64,
+        declared_slot_ids: registry
+            .evidence
+            .declared_slot_ids
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        physically_available_slots: registry
+            .evidence
+            .physically_available_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        estimable_slots: registry
+            .evidence
+            .estimable_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        anchor_entropy_bits: registry.evidence.anchor_entropy_bits,
+        panel_bits: registry.evidence.panel_bits,
+        panel_ci: registry.evidence.panel_ci,
+        effective_rank_features: registry.evidence.effective_rank_features,
+        sufficient: registry.evidence.sufficient,
+        deficit_bits: registry.evidence.deficit_bits,
+        pairs_monotonicity_floored: registry.evidence.pairs_monotonicity_floored as u64,
+        anchor_source_declared: registry.evidence.anchor_source_declared,
+        declared_equivalence_classes,
+        admitted_equivalence_classes,
+        association_scope: match registry.association_policy.scope {
+            synapse_calyx::SynapseCalyxCausalViewAssociationScope::WithinAtomOnly => {
+                StorageIntelligenceCausalViewAssociationScope::WithinAtomOnly
+            }
+        },
+        views_as_stream_nodes: registry.association_policy.views_as_stream_nodes,
+        sibling_pairs_generated: registry.association_policy.sibling_pairs_generated as u64,
+        resource_accounting: StorageIntelligenceCausalViewResourceAccounting {
+            registry_value_ceiling_bytes: registry.resource_accounting.registry_value_ceiling_bytes
+                as u64,
+            contract_count: registry.resource_accounting.contract_count as u64,
+            producing_contract_count: registry.resource_accounting.producing_contract_count as u64,
+            serving_contract_count: registry.resource_accounting.serving_contract_count as u64,
+            parked_underpowered_contract_count: registry
+                .resource_accounting
+                .parked_underpowered_contract_count
+                as u64,
+            metadata_only_candidate_contract_count: registry
+                .resource_accounting
+                .metadata_only_candidate_contract_count
+                as u64,
+            cpu_runtime_contract_count: registry.resource_accounting.cpu_runtime_contract_count
+                as u64,
+            gpu_runtime_contract_count: registry.resource_accounting.gpu_runtime_contract_count
+                as u64,
+            registry_persisted_vector_bytes: registry
+                .resource_accounting
+                .registry_persisted_vector_bytes,
+            registry_persisted_matrix_bytes: registry
+                .resource_accounting
+                .registry_persisted_matrix_bytes,
+            producing_f32_payload_bytes_per_record: registry
+                .resource_accounting
+                .producing_f32_payload_bytes_per_record,
+            producing_f32_payload_bytes_at_max_records: registry
+                .resource_accounting
+                .producing_f32_payload_bytes_at_max_records,
+            candidate_materialized_payload_bytes: registry
+                .resource_accounting
+                .candidate_materialized_payload_bytes,
+        },
+        catalog,
+        views,
+        ledger_seq: registry.ledger_seq,
+        ledger_hash: registry.ledger_hash,
+        physical_key_hex: readback.physical_key_hex,
+        stored_value_len_bytes: readback.stored_value_len_bytes as u64,
+        stored_value_sha256: readback.stored_value_sha256,
+        row_revision_sha256: readback.row_revision_sha256,
+        ledger_entry_kind: readback.ledger_entry_kind,
+        ledger_entry_payload_sha256: readback.ledger_entry_payload_sha256,
+        ledger_entry_self_verifies: readback.ledger_entry_self_verifies,
+        ledger_reference_verified: readback.ledger_reference_verified,
+        existing_identical: readback.existing_identical,
+    }
+}
+
+const fn storage_causal_view_family(
+    family: synapse_calyx::SynapseCalyxCausalViewFamily,
+) -> StorageIntelligenceCausalViewFamily {
+    match family {
+        synapse_calyx::SynapseCalyxCausalViewFamily::Level => {
+            StorageIntelligenceCausalViewFamily::Level
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Change => {
+            StorageIntelligenceCausalViewFamily::Change
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Position => {
+            StorageIntelligenceCausalViewFamily::Position
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Dispersion => {
+            StorageIntelligenceCausalViewFamily::Dispersion
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Shape => {
+            StorageIntelligenceCausalViewFamily::Shape
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::CrossSection => {
+            StorageIntelligenceCausalViewFamily::CrossSection
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Clock => {
+            StorageIntelligenceCausalViewFamily::Clock
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Vintage => {
+            StorageIntelligenceCausalViewFamily::Vintage
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Structure => {
+            StorageIntelligenceCausalViewFamily::Structure
+        }
+        synapse_calyx::SynapseCalyxCausalViewFamily::Meaning => {
+            StorageIntelligenceCausalViewFamily::Meaning
+        }
+    }
+}
+
+fn storage_causal_view_transform(
+    transform: &synapse_calyx::SynapseCalyxCausalViewTransformSpec,
+) -> StorageIntelligenceCausalViewTransformSpec {
+    match transform {
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::FrozenOneHotIndex { cardinality } => {
+            StorageIntelligenceCausalViewTransformSpec::FrozenOneHotIndex {
+                cardinality: *cardinality,
+            }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::FrozenUnitRecordVector {
+            dim,
+            source_feature_count,
+            l2_unit,
+            signed_hash,
+            collisions_possible,
+            collision_evidence_required,
+        } => StorageIntelligenceCausalViewTransformSpec::FrozenUnitRecordVector {
+            dim: *dim,
+            source_feature_count: *source_feature_count,
+            l2_unit: *l2_unit,
+            signed_hash: *signed_hash,
+            collisions_possible: *collisions_possible,
+            collision_evidence_required: *collision_evidence_required,
+        },
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateLevelBins { bins } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateLevelBins { bins: *bins }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateLagDifference { lag } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateLagDifference { lag: *lag }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateQuantilePosition { bins } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateQuantilePosition { bins: *bins }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateRollingDispersion {
+            window,
+            moments,
+        } => StorageIntelligenceCausalViewTransformSpec::CandidateRollingDispersion {
+            window: *window,
+            moments: *moments,
+        },
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateMomentShape { moments } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateMomentShape { moments: *moments }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateCrossSectionBuckets {
+            buckets,
+        } => StorageIntelligenceCausalViewTransformSpec::CandidateCrossSectionBuckets {
+            buckets: *buckets,
+        },
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateCyclicClock {
+            period_buckets,
+        } => StorageIntelligenceCausalViewTransformSpec::CandidateCyclicClock {
+            period_buckets: *period_buckets,
+        },
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateVintageBuckets { buckets } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateVintageBuckets {
+                buckets: *buckets,
+            }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateStructuralHash { buckets } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateStructuralHash {
+                buckets: *buckets,
+            }
+        }
+        synapse_calyx::SynapseCalyxCausalViewTransformSpec::CandidateMeaningHash { buckets } => {
+            StorageIntelligenceCausalViewTransformSpec::CandidateMeaningHash { buckets: *buckets }
+        }
+    }
+}
+
+const fn storage_causal_view_estimator_compatibility(
+    compatibility: synapse_calyx::SynapseCalyxCausalViewEstimatorCompatibility,
+) -> StorageIntelligenceCausalViewEstimatorCompatibility {
+    match compatibility {
+        synapse_calyx::SynapseCalyxCausalViewEstimatorCompatibility::LogisticProbe => {
+            StorageIntelligenceCausalViewEstimatorCompatibility::LogisticProbe
+        }
+        synapse_calyx::SynapseCalyxCausalViewEstimatorCompatibility::KsgMutualInformation => {
+            StorageIntelligenceCausalViewEstimatorCompatibility::KsgMutualInformation
+        }
+        synapse_calyx::SynapseCalyxCausalViewEstimatorCompatibility::LinearCorrelation => {
+            StorageIntelligenceCausalViewEstimatorCompatibility::LinearCorrelation
+        }
+        synapse_calyx::SynapseCalyxCausalViewEstimatorCompatibility::TransferEntropy => {
+            StorageIntelligenceCausalViewEstimatorCompatibility::TransferEntropy
+        }
+    }
 }
 
 /// Default for `min_gate_lenses`.
@@ -6491,26 +7386,27 @@ pub fn run_intelligence_kernel_answer(
     })
 }
 
-/// Predicts the grounded consequence of one stable action identifier.
+/// Predicts a grounded outcome from one persisted action constellation's exact
+/// pre-trigger typed causal slots.
 pub fn run_intelligence_oracle_predict(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<serde_json::Value, ErrorData> {
     require_action_panel(params, "oracle_predict")?;
-    let action_id = params
-        .action_id
+    let query_cx_id = params
+        .query_cx_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                "storage operation=intelligence sub_operation=oracle_predict requires a nonblank action_id"
+                "storage operation=intelligence sub_operation=oracle_predict requires query_cx_id"
                     .to_owned(),
             )
         })?;
-    db.oracle_predict_action(action_id)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+    db.oracle_predict_action(query_cx_id)
+        .map_err(|error| storage_mcp_error(&error))
 }
 
 /// Walks grounded evidence backward from an outcome to its likely action cause.
@@ -6527,7 +7423,7 @@ pub fn run_intelligence_oracle_reverse(
         )
     })?;
     db.oracle_reverse_action(outcome)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+        .map_err(|error| storage_mcp_error(&error))
 }
 
 /// Completes explicitly free action slots from persisted grounded peers.
@@ -6555,7 +7451,7 @@ pub fn run_intelligence_oracle_complete(
         ));
     }
     db.oracle_complete_action(cx_id, &params.free_slots)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+        .map_err(|error| storage_mcp_error(&error))
 }
 
 /// Measures and persists the six-tier action-domain readiness predicate.
@@ -6565,7 +7461,7 @@ pub fn run_intelligence_oracle_readiness(
 ) -> Result<serde_json::Value, ErrorData> {
     require_action_panel(params, "oracle_readiness")?;
     db.oracle_measure_readiness()
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+        .map_err(|error| storage_mcp_error(&error))
 }
 
 /// Produces and atomically persists chronological action-domain validation evidence.
@@ -6575,7 +7471,7 @@ pub fn run_intelligence_oracle_validate(
 ) -> Result<serde_json::Value, ErrorData> {
     require_action_panel(params, "oracle_validate")?;
     db.oracle_validate_action()
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+        .map_err(|error| storage_mcp_error(&error))
 }
 
 fn require_action_panel(

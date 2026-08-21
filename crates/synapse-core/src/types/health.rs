@@ -1115,6 +1115,14 @@ pub struct SubsystemHealth {
     /// lenses. Synapse deliberately reports `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_ward_model_lenses_compiled: Option<bool>,
+    /// Whether the running daemon contains Sextant's cuVS/CAGRA GPU paths.
+    /// Synapse deliberately reports `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_sextant_cuvs_compiled: Option<bool>,
+    /// Whether the running daemon contains Sextant's CUDA PQ kernels.
+    /// Synapse deliberately reports `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_sextant_cuda_pq_compiled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1219,6 +1227,8 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_backend_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_cuda_execution_provider_compiled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_selected_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_device_memory_policy: Option<String>,
@@ -1266,6 +1276,17 @@ pub struct SubsystemHealth {
     pub capture_config: Option<ObservationCaptureConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_runtime: Option<CaptureRuntimeReadback>,
+    /// Frozen startup preference after parsing the process environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_backend_requested: Option<String>,
+    /// Backend the running capture configuration will execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_backend_effective: Option<String>,
+    /// Structural build attestation; shipped Synapse requires `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_gpu_backends_compiled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_cuda_execution_provider_compiled: Option<bool>,
     /// Whether neural detection actually runs (#2054). `None` for every
     /// subsystem except `perception`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

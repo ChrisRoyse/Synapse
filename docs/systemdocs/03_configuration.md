@@ -123,6 +123,7 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `LOCALAPPDATA` | many (telemetry, m3, m4, models, etc.) | path | (Windows-provided) | Root for db/logs/models/runs/shell dirs (see §4). |
 | `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | Storage directory path (also CLI `--db`). |
 | `SYNAPSE_STORAGE_BACKEND` | `m3.rs` (`STORAGE_BACKEND_ENV`) and `main.rs` (`--storage-backend`) | enum | `calyx` | Selects the Calyx backend; invalid strings fail closed before serving. |
+| `SYNAPSE_CALYX_CUDA` | `scripts/synapse-setup.ps1` preflight only | string | unset (CPU-only; `off` also accepted) | Unset or `off` preserves the installed CPU-only contract. `auto` and `require` are explicit typed refusals, and any other value is invalid; setup never enables `calyx-cuda`. |
 | `SYNAPSE_ACTION_RECOVERY_FILE` | `synapse-action/recovery.rs` (`RECOVERY_FILE_ENV`) | path | derived (§4) | Held-input crash-recovery JSONL ledger path. |
 | `SYNAPSE_SHELL_SESSION_DIR` | `m4.rs` (`SHELL_SESSION_DIR_ENV`) | path | derived (§4) | Per-session shell working/session dir override. |
 | `SYNAPSE_SHELL_WORKING_DIR` | `m4.rs` (`SHELL_WORKING_DIR_ENV`) | path | none | Working dir for shell jobs. |
@@ -145,8 +146,8 @@ kernel_recall_gate = 0.95
 fusion_k = 60
 temporal_boost_min = 0.0
 temporal_boost_max = 0.10
-vram_budget_bytes = 12884901888
-math_backend = "auto"
+vram_budget_bytes = 0
+math_backend = "cpu"
 clock_mode = "system"
 rng_seed = 6491761763268826774
 ```
@@ -159,9 +160,9 @@ clock_mode = "fixed"
 fixed_clock_unix_ms = 1720000000123
 ```
 
-All omitted keys use the defaults above. Unknown keys, a missing `[calyx]` section, `clock_mode = "fixed"` without `fixed_clock_unix_ms`, `fixed_clock_unix_ms` with `clock_mode = "system"`, non-finite floats, zero `fusion_k`, zero `vram_budget_bytes`, and out-of-range guard/temporal values fail startup. `math_backend = "auto"` and `"cuda"` are strict CUDA selections: missing CUDA/NVML, corrupt or contended host reservation state, or an unprovable allocation fails startup/dispatch without moving to CPU. Use `"cpu"` only for an intentional CPU runtime.
+All omitted keys use the defaults above. Unknown keys, a missing `[calyx]` section, `clock_mode = "fixed"` without `fixed_clock_unix_ms`, `fixed_clock_unix_ms` with `clock_mode = "system"`, non-finite floats, zero `fusion_k`, a nonzero `vram_budget_bytes`, any `math_backend` other than `"cpu"`, and out-of-range guard/temporal values fail startup. `vram_budget_bytes` remains in the serialized configuration contract for compatibility, but the installed runtime requires zero and does not treat it as an allocation budget.
 
-The CUDA Source of Truth is `%ProgramData%\Calyx\gpu-reservations\device-0\reservations.json` plus its locked lease files. Startup first admits a conservative 4 GiB bootstrap envelope (bounded down by a smaller configured runtime ceiling), loads and probes CUDA, proves the NVML-observed retained footprint fits inside that admitted envelope, then atomically resizes the same lease to the measurement. The maximum runtime ceiling is not held while idle: every Forge operation separately admits its exact measured device-buffer MiB before CUDA allocation and explicitly releases it afterward. This distinction permits a repo-built candidate daemon to be validated before a healthy daemon hands off while keeping both CUDA contexts and every dispatch represented in the host ledger. `CALYX_GPU_HOST_CAP_MIB` changes the positive host aggregate cap; `CALYX_GPU_RESERVATION_ROOT` may point to another absolute host-wide directory. Invalid/empty/relative overrides fail closed. The `health` subsystem `calyx_vault` performs a fresh physical ledger/NVML read and reports the effective config, state path/SHA-256, device identity, free/cap/reserved MiB, counters, exact daemon row, last rejection, process-local dispatch counters, and any readback error.
+The installed daemon has a binding CPU-only/no-explicit-GPU-provider contract. Setup atomically installs a content-addressed `[calyx]` file containing `math_backend="cpu"` and `vram_budget_bytes=0`, pins its SHA-256 in the supervisor, and validates the same values through health readback. It never enables the optional `calyx-cuda` feature, makes no GPU reservation, and rejects automatic or explicit accelerator requests instead of falling back. The standalone Calyx workspace retains CUDA features only for an explicitly configured dependency compile/probe; they are not forwarded into `synapse-mcp` and standard setup does not configure NVCC for them.
 
 ### 3.3 Logging / telemetry
 
@@ -176,7 +177,9 @@ The CUDA Source of Truth is `%ProgramData%\Calyx\gpu-reservations\device-0\reser
 
 | Name | Read in | Type | Default | Description |
 |------|---------|------|---------|-------------|
-| `SYNAPSE_CAPTURE_FORCE_DXGI` | `synapse-capture/config.rs` | string | unset (Auto backend) | Force the DXGI capture backend preference. |
+| `SYNAPSE_CAPTURE_BACKEND` | `synapse-capture/backend.rs` | string | unset (`gdi_bitblt`) | Optional explicit capture policy. Only `cpu`, `gdi`, or `gdi_bitblt` are accepted. Any other value, including `auto`, WGC, or DXGI requests, fails with `CAPTURE_UNSUPPORTED_SEMANTICS`. |
+| `SYNAPSE_CAPTURE_FORCE_DXGI` | `synapse-capture/backend.rs` | string | unset | Legacy contradiction detector. Unset or `0`/`false`/`no` is accepted; a true, invalid, or non-Unicode value fails with `CAPTURE_UNSUPPORTED_SEMANTICS`. It never enables DXGI. |
+| `SYNAPSE_DETECTION_BACKEND` | `m1/detection.rs` | string | unset (`cpu`) | Detection execution-provider policy. Only unset or `cpu` is accepted; `auto`, `cuda`, invalid, and non-Unicode values fail closed under the installed zero-VRAM contract. Setup pins `cpu`. |
 | `SYNAPSE_MCP_SYNTHETIC_FIXTURE` | `m1.rs` | string | unset | `notepad` injects a synthetic observation fixture. |
 | `SYNAPSE_MCP_FORCE_NO_PERCEPTION` | `m1.rs` | bool (`1`/`true`) | off | Force perception off. |
 | `SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL` | `m1.rs` | bool (`1`/`true`) | off | Force internal observe path. |
@@ -248,6 +251,7 @@ The CUDA Source of Truth is `%ProgramData%\Calyx\gpu-reservations\device-0\reser
 |------|---------|------|---------|-------------|
 | `SYNAPSE_ENABLE_AUDIO` | `m3.rs` (also CLI) | bool | `false` | Enable audio runtime. |
 | `SYNAPSE_AUDIO_LOOPBACK` | `m3.rs` (`AUDIO_LOOPBACK_ENV`) | `1`/`0`/`true`/`false` | `1` (on) | System-audio loopback capture. Invalid value = hard error. |
+| `SYNAPSE_STT_BACKEND` | `synapse-audio/stt.rs` | string | unset (`cpu`) | Whisper execution-provider policy. Only unset or `cpu` is accepted; `auto`, `cuda`, invalid, and non-Unicode values fail closed under the installed zero-VRAM contract. Setup pins `cpu`. |
 
 ### 3.9 Recording / Codex bridge
 
@@ -272,7 +276,7 @@ These are written by setup/launcher scripts, not read by the daemon Rust code:
 
 ### 3.11 Test / benchmark only (not production config)
 
-Not part of normal operation; listed for completeness: `SYNAPSE_CAPTURE_FORCE_DXGI` (tests), `SYNAPSE_CAPTURE_BENCH_SECONDS`, `SYNAPSE_A11Y_MANUAL_BENCH`, `SYNAPSE_A11Y_BENCH_ITERS`, `SYNAPSE_ACTION_VIGEM_PAD_REAL`, `SYNAPSE_ACTION_SOFTWARE_PRESS_REAL`, `SYNAPSE_ACTION_SOFTWARE_CLICK_REAL`, `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT`, `SYNAPSE_PTY_TRACE`, `SYNAPSE_MCP_BIN`, `SYNAPSE_LOCAL_AGENT_ITEST_*`, `SYNAPSE_LOCAL_MODEL_TOOL_PROBE_TIMEOUT_MS`, `SYNAPSE_LOCAL_MODEL_NON_TOOL_PROBE_TIMEOUT_MS`.
+Not part of normal operation; listed for completeness: `SYNAPSE_CAPTURE_BENCH_SECONDS`, `SYNAPSE_A11Y_MANUAL_BENCH`, `SYNAPSE_A11Y_BENCH_ITERS`, `SYNAPSE_ACTION_VIGEM_PAD_REAL`, `SYNAPSE_ACTION_SOFTWARE_PRESS_REAL`, `SYNAPSE_ACTION_SOFTWARE_CLICK_REAL`, `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT`, `SYNAPSE_PTY_TRACE`, `SYNAPSE_MCP_BIN`, `SYNAPSE_LOCAL_AGENT_ITEST_*`, `SYNAPSE_LOCAL_MODEL_TOOL_PROBE_TIMEOUT_MS`, `SYNAPSE_LOCAL_MODEL_NON_TOOL_PROBE_TIMEOUT_MS`.
 
 ---
 

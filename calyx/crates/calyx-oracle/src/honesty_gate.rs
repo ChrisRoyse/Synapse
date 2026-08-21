@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use calyx_assay::{
-    AssayCacheKey, AssayRow, AssayStore, AssaySubject, DeficitRoutingContext, PanelSufficiency,
-    TrustTag, panel_sufficiency_from_estimate_with_context, per_sensor_attribution,
+    AssayCacheKey, AssayRow, AssayStore, AssaySubject, DeficitRoutingContext, EstimatorKind,
+    PanelSufficiency, TrustTag, panel_sufficiency_from_estimate_with_context,
+    per_sensor_attribution,
 };
 use calyx_aster::vault::AsterVault;
 use calyx_core::{AnchorKind, CalyxError, Clock, LensId, Panel, SlotId, VaultId};
@@ -138,16 +139,33 @@ fn panel_sufficiency_from_store(
     clock: &dyn Clock,
 ) -> Result<PanelSufficiency, OracleError> {
     let key = AssayCacheKey::scoped(panel.version, domain.as_str(), vault_id, AnchorKind::Reward);
-    let panel_estimate = &required_row(store, &key, &AssaySubject::Panel)?.estimate;
-    let outcome_entropy_bits = bits(
-        required_row(store, &key, &AssaySubject::OutcomeEntropy)?,
+    let panel_row = required_row(store, &key, &AssaySubject::Panel)?;
+    require_instrument(
+        panel_row,
+        &[EstimatorKind::PanelSufficiency],
+        "synapse-assay-sufficiency",
+        "panel sufficiency",
+    )?;
+    let panel_estimate = &panel_row.estimate;
+    let outcome_row = required_row(store, &key, &AssaySubject::OutcomeEntropy)?;
+    require_instrument(
+        outcome_row,
+        &[EstimatorKind::OutcomeEntropy],
+        "synapse-assay-sufficiency",
         "outcome entropy",
     )?;
+    let outcome_entropy_bits = bits(outcome_row, "outcome entropy")?;
     let slot_bits = panel
         .slots
         .iter()
         .map(|slot| {
             let row = required_row(store, &key, &AssaySubject::Lens { slot: slot.slot_id })?;
+            require_instrument(
+                row,
+                &[EstimatorKind::Ksg, EstimatorKind::DiscretePlugin],
+                "synapse-assay-bits",
+                "lens",
+            )?;
             Ok((slot.slot_id, bits(row, "lens")?))
         })
         .collect::<Result<Vec<_>, OracleError>>()?;
@@ -166,6 +184,23 @@ fn panel_sufficiency_from_store(
         },
     )
     .map_err(OracleError::from)
+}
+
+fn require_instrument(
+    row: &AssayRow,
+    allowed_estimators: &[EstimatorKind],
+    expected_provenance: &str,
+    label: &str,
+) -> Result<(), OracleError> {
+    if allowed_estimators.contains(&row.estimate.estimator) && row.provenance == expected_provenance
+    {
+        return Ok(());
+    }
+    Err(CalyxError::aster_corrupt_shard(format!(
+        "oracle sufficiency {label} row has estimator={:?} provenance={:?}; expected estimator in {allowed_estimators:?} and provenance={expected_provenance:?}",
+        row.estimate.estimator, row.provenance
+    ))
+    .into())
 }
 
 fn required_row<'a>(

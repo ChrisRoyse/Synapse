@@ -7,6 +7,7 @@ use calyx_core::{SlotId, dense_cosine};
 use crate::error::WardError;
 use crate::profile::{GuardPolicy, GuardProfile};
 use crate::verdict::{GuardVerdict, SlotVerdict};
+use crate::{ESTIMATOR, JOINT_POLICY_ESTIMATOR};
 
 pub const DEFAULT_TAU: f32 = 0.7;
 
@@ -103,9 +104,30 @@ pub fn validate_high_stakes_profile(
     profile: &GuardProfile,
     required: &[SlotId],
 ) -> Result<(), WardError> {
+    validate_non_inert_required(profile, required)?;
     let calibration = profile.calibration.as_ref().ok_or(WardError::Provisional {
         guard_id: profile.guard_id,
     })?;
+    let joint_policy = match calibration.estimator.as_str() {
+        ESTIMATOR if required.len() == 1 => false,
+        JOINT_POLICY_ESTIMATOR if required.len() > 1 => true,
+        _ => {
+            let slot = required[0];
+            return Err(WardError::CalibrationScoreContract {
+                guard_id: profile.guard_id,
+                slot,
+                estimator: calibration.estimator.clone(),
+                score_tolerance: calibration.score_tolerance,
+                scoring_engine: calibration.scoring_engine.clone(),
+            });
+        }
+    };
+    let profile_score_contract_valid = calibration.scoring_engine.as_deref()
+        == Some(calyx_core::DENSE_COSINE_SCORING_ENGINE)
+        && calibration
+            .score_tolerance
+            .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value));
+    let mut joint_tau_bits = None;
     for slot in required {
         let Some(slot_meta) = calibration.per_slot.get(slot) else {
             return Err(WardError::MissingSlotCalibration {
@@ -113,17 +135,50 @@ pub fn validate_high_stakes_profile(
                 slot: *slot,
             });
         };
-        if profile.tau_for(slot).is_none() {
+        let Some(tau) = profile.tau_for(slot) else {
             return Err(WardError::MissingSlotCalibration {
                 guard_id: profile.guard_id,
                 slot: *slot,
             });
-        }
+        };
         let score_tolerance = slot_meta.score_tolerance;
         let scoring_engine = slot_meta.scoring_engine.as_deref();
+        let expected_estimator = if joint_policy {
+            JOINT_POLICY_ESTIMATOR
+        } else {
+            ESTIMATOR
+        };
+        let estimator_matches = slot_meta.estimator == expected_estimator;
+        let tau_is_valid = tau.is_finite() && (-1.0..=1.0).contains(&tau);
+        let bounds_are_valid = [
+            slot_meta.far,
+            slot_meta.frr,
+            slot_meta.confidence,
+            calibration.far,
+            calibration.frr,
+            calibration.confidence,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(&value));
+        let joint_tau_matches = if joint_policy {
+            match joint_tau_bits {
+                Some(expected) => expected == tau.to_bits(),
+                None => {
+                    joint_tau_bits = Some(tau.to_bits());
+                    true
+                }
+            }
+        } else {
+            true
+        };
         if scoring_engine != Some(calyx_core::DENSE_COSINE_SCORING_ENGINE)
             || score_tolerance
                 .is_none_or(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || !estimator_matches
+            || !tau_is_valid
+            || !bounds_are_valid
+            || !joint_tau_matches
+            || !profile_score_contract_valid
         {
             return Err(WardError::CalibrationScoreContract {
                 guard_id: profile.guard_id,

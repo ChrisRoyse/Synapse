@@ -53,12 +53,15 @@ the roadmap (see the README "What's left on the docket" section).
    cargo fmt --manifest-path calyx/Cargo.toml --all
    cargo clippy --manifest-path calyx/Cargo.toml --workspace --all-targets
    ```
-   CUDA-enabled Calyx checks on Windows need `nvcc` plus an MSVC Hostx64
-   compiler directory published through `NVCC_CCBIN`. CUDA 13.x also requires
-   `NVCC_APPEND_FLAGS` to include `-Xcompiler=/Zc:preprocessor` so dependency
-   CUDA kernels compile with MSVC's conforming preprocessor. `scripts/synapse-setup.ps1`
-   detects and writes those user environment variables when CUDA is present.
-   The full Calyx CUDA compile check is:
+   The optional standalone Calyx CUDA compile probe on Windows needs `nvcc`
+   plus an MSVC Hostx64 compiler directory supplied through `NVCC_CCBIN`.
+   CUDA 13.x also requires `NVCC_APPEND_FLAGS` to include
+   `-Xcompiler=/Zc:preprocessor` so dependency CUDA kernels compile with MSVC's
+   conforming preprocessor. Configure those variables manually only for that
+   explicit probe. Standard `scripts/synapse-setup.ps1` does not detect or
+   publish NVCC variables, does not enable `calyx-cuda`, and rejects accelerator
+   requests under the installed daemon's CPU-only/no-explicit-GPU contract.
+   The standalone compile probe is:
    ```bash
    cargo check --manifest-path calyx/Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
    ```
@@ -82,7 +85,8 @@ the roadmap (see the README "What's left on the docket" section).
    (`scripts/repo-maintenance.ps1`) — don't leave throwaway worktrees with their
    own multi-GB `target/` lying around.
 4. Synapse is **Windows-native** for its real perception/action paths (Win32
-   `SendInput`, UI Automation, WGC/DXGI). Behavior that touches those
+   `SendInput`, UI Automation, and GDI `BitBlt` visible-surface capture; there is
+   no WGC/DXGI capture backend). Behavior that touches those
    surfaces should be verified on Windows — the project uses manual Full State
    Verification (FSV) on the configured Windows host as the shipping gate (see the
    README "Agent Doctrine" section). Automated tests are not part of the

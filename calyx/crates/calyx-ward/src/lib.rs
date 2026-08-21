@@ -26,8 +26,8 @@ pub mod verdict;
 pub const MODEL_LENSES_COMPILED: bool = cfg!(feature = "model-lenses");
 
 pub use calibrate::{
-    CalibrationInput, ESTIMATOR, MIN_BAD_SCORES, SlotKind, TAU_COLD_START, calibrate,
-    calibrate_slot, validate_calibration_slots,
+    CalibrationInput, ESTIMATOR, JOINT_POLICY_ESTIMATOR, MIN_BAD_SCORES, SlotKind, TAU_COLD_START,
+    calibrate, calibrate_slot, validate_calibration_slots,
 };
 pub use drift::{
     AnnealHook, DEFAULT_DRIFT_CHANNEL_CAPACITY, DEFAULT_DRIFT_WINDOW, DriftEvent, DriftMonitor,

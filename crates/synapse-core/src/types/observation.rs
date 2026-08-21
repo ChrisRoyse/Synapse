@@ -495,6 +495,11 @@ pub struct CaptureRuntimeReadback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_priority: Option<String>,
     pub stop_requested: bool,
+    pub worker_finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -567,8 +572,8 @@ pub struct OcrResult {
 
 /// Physical provenance of a browser-window OCR capture (#1823).
 ///
-/// Window capture (WGC) renders only the tab that is currently active in the
-/// window, so per-tab OCR of a background tab is impossible by construction.
+/// Visible-surface GDI window capture sees only the tab that is currently rendered
+/// in the window, so per-tab OCR of a background tab is impossible by construction.
 /// This records the tab that actually produced the pixels, plus the session's
 /// bound tab when there is one, so cross-tab contamination is always visible in
 /// the response instead of being silently plausible.

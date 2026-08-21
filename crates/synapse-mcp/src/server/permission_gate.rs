@@ -606,7 +606,7 @@ fn build_request(
 
 fn oracle_preflight(
     service: &SynapseService,
-    db: &Arc<synapse_storage::Db>,
+    _db: &Arc<synapse_storage::Db>,
     tool_name: &str,
     input: &Value,
     by_session: &str,
@@ -630,115 +630,37 @@ fn oracle_preflight(
         }),
         Some(by_session),
     )?;
-    let ward = match crate::m3::hygiene::run_guard_verify(
-        db,
-        &crate::m3::hygiene::HygieneGuardVerifyParams {
-            panel_version: synapse_storage::SYN_ACTION_PANEL_VERSION,
-            query_cx_id: candidate_cx_id.clone(),
-            high_stakes: Some(false),
+    // Generic approval candidates are deliberately not reinterpreted as
+    // causal action queries.  The typed action predictor accepts only a
+    // writer-sealed `command_audit` intent carrying the complete pre-trigger
+    // cause roster and no terminal outcome.  This row is a generic approval
+    // audit (`status=preflight`) and has neither that role nor those causes.
+    // Calling the Oracle or Ward with it would either revive action-id
+    // recurrence or silently score absent slots.  Preserve the physical audit
+    // identity, disclose the unsupported causal role, and keep the risky call
+    // behind the operator gate.  Any supported action-family integration must
+    // invoke the typed Oracle only after its canonical intent row exists.
+    Ok(json!({
+        "schema": "synapse.steering.risky_preflight.v2",
+        "grounding": "provisional_unsupported_query_role",
+        "query_cx_id": candidate_cx_id,
+        "oracle": {
+            "code": "SYNAPSE_CALYX_TYPED_PREDICTION_QUERY_ROLE_UNSUPPORTED",
+            "detail": format!(
+                "generic approval preflight for tool {tool_name:?} is not a writer-sealed command_audit intent and cannot be causally predicted"
+            ),
+            "remediation": "retain operator gating; invoke the typed Oracle only with the exact pre-trigger constellation produced by a supported action-family writer"
         },
-    ) {
-        Ok(report) => {
-            if report.persisted_novelty.is_some() {
-                synapse_storage::derived_state::run_novelty_relay_once(db).map_err(|detail| {
-                    mcp_internal(format!(
-                        "STEERING_PREFLIGHT_WARD_RELAY_FAILED: query_cx_id={candidate_cx_id} detail={detail}"
-                    ))
-                })?;
-            }
-            serde_json::to_value(report).map_err(|error| {
-                mcp_internal(format!(
-                    "STEERING_PREFLIGHT_WARD_ENCODE_FAILED: query_cx_id={candidate_cx_id} detail={error}"
-                ))
-            })?
-        }
-        Err(error)
-            if error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
-                .is_some_and(|code| {
-                    matches!(
-                        code,
-                        "CALYX_GUARD_PROVISIONAL" | "SYNAPSE_CALYX_GUARD_PROVISIONAL"
-                    )
-                }) =>
-        {
-            json!({
-                "status": "provisional_uncalibrated",
-                "query_cx_id": candidate_cx_id,
-                "code": error.data.as_ref().and_then(|data| data.get("code")),
-                "detail": error.message,
-                "remediation": "calibrate the action panel Ward profile from grounded good/bad outcomes before enabling Ward enforcement"
-            })
-        }
-        Err(error) => {
-            return Err(mcp_internal(format!(
-                "STEERING_PREFLIGHT_WARD_FAILED: query_cx_id={candidate_cx_id} detail={} data={:?}; remediation=repair the Ward profile, Ledger, or action constellation before retrying the risky call",
-                error.message, error.data
-            )));
-        }
-    };
-    let ward_grounded = ward.get("provisional").and_then(Value::as_bool) == Some(false);
-    let ward_action = ward.get("action").and_then(Value::as_str);
-    match db.oracle_predict_action(tool_name) {
-        Ok(prediction) => {
-            let outcome = prediction
-                .pointer("/outcome/bool")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| {
-                    mcp_internal(format!(
-                        "STEERING_ORACLE_SHAPE_INVALID: action={tool_name:?} prediction lacks /outcome/bool"
-                    ))
-                })?;
-            let sufficient = prediction
-                .pointer("/bound/sufficient")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| {
-                    mcp_internal(format!(
-                        "STEERING_ORACLE_SHAPE_INVALID: action={tool_name:?} prediction lacks /bound/sufficient"
-                    ))
-                })?;
-            Ok(json!({
-                "schema": "synapse.steering.risky_preflight.v1",
-                "grounding": if sufficient && ward_grounded { "grounded" } else { "provisional_insufficient" },
-                "oracle": prediction,
-                "grounded_bad_outcome": sufficient && !outcome,
-                "ward": ward,
-                "ward_quarantine": ward_grounded && ward_action == Some("quarantine"),
-                "enforcement": "operator_gate",
-            }))
-        }
-        Err(error)
-            if matches!(
-                error.code(),
-                "CALYX_ORACLE_INSUFFICIENT"
-                    | "CALYX_ORACLE_NO_RECURRENCE"
-                    | "CALYX_ORACLE_DOMAIN_NOT_FOUND"
-                    | "SYNAPSE_CALYX_ENSEMBLE_NO_ANCHORED_RECORDS"
-                    | "SYNAPSE_CALYX_ENSEMBLE_ANCHOR_NOT_BINARY"
-                    | "SYNAPSE_CALYX_ENSEMBLE_NO_COPRESENT_LENSES"
-            ) =>
-        {
-            Ok(json!({
-                "schema": "synapse.steering.risky_preflight.v1",
-                "grounding": "provisional_insufficient",
-                "oracle": {
-                    "code": error.code(),
-                    "detail": error.to_string(),
-                },
-                "grounded_bad_outcome": false,
-                "ward": ward,
-                "ward_quarantine": ward_grounded && ward_action == Some("quarantine"),
-                "enforcement": "operator_gate",
-            }))
-        }
-        Err(error) => Err(mcp_internal(format!(
-            "STEERING_ORACLE_PREFLIGHT_FAILED: action={tool_name:?} code={} detail={error}; remediation=repair the Oracle evidence/ledger failure before retrying the risky call",
-            error.code()
-        ))),
-    }
+        "grounded_bad_outcome": false,
+        "ward": {
+            "status": "not_evaluated",
+            "code": "SYNAPSE_CALYX_GUARD_QUERY_ROLE_UNSUPPORTED",
+            "detail": "the generic approval audit does not carry the frozen action Guard roster",
+            "remediation": "apply the calibrated Guard to the canonical action-family intent row, never to a generic approval audit"
+        },
+        "ward_quarantine": false,
+        "enforcement": "operator_gate",
+    }))
 }
 
 fn build_question_request(

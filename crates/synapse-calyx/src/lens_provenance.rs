@@ -333,7 +333,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "usage",
         ],
     ),
-    // The action panel's slots move to generation 2_185_006 together. The
+    // The action panel's slots move to generation 2_260_001 together. The
     // version column is load-bearing, not documentary: `syn_anchor_source_
     // provenance` filters this table by `version == panel_version`, so a slot
     // left on the superseded generation is invisible to the leakage check for
@@ -342,7 +342,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // panel, exactly as the timeline rows name 1_963_001 and not 1_900_001.
     (
         48,
-        2_185_006,
+        2_260_001,
         "syn.action.kind_onehot.v2",
         &["row_kind", "tool", "verb"],
     ),
@@ -353,7 +353,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // unaudited measurement this table exists to make impossible.
     (
         49,
-        2_185_006,
+        2_260_001,
         "syn.action.target_hash.v2",
         &[
             "agent_logical_foreground.target",
@@ -368,7 +368,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // transitively and declares them too.
     (
         50,
-        2_185_006,
+        2_260_001,
         "syn.action.record_vector.v2",
         &[
             "agent_logical_foreground.target",
@@ -382,8 +382,8 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
-    (51, 2_185_006, "syn.action.hour_cyclic.v1", &["ts_ns"]),
-    (52, 2_185_006, "syn.action.dow_cyclic.v1", &["ts_ns"]),
+    (51, 2_260_001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
+    (52, 2_260_001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
     // #2050's dense target-identity lane. It resolves the target through the
     // SAME `ACTION_TARGET_POINTERS` precedence slot 49 uses and then decomposes
     // the resolved value per field, so its declared source set is identical to
@@ -399,7 +399,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // claim in a comment.
     (
         117,
-        2_185_006,
+        2_260_001,
         "syn.action.target_vector.v2",
         &[
             "agent_logical_foreground.target",
@@ -414,7 +414,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // status/error/after and response fields are intentionally absent.
     (
         118,
-        2_185_006,
+        2_260_001,
         "syn.action.request_vector.v1",
         &[
             "agent_logical_foreground.target",
@@ -438,7 +438,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // refused before the size class is measured.
     (
         119,
-        2_185_006,
+        2_260_001,
         "syn.action.request_size_class.v1",
         &[
             "payload_bytes",
@@ -455,7 +455,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // time and all terminal fields are absent from the class signature.
     (
         120,
-        2_185_006,
+        2_260_001,
         "syn.action.request_shape_class.v1",
         &[
             "payload_bytes",
@@ -473,7 +473,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // semantics while slot 118 retains exact audit identity.
     (
         121,
-        2_185_006,
+        2_260_001,
         "syn.action.request_atoms.v1",
         &[
             "channel",
@@ -493,7 +493,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // structurally, not merely by convention.
     (
         122,
-        2_185_006,
+        2_260_001,
         "syn.action.precondition_atoms.v1",
         &["before", "row_kind"],
     ),
@@ -501,7 +501,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // independent guard anchor axis and never enter this lens.
     (
         123,
-        2_185_006,
+        2_260_001,
         "syn.action.admission_context.v1",
         &[
             "before",
@@ -518,7 +518,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // Terminal result fields remain structurally excluded.
     (
         124,
-        2_185_007,
+        2_260_001,
         "syn.action.admission_context.v2",
         &[
             "before",
@@ -537,7 +537,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // payload_bounded; terminal result fields remain structurally excluded.
     (
         125,
-        2_185_008,
+        2_260_001,
         "syn.action.admission_context.v3",
         &[
             "before",
@@ -550,6 +550,75 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "tool",
             "verb",
         ],
+    ),
+    (
+        126,
+        2_260_001,
+        "syn.action.command_shape_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        127,
+        2_260_001,
+        "syn.action.environment_state_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        128,
+        2_260_001,
+        "syn.action.policy_hazard_mask_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        129,
+        2_260_001,
+        "syn.action.timeout_policy_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        130,
+        2_260_001,
+        "syn.action.execution_route_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        131,
+        2_260_001,
+        "syn.action.request_identity_policy_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        132,
+        2_260_001,
+        "syn.action.allow_shell_policy_onehot.v1",
+        &["payload_bounded", "row_kind"],
+    ),
+    (
+        133,
+        2_260_001,
+        "syn.action.executable_resolution_onehot.v1",
+        &["before", "row_kind"],
+    ),
+    (
+        134,
+        2_260_001,
+        "syn.action.working_directory_state_onehot.v1",
+        &["before", "row_kind"],
+    ),
+    (
+        135,
+        2_260_001,
+        "syn.action.host_precondition_state_onehot.v1",
+        &["before", "row_kind"],
+    ),
+    (
+        136,
+        2_260_001,
+        "syn.action.resource_headroom.v1",
+        // Dense16 signed unit-field projection over eleven bounded resource
+        // features. Field-hash collisions are part of the frozen lens
+        // contract; this table names only the physical source boundary.
+        &["before", "row_kind"],
     ),
     (53, 1_965_004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
     (54, 1_965_004, "syn.reflex.outcome_onehot.v1", &["status"]),
@@ -815,10 +884,10 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
 pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // `action_outcome_anchor`: command-final readiness uses `outcome`; physical
     // action completion is a separate grounded axis determined by `status`.
-    // No active 2_185_008 lens reads these post-treatment fields.
-    ("reward", 2_185_008, &["outcome"]),
-    ("action_execution_reward", 2_185_008, &["status"]),
-    ("action_guard_region", 2_185_008, &["outcome", "error_code"]),
+    // No active 2_260_001 lens reads these post-treatment fields.
+    ("reward", 2_260_001, &["outcome"]),
+    ("action_execution_reward", 2_260_001, &["status"]),
+    ("action_guard_region", 2_260_001, &["outcome", "error_code"]),
     // `record.status`, and `error_type` which is `Some` exactly when the call
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (

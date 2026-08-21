@@ -18,7 +18,7 @@ title_regex = "^Calculator$"
 
 [capture]
 target = "foreground_window"
-min_update_interval_ms = 50
+min_update_interval_ms = 250
 cursor_visible = true
 
 [keymap]

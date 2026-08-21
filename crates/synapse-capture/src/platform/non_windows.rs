@@ -1,14 +1,14 @@
 use synapse_core::{Point, Rect};
 
 use crate::{
-    CaptureConfig, CaptureError, CaptureThreadPriority, CapturedBgraBitmap,
+    CaptureConfig, CaptureError, CaptureThreadPriority, CapturedBgraBitmap, CapturedFrame,
     CapturedWindowBgraBitmap, DpiAwarenessStatus, controller::CaptureThreadContext,
 };
 
 /// Builds the error returned by every capture entry point on non-Windows builds.
 ///
-/// Real screen capture in Synapse is implemented only on Windows (DXGI Desktop
-/// Duplication and `Windows.Graphics.Capture`). Earlier non-Windows builds
+/// Real screen capture in Synapse is implemented only on Windows through the
+/// CPU/GDI `BitBlt` backend. Earlier non-Windows builds
 /// produced *synthetic* placeholder frames here, which silently fed fabricated
 /// pixels into perception. That is mock data masquerading as a real capture and
 /// is intentionally removed: a build that cannot see the screen must fail loudly
@@ -16,8 +16,7 @@ use crate::{
 #[cfg(not(windows))]
 fn capture_backend_unavailable() -> CaptureError {
     let detail = format!(
-        "real screen capture is implemented only on Windows (DXGI Desktop Duplication / \
-         Windows.Graphics.Capture); this {} build has no capture backend. Run the Windows \
+        "real CPU/GDI screen capture is implemented only on Windows; this {} build has no capture backend. Run the Windows \
          synapse-mcp build to perceive a real desktop. Synthetic/placeholder frames are \
          intentionally not produced so perception never reports fabricated pixels.",
         std::env::consts::OS
@@ -32,7 +31,7 @@ fn capture_backend_unavailable() -> CaptureError {
 
 #[cfg(not(windows))]
 #[allow(clippy::needless_pass_by_value)]
-pub fn run_graphics_capture(
+pub fn run_gdi_capture(
     _config: CaptureConfig,
     _ctx: CaptureThreadContext,
 ) -> Result<(), CaptureError> {
@@ -40,11 +39,10 @@ pub fn run_graphics_capture(
 }
 
 #[cfg(not(windows))]
-#[allow(clippy::needless_pass_by_value)]
-pub fn run_dxgi_capture(
-    _config: CaptureConfig,
-    _ctx: CaptureThreadContext,
-) -> Result<(), CaptureError> {
+pub fn capture_gdi_frame(
+    _config: &CaptureConfig,
+    _frame_seq: u64,
+) -> Result<CapturedFrame, CaptureError> {
     Err(capture_backend_unavailable())
 }
 
@@ -80,6 +78,10 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 pub fn window_capture_region(_hwnd: i64) -> Result<Rect, CaptureError> {
+    Err(capture_backend_unavailable())
+}
+
+pub fn window_printwindow_capture_region(_hwnd: i64) -> Result<Rect, CaptureError> {
     Err(capture_backend_unavailable())
 }
 

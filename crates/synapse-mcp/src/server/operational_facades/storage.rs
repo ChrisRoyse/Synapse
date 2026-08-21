@@ -1186,8 +1186,8 @@ pub(super) async fn handle(
             // the foreground input lease; measurement-class ones clear the
             // measurement grant and are runnable unattended. An undeclared
             // sub-operation resolves to control and fails closed. Read-only
-            // sub-operations (abundance, kernel_answer, olap_aggregate) reach no
-            // gate at all, exactly as before.
+            // sub-operations (abundance, causal_map_read, kernel_answer,
+            // olap_aggregate, view_registry_read) reach no gate at all.
             if sub_operation.mutates_state() {
                 let (class, rationale) =
                     crate::server::tool_profiles::classify_intelligence_operation(sub_operation);
@@ -1225,8 +1225,10 @@ pub(super) async fn handle(
             // surface time out before its actual work began. They use a
             // separate single-permit bounded-read lane; causal_map_read joins
             // it because it re-fingerprints at most the persisted 20,000-row
-            // source contract and never reruns an estimator. No second
-            // whole-corpus working set is admitted.
+            // source contract and never reruns an estimator, while
+            // view_registry_read point-reads one exact Registry row and its
+            // referenced Assay Ledger entry. No second whole-corpus working set
+            // is admitted.
             let bounded_read = sub_operation.is_bounded_read();
             let work = move || {
                 use crate::m3::storage::{
@@ -1252,6 +1254,7 @@ pub(super) async fn handle(
                     kernel_answer: None,
                     oracle: None,
                     ensemble_card: None,
+                    causal_view_registry: None,
                     olap_aggregate: None,
                     search_commission: None,
                 };
@@ -1412,6 +1415,22 @@ pub(super) async fn handle(
                         crate::m3::storage::run_intelligence_ensemble_card(&db, &spec).map(
                             |ensemble_card| StorageIntelligenceResponse {
                                 ensemble_card: Some(ensemble_card),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::ViewRegistryMeasure => {
+                        crate::m3::storage::run_intelligence_view_registry_measure(&db, &spec).map(
+                            |causal_view_registry| StorageIntelligenceResponse {
+                                causal_view_registry: Some(causal_view_registry),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::ViewRegistryRead => {
+                        crate::m3::storage::run_intelligence_view_registry_read(&db, &spec).map(
+                            |causal_view_registry| StorageIntelligenceResponse {
+                                causal_view_registry: Some(causal_view_registry),
                                 ..base
                             },
                         )
@@ -1714,6 +1733,41 @@ pub(super) async fn handle(
                     kernel_answer.hop_count,
                     kernel_answer.total_score,
                     kernel_answer.recall_ratio,
+                )
+            } else if let Some(registry) = &response.causal_view_registry {
+                format!(
+                    "intelligence {} panel={} anchor={} generation={} panel_content_seq={} anchors_cf_frontier=({}, {}) required_record_slots={:?} physically_available_slots={:?} estimable_slots={:?} contracts={} admitted_equivalence_classes={} power={:?} samples={}/{} within_atom_only={} stream_nodes={} sibling_pairs={} gpu_contracts={} registry_vector_bytes={} registry_matrix_bytes={} producing_f32_bytes_per_record={} producing_f32_bytes_at_max_records={} candidate_materialized_bytes={} evidence_sha256={} registry_sha256={} physical_key={} value_sha256={} ledger_seq={} ledger_verified={} identical={}",
+                    response.operation.as_str(),
+                    registry.panel_version,
+                    registry.anchor_kind,
+                    registry.generation,
+                    registry.source_panel_content_seq,
+                    registry.source_anchors_cf_last_commit_seq,
+                    registry.source_anchors_cf_out_of_band_epoch,
+                    registry.required_record_slots,
+                    registry.physically_available_slots,
+                    registry.estimable_slots,
+                    registry.catalog.len(),
+                    registry.admitted_equivalence_classes,
+                    registry.selection_power_state,
+                    registry.observed_sample_count,
+                    registry.required_sample_count,
+                    matches!(registry.association_scope, crate::m3::storage::StorageIntelligenceCausalViewAssociationScope::WithinAtomOnly),
+                    registry.views_as_stream_nodes,
+                    registry.sibling_pairs_generated,
+                    registry.resource_accounting.gpu_runtime_contract_count,
+                    registry.resource_accounting.registry_persisted_vector_bytes,
+                    registry.resource_accounting.registry_persisted_matrix_bytes,
+                    registry.resource_accounting.producing_f32_payload_bytes_per_record,
+                    registry.resource_accounting.producing_f32_payload_bytes_at_max_records,
+                    registry.resource_accounting.candidate_materialized_payload_bytes,
+                    registry.evidence_sha256,
+                    registry.registry_sha256,
+                    registry.physical_key_hex,
+                    registry.stored_value_sha256,
+                    registry.ledger_seq,
+                    registry.ledger_reference_verified,
+                    registry.existing_identical,
                 )
             } else {
                 "intelligence".to_owned()

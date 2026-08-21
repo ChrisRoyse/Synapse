@@ -15,7 +15,9 @@ use tracing::instrument;
 use crate::error::ProfileError;
 use crate::toml_format::RawProfile;
 
-const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 50;
+const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 250;
+pub(crate) const MIN_CAPTURE_INTERVAL_MS: u32 = 250;
+pub(crate) const MAX_CAPTURE_INTERVAL_MS: u32 = 60_000;
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_MAX_DETECTIONS: u32 = 32;
 const DEFAULT_SCREEN_WIDTH: i32 = 3840;

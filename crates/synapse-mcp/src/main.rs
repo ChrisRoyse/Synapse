@@ -94,16 +94,30 @@
 ///
 /// # Blast radius
 ///
-/// This replaces the allocator for the whole process, including the CUDA/ORT
-/// host allocations made through `calyx-forge` and `synapse-models`. Those paths
-/// allocate device memory through their own driver APIs; only their host-side
-/// bookkeeping crosses this allocator, which is ordinary heap traffic.
+/// This replaces the allocator for the whole process, including CPU-only ORT
+/// host allocations made through `synapse-models`. Device execution providers
+/// are excluded by the daemon's compile-time zero-VRAM guard below.
 ///
 /// Tracked by #2115 (the histogram and the double-materializing scan that feeds
 /// it) and #2141 (which gated this change on exactly the histogram evidence
 /// tabulated above, rather than on the plausibility of the story).
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// The binary feature surface is closed, but Cargo also permits a caller to
+// inject a dependency feature with `dependency/feature` syntax. Make every
+// accelerator/heavy model-runtime path a compile-time error too.
+const _: () = assert!(
+    !synapse_calyx::SYNAPSE_CALYX_CUDA_COMPILED
+        && !synapse_models::CUDA_EXECUTION_PROVIDER_COMPILED
+        && !synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED
+        && !calyx_registry::EMBEDDING_RUNTIMES_COMPILED
+        && !calyx_registry::CANDLE_CUDA_COMPILED
+        && !calyx_ward::MODEL_LENSES_COMPILED
+        && !calyx_sextant::CUVS_COMPILED
+        && !calyx_sextant::CUDA_PQ_COMPILED,
+    "SYNAPSE_ZERO_VRAM_COMPILE_GUARD: synapse-mcp cannot contain Calyx CUDA, model CUDA, registry embedding runtimes, Ward model lenses, cuVS, or CUDA PQ"
+);
 
 unsafe extern "C" {
     // Present in the mimalloc v3 library linked by `libmimalloc-sys`. The sys
@@ -418,8 +432,20 @@ struct Cli {
     calyx_vault: bool,
     #[arg(long, env = "SYNAPSE_CALYX_VAULT_DIR", value_name = "PATH")]
     calyx_vault_dir: Option<PathBuf>,
-    #[arg(long, env = "SYNAPSE_CALYX_CONFIG", value_name = "PATH")]
+    #[arg(
+        long,
+        env = "SYNAPSE_CALYX_CONFIG",
+        value_name = "PATH",
+        requires = "calyx_config_sha256"
+    )]
     calyx_config: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "SYNAPSE_CALYX_CONFIG_SHA256",
+        value_name = "SHA256",
+        requires = "calyx_config"
+    )]
+    calyx_config_sha256: Option<String>,
     #[arg(
         long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
@@ -562,6 +588,7 @@ impl Cli {
         config.calyx_vault = self.calyx_vault;
         config.calyx_vault_dir = self.calyx_vault_dir.clone();
         config.calyx_config_path = self.calyx_config.clone();
+        config.calyx_config_sha256 = self.calyx_config_sha256.clone();
         Ok(config)
     }
 
@@ -589,6 +616,15 @@ fn main() -> ExitCode {
         Ok(policy) => policy,
         Err(error) => return top_level_error_exit(error),
     };
+    if let Err(error) = synapse_capture::capture_backend_preference_from_environment() {
+        return top_level_error_exit(anyhow::anyhow!(error.to_string()));
+    }
+    if let Err((code, detail)) = m1::validate_detection_backend_policy() {
+        return top_level_error_exit(anyhow::anyhow!("{code}: {detail}"));
+    }
+    if let Err(error) = synapse_audio::stt_backend_policy() {
+        return top_level_error_exit(anyhow::anyhow!(error.to_string()));
+    }
     if let Some(result) = m1::run_detection_worker_from_process_args() {
         return match result {
             Ok(code) => code,

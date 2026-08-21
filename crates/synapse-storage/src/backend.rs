@@ -27,12 +27,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    AsterOrphanSlotGcReport, SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-    SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
+    ACTION_CAUSAL_PREDICTOR_SLOTS, AsterOrphanSlotGcReport, SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+    SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, SynapseCalyxAbundanceReport,
+    SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
     SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
     SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxBackupReport,
     SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
-    SynapseCalyxCausalMapReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
+    SynapseCalyxCausalMapReport, SynapseCalyxCausalViewRegistryReadback,
+    SynapseCalyxCausalViewRegistryScope, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
     SynapseCalyxCfRows, SynapseCalyxCfWalk, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError,
     SynapseCalyxConfig, SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport,
     SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
@@ -845,7 +847,7 @@ pub trait StorageBackend: Send + Sync {
         occurrence_identity: &[u8],
         context: &[u8],
     ) -> StorageResult<ActionOraclePublicationReport>;
-    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value>;
+    fn oracle_predict_action(&self, query_cx_id: &str) -> StorageResult<Value>;
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value>;
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value>;
     fn oracle_validate_action(&self) -> StorageResult<Value>;
@@ -1186,6 +1188,15 @@ pub trait StorageBackend: Send + Sync {
         params: &SynapseCalyxAssayParams,
         min_gate_lenses: usize,
     ) -> StorageResult<SynapseCalyxEnsembleCardReport>;
+    fn measure_causal_view_registry_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<SynapseCalyxCausalViewRegistryReadback>;
+    fn read_causal_view_registry_intelligence(
+        &self,
+        scope: &SynapseCalyxCausalViewRegistryScope,
+    ) -> StorageResult<Option<SynapseCalyxCausalViewRegistryReadback>>;
     fn assay_redundancy_intelligence(
         &self,
         params: &SynapseCalyxAssayParams,
@@ -1640,54 +1651,37 @@ impl CalyxVaultRuntime {
         )
     }
 
-    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value> {
-        let action_id = validate_recurrence_subject_id(action_id)?;
+    fn oracle_predict_action(&self, query_cx_id: &str) -> StorageResult<Value> {
+        let query_cx_id = query_cx_id.parse::<calyx_core::CxId>().map_err(|error| {
+            let source = SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CX_ID_INVALID",
+                format!("invalid causal prediction query_cx_id: {error}"),
+                "supply the exact 32-hex-character id of a persisted current action constellation",
+            );
+            calyx_write_failed("calyx_oracle", "parse causal prediction query", &source)
+        })?;
         self.with_vault(
             "calyx_oracle",
-            "predict terminal action outcome",
+            "predict terminal action outcome from typed pre-trigger causes",
             true,
             |vault| {
-                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
-                let mut panel =
-                    syn_queryable_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
-                        .ok_or_else(|| {
+                let _ = current_action_causal_registry(vault)?;
+                vault
+                    .predict_typed_action_outcome(query_cx_id)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_oracle",
+                            "predict action outcome from typed pre-trigger causes",
+                            &source,
+                        )
+                    })
+                    .and_then(|prediction| {
+                        serde_json::to_value(prediction).map_err(|error| {
                             calyx_write_failed_detail(
                                 "calyx_oracle",
-                                "syn-action panel contract is absent",
+                                format!("encode typed causal prediction: {error}"),
                             )
-                        })?
-                        .panel;
-                let assay = synapse_calyx::SynapseCalyxAssayParams::new(
-                    SYN_ACTION_PANEL_VERSION,
-                    "reward".to_owned(),
-                )
-                .with_corpus_shard("synapse.action".to_owned())
-                .with_lens_names(crate::constellations::syn_slot_lens_names());
-                let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
-                    calyx_write_failed(
-                        "calyx_oracle",
-                        "measure calibrated action-panel capability before prediction",
-                        &source,
-                    )
-                })?;
-                panel
-                    .slots
-                    .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
-                if panel.slots.is_empty() {
-                    return Err(calyx_write_failed(
-                        "calyx_oracle",
-                        "measure action-panel sufficiency before prediction",
-                        &SynapseCalyxError::new(
-                            "CALYX_ORACLE_INSUFFICIENT",
-                            "action-panel sufficiency produced no measured slots",
-                            "anchor at least 50 diverse terminal outcomes before prediction",
-                        ),
-                    ));
-                }
-                vault
-                    .oracle_predict_action(&action_id, "synapse.action", panel)
-                    .map_err(|source| {
-                        calyx_write_failed("calyx_oracle", "predict action outcome", &source)
+                        })
                     })
             },
         )
@@ -1751,28 +1745,48 @@ impl CalyxVaultRuntime {
                 );
                 return Err(calyx_write_failed("calyx_oracle", "validate completion target", &source));
             }
-            let assay = synapse_calyx::SynapseCalyxAssayParams::new(
-                SYN_ACTION_PANEL_VERSION,
-                "reward".to_owned(),
-            )
-            .with_corpus_shard("synapse.action".to_owned())
-            .with_lens_names(crate::constellations::syn_slot_lens_names());
-            let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
+            let readiness = vault.read_action_readiness().map_err(|source| {
+                calyx_read_failed(
+                    "calyx_oracle",
+                    "read authenticated action readiness before completion",
+                    &source,
+                )
+            })?.ok_or_else(|| {
+                calyx_write_failed_detail(
+                    "calyx_oracle",
+                    "action Oracle completion requires an authenticated current readiness row",
+                )
+            })?;
+            synapse_calyx::ensure_action_readiness_serving_admitted(&readiness).map_err(|source| {
                 calyx_write_failed(
                     "calyx_oracle",
-                    "measure calibrated action-panel capability before completion",
+                    "admit authenticated action readiness before completion",
                     &source,
                 )
             })?;
-            panel
-                .slots
-                .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
-            if panel.slots.is_empty() {
-                return Err(calyx_write_failed_detail(
+            let unsupported_free_slots = free_slots
+                .iter()
+                .copied()
+                .filter(|slot| !readiness.sufficiency_slots.contains(slot))
+                .collect::<Vec<_>>();
+            if !unsupported_free_slots.is_empty() {
+                let source = SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ORACLE_COMPLETION_SLOT_UNMEASURED",
+                    format!(
+                        "completion free slots {unsupported_free_slots:?} are outside authenticated sufficiency roster {:?}",
+                        readiness.sufficiency_slots
+                    ),
+                    "request only an estimator-backed slot named by oracle_readiness; physically valid constants remain serving causes but have no Lens Assay row to authorize completion",
+                );
+                return Err(calyx_write_failed(
                     "calyx_oracle",
-                    "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before completion",
+                    "validate completion sufficiency roster",
+                    &source,
                 ));
             }
+            panel
+                .slots
+                .retain(|slot| readiness.sufficiency_slots.contains(&slot.slot_id.get()));
             let free_slots = free_slots
                 .iter()
                 .copied()
@@ -1788,35 +1802,41 @@ impl CalyxVaultRuntime {
         self.with_vault("calyx_oracle", "measure action readiness", true, |vault| {
             let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
             let mut panel = syn_queryable_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
-                .ok_or_else(|| calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent"))?
+                .ok_or_else(|| {
+                    calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent")
+                })?
                 .panel;
-            let assay = synapse_calyx::SynapseCalyxAssayParams::new(
+            let mut assay = synapse_calyx::SynapseCalyxAssayParams::new(
                 SYN_ACTION_PANEL_VERSION,
                 "reward".to_owned(),
             )
             .with_corpus_shard("synapse.action".to_owned())
-            .with_lens_names(crate::constellations::syn_slot_lens_names());
-            let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
-                calyx_write_failed(
-                    "calyx_oracle",
-                    "measure calibrated action-panel capability before readiness",
-                    &source,
-                )
-            })?;
+            .with_lens_names(crate::constellations::syn_slot_lens_names())
+            .with_required_record_slots([synapse_calyx::SYNAPSE_CAUSAL_VIEW_REQUIRED_RECORD_SLOT]);
+            let predictor_slots = ACTION_CAUSAL_PREDICTOR_SLOTS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assay.excluded_slots.extend(
+                panel
+                    .slots
+                    .iter()
+                    .map(|slot| slot.slot_id.get())
+                    .filter(|slot| !predictor_slots.contains(slot)),
+            );
             panel
                 .slots
-                .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
-            if panel.slots.is_empty() {
-                return Err(calyx_write_failed_detail(
-                    "calyx_oracle",
-                    "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before readiness",
-                ));
-            }
-            let snapshot = vault.measure_action_readiness(&panel).map_err(|source| {
-                calyx_write_failed("calyx_oracle", "measure action readiness", &source)
-            })?;
+                .retain(|slot| predictor_slots.contains(&slot.slot_id.get()));
+            let snapshot = vault
+                .measure_action_readiness_from_assay(&panel, &assay)
+                .map_err(|source| {
+                    calyx_write_failed("calyx_oracle", "measure action readiness", &source)
+                })?;
             serde_json::to_value(snapshot).map_err(|error| {
-                calyx_write_failed_detail("calyx_oracle", format!("encode readiness snapshot: {error}"))
+                calyx_write_failed_detail(
+                    "calyx_oracle",
+                    format!("encode readiness snapshot: {error}"),
+                )
             })
         })
     }
@@ -1827,6 +1847,7 @@ impl CalyxVaultRuntime {
             "validate action readiness evidence",
             true,
             |vault| {
+                let _ = current_action_causal_registry(vault)?;
                 let evidence = vault
                     .validate_action_readiness(SYN_ACTION_PANEL_VERSION)
                     .map_err(|source| {
@@ -1851,7 +1872,7 @@ impl CalyxVaultRuntime {
             vault
                 .read_action_readiness()
                 .map_err(|source| {
-                    calyx_operation_failed("calyx_oracle", false, source.to_string())
+                    calyx_read_failed("calyx_oracle", "read action readiness", &source)
                 })?
                 .map(serde_json::to_value)
                 .transpose()
@@ -5661,8 +5682,8 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
-    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value> {
-        self.vault.oracle_predict_action(action_id)
+    fn oracle_predict_action(&self, query_cx_id: &str) -> StorageResult<Value> {
+        self.vault.oracle_predict_action(query_cx_id)
     }
 
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value> {
@@ -6426,6 +6447,81 @@ impl StorageBackend for CalyxBackend {
                             &source,
                         )
                     })
+            },
+        )
+    }
+
+    fn measure_causal_view_registry_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<SynapseCalyxCausalViewRegistryReadback> {
+        self.with_vault(
+            "calyx_registry",
+            "measure and atomically publish the native Calyx causal-view registry",
+            true,
+            |vault| {
+                let withheld_predictor_slots = ACTION_CAUSAL_PREDICTOR_SLOTS
+                    .iter()
+                    .copied()
+                    .filter(|slot| params.excluded_slots.contains(slot))
+                    .collect::<Vec<_>>();
+                if !withheld_predictor_slots.is_empty() {
+                    let source = SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_CAUSAL_VIEW_REGISTRY_PREDICTOR_VIEW_EXCLUDED",
+                        format!(
+                            "canonical action Registry request withheld predictor slots {withheld_predictor_slots:?}"
+                        ),
+                        "remove every frozen action predictor slot from excluded_slots; only declared anchor carriers and parked collection-only views may be withheld",
+                    );
+                    return Err(calyx_write_failed(
+                        "calyx_registry",
+                        "validate canonical Registry predictor roster",
+                        &source,
+                    ));
+                }
+                let mut bound_params = params.clone();
+                bound_params.physical_lens_bindings =
+                    crate::constellations::syn_action_causal_physical_lens_bindings()?;
+                bound_params.required_record_slots = std::iter::once(
+                    synapse_calyx::SYNAPSE_CAUSAL_VIEW_REQUIRED_RECORD_SLOT,
+                )
+                .collect();
+                vault
+                    .measure_causal_view_registry(&bound_params, min_gate_lenses)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "measure and atomically publish the native Calyx causal-view registry",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn read_causal_view_registry_intelligence(
+        &self,
+        scope: &SynapseCalyxCausalViewRegistryScope,
+    ) -> StorageResult<Option<SynapseCalyxCausalViewRegistryReadback>> {
+        self.with_vault(
+            "calyx_registry",
+            "read the persisted native Calyx causal-view registry",
+            false,
+            |vault| {
+                if scope.panel_version == SYN_ACTION_PANEL_VERSION
+                    && scope.corpus_shard == "synapse.action"
+                    && scope.anchor_kind == "reward"
+                {
+                    return current_action_causal_registry(vault).map(Some);
+                }
+                vault.read_causal_view_registry(scope).map_err(|source| {
+                    calyx_read_failed(
+                        "calyx_registry",
+                        "read the persisted native Calyx causal-view registry",
+                        &source,
+                    )
+                })
             },
         )
     }
@@ -18240,6 +18336,69 @@ fn calyx_read_failed(
         // error envelope they actually read (#1911).
         remediation: source.remediation,
     }
+}
+
+fn current_action_causal_registry(
+    vault: &SynapseCalyxVault,
+) -> StorageResult<SynapseCalyxCausalViewRegistryReadback> {
+    let scope = SynapseCalyxCausalViewRegistryScope {
+        panel_version: SYN_ACTION_PANEL_VERSION,
+        corpus_shard: "synapse.action".to_owned(),
+        anchor_kind: "reward".to_owned(),
+    };
+    let readback = vault
+        .read_causal_view_registry(&scope)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_registry",
+                "read and verify the canonical action causal-view Registry",
+                &source,
+            )
+        })?
+        .ok_or_else(|| {
+            let source = SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CAUSAL_VIEW_REGISTRY_ABSENT",
+                "canonical panel=2260001 corpus_shard=synapse.action anchor=reward Registry row is absent",
+                "run storage intelligence view_registry_measure explicitly before Oracle validation/readiness/serving",
+            );
+            calyx_write_failed("calyx_registry", "read canonical action Registry", &source)
+        })?;
+    let physical = crate::constellations::syn_action_causal_physical_lens_bindings()?;
+    let producing = readback
+        .registry
+        .catalog
+        .iter()
+        .filter(|view| view.producing)
+        .collect::<Vec<_>>();
+    let physical_matches = producing.len() == physical.len()
+        && producing.iter().all(|view| {
+            let Some(slot) = view.slot else {
+                return false;
+            };
+            physical.get(&slot).is_some_and(|binding| {
+                view.lens_id.as_deref() == Some(binding.lens_id.as_str())
+                    && view.lens_spec_sha256.as_deref() == Some(binding.lens_spec_sha256.as_str())
+                    && view.extractor_schema_sha256.as_deref()
+                        == Some(binding.extractor_schema_sha256.as_str())
+            })
+        });
+    if !physical_matches {
+        let source = SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CAUSAL_VIEW_REGISTRY_PHYSICAL_CONTRACT_MOVED",
+            format!(
+                "Registry producing contracts={} current physical bindings={} and at least one LensId/LensSpec/extractor digest differs",
+                producing.len(),
+                physical.len()
+            ),
+            "allocate a new immutable action panel/view generation and explicitly remeasure the Registry; serving never reinterprets a changed extractor under an old content id",
+        );
+        return Err(calyx_write_failed(
+            "calyx_registry",
+            "bind Registry to the current physical action panel",
+            &source,
+        ));
+    }
+    Ok(readback)
 }
 
 fn calyx_write_failed(cf_name: &str, action: &str, source: &SynapseCalyxError) -> StorageError {

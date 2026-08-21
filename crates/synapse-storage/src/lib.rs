@@ -1179,14 +1179,14 @@ impl Db {
         )
     }
 
-    /// Predicts one action's grounded terminal outcome through Calyx Oracle's
-    /// persisted sufficiency and provenance gates.
+    /// Predicts one persisted action constellation's grounded terminal outcome
+    /// from its exact pre-trigger typed causal slots.
     ///
     /// # Errors
     ///
     /// Returns the structured backend error when validation or Oracle prediction fails.
-    pub fn oracle_predict_action(&self, action_id: &str) -> StorageResult<serde_json::Value> {
-        self.backend.oracle_predict_action(action_id)
+    pub fn oracle_predict_action(&self, query_cx_id: &str) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_predict_action(query_cx_id)
     }
 
     /// Walks backward from a terminal success/failure outcome to grounded
@@ -2065,6 +2065,38 @@ impl Db {
     ) -> StorageResult<synapse_calyx::SynapseCalyxEnsembleCardReport> {
         self.backend
             .assay_ensemble_card_intelligence(params, min_gate_lenses)
+    }
+
+    /// Measures the existing ensemble card once and atomically publishes its
+    /// compact causal-view projection to Registry with an Assay ledger entry.
+    /// No vectors or pair matrices are stored in the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the frozen catalog is invalid,
+    /// Assay measurement fails, the 256 KiB Registry budget is exceeded, or
+    /// atomic persistence/readback disagrees.
+    pub fn measure_causal_view_registry_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxCausalViewRegistryReadback> {
+        self.backend
+            .measure_causal_view_registry_intelligence(params, min_gate_lenses)
+    }
+
+    /// Reads and integrity-verifies the exact latest causal-view Registry row
+    /// for one logical panel/anchor scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the physical Registry row is
+    /// unreadable, corrupt, mis-keyed, or fails one of its content hashes.
+    pub fn read_causal_view_registry_intelligence(
+        &self,
+        scope: &synapse_calyx::SynapseCalyxCausalViewRegistryScope,
+    ) -> StorageResult<Option<synapse_calyx::SynapseCalyxCausalViewRegistryReadback>> {
+        self.backend.read_causal_view_registry_intelligence(scope)
     }
 
     /// Measures directed transfer entropy (KSG, lag sweep) between two activity

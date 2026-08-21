@@ -6,17 +6,13 @@ use std::{
     time::Instant,
 };
 
-use calyx_forge::vram::{
-    HostCudaDeviceVerdict, HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore,
-    probe_host_cuda_device,
-};
 use ort::session::Session;
 use ort::value::{PrimitiveTensorElementType, Tensor};
 use serde::{Deserialize, Serialize};
 use synapse_models::{
-    LoadedModel, ModelBackend, ModelDescriptor, ModelError, ModelLoader, SessionHandle,
-    WHISPER_TINY_INT8_ONNX, WHISPER_TINY_INT8_ONNX_FILENAME, WHISPER_TINY_INT8_ONNX_LENGTH,
-    WHISPER_TINY_INT8_ONNX_SHA256, default_model_dir,
+    LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, WHISPER_TINY_INT8_ONNX,
+    WHISPER_TINY_INT8_ONNX_FILENAME, WHISPER_TINY_INT8_ONNX_LENGTH, WHISPER_TINY_INT8_ONNX_SHA256,
+    default_model_dir,
 };
 
 mod window;
@@ -36,27 +32,8 @@ pub const WHISPER_TINY_INT8_EXPECTED_LEN: u64 = WHISPER_TINY_INT8_ONNX_LENGTH;
 
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";
-/// `auto` (default) | `cuda` | `cpu`.
-///
-/// Mirrors `SYNAPSE_DETECTION_BACKEND` so the two ORT consumers in the daemon
-/// are configured the same way.
+/// CPU-only STT execution-provider selector.
 pub const STT_BACKEND_ENV: &str = "SYNAPSE_STT_BACKEND";
-const STT_GPU_DEVICE_INDEX: u32 = 0;
-/// Host GPU capacity declared for the whole life of a GPU-backed STT session.
-///
-/// Forge reserves the exact device buffers of each dispatch because forge
-/// allocates and frees them per call. ORT does not work that way: the session
-/// owns its device allocator, its cuDNN/cuBLAS workspaces and the whisper
-/// weights from `commit_from_file` until the session is dropped, and this
-/// session is built once and cached for the process lifetime. A per-inference
-/// reservation would therefore claim capacity the session is already holding
-/// and release capacity it has not given back, which is a lie in both
-/// directions. A session-lifetime envelope is the only honest shape here.
-///
-/// The number is a measurement: manual FSV reads `nvidia-smi` before and after
-/// session construction and refuses if the observed device delta exceeds this
-/// envelope.
-const STT_GPU_ADMISSION_MIB: u64 = 1_536;
 // Exact prompt used by the pinned Olive graph's behavioral parity probe:
 // decoder start followed by no-timestamps.
 const EN_DECODER_PROMPT: [i32; 2] = [50_257, 50_362];
@@ -101,13 +78,11 @@ impl TranscriptionConfidenceSource {
 
 /// Execution-provider policy for the pinned Whisper session.
 ///
-/// `Auto` prefers CUDA, then CPU. It advances only after positive proof that
-/// CUDA hardware/provider is absent.
-/// A present-but-broken provider, an admission refusal, or any other load
-/// failure is a hard error — never a silent demotion.
+/// The installed runtime has one legal policy: a pinned CPU provider. Keeping
+/// the policy typed makes health attest the decision without an implicit or
+/// GPU-preferring `auto` state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SttBackendPolicy {
-    Auto,
     Pinned(ModelBackend),
 }
 
@@ -120,27 +95,22 @@ pub struct SttBackendReadback {
     pub gpu_reservation_id: Option<String>,
     pub gpu_reservation_mib: Option<u64>,
     pub device_memory_policy: Option<String>,
-    /// Set when `Auto` demoted to CPU, with the proof that made it legal.
+    /// Always absent in the CPU-only runtime; retained for wire compatibility.
     pub fallback_code: Option<String>,
     pub fallback_detail: Option<String>,
 }
 
 struct LoadedStt {
     model: LoadedModel,
-    /// Session-lifetime host GPU lease. Dropping this releases the ledger row,
-    /// so it must outlive the ORT session it admitted.
-    reservation: Option<HostGpuReservation>,
 }
 
 struct SttBackendFailure {
     error: AudioError,
-    proves_gpu_absent: bool,
 }
 
 pub struct WhisperTinyStt {
     descriptor: ModelDescriptor,
     loaded: Mutex<Option<LoadedStt>>,
-    fallback: Mutex<Option<(String, String)>>,
 }
 
 impl Debug for WhisperTinyStt {
@@ -166,64 +136,43 @@ impl WhisperTinyStt {
                 class_map: Vec::new(),
             },
             loaded: Mutex::new(None),
-            fallback: Mutex::new(None),
         }
     }
 
-    /// Reports the configured policy and, once a session exists, the provider,
-    /// memory policy, demotion evidence, and CUDA ledger row (when applicable).
+    /// Reports the configured policy and, once a session exists, the provider
+    /// and host-memory policy. GPU/fallback fields remain explicitly absent.
     ///
     /// # Errors
     ///
     /// Returns a structured model error if either source-of-truth mutex is
     /// poisoned, rather than reporting an invented unloaded state.
     pub fn backend_readback(&self) -> AudioResult<SttBackendReadback> {
-        let policy = match stt_backend_policy() {
-            Ok(SttBackendPolicy::Auto) => "auto".to_owned(),
-            Ok(SttBackendPolicy::Pinned(backend)) => format!("pinned:{backend:?}"),
-            Err(error) => format!("invalid:{error}"),
+        let policy = match stt_backend_policy()? {
+            SttBackendPolicy::Pinned(backend) => format!("pinned:{backend:?}"),
         };
-        let (loaded, selected_backend, gpu_reservation_id, gpu_reservation_mib) =
-            match self.loaded.lock() {
-                Ok(guard) => guard.as_ref().map_or((false, None, None, None), |state| {
-                    (
-                        true,
-                        Some(state.model.selected_backend()),
-                        state
-                            .reservation
-                            .as_ref()
-                            .map(|lease| lease.reservation_id().to_owned()),
-                        state.reservation.as_ref().map(|_| STT_GPU_ADMISSION_MIB),
-                    )
-                }),
-                Err(_poisoned) => {
-                    return Err(AudioError::ModelLoadFailed {
-                        path: self.descriptor.path.clone(),
-                        detail: "STT backend readback model cache lock was poisoned".to_owned(),
-                    });
-                }
-            };
-        let (fallback_code, fallback_detail) = self
-            .fallback
-            .lock()
-            .map_err(|_| AudioError::ModelLoadFailed {
-                path: self.descriptor.path.clone(),
-                detail: "STT backend readback fallback lock was poisoned".to_owned(),
-            })?
-            .clone()
-            .map_or((None, None), |(code, detail)| (Some(code), Some(detail)));
+        let (loaded, selected_backend) = match self.loaded.lock() {
+            Ok(guard) => guard.as_ref().map_or((false, None), |state| {
+                (true, Some(state.model.selected_backend()))
+            }),
+            Err(_poisoned) => {
+                return Err(AudioError::ModelLoadFailed {
+                    path: self.descriptor.path.clone(),
+                    detail: "STT backend readback model cache lock was poisoned".to_owned(),
+                });
+            }
+        };
         Ok(SttBackendReadback {
             policy,
             loaded,
             selected_backend,
-            gpu_reservation_id,
-            gpu_reservation_mib,
+            gpu_reservation_id: None,
+            gpu_reservation_mib: None,
             device_memory_policy: selected_backend.map(|backend| match backend {
-                ModelBackend::Cuda => "nvml_dedicated_memory_session_lease".to_owned(),
+                ModelBackend::Cuda => "invalid_cuda_backend".to_owned(),
                 ModelBackend::Cpu => "host_memory".to_owned(),
             }),
-            fallback_code,
-            fallback_detail,
+            fallback_code: None,
+            fallback_detail: None,
         })
     }
 
@@ -372,15 +321,8 @@ impl WhisperTinyStt {
     }
 
     /// Builds the one persistent ORT session under the configured provider
-    /// policy (#2109).
-    ///
-    /// The old code passed `vec![ModelBackend::Cpu]`, a single-element list that
-    /// bypassed provider selection entirely on a host whose CUDA EP is compiled
-    /// in and whose GPU is idle.
+    /// policy (#2109, #2260).
     fn build_session(&self) -> AudioResult<LoadedStt> {
-        if let Ok(mut guard) = self.fallback.lock() {
-            *guard = None;
-        }
         match stt_backend_policy()? {
             SttBackendPolicy::Pinned(backend) => {
                 self.load_with_backend(backend).map_err(|failure| {
@@ -393,114 +335,28 @@ impl WhisperTinyStt {
                     failure.error
                 })
             }
-            SttBackendPolicy::Auto => match self.load_with_backend(ModelBackend::Cuda) {
-                Ok(state) => Ok(state),
-                Err(cuda_failure) if cuda_failure.proves_gpu_absent => {
-                    let code = "SYNAPSE_STT_AUTO_CPU_NO_CUDA_PROVIDER";
-                    let detail = cuda_failure.error.to_string();
-                    tracing::warn!(code, source_error = %detail,
-                        "STT auto policy selected CPU after positive CUDA absence proof");
-                    self.record_fallback(code, detail)?;
-                    self.load_with_backend(ModelBackend::Cpu)
-                        .map_err(|failure| failure.error)
-                }
-                Err(failure) => {
-                    tracing::error!(
-                        code = "SYNAPSE_STT_CUDA_SESSION_FAILED",
-                        source_code = failure.error.code(),
-                        error = %failure.error,
-                        "STT refused to demote to CPU: the CUDA failure is not proof that this \
-                         host lacks a CUDA execution provider"
-                    );
-                    Err(failure.error)
-                }
-            },
         }
-    }
-
-    fn record_fallback(&self, code: &str, detail: String) -> AudioResult<()> {
-        let mut guard = self
-            .fallback
-            .lock()
-            .map_err(|_| AudioError::ModelLoadFailed {
-                path: self.descriptor.path.clone(),
-                detail: "STT fallback audit lock was poisoned".to_owned(),
-            })?;
-        *guard = Some((code.to_owned(), detail));
-        drop(guard);
-        Ok(())
     }
 
     fn load_with_backend(
         &self,
         backend: ModelBackend,
     ) -> Result<LoadedStt, Box<SttBackendFailure>> {
-        let reservation = self.acquire_gpu_reservation(backend).map_err(|error| {
-            let verdict = (backend == ModelBackend::Cuda)
-                .then(|| probe_host_cuda_device(STT_GPU_DEVICE_INDEX));
-            let absence_basis = match verdict {
-                Some(HostCudaDeviceVerdict::Absent { basis }) => Some(basis),
-                _ => None,
-            };
-            let error = match absence_basis.as_ref() {
-                Some(basis) => AudioError::ModelLoadFailed {
+        if backend != ModelBackend::Cpu {
+            return Err(Box::new(SttBackendFailure {
+                error: AudioError::ModelLoadFailed {
                     path: self.descriptor.path.clone(),
-                    detail: format!(
-                        "CUDA device absence proved before STT provider selection: {basis}; \
-                         preceding CUDA admission result: {error}"
-                    ),
+                    detail: "SYNAPSE_STT_ZERO_VRAM_POLICY: CUDA is forbidden; the installed STT runtime accepts only the CPU execution provider"
+                        .to_owned(),
                 },
-                None => error,
-            };
-            Box::new(SttBackendFailure {
-                error,
-                // Capacity and indeterminate probe failures are never absence.
-                // A separately classified NVML Absent verdict is physical
-                // evidence that CUDA cannot exist on this host.
-                proves_gpu_absent: absence_basis.is_some(),
-            })
-        })?;
+            }));
+        }
         match ModelLoader::new(vec![backend]).load(self.descriptor.clone()) {
-            Ok(model) => Ok(LoadedStt { model, reservation }),
-            Err(error) => {
-                let proves_gpu_absent = model_error_proves_backend_absent(&error, backend);
-                // `reservation` drops here, releasing the ledger row we did not
-                // end up using.
-                Err(Box::new(SttBackendFailure {
-                    error: AudioError::from(error),
-                    proves_gpu_absent,
-                }))
-            }
+            Ok(model) => Ok(LoadedStt { model }),
+            Err(error) => Err(Box::new(SttBackendFailure {
+                error: AudioError::from(error),
+            })),
         }
-    }
-
-    /// Registers CUDA's declared dedicated-memory envelope before ORT allocates.
-    fn acquire_gpu_reservation(
-        &self,
-        backend: ModelBackend,
-    ) -> AudioResult<Option<HostGpuReservation>> {
-        if backend != ModelBackend::Cuda {
-            return Ok(None);
-        }
-        let store = HostGpuReservationStore::from_env(STT_GPU_DEVICE_INDEX).map_err(|error| {
-            AudioError::ModelLoadFailed {
-                path: self.descriptor.path.clone(),
-                detail: format!(
-                    "open device-{STT_GPU_DEVICE_INDEX} host GPU reservation SoT for the STT \
-                     session: {error}"
-                ),
-            }
-        })?;
-        store
-            .acquire(stt_gpu_reservation_request(backend))
-            .map(Some)
-            .map_err(|error| AudioError::ModelLoadFailed {
-                path: self.descriptor.path.clone(),
-                detail: format!(
-                    "device-{STT_GPU_DEVICE_INDEX} host GPU admission refused the \
-                     {STT_GPU_ADMISSION_MIB} MiB STT session envelope: {error}"
-                ),
-            })
     }
 
     fn run_session(&self, session: &mut Session, bytes: Vec<u8>) -> AudioResult<String> {
@@ -597,30 +453,7 @@ pub fn default_model_path() -> PathBuf {
     default_model_dir().join(WHISPER_TINY_INT8_FILENAME)
 }
 
-/// The exact host GPU admission request a GPU-backed STT session makes.
-///
-/// Public so a field verification can acquire the identical row against the
-/// live ledger rather than a hand-rolled approximation of it.
-#[must_use]
-pub fn stt_gpu_reservation_request(backend: ModelBackend) -> HostGpuReservationRequest {
-    HostGpuReservationRequest::new(
-        "synapse-audio-stt",
-        format!("synapse-stt-pid-{}", std::process::id()),
-        format!(
-            "ORT {backend:?} whisper-tiny-int8 session; \
-             declared_session_lifetime_envelope_mib={STT_GPU_ADMISSION_MIB}"
-        ),
-        STT_GPU_ADMISSION_MIB,
-    )
-}
-
-/// Declared session-lifetime GPU envelope in MiB.
-#[must_use]
-pub const fn stt_gpu_admission_mib() -> u64 {
-    STT_GPU_ADMISSION_MIB
-}
-
-/// Reads [`STT_BACKEND_ENV`]. Unset or `auto` means the GPU-preferring policy.
+/// Reads [`STT_BACKEND_ENV`]. Unset deterministically means CPU.
 ///
 /// # Errors
 ///
@@ -629,7 +462,9 @@ pub const fn stt_gpu_admission_mib() -> u64 {
 pub fn stt_backend_policy() -> AudioResult<SttBackendPolicy> {
     let value = match std::env::var(STT_BACKEND_ENV) {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(SttBackendPolicy::Auto),
+        Err(std::env::VarError::NotPresent) => {
+            return Ok(SttBackendPolicy::Pinned(ModelBackend::Cpu));
+        }
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(AudioError::ModelLoadFailed {
                 path: default_model_path(),
@@ -638,48 +473,14 @@ pub fn stt_backend_policy() -> AudioResult<SttBackendPolicy> {
         }
     };
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-        return Ok(SttBackendPolicy::Auto);
-    }
-    if trimmed.eq_ignore_ascii_case("cuda") {
-        return Ok(SttBackendPolicy::Pinned(ModelBackend::Cuda));
-    }
     if trimmed.eq_ignore_ascii_case("cpu") {
         return Ok(SttBackendPolicy::Pinned(ModelBackend::Cpu));
     }
     Err(AudioError::ModelLoadFailed {
         path: default_model_path(),
-        detail: format!("{STT_BACKEND_ENV} must be auto, cuda, or cpu; got {value:?}"),
-    })
-}
-
-/// Whether an ORT session failure is positive proof that this host has no
-/// usable GPU execution provider, which is the only justification for `auto`
-/// resolving to CPU.
-///
-/// Deliberately narrow. "The provider DLL is not on this host" and "the driver
-/// reports no CUDA device" are absence. Everything else — an EP that loaded and
-/// then failed, an out-of-memory, a rejected graph — is a present-but-broken
-/// GPU, and uncertainty is not evidence.
-fn model_error_proves_backend_absent(error: &ModelError, expected: ModelBackend) -> bool {
-    let ModelError::BackendUnavailable { failures, .. } = error else {
-        return false;
-    };
-    failures.iter().any(|(backend, detail)| {
-        if *backend != expected {
-            return false;
-        }
-        let detail = detail.to_ascii_lowercase();
-        match expected {
-            ModelBackend::Cuda => {
-                detail.contains("no cuda-capable device")
-                    || detail.contains("cuda_error_no_device")
-                    || detail.contains("cudaerrornodevice")
-                    || detail.contains("onnxruntime_providers_cuda")
-                    || (detail.contains("libraries are not found") && detail.contains("cuda"))
-            }
-            ModelBackend::Cpu => false,
-        }
+        detail: format!(
+            "SYNAPSE_STT_BACKEND_ZERO_VRAM_POLICY: {STT_BACKEND_ENV} must be cpu or unset; got {value:?}; auto and cuda are forbidden by the installed zero-VRAM contract"
+        ),
     })
 }
 

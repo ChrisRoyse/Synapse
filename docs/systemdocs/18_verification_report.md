@@ -66,7 +66,7 @@
 |---|---|
 | Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide. |
 | Pre-push gate | `.githooks/pre-push` runs structural D1 Gate 0 on every push. Rust/Cargo inputs additionally run the full root and standalone Calyx fmt/deny/clippy/lock-policy gates through the single `scripts/lint.ps1` entry point. |
-| Calyx CUDA build env | `scripts/synapse-setup.ps1` publishes `NVCC_CCBIN` and appends `-Xcompiler=/Zc:preprocessor` to `NVCC_APPEND_FLAGS` when CUDA is installed so Windows CUDA 13.x dependency kernels fail loudly only on real compiler/config errors. |
+| Installed accelerator policy | `scripts/synapse-setup.ps1` installs and pins `math_backend="cpu"`, `vram_budget_bytes=0`, sets detection/STT to CPU and capture to GDI `BitBlt`, and rejects `SYNAPSE_CALYX_CUDA=auto|require` or contradictory backend requests. It neither detects nor publishes NVCC settings; optional CUDA features remain only for separately configured standalone Calyx compile probes and are not part of the installed daemon graph. |
 | Dependency/license gate | `cargo-deny` (`deny.toml`), run as gate 5 of `scripts/lint.ps1` over **both** workspaces (root config passed to calyx via `--config`). Targets x86_64 linux-gnu + windows-msvc; allowed licenses MIT, Apache-2.0 (+LLVM-exception), BSD-2/3-Clause, MPL-2.0, ISC, Zlib, Unicode-3.0, BSL-1.0, CC0-1.0, CDLA-Permissive-2.0; advisories version 2 with `unsound`/`unmaintained = "all"`, `yanked = "deny"` and `unused-ignored-advisory = "deny"`. First-party crates are `publish = false` and exempted via `licenses.private.ignore`. Requires `cargo-deny >= 0.20.2` (`scripts/install-cargo-deny.ps1`); an absent binary is a hard failure, not a skip (#1930). |
 | Lock-graph gate | `scripts/calyx-lock.ps1 -Check`, run as gate 3 of `scripts/lint.ps1`. Asserts that every package version reachable from calyx's own crates in `calyx/Cargo.lock` is also present in the root `Cargo.lock`, so the calyx lint workspace compiles the graph that ships. `-Sync` regenerates `calyx/Cargo.lock` from the root lock (#1929). |
 | CI | None (no `.github/` workflows, Makefile, justfile, or nextest config). |
@@ -101,7 +101,7 @@ See [17_test_suite.md](17_test_suite.md) for the no-test policy and structural-c
 | Audio ring | 30 s, 48 kHz, f32, stereo | [08](08_audio_subsystem.md) |
 | STT | Whisper tiny INT8, 16 kHz mono, English | [08](08_audio_subsystem.md) |
 | Template match | NCC clamped [-1,1]; 10 slots, min conf 0.85 | [07](07_perception_subsystem.md) |
-| Frame channel | capacity 2, drop-oldest | [05](05_capture_subsystem.md) |
+| Frame channel | capacity 1, demand-driven; defensive drop-oldest on an unexpected full send | [05](05_capture_subsystem.md) |
 | Double-click delay | clamp(`GetDoubleClickTime`/4, 30..150) ms | [09](09_action_subsystem.md) |
 | Bigram typing speedup | 0.75× over 50 common English bigrams | [09](09_action_subsystem.md) |
 | Registered ML models | 1 (RT-DETRv2-S COCO) | [13](13_models_subsystem.md) |

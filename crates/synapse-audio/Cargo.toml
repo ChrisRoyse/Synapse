@@ -11,17 +11,8 @@ publish.workspace = true
 
 [features]
 default = []
-# The STT session now *selects* an execution provider (#2109), so this crate
-# declares the provider features it depends on instead of inheriting them by
-# accident from whatever else the workspace build happens to link.
-cuda = ["synapse-models/cuda"]
 
 [dependencies]
-# calyx-forge (no `cuda` feature: this crate needs the host GPU reservation
-# ledger, not the kernels) is how a GPU-backed STT session registers its
-# device envelope with the same OS-wide Source of Truth every other GPU
-# consumer uses (#2109).
-calyx-forge = { workspace = true }
 chrono.workspace = true
 metrics.workspace = true
 ort.workspace = true

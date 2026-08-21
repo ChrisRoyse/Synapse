@@ -147,6 +147,32 @@ impl SynapseService {
         }
     }
 
+    /// Persists a policy refusal whose external action was never attempted.
+    /// This is causal-decision provenance, not a failed execution outcome, so
+    /// the distinct status is deliberately outside the grounded
+    /// `ok|error|denied` terminal roster.
+    pub(super) fn audit_action_refused_unobserved_with_details_for_session(
+        &self,
+        tool: &'static str,
+        error: &ErrorData,
+        details: &Value,
+        session_id: &str,
+    ) -> Result<(), ErrorData> {
+        self.write_action_audit_row(
+            tool,
+            "causal_refused_unobserved",
+            error_data_code(error),
+            &json!({
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+                "request": details,
+                "external_action_attempted": false,
+                "grounded_execution_outcome": false,
+            }),
+            Some(session_id),
+        )
+    }
+
     pub(super) fn audit_action_denied_with_details_for_request(
         &self,
         tool: &'static str,

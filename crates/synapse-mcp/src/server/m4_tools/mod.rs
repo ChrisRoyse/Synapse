@@ -37,6 +37,7 @@ use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 use synapse_storage::{cf, decode_json};
 
+use crate::m1::mcp_error_with_remediation;
 use crate::m3::local_models::{
     LocalModelApiShape, LocalModelProbeParams, LocalModelRegistryRow, ResolvedApiKey,
 };
@@ -45,6 +46,7 @@ use crate::m4::{
     ActRunShellExecutionMode, LaunchProcessExitObservation, LaunchTerminalCapture,
     launch_process_terminal_history_row, launch_process_terminal_history_row_key,
     run_shell_precondition_snapshot, run_shell_start_precondition_snapshot,
+    shell_precondition_resource_refusal,
 };
 
 use super::{
@@ -70,6 +72,133 @@ const PROCESS_LIST_MAX_LIMIT: usize = 1000;
 const PROCESS_HISTORY_DEFAULT_LIMIT: usize = 20;
 const PROCESS_HISTORY_MAX_LIMIT: usize = 200;
 const PROCESS_HISTORY_MAX_SCAN_ROWS: usize = 10_000;
+
+const ACTION_CAUSAL_ORACLE_REFUSED: &str = "SYNAPSE_CALYX_ACTION_CAUSAL_ORACLE_REFUSED";
+
+fn storage_error_with_remediation(error: &synapse_storage::StorageError) -> ErrorData {
+    error.remediation().map_or_else(
+        || mcp_error(error.code(), error.to_string()),
+        |remediation| mcp_error_with_remediation(error.code(), error.to_string(), remediation),
+    )
+}
+
+fn readiness_drift_disarms_autonomy(code: &str) -> bool {
+    matches!(
+        code,
+        "SYNAPSE_CALYX_READINESS_PUBLICATION_SOURCE_MOVED"
+            | "SYNAPSE_CALYX_READINESS_SOURCE_FRONTIER_MOVED"
+            | "SYNAPSE_CALYX_READINESS_EVIDENCE_STALE"
+            | "SYNAPSE_CALYX_READINESS_EVIDENCE_CORPUS_MOVED"
+            | "SYNAPSE_CALYX_READINESS_CAUSAL_REGISTRY_MOVED"
+            | "SYNAPSE_CALYX_READINESS_EVIDENCE_GUARD_REBOUND"
+    )
+}
+
+/// Applies the typed causal Oracle only after a canonical command-audit intent
+/// has been physically measured. `admitted=true, enforced=false` means the
+/// honesty gate is not ready and the pre-existing operator/allowlist boundary
+/// remains authoritative; it is never represented as a causal prediction.
+fn shell_causal_oracle_decision(
+    service: &SynapseService,
+    tool: &'static str,
+    intent: &super::command_audit::CommandAuditRowReadback,
+) -> Result<(Value, bool), ErrorData> {
+    let query_cx_id = intent.constellation_cx_id.as_deref().ok_or_else(|| {
+        mcp_error_with_remediation(
+            "SYNAPSE_CALYX_ACTION_CAUSAL_QUERY_ID_ABSENT",
+            format!(
+                "canonical {tool} intent row {} has no measured Calyx constellation identity",
+                intent.key_hex
+            ),
+            "preserve the action row and repair command-audit constellation publication; never reconstruct a causal query from a tool name or audit id",
+        )
+    })?;
+    let db = service.m3_storage()?;
+    let readiness = match db.oracle_readiness() {
+        Ok(value) => value,
+        Err(error) if readiness_drift_disarms_autonomy(error.code()) => {
+            return Ok((
+                json!({
+                    "schema": "synapse.action.causal_oracle_enforcement.v1",
+                    "query_cx_id": query_cx_id,
+                    "enforced": false,
+                    "admitted": true,
+                    "authority": "operator_and_allowlist",
+                    "readiness": "stale_not_armed",
+                    "code": error.code(),
+                    "detail": error.to_string(),
+                    "remediation": error.remediation(),
+                }),
+                true,
+            ));
+        }
+        Err(error) => return Err(storage_error_with_remediation(&error)),
+    };
+    let Some(readiness) = readiness else {
+        return Ok((
+            json!({
+                "schema": "synapse.action.causal_oracle_enforcement.v1",
+                "query_cx_id": query_cx_id,
+                "enforced": false,
+                "admitted": true,
+                "authority": "operator_and_allowlist",
+                "readiness": "absent_not_armed",
+                "remediation": "measure the compact causal Registry, validate grounded action evidence, calibrate the Guard, and persist readiness before enabling causal autonomy",
+            }),
+            true,
+        ));
+    };
+    let ready = readiness
+        .pointer("/report/overall")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            mcp_error_with_remediation(
+                "SYNAPSE_CALYX_ACTION_READINESS_SHAPE_INVALID",
+                "persisted action readiness has no Boolean report.overall verdict",
+                "quarantine the malformed readiness row and rerun oracle_validate plus oracle_readiness",
+            )
+        })?;
+    if !ready {
+        return Ok((
+            json!({
+                "schema": "synapse.action.causal_oracle_enforcement.v1",
+                "query_cx_id": query_cx_id,
+                "enforced": false,
+                "admitted": true,
+                "authority": "operator_and_allowlist",
+                "readiness": "not_ready_not_armed",
+                "readiness_row_revision_sha256": readiness.get("row_revision_sha256"),
+                "remediation": "follow the persisted readiness tier deficits; no causal prediction was requested or inferred",
+            }),
+            true,
+        ));
+    }
+    let prediction = db
+        .oracle_predict_action(query_cx_id)
+        .map_err(|error| storage_error_with_remediation(&error))?;
+    let admitted = prediction
+        .get("predicted_outcome")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            mcp_error_with_remediation(
+                "SYNAPSE_CALYX_ACTION_CAUSAL_PREDICTION_SHAPE_INVALID",
+                "typed action Oracle returned no Boolean predicted_outcome",
+                "preserve the Answer ledger and repair the typed Oracle response contract before retrying the action",
+            )
+        })?;
+    Ok((
+        json!({
+            "schema": "synapse.action.causal_oracle_enforcement.v1",
+            "query_cx_id": query_cx_id,
+            "enforced": true,
+            "admitted": admitted,
+            "authority": "typed_causal_oracle",
+            "readiness": "ready",
+            "prediction": prediction,
+        }),
+        admitted,
+    ))
+}
 
 mod agent_spawn;
 mod facade;
@@ -838,34 +967,225 @@ impl SynapseService {
         let preconditions = match run_shell_precondition_snapshot(&params, Some(&shell_context)) {
             Ok(preconditions) => preconditions,
             Err(error) => {
-                // A filesystem metadata refusal is an internal pre-trigger
-                // measurement failure, not evidence that the request is OOD.
-                // Preserve its structured candidate digest/source in the
-                // action audit and fail before execution.
-                self.audit_action_denied_for_request(
+                // A probe refusal is itself a measured pre-trigger cause. It
+                // cannot populate resource counters that were never observed,
+                // but the exact typed failure must still join the command and
+                // outcome in the physical action log.
+                let command_before = json!({
+                    "source_of_truth": "durable shell registry/log files or inline child process",
+                    "session_id": &session_id,
+                    "execution_mode": params.execution_mode.as_str(),
+                    "precondition_measurement": {
+                        "status": "error",
+                        "error": super::command_audit::command_audit_error_from_error_data(&error),
+                        "process_created": false,
+                        "missing_counters_imputed": false,
+                    },
+                });
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "act_run_shell",
+                        "shell_run",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload.clone(),
+                        command_before.clone(),
+                        json!({
+                            "source_of_truth": "durable shell registry/log files or inline child process",
+                            "process_created": false,
+                        }),
+                        "error",
+                    )
+                    .with_error(super::command_audit::command_audit_error_from_error_data(
+                        &error,
+                    )),
+                )?;
+                self.audit_action_denied_with_details_for_session(
                     "act_run_shell_precondition_snapshot",
                     &error,
-                    &request_context,
+                    &command_before,
+                    &session_id,
                 );
                 return Err(error);
             }
         };
-        let command_before = json!({
+        let mut command_before = json!({
             "source_of_truth": "durable shell registry/log files or inline child process",
             "session_id": &session_id,
             "execution_mode": params.execution_mode.as_str(),
             "preconditions": preconditions,
         });
-        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+        let intent_audit =
+            self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+                "act_run_shell",
+                "shell_run",
+                Some(session_id.clone()),
+                Some(session_id.clone()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            ))?;
+        let (causal_oracle, oracle_admitted) = match shell_causal_oracle_decision(
+            self,
             "act_run_shell",
-            "shell_run",
-            Some(session_id.clone()),
-            Some(session_id.clone()),
-            command_payload.clone(),
-            command_before.clone(),
-            Value::Null,
-            "pending",
-        ))?;
+            &intent_audit,
+        ) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let causal_oracle = json!({
+                    "schema": "synapse.action.causal_oracle_enforcement.v1",
+                    "query_cx_id": intent_audit.constellation_cx_id,
+                    "enforced": true,
+                    "admitted": false,
+                    "authority": "typed_causal_oracle",
+                    "evaluation_error": {
+                        "message": error.message.to_string(),
+                        "data": error.data,
+                    },
+                    "external_action_attempted": false,
+                });
+                command_before
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            "act_run_shell command-before evidence is not an object",
+                        )
+                    })?
+                    .insert("causal_oracle".to_owned(), causal_oracle.clone());
+                self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "act_run_shell",
+                            "shell_run",
+                            Some(session_id.clone()),
+                            Some(session_id.clone()),
+                            command_payload.clone(),
+                            command_before.clone(),
+                            json!({
+                                "source_of_truth": "durable shell registry/log files or inline child process",
+                                "process_created": false,
+                                "causal_oracle": causal_oracle,
+                            }),
+                            "causal_refused_unobserved",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                self.audit_action_refused_unobserved_with_details_for_session(
+                    "act_run_shell_causal_oracle",
+                    &error,
+                    &command_before,
+                    &session_id,
+                )?;
+                return Err(error);
+            }
+        };
+        command_before
+            .as_object_mut()
+            .ok_or_else(|| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "act_run_shell command-before evidence is not an object",
+                )
+            })?
+            .insert("causal_oracle".to_owned(), causal_oracle.clone());
+        if !oracle_admitted {
+            let error = mcp_error_with_remediation(
+                ACTION_CAUSAL_ORACLE_REFUSED,
+                format!(
+                    "typed causal Oracle predicts failure for canonical intent constellation {:?}; no process was created",
+                    intent_audit.constellation_cx_id
+                ),
+                "inspect the prediction's grounded source CxIds and pre-trigger causes; change the request or collect a corrected grounded outcome before retrying",
+            );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell",
+                    "shell_run",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload.clone(),
+                    command_before.clone(),
+                    json!({
+                        "source_of_truth": "durable shell registry/log files or inline child process",
+                        "process_created": false,
+                        "causal_oracle": causal_oracle,
+                    }),
+                    "causal_refused_unobserved",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(
+                    &error,
+                )),
+            )?;
+            self.audit_action_refused_unobserved_with_details_for_session(
+                "act_run_shell_causal_oracle",
+                &error,
+                &command_before,
+                &session_id,
+            )?;
+            return Err(error);
+        }
+        let resource_refusal = match shell_precondition_resource_refusal(&preconditions) {
+            Ok(refusal) => refusal,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "act_run_shell",
+                        "shell_run",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload.clone(),
+                        command_before.clone(),
+                        json!({
+                            "source_of_truth": "durable shell registry/log files or inline child process",
+                            "process_created": false,
+                            "resource_snapshot_contract_valid": false,
+                        }),
+                        "error",
+                    )
+                    .with_error(super::command_audit::command_audit_error_from_error_data(
+                        &error,
+                    )),
+                )?;
+                self.audit_action_denied_with_details_for_session(
+                    "act_run_shell_resource_snapshot_contract",
+                    &error,
+                    &command_before,
+                    &session_id,
+                );
+                return Err(error);
+            }
+        };
+        if let Some(error) = resource_refusal {
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell",
+                    "shell_run",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload.clone(),
+                    command_before.clone(),
+                    json!({
+                        "source_of_truth": "durable shell registry/log files or inline child process",
+                        "process_created": false,
+                        "resource_snapshot_persisted_before_refusal": true,
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(
+                    &error,
+                )),
+            )?;
+            self.audit_action_denied_with_details_for_session(
+                "act_run_shell",
+                &error,
+                &command_before,
+                &session_id,
+            );
+            return Err(error);
+        }
         self.audit_action_started_with_details_for_session(
             "act_run_shell",
             &command_payload,
@@ -968,34 +1288,224 @@ impl SynapseService {
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_start_params_for_context(raw_params, &shell_context)?;
         let command_payload = run_shell_start_request_details(&self.m4_config, &params);
-        let preconditions =
-            match run_shell_start_precondition_snapshot(&params, Some(&shell_context)) {
-                Ok(preconditions) => preconditions,
-                Err(error) => {
-                    self.audit_action_denied_for_request(
-                        "act_run_shell_start_precondition_snapshot",
-                        &error,
-                        &request_context,
-                    );
-                    return Err(error);
-                }
-            };
-        let command_before = json!({
+        let preconditions = match run_shell_start_precondition_snapshot(
+            &params,
+            Some(&shell_context),
+        ) {
+            Ok(preconditions) => preconditions,
+            Err(error) => {
+                let command_before = json!({
+                    "source_of_truth": "durable shell registry/log files/process table",
+                    "session_id": &session_id,
+                    "job_id": &params.job_id,
+                    "precondition_measurement": {
+                        "status": "error",
+                        "error": super::command_audit::command_audit_error_from_error_data(&error),
+                        "process_created": false,
+                        "missing_counters_imputed": false,
+                    },
+                });
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "act_run_shell_start",
+                        "shell_spawn",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload.clone(),
+                        command_before.clone(),
+                        json!({
+                            "source_of_truth": "durable shell registry/log files/process table",
+                            "process_created": false,
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                self.audit_action_denied_with_details_for_session(
+                    "act_run_shell_start_precondition_snapshot",
+                    &error,
+                    &command_before,
+                    &session_id,
+                );
+                return Err(error);
+            }
+        };
+        let mut command_before = json!({
             "source_of_truth": "durable shell registry/log files/process table",
             "session_id": &session_id,
             "job_id": &params.job_id,
             "preconditions": preconditions,
         });
-        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
-            "act_run_shell_start",
-            "shell_spawn",
-            Some(session_id.clone()),
-            Some(session_id.clone()),
-            command_payload.clone(),
-            command_before.clone(),
-            Value::Null,
-            "pending",
-        ))?;
+        let intent_audit =
+            self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+                "act_run_shell_start",
+                "shell_spawn",
+                Some(session_id.clone()),
+                Some(session_id.clone()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            ))?;
+        let (causal_oracle, oracle_admitted) =
+            match shell_causal_oracle_decision(self, "act_run_shell_start", &intent_audit) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    let causal_oracle = json!({
+                        "schema": "synapse.action.causal_oracle_enforcement.v1",
+                        "query_cx_id": intent_audit.constellation_cx_id,
+                        "enforced": true,
+                        "admitted": false,
+                        "authority": "typed_causal_oracle",
+                        "evaluation_error": {
+                            "message": error.message.to_string(),
+                            "data": error.data,
+                        },
+                        "external_action_attempted": false,
+                    });
+                    command_before
+                        .as_object_mut()
+                        .ok_or_else(|| {
+                            mcp_error(
+                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                "act_run_shell_start command-before evidence is not an object",
+                            )
+                        })?
+                        .insert("causal_oracle".to_owned(), causal_oracle.clone());
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "act_run_shell_start",
+                            "shell_spawn",
+                            Some(session_id.clone()),
+                            Some(session_id.clone()),
+                            command_payload.clone(),
+                            command_before.clone(),
+                            json!({
+                                "source_of_truth": "durable shell registry/log files/process table",
+                                "process_created": false,
+                                "causal_oracle": causal_oracle,
+                            }),
+                            "causal_refused_unobserved",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    self.audit_action_refused_unobserved_with_details_for_session(
+                        "act_run_shell_start_causal_oracle",
+                        &error,
+                        &command_before,
+                        &session_id,
+                    )?;
+                    return Err(error);
+                }
+            };
+        command_before
+            .as_object_mut()
+            .ok_or_else(|| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "act_run_shell_start command-before evidence is not an object",
+                )
+            })?
+            .insert("causal_oracle".to_owned(), causal_oracle.clone());
+        if !oracle_admitted {
+            let error = mcp_error_with_remediation(
+                ACTION_CAUSAL_ORACLE_REFUSED,
+                format!(
+                    "typed causal Oracle predicts failure for canonical intent constellation {:?}; no process was created",
+                    intent_audit.constellation_cx_id
+                ),
+                "inspect the prediction's grounded source CxIds and pre-trigger causes; change the request or collect a corrected grounded outcome before retrying",
+            );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_start",
+                    "shell_spawn",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload.clone(),
+                    command_before.clone(),
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                        "process_created": false,
+                        "causal_oracle": causal_oracle,
+                    }),
+                    "causal_refused_unobserved",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            self.audit_action_refused_unobserved_with_details_for_session(
+                "act_run_shell_start_causal_oracle",
+                &error,
+                &command_before,
+                &session_id,
+            )?;
+            return Err(error);
+        }
+        let resource_refusal = match shell_precondition_resource_refusal(&preconditions) {
+            Ok(refusal) => refusal,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "act_run_shell_start",
+                        "shell_spawn",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload.clone(),
+                        command_before.clone(),
+                        json!({
+                            "source_of_truth": "durable shell registry/log files/process table",
+                            "process_created": false,
+                            "resource_snapshot_contract_valid": false,
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                self.audit_action_denied_with_details_for_session(
+                    "act_run_shell_start_resource_snapshot_contract",
+                    &error,
+                    &command_before,
+                    &session_id,
+                );
+                return Err(error);
+            }
+        };
+        if let Some(error) = resource_refusal {
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_start",
+                    "shell_spawn",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload.clone(),
+                    command_before.clone(),
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                        "process_created": false,
+                        "resource_snapshot_persisted_before_refusal": true,
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            self.audit_action_denied_with_details_for_session(
+                "act_run_shell_start",
+                &error,
+                &command_before,
+                &session_id,
+            );
+            return Err(error);
+        }
         self.audit_action_started_with_details_for_session(
             "act_run_shell_start",
             &command_payload,

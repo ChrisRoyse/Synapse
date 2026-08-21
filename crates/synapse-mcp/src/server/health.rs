@@ -1808,6 +1808,8 @@ impl SynapseService {
                 calyx_registry::EMBEDDING_RUNTIMES_COMPILED,
             ),
             calyx_ward_model_lenses_compiled: Some(calyx_ward::MODEL_LENSES_COMPILED),
+            calyx_sextant_cuvs_compiled: Some(calyx_sextant::CUVS_COMPILED),
+            calyx_sextant_cuda_pq_compiled: Some(calyx_sextant::CUDA_PQ_COMPILED),
             calyx_math_device_name: math_backend.as_ref().map(|math| math.device_name.clone()),
             calyx_math_device_vram_mib: math_backend.as_ref().and_then(|math| math.device_vram_mib),
             calyx_math_cpu_simd_path: math_backend.as_ref().map(|math| math.cpu_simd_path.clone()),
@@ -2917,12 +2919,70 @@ impl SynapseService {
                     prefix =
                         "perception runtime filesystem watcher reported a native or queue failure";
                 }
+                let capture_runtime = state.capture_runtime_readback();
+                match capture_runtime.status.as_str() {
+                    "inactive" | "running" => {}
+                    "failed" => {
+                        status = "error";
+                        prefix = "perception capture worker reported a terminal failure";
+                    }
+                    "stopped" => {
+                        status = "error";
+                        prefix =
+                            "perception capture worker stopped while its target remained active";
+                    }
+                    _ => {
+                        status = "error";
+                        prefix = "perception capture worker returned an unknown runtime state";
+                    }
+                }
+                let capture_detail = format!(
+                    "capture_runtime_status={} capture_terminal_error_code={} capture_terminal_error_message={}",
+                    capture_runtime.status,
+                    capture_runtime
+                        .terminal_error_code
+                        .as_deref()
+                        .unwrap_or("<none>"),
+                    capture_runtime
+                        .terminal_error_message
+                        .as_deref()
+                        .unwrap_or("<none>")
+                );
+                let capture_backend_requested = match state.capture_config.backend_preference {
+                    synapse_capture::CaptureBackendPreference::GdiBitBlt => {
+                        synapse_capture::NO_EXPLICIT_GPU_API_CAPTURE_BACKEND
+                    }
+                    synapse_capture::CaptureBackendPreference::GraphicsCaptureApi => {
+                        "graphics_capture_api"
+                    }
+                    synapse_capture::CaptureBackendPreference::DxgiDuplication => {
+                        "dxgi_duplication"
+                    }
+                    synapse_capture::CaptureBackendPreference::InvalidEnvironment => {
+                        "invalid_environment"
+                    }
+                };
+                let capture_backend_effective = match state.capture_config.selected_backend() {
+                    synapse_capture::CaptureBackend::GdiBitBlt => {
+                        synapse_capture::NO_EXPLICIT_GPU_API_CAPTURE_BACKEND
+                    }
+                };
                 SubsystemHealth {
                     status: status.to_owned(),
-                    detail: Some(format!("{prefix}; {detection_detail}; {bundled_blob}")),
+                    detail: Some(format!(
+                        "{prefix}; {detection_detail}; {bundled_blob}; {capture_detail}"
+                    )),
                     perception_mode: Some(state.perception_mode),
                     capture_config: Some(state.active_capture_config.clone()),
-                    capture_runtime: Some(state.capture_runtime_readback()),
+                    capture_runtime: Some(capture_runtime),
+                    capture_backend_requested: Some(capture_backend_requested.to_owned()),
+                    capture_backend_effective: Some(capture_backend_effective.to_owned()),
+                    capture_gpu_backends_compiled: Some(
+                        synapse_capture::GPU_CAPTURE_BACKENDS_COMPILED,
+                    ),
+                    detection_cuda_execution_provider_compiled: Some(
+                        synapse_models::CUDA_EXECUTION_PROVIDER_COMPILED,
+                    ),
                     perception_detection: Some(detection),
                     perception_fs_watch: Some(fs_watch.into_health_value()),
                     ..SubsystemHealth::default()
@@ -3010,10 +3070,41 @@ impl SynapseService {
                 // is switched on: is the optional STT model actually packaged?
                 // (#1863)
                 let stt_availability = stt_model_availability();
+                let stt_backend_policy = match synapse_audio::stt_backend_policy() {
+                    Ok(synapse_audio::SttBackendPolicy::Pinned(
+                        synapse_models::ModelBackend::Cpu,
+                    )) => "pinned:Cpu".to_owned(),
+                    Ok(synapse_audio::SttBackendPolicy::Pinned(backend)) => {
+                        return SubsystemHealth {
+                            status: "error".to_owned(),
+                            detail: Some(format!(
+                                "STT zero-VRAM policy selected prohibited backend {backend:?}"
+                            )),
+                            stt_cuda_execution_provider_compiled: Some(
+                                synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                            ),
+                            ..SubsystemHealth::default()
+                        };
+                    }
+                    Err(error) => {
+                        return SubsystemHealth {
+                            status: "error".to_owned(),
+                            detail: Some(format!("STT backend policy invalid: {error}")),
+                            stt_cuda_execution_provider_compiled: Some(
+                                synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                            ),
+                            ..SubsystemHealth::default()
+                        };
+                    }
+                };
                 if let Some(error) = &state.audio_last_error {
                     return SubsystemHealth {
                         status: "error".to_owned(),
                         detail: Some(error.clone()),
+                        stt_backend_policy: Some(stt_backend_policy),
+                        stt_cuda_execution_provider_compiled: Some(
+                            synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                        ),
                         stt_model_available: Some(stt_availability.is_none()),
                         stt_model_unavailable_reason: stt_availability,
                         ..SubsystemHealth::default()
@@ -3025,6 +3116,10 @@ impl SynapseService {
                         detail: Some("audio is disabled; start with --enable-audio".to_owned()),
                         ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
                         stt_model_loaded: Some(false),
+                        stt_backend_policy: Some(stt_backend_policy),
+                        stt_cuda_execution_provider_compiled: Some(
+                            synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                        ),
                         stt_model_available: Some(stt_availability.is_none()),
                         stt_model_unavailable_reason: stt_availability,
                         ..SubsystemHealth::default()
@@ -3041,6 +3136,10 @@ impl SynapseService {
                         )),
                         ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
                         stt_model_loaded: Some(false),
+                        stt_backend_policy: Some(stt_backend_policy),
+                        stt_cuda_execution_provider_compiled: Some(
+                            synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                        ),
                         stt_model_available: Some(false),
                         stt_model_unavailable_reason: Some(reason),
                         ..SubsystemHealth::default()
@@ -3055,6 +3154,10 @@ impl SynapseService {
                         ),
                         ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
                         stt_model_loaded: Some(false),
+                        stt_backend_policy: Some(stt_backend_policy),
+                        stt_cuda_execution_provider_compiled: Some(
+                            synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                        ),
                         stt_model_available: Some(true),
                         ..SubsystemHealth::default()
                     };
@@ -3066,6 +3169,10 @@ impl SynapseService {
                         return SubsystemHealth {
                             status: "error".to_owned(),
                             detail: Some(format!("STT backend readback failed: {error}")),
+                            stt_backend_policy: Some(stt_backend_policy),
+                            stt_cuda_execution_provider_compiled: Some(
+                                synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                            ),
                             stt_model_available: Some(true),
                             ..SubsystemHealth::default()
                         };
@@ -3096,6 +3203,9 @@ impl SynapseService {
                     audio_timeline_last_discontinuity: loopback_status.last_timeline_discontinuity,
                     stt_model_loaded: Some(runtime.stt_model_loaded()),
                     stt_backend_policy: Some(stt_readback.policy),
+                    stt_cuda_execution_provider_compiled: Some(
+                        synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED,
+                    ),
                     stt_selected_backend: stt_readback
                         .selected_backend
                         .map(|backend| format!("{backend:?}")),

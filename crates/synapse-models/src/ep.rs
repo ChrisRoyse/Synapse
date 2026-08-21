@@ -12,7 +12,7 @@ pub enum ModelBackend {
 
 #[must_use]
 pub fn default_provider_order() -> Vec<ModelBackend> {
-    vec![Cuda, Cpu]
+    vec![Cpu]
 }
 
 #[cfg(feature = "ort")]
@@ -50,7 +50,16 @@ pub fn create_ort_session(
         })?;
     }
     let execution_provider = match provider {
+        #[cfg(feature = "cuda")]
         Cuda => ep::CUDA::default().build().error_on_failure(),
+        #[cfg(not(feature = "cuda"))]
+        Cuda => {
+            return Err(crate::ModelError::LoadFailed {
+                path: descriptor.path.clone(),
+                detail: "SYNAPSE_MODELS_CUDA_NOT_COMPILED: the installed Synapse model runtime is CPU-only under the zero-VRAM contract; select the CPU execution provider"
+                    .to_owned(),
+            });
+        }
         Cpu => ep::CPU::default()
             .with_arena_allocator(false)
             .build()

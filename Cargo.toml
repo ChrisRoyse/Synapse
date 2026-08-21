@@ -115,9 +115,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
@@ -129,7 +126,6 @@ windows = { version = "0.62.2", features = [
     "Foundation_Collections",
 ] }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
-windows-capture = "2.0.0"
 uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
 chromiumoxide = "0.9.1"
 wasapi = "0.23.0"

@@ -71,6 +71,7 @@ const STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV: &str = "SYNAPSE_STORAGE_PRESSURE_F
 const CALYX_VAULT_ENV: &str = "SYNAPSE_CALYX_VAULT";
 const CALYX_VAULT_DIR_ENV: &str = "SYNAPSE_CALYX_VAULT_DIR";
 const CALYX_CONFIG_ENV: &str = "SYNAPSE_CALYX_CONFIG";
+const CALYX_CONFIG_SHA256_ENV: &str = "SYNAPSE_CALYX_CONFIG_SHA256";
 const ENABLE_AUDIO_ENV: &str = "SYNAPSE_ENABLE_AUDIO";
 const ALLOW_UNKNOWN_PROFILE_ENV: &str = "SYNAPSE_ALLOW_UNKNOWN_PROFILE";
 const ALLOWED_PERMISSIONS_ENV: &str = "SYNAPSE_MCP_ALLOWED_PERMISSIONS";
@@ -151,6 +152,7 @@ pub struct M3ServiceConfig {
     pub calyx_vault: bool,
     pub calyx_vault_dir: Option<PathBuf>,
     pub calyx_config_path: Option<PathBuf>,
+    pub calyx_config_sha256: Option<String>,
 }
 
 impl M3ServiceConfig {
@@ -192,6 +194,7 @@ impl M3ServiceConfig {
             calyx_vault: true,
             calyx_vault_dir: None,
             calyx_config_path: None,
+            calyx_config_sha256: None,
         }
     }
 
@@ -234,6 +237,7 @@ impl M3ServiceConfig {
                 .map_or(Ok(true), |raw| parse_bool_env(CALYX_VAULT_ENV, Some(raw)))?,
             calyx_vault_dir: std::env::var_os(CALYX_VAULT_DIR_ENV).map(PathBuf::from),
             calyx_config_path: std::env::var_os(CALYX_CONFIG_ENV).map(PathBuf::from),
+            calyx_config_sha256: std::env::var(CALYX_CONFIG_SHA256_ENV).ok(),
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
             max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
@@ -646,6 +650,7 @@ impl M3State {
             config.calyx_vault,
             config.calyx_vault_dir,
             config.calyx_config_path,
+            config.calyx_config_sha256,
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
@@ -669,6 +674,7 @@ impl M3State {
         calyx_vault_enabled: bool,
         calyx_vault_dir: Option<PathBuf>,
         calyx_config_path: Option<PathBuf>,
+        calyx_config_sha256: Option<String>,
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
@@ -697,10 +703,18 @@ impl M3State {
                 );
             }
         }
+        if calyx_config_path.is_some() != calyx_config_sha256.is_some() {
+            anyhow::bail!(
+                "SYNAPSE_CALYX_CONFIG_IDENTITY_INCOMPLETE: Calyx config path_present={} sha256_present={}; supply both --calyx-config/SYNAPSE_CALYX_CONFIG and --calyx-config-sha256/SYNAPSE_CALYX_CONFIG_SHA256, or omit both",
+                calyx_config_path.is_some(),
+                calyx_config_sha256.is_some()
+            );
+        }
         let calyx_vault_config = Some(
-            synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
+            synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path_with_expected_sha256(
                 Some(storage_vault_dir),
                 calyx_config_path,
+                calyx_config_sha256.as_deref(),
             )?,
         );
         let calyx_vault_status = calyx_vault_config

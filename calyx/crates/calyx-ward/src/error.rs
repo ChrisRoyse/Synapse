@@ -211,8 +211,9 @@ impl fmt::Display for WardError {
                 scoring_engine,
             } => write!(
                 f,
-                "{CALYX_GUARD_CALIBRATION_SCORE_CONTRACT}: guard {guard_id} required slot {slot} has no supported serving-score contract (estimator={estimator:?}, scoring_engine={scoring_engine:?}, score_tolerance={score_tolerance:?}); recalibrate this profile with {} and {} before high-stakes use",
+                "{CALYX_GUARD_CALIBRATION_SCORE_CONTRACT}: guard {guard_id} required slot {slot} has no supported serving-score contract (estimator={estimator:?}, scoring_engine={scoring_engine:?}, score_tolerance={score_tolerance:?}); recalibrate this profile with {} (one slot) or {} (a row-aligned multi-slot policy) and {} before high-stakes use",
                 crate::calibrate::ESTIMATOR,
+                crate::calibrate::JOINT_POLICY_ESTIMATOR,
                 calyx_core::DENSE_COSINE_SCORING_ENGINE
             ),
             Self::InertProfile { guard_id, reason } => write!(

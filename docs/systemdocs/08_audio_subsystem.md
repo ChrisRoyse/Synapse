@@ -41,7 +41,7 @@ wires together five concerns:
 | Dependency | Purpose |
 |---|---|
 | `ort` | ONNX Runtime for Whisper inference |
-| `synapse-models` (feature `directml`) | Model loading/verification (`ModelLoader`, `LoadedModel`, `SessionHandle`) |
+| `synapse-models` (daemon enables feature `ort`) | Model loading/verification (`ModelLoader`, `LoadedModel`, `SessionHandle`) through the CPU execution provider |
 | `synapse-core` | `Event`, `AudioEvent`, `AudioContext`, `DirectionEstimate`, `error_codes` |
 | `wasapi`, `windows` (`cfg(windows)` only) | WASAPI loopback + MMCSS thread priority |
 | `metrics`, `tracing`, `chrono`, `serde`, `serde_json`, `thiserror`, `tokio` | telemetry, logging, serialization, errors |

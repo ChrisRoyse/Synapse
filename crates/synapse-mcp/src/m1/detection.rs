@@ -9,7 +9,6 @@ use std::{
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
-use synapse_calyx::{SynapseCalyxGpuReservation, readback_gpu_reservations};
 use synapse_core::{
     DetectedEntity, Detection, DetectionBatch, PerceptionMode, ProfileDetection, Rect,
     SensorStatus, entity_id, error_codes,
@@ -22,7 +21,6 @@ use synapse_models::{
 const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
-const DETECTION_GPU_ADMISSION_MIB: u64 = 4_096;
 const DETECTION_WORKER_TIMEOUT_MS: u32 = 120_000;
 const DETECTION_WORKER_SHUTDOWN_TIMEOUT_MS: u32 = 5_000;
 const DETECTION_WORKER_POLL_MS: u64 = 2;
@@ -390,9 +388,7 @@ fn run_detection_worker(
 
 struct LoadedDetectionWorker {
     model_id: String,
-    backend: ModelBackend,
     model: synapse_models::LoadedModel,
-    _reservation: Option<SynapseCalyxGpuReservation>,
     reservation_id: Option<String>,
 }
 
@@ -401,10 +397,16 @@ fn load_detection_worker_model(
     progress_path: &Path,
 ) -> Result<LoadedDetectionWorker, (String, String)> {
     let backend = selected_detection_backend()?;
-    let registered = if backend == ModelBackend::Cpu && model_id == DEFAULT_DETECTION_MODEL_ID {
+    if backend != ModelBackend::Cpu {
+        return Err((
+            "DETECTION_BACKEND_ZERO_VRAM_POLICY".to_owned(),
+            format!(
+                "selected detection backend {backend:?} violates the installed CPU-only zero-VRAM contract"
+            ),
+        ));
+    }
+    let registered = if model_id == DEFAULT_DETECTION_MODEL_ID {
         lightweight_cpu_detection_model()
-    } else if model_id == DEFAULT_DETECTION_MODEL_ID {
-        synapse_models::default_detection_model()
     } else {
         registered_model(model_id).ok_or_else(|| {
             (
@@ -417,51 +419,16 @@ fn load_detection_worker_model(
         .materialize_embedded_verified()
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
     write_worker_progress(progress_path, "model_verified")?;
-    let reservation = if backend == ModelBackend::Cuda {
-        let reservation = SynapseCalyxGpuReservation::acquire(
-            0,
-            "synapse-mcp-detection-worker",
-            format!("synapse-detection-worker-pid-{}", std::process::id()),
-            format!(
-                "isolated ORT CUDA detector model={model_id}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}"
-            ),
-            DETECTION_GPU_ADMISSION_MIB,
-        )
-        .map_err(|error| (error.code.to_owned(), error.to_string()))?;
-        write_worker_progress(progress_path, "gpu_reservation_acquired")?;
-        configure_cuda_runtime_dlls()?;
-        write_worker_progress(progress_path, "cuda_runtime_verified")?;
-        Some(reservation)
-    } else {
-        write_worker_progress(progress_path, "cpu_backend_selected")?;
-        None
-    };
-    let reservation_id = reservation.as_ref().and_then(|reservation| {
-        reservation
-            .admitted_snapshot()
-            .reservations
-            .iter()
-            .find(|row| row.pid == std::process::id())
-            .map(|row| row.reservation_id.clone())
-    });
-    let loader = ModelLoader::new(vec![backend]);
+    write_worker_progress(progress_path, "cpu_backend_selected")?;
+    let loader = ModelLoader::new(vec![ModelBackend::Cpu]);
     let model = loader
         .load_verified(descriptor)
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
-    write_worker_progress(
-        progress_path,
-        if backend == ModelBackend::Cuda {
-            "cuda_session_loaded"
-        } else {
-            "cpu_session_loaded"
-        },
-    )?;
+    write_worker_progress(progress_path, "cpu_session_loaded")?;
     Ok(LoadedDetectionWorker {
         model_id: model_id.to_owned(),
-        backend,
         model,
-        _reservation: reservation,
-        reservation_id,
+        reservation_id: None,
     })
 }
 
@@ -602,11 +569,7 @@ fn run_persistent_detection_worker(mailbox: &Path, model_id: &str) -> anyhow::Re
         protocol: DETECTION_WORKER_PROTOCOL.to_owned(),
         worker_pid: std::process::id(),
         model_id: worker.model_id.clone(),
-        backend: match worker.backend {
-            ModelBackend::Cuda => "cuda",
-            ModelBackend::Cpu => "cpu",
-        }
-        .to_owned(),
+        backend: "cpu".to_owned(),
         session_id: worker.model.session_id(),
         reservation_id: worker.reservation_id.clone(),
     };
@@ -658,52 +621,37 @@ fn selected_detection_backend() -> Result<ModelBackend, (String, String)> {
     SELECTED.get_or_init(probe_detection_backend).clone()
 }
 
+/// Validates the process-wide detector execution-provider policy without
+/// loading a model or starting a worker. Daemon startup calls this before any
+/// mode dispatch so a contradictory environment cannot remain latent until
+/// the first perception request.
+pub(crate) fn validate_detection_backend_policy() -> Result<(), (String, String)> {
+    selected_detection_backend().map(|_| ())
+}
+
 fn probe_detection_backend() -> Result<ModelBackend, (String, String)> {
     match std::env::var(DETECTION_BACKEND_ENV) {
-        Ok(value) if value.eq_ignore_ascii_case("cuda") => return Ok(ModelBackend::Cuda),
-        Ok(value) if value.eq_ignore_ascii_case("cpu") => return Ok(ModelBackend::Cpu),
-        Ok(value) if value.eq_ignore_ascii_case("auto") => {}
-        Ok(value) => {
-            return Err((
-                "DETECTION_BACKEND_CONFIG_INVALID".to_owned(),
-                format!("{DETECTION_BACKEND_ENV} must be auto, cuda, or cpu; got {value:?}"),
-            ));
+        Ok(value) if value.trim().eq_ignore_ascii_case("cpu") => Ok(ModelBackend::Cpu),
+        Ok(value)
+            if value.trim().eq_ignore_ascii_case("auto")
+                || value.trim().eq_ignore_ascii_case("cuda") =>
+        {
+            Err((
+                "DETECTION_BACKEND_ZERO_VRAM_POLICY".to_owned(),
+                format!(
+                    "{DETECTION_BACKEND_ENV} must be cpu or unset; got {value:?}; auto and cuda are forbidden by the installed zero-VRAM contract"
+                ),
+            ))
         }
-        Err(std::env::VarError::NotPresent) => {}
-        Err(error) => {
-            return Err((
-                "DETECTION_BACKEND_CONFIG_INVALID".to_owned(),
-                format!("{DETECTION_BACKEND_ENV} is not valid Unicode: {error}"),
-            ));
-        }
-    }
-
-    match readback_gpu_reservations(0) {
-        Ok(snapshot) => Ok(
-            if snapshot
-                .reservations
-                .iter()
-                .any(|row| row.owner == "synapse-mcp")
-            {
-                ModelBackend::Cuda
-            } else {
-                ModelBackend::Cpu
-            },
-        ),
-        Err(error) => {
-            let detail = error.to_string();
-            if detail.contains("NVML init failed loading")
-                || (detail.contains("NVML device_by_index(0) failed")
-                    && (detail.contains("Not Found") || detail.contains("No device")))
-            {
-                Ok(ModelBackend::Cpu)
-            } else {
-                Err((
-                    "DETECTION_BACKEND_PROBE_FAILED".to_owned(),
-                    format!("could not prove whether CUDA device 0 is absent or broken: {detail}"),
-                ))
-            }
-        }
+        Ok(value) => Err((
+            "DETECTION_BACKEND_CONFIG_INVALID".to_owned(),
+            format!("{DETECTION_BACKEND_ENV} must be cpu or unset; got {value:?}"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(ModelBackend::Cpu),
+        Err(error) => Err((
+            "DETECTION_BACKEND_CONFIG_INVALID".to_owned(),
+            format!("{DETECTION_BACKEND_ENV} is not valid Unicode: {error}"),
+        )),
     }
 }
 
@@ -727,11 +675,13 @@ pub struct DetectionBundleReadback {
 
 pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (String, String)> {
     let backend = selected_detection_backend()?;
-    let model = if backend == ModelBackend::Cpu {
-        lightweight_cpu_detection_model()
-    } else {
-        synapse_models::default_detection_model()
-    };
+    if backend != ModelBackend::Cpu {
+        return Err((
+            "DETECTION_BACKEND_ZERO_VRAM_POLICY".to_owned(),
+            format!("health readback observed forbidden backend {backend:?}"),
+        ));
+    }
+    let model = lightweight_cpu_detection_model();
     let descriptor = model.descriptor();
     let metadata = fs::metadata(&descriptor.path)
         .ok()
@@ -765,10 +715,7 @@ pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (St
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
     Ok(DetectionBundleReadback {
-        provider: match backend {
-            ModelBackend::Cuda => "cuda",
-            ModelBackend::Cpu => "cpu",
-        },
+        provider: "cpu",
         model_id: model.id,
         materialized,
         materialized_verified,
@@ -776,87 +723,6 @@ pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (St
         materialized_modified_unix_ms,
         materialized_path: descriptor.path.display().to_string(),
     })
-}
-
-#[cfg(windows)]
-fn configure_cuda_runtime_dlls() -> Result<(), (String, String)> {
-    use windows::{Win32::System::LibraryLoader::LoadLibraryW, core::PCWSTR};
-
-    const REQUIRED: &[&str] = &[
-        "cudart64_12.dll",
-        "cublas64_12.dll",
-        "cublasLt64_12.dll",
-        "cufft64_11.dll",
-        "cudnn64_9.dll",
-    ];
-    let mut bins = Vec::new();
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let python_root = PathBuf::from(appdata).join("Python");
-        if let Ok(versions) = fs::read_dir(python_root) {
-            for version in versions.flatten() {
-                let nvidia = version.path().join("site-packages").join("nvidia");
-                if let Ok(packages) = fs::read_dir(nvidia) {
-                    for package in packages.flatten() {
-                        let bin = package.path().join("bin");
-                        if bin.is_dir() {
-                            bins.push(bin);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(cuda_path) = std::env::var_os("CUDA_PATH_V12_9") {
-        let bin = PathBuf::from(cuda_path).join("bin");
-        if bin.is_dir() {
-            bins.push(bin);
-        }
-    }
-    bins.sort();
-    bins.dedup();
-    let missing = REQUIRED
-        .iter()
-        .filter(|name| !bins.iter().any(|bin| bin.join(name).is_file()))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err((
-            "DETECTION_CUDA_RUNTIME_MISSING".to_owned(),
-            format!(
-                "ONNX Runtime CUDA requires CUDA 12.x + cuDNN 9; missing DLLs [{}] across discovered runtime bins [{}]",
-                missing.join(", "),
-                bins.iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
-    }
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = bins.clone();
-    paths.extend(std::env::split_paths(&inherited));
-    let joined = std::env::join_paths(paths).map_err(|error| {
-        (
-            "DETECTION_CUDA_RUNTIME_PATH_INVALID".to_owned(),
-            error.to_string(),
-        )
-    })?;
-    // The detection worker is a dedicated single-threaded process at this
-    // point, before ORT creates any threads or reads PATH.
-    unsafe { std::env::set_var("PATH", joined) };
-    for name in REQUIRED {
-        let wide = name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }.map_err(|error| {
-            (
-                "DETECTION_CUDA_RUNTIME_LOAD_FAILED".to_owned(),
-                format!("LoadLibraryW({name}) failed after verified discovery: {error}"),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn write_worker_progress(path: &std::path::Path, stage: &str) -> Result<(), (String, String)> {
@@ -957,20 +823,19 @@ impl PersistentDetectionWorker {
         if ready.protocol != DETECTION_WORKER_PROTOCOL
             || ready.worker_pid != process.pid()
             || ready.model_id != model_id
-            || !matches!(ready.backend.as_str(), "cpu" | "cuda")
+            || ready.backend != "cpu"
             || ready.session_id == 0
-            || (ready.backend == "cuda") != ready.reservation_id.is_some()
+            || ready.reservation_id.is_some()
         {
             return Err(detection_model_not_loaded(format!(
                 "persistent detector ready attestation mismatch: expected protocol={DETECTION_WORKER_PROTOCOL:?} pid={} model={model_id:?}; actual={ready:?}",
                 process.pid()
             )));
         }
-        verify_persistent_worker_reservation(
+        verify_persistent_worker_cpu_contract(
             ready.worker_pid,
             &ready.backend,
             ready.reservation_id.as_deref(),
-            true,
         )
         .map_err(detection_model_not_loaded)?;
         fs::remove_file(&ready_path).map_err(|error| {
@@ -1181,11 +1046,10 @@ impl PersistentDetectionWorker {
                     self.process.pid()
                 ))
             })?;
-        let reservation_cleanup = verify_persistent_worker_reservation(
+        let reservation_cleanup = verify_persistent_worker_cpu_contract(
             verdict.pid,
             &self.backend,
             self.reservation_id.as_deref(),
-            false,
         );
         if verdict.timed_out || verdict.exit_code != 0 {
             return Err(detection_infer_failed(format!(
@@ -1203,31 +1067,14 @@ impl PersistentDetectionWorker {
 }
 
 #[cfg(windows)]
-fn verify_persistent_worker_reservation(
+fn verify_persistent_worker_cpu_contract(
     worker_pid: u32,
     backend: &str,
     reservation_id: Option<&str>,
-    should_exist: bool,
 ) -> Result<(), String> {
-    if backend == "cpu" {
-        if reservation_id.is_some() {
-            return Err(format!(
-                "CPU persistent detector pid {worker_pid} unexpectedly reported GPU reservation {reservation_id:?}"
-            ));
-        }
-        return Ok(());
-    }
-    let snapshot = readback_gpu_reservations(0).map_err(|error| {
-        format!("persistent detector pid {worker_pid} GPU reservation readback failed: {error}")
-    })?;
-    let matching = snapshot
-        .reservations
-        .iter()
-        .find(|row| row.pid == worker_pid && reservation_id == Some(row.reservation_id.as_str()));
-    if matching.is_some() != should_exist {
+    if backend != "cpu" || reservation_id.is_some() {
         return Err(format!(
-            "persistent detector pid {worker_pid} reservation expectation failed: expected_exists={should_exist} reservation_id={reservation_id:?} state_path={} matching={matching:?}",
-            snapshot.state_path
+            "SYNAPSE_DETECTION_ZERO_VRAM_ATTESTATION_FAILED: persistent detector pid {worker_pid} reported backend={backend:?} reservation_id={reservation_id:?}; expected backend=cpu reservation_id=None"
         ));
     }
     Ok(())

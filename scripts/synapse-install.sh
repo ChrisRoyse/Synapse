@@ -3,8 +3,10 @@
 # Synapse installer — WSL entry point.
 #
 # Synapse's controlling body is ALWAYS the Windows-native synapse-mcp.exe HTTP
-# daemon (only Windows has real SendInput / UI Automation / WGC capture; it
-# drives Windows windows AND WSLg GUI windows, and reaches WSL CLIs via wsl.exe).
+# daemon (only Windows has real SendInput / UI Automation / visible-desktop
+# GDI BitBlt capture with no explicit GPU API; Windows/the driver may still
+# accelerate GDI internally). It drives Windows windows AND WSLg GUI windows,
+# and reaches WSL CLIs via wsl.exe.
 # Installing "in WSL" therefore means: build + run that Windows daemon through
 # interop, then point the WSL-side MCP clients (Claude Code, Codex) at it.
 #

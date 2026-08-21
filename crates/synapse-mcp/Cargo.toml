@@ -31,13 +31,9 @@ path = "src/main.rs"
 name = "synapse-chrome-native-host"
 path = "src/bin/synapse-chrome-native-host.rs"
 
-[features]
-# Compiles the Calyx CUDA kernels into the daemon. Off by default because
-# calyx-forge's build script requires a CUDA 13.3 toolkit (#1859);
-# scripts/synapse-setup.ps1 turns it on only after proving this host has both an
-# NVIDIA device and nvcc.
-default = []
-calyx-cuda = ["synapse-calyx/calyx-cuda"]
+[[bin]]
+name = "synapse-supervisor-bootstrap"
+path = "src/bin/synapse-supervisor-bootstrap.rs"
 
 [build-dependencies]
 serde_json.workspace = true
@@ -51,6 +47,7 @@ axum.workspace = true
 base64.workspace = true
 calyx-core.workspace = true
 calyx-registry.workspace = true
+calyx-sextant.workspace = true
 calyx-ward.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -90,12 +87,16 @@ sysinfo.workspace = true
 tempfile.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
-synapse-audio = { version = "0.1.0", path = "../synapse-audio", features = ["cuda"] }
+# The installed daemon compiles no explicit GPU model/CUDA provider. Keep ORT
+# itself for the real CPU detector/STT models, but do not compile its CUDA
+# execution provider into this process. Capture separately uses GDI BitBlt,
+# which Windows/the display driver may accelerate internally.
+synapse-audio = { version = "0.1.0", path = "../synapse-audio" }
 synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-chrome-bridge = { version = "0.1.0", path = "../synapse-chrome-bridge" }
-synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["cuda"] }
+synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["ort"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }

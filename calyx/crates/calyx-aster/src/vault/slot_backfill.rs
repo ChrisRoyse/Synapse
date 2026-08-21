@@ -1,6 +1,6 @@
 use super::base_rewrite::BaseRowRewrite;
 use super::{AsterVault, encode};
-use crate::cf::{ColumnFamily, base_key, slot_key};
+use crate::cf::{ColumnFamily, anchor_key, base_key, slot_key};
 use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotVector};
 
 impl<C> AsterVault<C>
@@ -25,19 +25,50 @@ where
         let encoded = encode::encode_slot_vector(vector)?;
         self.with_durable_commit_lock(|| {
             let mut rewrite = self.base_rewrite_declaring_slot(cx_id, panel_slot)?;
+            let grounded_anchors = rewrite.constellation().anchors.clone();
             rewrite.set_slot_hash(panel_slot.slot_id(), &encoded)?;
-            let rows = [
-                encode::WriteRow {
-                    cf: ColumnFamily::slot(panel_slot.slot_id()),
-                    key: slot_key(cx_id),
-                    value: encoded.clone(),
-                },
-                encode::WriteRow {
-                    cf: ColumnFamily::Base,
-                    key: base_key(cx_id),
-                    value: rewrite.encode()?,
-                },
-            ];
+            let mut rows = Vec::with_capacity(2 + grounded_anchors.len());
+            rows.push(encode::WriteRow {
+                cf: ColumnFamily::slot(panel_slot.slot_id()),
+                key: slot_key(cx_id),
+                value: encoded.clone(),
+            });
+            rows.push(encode::WriteRow {
+                cf: ColumnFamily::Base,
+                key: base_key(cx_id),
+                value: rewrite.encode()?,
+            });
+            // A qualified slot rewrite changes the causal content of a
+            // grounded observation even though its outcome anchor bytes do
+            // not change. Re-publish those exact immutable anchor rows in the
+            // same durable batch so the Anchors-CF change signal is also a
+            // complete grounded-corpus-content frontier. Readiness can then
+            // remain O(1)-fresh without comparing the global panel watermark,
+            // which would incorrectly invalidate on every new unanchored
+            // pre-trigger query.
+            for anchor in grounded_anchors {
+                let key = anchor_key(cx_id, &anchor.kind);
+                let encoded_anchor = encode::encode_anchor(&anchor)?;
+                let stored_anchor = self
+                    .read_cf_at(self.latest_seq(), ColumnFamily::Anchors, &key)?
+                    .ok_or_else(|| {
+                        CalyxError::aster_corrupt_shard(format!(
+                            "grounded constellation {cx_id} carries anchor kind {:?} in Base but the physical Anchors row is absent during qualified slot write; refuse rather than silently repairing the authenticated causal frontier",
+                            anchor.kind
+                        ))
+                    })?;
+                if stored_anchor != encoded_anchor {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "grounded constellation {cx_id} anchor kind {:?} differs between Base and Anchors during qualified slot write; refuse rather than overwriting the physical source of truth",
+                        anchor.kind
+                    )));
+                }
+                rows.push(encode::WriteRow {
+                    cf: ColumnFamily::Anchors,
+                    key,
+                    value: encoded_anchor,
+                });
+            }
             self.commit_rows_locked(&rows)
         })
     }

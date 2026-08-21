@@ -881,7 +881,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words (not an OCR_NO_TEXT error); pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. BROWSER TAB CONSTRAINT (#1823): window capture observes only the tab a browser window is currently rendering, so per-tab OCR of a background tab is impossible by construction. When this session is bound to a CDP tab and the capture window is that tab's window, read_text proves the bound tab is the rendered one and returns its identity in captured_target; if a different tab is rendered it fails closed with OCR_TARGET_NOT_FOREGROUND naming both tabs instead of silently returning the other page's text. Use browser_dom/browser_capture for tab-exact readback of a background tab, or browser_tabs operation=activate first. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
+        description = "OCR text from a screen region, visible element, or target window using no-explicit-GPU-API GDI physical-desktop pixels (Windows/the display driver may still accelerate GDI internally). With window_hwnd or this MCP session's active window target, region is window-client-relative; omitting region/element_id OCRs the complete DWM frame rectangle. Normal window targets must be visible, non-minimized, non-cloaked, and fully on-screen, and visible occluders remain in the pixels. With no target it uses screen-region/focused-element OCR. PrintWindow is reserved for an explicit bounded hidden-desktop worker. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words; pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. BROWSER TAB CONSTRAINT (#1823): window capture observes only the tab a browser window is currently rendering, so per-tab OCR of a background tab is impossible by construction. When this session is bound to a CDP tab and the capture window is that tab's window, read_text proves the bound tab is the rendered one and returns its identity in captured_target; if a different tab is rendered it fails closed with OCR_TARGET_NOT_FOREGROUND naming both tabs. Use browser_dom/browser_capture for tab-exact background-tab readback, or browser_tabs operation=activate first. Suspected prompt injection remains annotated."
     )]
     pub async fn read_text(
         &self,
@@ -1052,7 +1052,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge is debugger-free and refuses Page.captureScreenshot before queueing any Chrome command, because Chrome's debugger infobar changes viewport/layout and breaks coordinate truth; use raw CDP on a dedicated silent automation profile or passive window capture instead. With window_hwnd or a window target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving (Lanczos3) to fit a vision-model pixel budget (e.g. max_long_edge=1568 / max_pixels=1150000 for the Claude 4.6 family, 2576 / 3750000 for Opus 4.7; the more restrictive wins). They are no-ops when the native capture already fits. The response always reports native_width/native_height and the applied scale (written_long_edge/native_long_edge, 1.0 when not downscaled) so a coordinate read off the written image maps back to native pixels by multiplying by 1.0/scale. To inspect a small or dense UI region at full native resolution (the computer-use 'zoom' affordance), pass a tight client-relative region and omit the pixel budget."
+        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge remains debugger-free and refuses Page.captureScreenshot. With window_hwnd or a window target, captures no-explicit-GPU-API GDI pixels (Windows/the display driver may still accelerate GDI internally) from that window's physically visible desktop rectangle and interprets region as client-relative; minimized, hidden, cloaked, or partly off-screen targets fail closed, and visible occluders remain in the image. With no target, captures the foreground window or an absolute physical screen region. PrintWindow is reserved for an explicit bounded hidden-desktop worker. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving (Lanczos3) to fit a vision-model pixel budget. The response reports native_width/native_height and applied scale so written-image coordinates map back to native pixels. To inspect a small/dense region at native resolution, pass a tight client-relative region and omit the pixel budget."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -1470,7 +1470,9 @@ impl SynapseService {
             .map(Json)
     }
 
-    #[tool(description = "Set the active capture target")]
+    #[tool(
+        description = "Set the active no-explicit-GPU-API GDI capture target (Windows/the display driver may still accelerate GDI internally). min_update_interval_ms must be 250..=60000; dirty_region_only and explicit GPU backends are unsupported and fail closed."
+    )]
     pub async fn set_capture_target(
         &self,
         params: Parameters<SetCaptureTargetParams>,
@@ -15800,7 +15802,7 @@ fn browser_tabs_activation_visual_probe(
         width = bitmap.width,
         height = bitmap.height,
         bitmap_sha256 = %bitmap_sha256,
-        "readback=passive_wgc_window_bgra outcome=activation_visual_probe"
+        "readback=gdi_bitblt_visible_window_bgra outcome=activation_visual_probe"
     );
     Ok(BrowserTabsActivationVisualProbe {
         window_title: context.window_title,
@@ -15844,7 +15846,7 @@ async fn browser_tabs_verify_activation_visualized(
                 before_bitmap_sha256 = %before.bitmap_sha256,
                 after_bitmap_sha256 = %after.bitmap_sha256,
                 target_title_matched_window_title = title_match.unwrap_or(true),
-                "readback=passive_wgc_window_bgra outcome=activation_visual_postcondition_verified"
+                "readback=gdi_bitblt_visible_window_bgra outcome=activation_visual_postcondition_verified"
             );
             return Ok(browser_tabs_activation_visual_readback(
                 "verified_hwnd_pixels_changed",
@@ -15905,7 +15907,7 @@ fn browser_tabs_activation_visual_readback(
     BrowserTabsActivationVisualReadback {
         status: status.to_owned(),
         source_of_truth:
-            "passive per-window WGC BGRA capture of the owning Chrome HWND before and after chrome.tabs.update(active=true)"
+            "CPU/GDI BitBlt of the owning Chrome HWND's physically visible desktop rectangle before and after chrome.tabs.update(active=true)"
                 .to_owned(),
         before_window_title: Some(before.window_title.clone()),
         after_window_title: Some(after.window_title.clone()),
@@ -17923,7 +17925,7 @@ fn quarantine_artifact_publish_failure(
     )
 }
 
-fn publish_atomic_artifact(
+pub(super) fn publish_atomic_artifact(
     temp_path: &Path,
     output_path: &Path,
     overwrite: bool,

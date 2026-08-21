@@ -132,8 +132,8 @@ use calyx_core::{
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::load_vault_panel_state;
 use calyx_ward::{
-    CalibrationInput, GuardId, GuardPolicy, GuardProfile, MIN_BAD_SCORES, NoveltyAction, SlotKind,
-    calibrate, guard, validate_calibration_slots,
+    CalibrationInput, GuardId, GuardPolicy, GuardProfile, JOINT_POLICY_ESTIMATOR, MIN_BAD_SCORES,
+    NoveltyAction, SlotKind, calibrate, guard, validate_calibration_slots,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -281,8 +281,10 @@ pub struct SynapseCalyxGuardSlotCalibration {
     pub achieved_frr: f64,
     pub good_scores: usize,
     pub bad_scores: usize,
-    /// Exact one-sided Clopper-Pearson tail `P(X <= bad_accepts | n, target_far)`
-    /// recomputed here as an independent readback of ward's own gate.
+    /// Per-slot diagnostic Clopper-Pearson tail. For a multi-slot joint-policy
+    /// profile, `policy_clopper_pearson_tail` is the authoritative certificate;
+    /// an individual slot is allowed to accept a heterogeneous bad case that
+    /// another required slot rejects.
     pub clopper_pearson_tail: f64,
     /// Smallest bad-corpus size at which `target_far` is certifiable at `alpha`.
     pub certifiable_min_bad_scores: usize,
@@ -290,6 +292,10 @@ pub struct SynapseCalyxGuardSlotCalibration {
 
 /// Result of one guard calibration pass with the physical Guard CF readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each Boolean is an independently read-back physical certification claim exposed to the MCP caller"
+)]
 pub struct SynapseCalyxGuardCalibrateReport {
     pub panel_version: u32,
     pub domain: String,
@@ -306,6 +312,12 @@ pub struct SynapseCalyxGuardCalibrateReport {
     /// guard slots. A large value here against a healthy `adjudicated_*` count
     /// means the named slots are wrong for this panel, not that the corpus is.
     pub adjudicated_without_guarded_slots: usize,
+    /// Adjudicated rows carrying only a strict subset of a multi-slot joint
+    /// Guard roster. They are excluded as a named physical population rather
+    /// than letting each slot silently calibrate on different identities.
+    pub adjudicated_incomplete_guarded_slots: usize,
+    pub adjudicated_incomplete_guarded_slots_sha256: String,
+    pub adjudicated_incomplete_guarded_slots_sample: Vec<String>,
     pub estimator: String,
     /// Backend executing the canonical calibration/serving scorer.
     pub scoring_backend: String,
@@ -315,6 +327,14 @@ pub struct SynapseCalyxGuardCalibrateReport {
     /// Maximum calibration-to-serving cosine deviation conservatively folded
     /// into every bad/good score before tau selection.
     pub scoring_tolerance: f32,
+    /// Frozen serving combination policy whose actual accept/reject decision
+    /// was conformally certified over aligned physical bad rows.
+    pub policy: String,
+    pub policy_bad_accepts: usize,
+    pub policy_achieved_far: f64,
+    pub policy_achieved_frr: f64,
+    pub policy_clopper_pearson_tail: f64,
+    pub policy_certified: bool,
     pub slots: Vec<SynapseCalyxGuardSlotCalibration>,
     pub persisted: bool,
     /// Byte length of the Guard CF row read back after the write.
@@ -486,10 +506,23 @@ struct AdjudicatedCorpus {
     /// Previously an uncounted `continue`, which is how the #1894 hydration
     /// defect stayed invisible: every record landed here and nothing said so.
     adjudicated_without_guarded_slots: usize,
+    adjudicated_incomplete_guarded_slots: Vec<CxId>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     crate::hex_bytes(&Sha256::digest(bytes))
+}
+
+fn guard_identity_population_sha256(ids: &[CxId]) -> String {
+    let mut identities = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    identities.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-guard-identity-population-v1\0");
+    for identity in identities {
+        hasher.update((identity.len() as u64).to_be_bytes());
+        hasher.update(identity.as_bytes());
+    }
+    crate::hex_bytes(&hasher.finalize())
 }
 
 fn encode_guard_serving_artifact(
@@ -677,8 +710,10 @@ fn validate_guard_serving_artifact(
 }
 
 impl SynapseCalyxVault {
-    /// Reads the worst per-slot false-accept rate from the persisted calibrated
-    /// guard for a panel. This is a read-only readiness input.
+    /// Reads the serving-policy false-accept rate from the persisted calibrated
+    /// guard for a panel. Joint-policy profiles use their independently
+    /// certified combined FAR; legacy one-slot profiles retain the conservative
+    /// worst-per-slot interpretation. This is a read-only readiness input.
     ///
     /// # Errors
     ///
@@ -727,11 +762,19 @@ impl SynapseCalyxVault {
                 "recalibrate the guard from held-out good and bad cases",
             )
         })?;
-        Ok(calibration
-            .per_slot
-            .values()
-            .map(|slot| slot.far)
-            .fold(calibration.far, f32::max))
+        if calibration.estimator == JOINT_POLICY_ESTIMATOR {
+            // Multi-slot calibration certifies the actual combined serving
+            // policy. Per-slot FARs remain diagnostics: a heterogeneous bad
+            // case may legitimately collide on an unrelated slot while the
+            // all-required policy still rejects it on another physical atom.
+            Ok(calibration.far)
+        } else {
+            Ok(calibration
+                .per_slot
+                .values()
+                .map(|slot| slot.far)
+                .fold(calibration.far, f32::max))
+        }
     }
 
     /// Calibrates a Ward [`GuardProfile`] from the vault's adjudicated corpus and
@@ -796,13 +839,14 @@ impl SynapseCalyxVault {
             return Err(guard_error(
                 "SYNAPSE_CALYX_GUARD_BAD_CORPUS_ABSENT",
                 format!(
-                    "panel {} has no adjudicated bad case: {} record(s) scanned, {} adjudicated good (Bool(true), or a declared Enum good value, with confidence > 0), {} adjudicated bad (Bool(false), or any other value of a declared Enum kind), {} unadjudicated (anchors carrying Number/Text/OneHot/Vector values, or an Enum whose kind is not in SYNAPSE_DECLARED_ENUM_ADJUDICATIONS — none of which has a polarity Ward may infer), {} adjudicated but carrying none of the requested guard slots",
+                    "panel {} has no adjudicated bad case: {} record(s) scanned, {} adjudicated good (Bool(true), or a declared Enum good value, with confidence > 0), {} adjudicated bad (Bool(false), or any other value of a declared Enum kind), {} unadjudicated (anchors carrying Number/Text/OneHot/Vector values, or an Enum whose kind is not in SYNAPSE_DECLARED_ENUM_ADJUDICATIONS — none of which has a polarity Ward may infer), {} adjudicated but carrying none of the requested guard slots, {} adjudicated but carrying only a strict subset of the joint Guard roster",
                     params.panel_version,
                     corpus.records_scanned,
                     corpus.good.len(),
                     corpus.bad.len(),
                     corpus.unadjudicated,
-                    corpus.adjudicated_without_guarded_slots
+                    corpus.adjudicated_without_guarded_slots,
+                    corpus.adjudicated_incomplete_guarded_slots.len(),
                 ),
                 "a conformal FAR bound is only meaningful over a real known-bad distribution, so calibrating on manufactured badness would report `ok` forever and is refused here, not worked around. This panel genuinely carries no adjudicated bad case — but another panel may: calibration is no longer pinned to the durable active panel (#1919), so name the panel that actually receives outcomes. On this vault that is syn-mcp-usage-v1 @ 1776006 (synapse:mcp_tool_call_outcome, a declared enum adjudication) and syn-agent-event-v1 @ 1665001 (synapse:agent_tool_call_success, Bool(!error_present) — every failed tool call is a Bool(false)). Read `hygiene operation=grounding_gap` per panel to see which is adjudicated before concluding that no adjudication path exists",
             ));
@@ -830,6 +874,8 @@ impl SynapseCalyxVault {
             }
             let good_scores = score_report.good_scores;
             let bad_scores = score_report.bad_scores;
+            let good_case_ids = score_report.good_case_ids;
+            let bad_case_ids = score_report.bad_case_ids;
             if good_scores.len() < SYNAPSE_GUARD_MIN_GOOD_SCORES {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_GOOD_CORPUS_INSUFFICIENT",
@@ -875,6 +921,8 @@ impl SynapseCalyxVault {
                 slot: SlotId::new(spec.slot),
                 good_scores,
                 bad_scores,
+                good_case_ids,
+                bad_case_ids,
                 slot_kind: spec.aspect.slot_kind(),
                 target_far,
                 score_tolerance: 0.0,
@@ -916,6 +964,48 @@ impl SynapseCalyxVault {
                 )
             })?;
 
+        let calibration = profile.calibration.as_ref().ok_or_else(|| {
+            guard_error(
+                "SYNAPSE_CALYX_GUARD_PROFILE_UNCALIBRATED",
+                "ward returned a profile without calibration metadata".to_owned(),
+                "repair calyx-ward calibration; a profile without an estimator and corpus hash is never persisted",
+            )
+        })?;
+        let joint_policy = calibration.estimator == JOINT_POLICY_ESTIMATOR;
+        let policy_target_far = evidence
+            .iter()
+            .map(|(_, target_far, _)| *target_far)
+            .reduce(f32::min)
+            .ok_or_else(|| {
+                guard_error(
+                    "SYNAPSE_CALYX_GUARD_POLICY_EVIDENCE_EMPTY",
+                    "guard calibration produced no policy FAR target".to_owned(),
+                    "name at least one dense active guard slot",
+                )
+            })?;
+        let (policy_bad_accepts, policy_bad_count) =
+            calibration_policy_accepts(&profile, &inputs, true)?;
+        let (policy_good_accepts, policy_good_count) =
+            calibration_policy_accepts(&profile, &inputs, false)?;
+        let policy_tail =
+            clopper_pearson_tail(policy_bad_accepts, policy_bad_count, policy_target_far);
+        let policy_certified = policy_tail <= f64::from(params.alpha) + f64::EPSILON;
+        if !policy_certified {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_POLICY_TAU_UNCERTIFIED",
+                format!(
+                    "guard policy {:?} tau profile accepts {policy_bad_accepts}/{policy_bad_count} aligned bad case(s); exact one-sided Clopper-Pearson tail {policy_tail} exceeds alpha {} at target_far {policy_target_far}",
+                    profile.policy, params.alpha
+                ),
+                "collect more physically adjudicated bad cases or strengthen the frozen causal views; a policy whose combined serving verdict is uncertified is never persisted",
+            ));
+        }
+        let policy_far = fraction(policy_bad_accepts, policy_bad_count);
+        let policy_false_reject_rate = fraction(
+            policy_good_count.saturating_sub(policy_good_accepts),
+            policy_good_count,
+        );
+
         let mut slots = Vec::with_capacity(inputs.len());
         for (input, (spec, target_far, certifiable_min)) in inputs.iter().zip(evidence) {
             let tau = profile.tau_for(&input.slot).ok_or_else(|| {
@@ -934,7 +1024,7 @@ impl SynapseCalyxVault {
             // Independent readback of ward's own gate: if the returned tau is
             // not certified at alpha, ward took its conservative fallback and
             // the profile's reported FAR is not a bound. Refuse to persist it.
-            if tail > f64::from(params.alpha) + f64::EPSILON {
+            if !joint_policy && tail > f64::from(params.alpha) + f64::EPSILON {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_TAU_UNCERTIFIED",
                     format!(
@@ -1129,6 +1219,14 @@ impl SynapseCalyxVault {
         let guard_cf_rows_after = self
             .count_cf_latest_bounded(ColumnFamily::Guard)?
             .rows_visited;
+        let incomplete_guarded_slots_sha256 =
+            guard_identity_population_sha256(&corpus.adjudicated_incomplete_guarded_slots);
+        let incomplete_guarded_slots_sample = corpus
+            .adjudicated_incomplete_guarded_slots
+            .iter()
+            .take(16)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
 
         Ok(SynapseCalyxGuardCalibrateReport {
             panel_version: params.panel_version,
@@ -1147,10 +1245,22 @@ impl SynapseCalyxVault {
             unadjudicated: corpus.unadjudicated,
             conflicting: corpus.conflicting,
             adjudicated_without_guarded_slots: corpus.adjudicated_without_guarded_slots,
-            estimator: calyx_ward::ESTIMATOR.to_owned(),
+            adjudicated_incomplete_guarded_slots: corpus.adjudicated_incomplete_guarded_slots.len(),
+            adjudicated_incomplete_guarded_slots_sha256: incomplete_guarded_slots_sha256,
+            adjudicated_incomplete_guarded_slots_sample: incomplete_guarded_slots_sample,
+            estimator: calibration.estimator.clone(),
             scoring_backend,
             scoring_engine: DENSE_COSINE_SCORING_ENGINE.to_owned(),
             scoring_tolerance: 0.0,
+            policy: match profile.policy {
+                GuardPolicy::AllRequired => "all_required".to_owned(),
+                GuardPolicy::KofN { k } => format!("k_of_n:{k}"),
+            },
+            policy_bad_accepts,
+            policy_achieved_far: policy_far,
+            policy_achieved_frr: policy_false_reject_rate,
+            policy_clopper_pearson_tail: policy_tail,
+            policy_certified,
             slots,
             persisted: params.persist,
             guard_cf_profile_bytes,
@@ -1610,6 +1720,7 @@ impl SynapseCalyxVault {
             unadjudicated: 0,
             conflicting: 0,
             adjudicated_without_guarded_slots: 0,
+            adjudicated_incomplete_guarded_slots: Vec::new(),
         };
         // The panel membership sidecar prevents a cross-panel Base scan. This
         // fold selects adjudicated exemplars and stops at `max_records`, so its
@@ -1716,6 +1827,12 @@ impl SynapseCalyxVault {
                             corpus.adjudicated_without_guarded_slots += 1;
                             return Ok(crate::SynapseCalyxWalkStep::Continue);
                         }
+                        if slots.len() != wanted.len() {
+                            corpus
+                                .adjudicated_incomplete_guarded_slots
+                                .push(constellation.cx_id);
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
                         let record = AdjudicatedRecord {
                             cx_id: constellation.cx_id,
                             slots,
@@ -1802,6 +1919,8 @@ struct NearestGoodMatch {
 struct CalibrationSlotScores {
     good_scores: Vec<f32>,
     bad_scores: Vec<f32>,
+    good_case_ids: Vec<String>,
+    bad_case_ids: Vec<String>,
     nearest_good: Vec<NearestGoodMatch>,
 }
 
@@ -1867,6 +1986,8 @@ fn calibration_slot_scores(
         return Ok(CalibrationSlotScores {
             good_scores: Vec::new(),
             bad_scores: Vec::new(),
+            good_case_ids: Vec::new(),
+            bad_case_ids: Vec::new(),
             nearest_good: Vec::new(),
         });
     };
@@ -1878,6 +1999,10 @@ fn calibration_slot_scores(
     Ok(CalibrationSlotScores {
         good_scores,
         bad_scores,
+        good_case_ids: good_matrix.row_ids.clone(),
+        bad_case_ids: bad_matrix
+            .as_ref()
+            .map_or_else(Vec::new, |matrix| matrix.row_ids.clone()),
         nearest_good,
     })
 }
@@ -2054,6 +2179,90 @@ fn conservative_bad_guard_score(score: f32, tolerance: f32) -> f32 {
 
 fn conservative_good_guard_score(score: f32, tolerance: f32) -> f32 {
     (score - tolerance).max(-1.0)
+}
+
+/// Independently replays the persisted Guard combination policy over the exact
+/// aligned calibration rows. This does not reuse Ward's joint-score reducer:
+/// it evaluates the same per-slot comparisons the serving guard performs and
+/// therefore catches row-order, tau, or policy drift before persistence.
+fn calibration_policy_accepts(
+    profile: &GuardProfile,
+    inputs: &[CalibrationInput],
+    bad: bool,
+) -> Result<(usize, usize), SynapseCalyxError> {
+    let first = inputs.first().ok_or_else(|| {
+        guard_error(
+            "SYNAPSE_CALYX_GUARD_POLICY_EVIDENCE_EMPTY",
+            "guard policy readback has no calibration inputs".to_owned(),
+            "name at least one dense active guard slot",
+        )
+    })?;
+    let first_ids = if bad {
+        &first.bad_case_ids
+    } else {
+        &first.good_case_ids
+    };
+    for input in inputs {
+        let ids = if bad {
+            &input.bad_case_ids
+        } else {
+            &input.good_case_ids
+        };
+        let scores = if bad {
+            &input.bad_scores
+        } else {
+            &input.good_scores
+        };
+        if ids != first_ids || ids.len() != scores.len() {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_POLICY_CORPUS_MISALIGNED",
+                format!(
+                    "guard slot {} has {} {} ids and {} scores, but the policy corpus has {} ordered ids",
+                    input.slot,
+                    ids.len(),
+                    if bad { "bad" } else { "good" },
+                    scores.len(),
+                    first_ids.len(),
+                ),
+                "repair the physical calibration scan; a joint Guard policy is never certified over count-only or differently ordered slot corpora",
+            ));
+        }
+    }
+    let mut accepted = 0usize;
+    for row_index in 0..first_ids.len() {
+        let mut pass_count = 0usize;
+        for input in inputs {
+            let score = if bad {
+                conservative_bad_guard_score(input.bad_scores[row_index], input.score_tolerance)
+            } else {
+                conservative_good_guard_score(input.good_scores[row_index], input.score_tolerance)
+            };
+            let tau = profile.tau_for(&input.slot).ok_or_else(|| {
+                guard_error(
+                    "SYNAPSE_CALYX_GUARD_TAU_MISSING",
+                    format!("joint guard profile has no tau for slot {}", input.slot),
+                    "repair calyx-ward calibration; every required slot must carry an explicit finite tau",
+                )
+            })?;
+            pass_count += usize::from(score >= tau);
+        }
+        let passes = match profile.policy {
+            GuardPolicy::AllRequired => pass_count == inputs.len(),
+            GuardPolicy::KofN { k } if k > 0 && k <= inputs.len() => pass_count >= k,
+            GuardPolicy::KofN { k } => {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_POLICY_INVALID",
+                    format!(
+                        "joint guard policy k={k} is invalid for {} slots",
+                        inputs.len()
+                    ),
+                    "repair the Guard profile with 1 <= k <= required slot count",
+                ));
+            }
+        };
+        accepted += usize::from(passes);
+    }
+    Ok((accepted, first_ids.len()))
 }
 
 /// Index of and cosine to the best-matching good exemplar on `slot`.

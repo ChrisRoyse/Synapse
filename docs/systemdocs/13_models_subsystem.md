@@ -20,7 +20,7 @@ The `synapse-models` crate manages the lifecycle of ONNX detection models. The p
 1. **Registry** (`registry.rs`) — A compile-time table (`REGISTERED_MODELS`) declares each known model with its filename, expected SHA-256, download URL, license, and input shape. The default detection model is `rtdetr_v2_s_coco_onnx`.
 2. **Download** (`download.rs`) — Models live on disk under `default_model_dir()`. **Automated download is disabled in M1**; `model_download_failed` returns a `DownloadFailed` error directing the operator to side-load a verified file. There is no network fetch implemented in this crate.
 3. **Verify** (`verify.rs`) — Before a session is built, the on-disk file's SHA-256 is computed via a streaming 64 KiB-chunked hash and compared against the descriptor's expected hash. A mismatch yields `HashMismatch`.
-4. **Session** (`session.rs` + `ep.rs`) — `ModelLoader::load` verifies the file, then asks a `SessionFactory` to build a persistent ONNX Runtime session, trying execution providers in order (CUDA → DirectML → CPU). A successful build produces a `LoadedModel` that implements the `Detector` trait for inference.
+4. **Session** (`session.rs` + `ep.rs`) — `ModelLoader::load` verifies the file, then asks a `SessionFactory` to build a persistent ONNX Runtime session. The default provider list is exactly CPU. A successful build produces a `LoadedModel` that implements the `Detector` trait for inference.
 
 The `ort` (ONNX Runtime) integration is **feature-gated**. Without the `ort` feature compiled in, sessions fall back to a `Placeholder` handle and `OrtSessionFactory` returns `BackendUnavailable`.
 
@@ -246,29 +246,27 @@ Serde-serialized as `snake_case` (`crates/synapse-models/src/ep.rs`):
 
 | Variant | serde name | Notes |
 |---------|-----------|-------|
-| `Cuda` | `cuda` | NVIDIA CUDA EP |
-| `DirectMl` | `direct_ml` | Windows DirectML EP |
+| `Cuda` | `cuda` | NVIDIA CUDA EP only when the crate is separately built with its optional `cuda` feature; the installed daemon does not compile it |
 | `Cpu` | `cpu` | CPU EP (`#[default]`) |
 
 ### 13.5.2 Default provider order
 
 ```rust
 pub fn default_provider_order() -> Vec<ModelBackend> {
-    vec![Cuda, DirectMl, Cpu]
+    vec![Cpu]
 }
 ```
 
-**Order: CUDA → DirectML → CPU.** The loader tries each in sequence and selects the first that successfully builds a session. `Cpu` is the default single-variant fallback and the enum's `#[default]`.
+**Default provider: CPU only.** `Cpu` is the enum's `#[default]` and the only entry returned by `default_provider_order`; the installed runtime does not probe an accelerator and does not silently fall back from one.
 
 ### 13.5.3 `create_ort_session` (`ort` feature only)
 
 Builds one `ort::session::Session` for a descriptor and a single provider:
 
 1. Creates a `Session::builder()`; failures → `LoadFailed`.
-2. **Whisper special case:** if `descriptor.id == "whisper_tiny_int8"`, registers the ONNX Runtime extensions operator library — preferring a local library from `local_ort_extensions_library()` via `with_operator_library`, otherwise falling back to `with_extensions()`. Either failure → `LoadFailed`. See [08_audio_subsystem.md](08_audio_subsystem.md).
+2. **Whisper special case:** if `descriptor.id == "whisper_tiny_int8"`, resolves the pinned local ONNX Runtime Extensions library through `local_ort_extensions_library()` and registers it via `with_operator_library`. Either failure → `LoadFailed`. See [08_audio_subsystem.md](08_audio_subsystem.md).
 3. Selects the EP and builds it with `.error_on_failure()`:
-   - `Cuda` → `ep::CUDA::default()`
-   - `DirectMl` → `ep::DirectML::default()`
+   - `Cuda` → `ep::CUDA::default()` only under the optional crate feature; otherwise returns `SYNAPSE_MODELS_CUDA_NOT_COMPILED`
    - `Cpu` → `ep::CPU::default().with_arena_allocator(false)`
 4. `builder.with_execution_providers([execution_provider])` — on error logs a `warn` and returns `BackendUnavailable { attempted: vec![provider] }`.
 5. `builder.commit_from_file(&descriptor.path)` loads the model; failure → `LoadFailed`.
@@ -280,9 +278,8 @@ Builds one `ort::session::Session` for a descriptor and a single provider:
 | `default` | (none) — ORT not compiled, `Placeholder` sessions only |
 | `ort` | `dep:ort`, `ort/api-24`, `ort/load-dynamic`, `ort/std` |
 | `cuda` | `ort` + `ort/cuda` |
-| `directml` | `ort` + `ort/directml` |
 
-ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`. `download-binaries`, its TLS client, and `copy-dylibs` are deliberately absent: a development build has no authority to acquire a runtime, while the installer verifies and deploys the one supported runtime bundle.
+ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`. `download-binaries`, its TLS client, and `copy-dylibs` are deliberately absent: a development build has no authority to acquire a runtime, while the installer verifies and deploys the one supported runtime bundle. `synapse-mcp` enables only `synapse-models/ort`; its compile-time feature guard rejects `synapse-models/cuda`, and no DirectML feature or backend exists.
 
 ---
 

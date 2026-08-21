@@ -10,11 +10,12 @@ use synapse_core::{
 use crate::{
     error::ProfileError,
     parser::{
-        LoadedProfile, ProfileDefaults, ScreenBounds, default_backend, default_capture_interval,
-        default_capture_target, default_confidence_threshold, default_cursor_visible,
-        default_hud_region_kind, default_max_detections, default_mode, default_ocr_backend,
-        natural_default, parse_backend, parse_capture_target, parse_mode, parse_ocr_backend,
-        parse_use_scope, validate_hud_region, validate_keymap, validate_match,
+        LoadedProfile, MAX_CAPTURE_INTERVAL_MS, MIN_CAPTURE_INTERVAL_MS, ProfileDefaults,
+        ScreenBounds, default_backend, default_capture_interval, default_capture_target,
+        default_confidence_threshold, default_cursor_visible, default_hud_region_kind,
+        default_max_detections, default_mode, default_ocr_backend, natural_default, parse_backend,
+        parse_capture_target, parse_mode, parse_ocr_backend, parse_use_scope, validate_hud_region,
+        validate_keymap, validate_match,
     },
 };
 
@@ -245,6 +246,17 @@ impl Default for RawCapture {
 
 impl RawCapture {
     fn into_capture(self, path: &Path) -> Result<ProfileCapture, ProfileError> {
+        if !(MIN_CAPTURE_INTERVAL_MS..=MAX_CAPTURE_INTERVAL_MS)
+            .contains(&self.min_update_interval_ms)
+        {
+            return Err(ProfileError::Parse {
+                path: path.to_path_buf(),
+                message: format!(
+                    "capture.min_update_interval_ms={} is outside the CPU/GDI low-CPU policy range {}..={} ms",
+                    self.min_update_interval_ms, MIN_CAPTURE_INTERVAL_MS, MAX_CAPTURE_INTERVAL_MS
+                ),
+            });
+        }
         Ok(ProfileCapture {
             target: parse_capture_target(&self.target, path)?,
             min_update_interval_ms: self.min_update_interval_ms,

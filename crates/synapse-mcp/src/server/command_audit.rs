@@ -160,6 +160,11 @@ pub(crate) struct CommandAuditRowReadback {
     pub key_hex: String,
     pub value_len_bytes: u64,
     pub value_sha256: String,
+    /// Exact content-addressed Calyx constellation measured from this physical
+    /// action-log row. Supported action-family Oracles must use this identity;
+    /// reconstructing a query from a tool name or audit id is forbidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constellation_cx_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -824,6 +829,9 @@ impl SynapseService {
             key_hex: repair_key_hex,
             value_len_bytes: repair_readback.len() as u64,
             value_sha256: sha256_hex(&repair_readback),
+            // The revision-guarded legacy cleanup writes one atomic raw repair
+            // audit rather than publishing a causal action observation.
+            constellation_cx_id: None,
         };
         tracing::warn!(
             code = "COMMAND_AUDIT_LEGACY_PROBE_ROW_REPAIRED",
@@ -1016,11 +1024,23 @@ impl SynapseService {
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while writing command audit")
         })?;
-        runtime
+        let constellation_reports = runtime
             .storage_put_action_log_rows(vec![(key.clone(), encoded.clone())])
             .map_err(|error| {
                 command_audit_internal_error(format!("command audit write failed: {error}"))
             })?;
+        let [constellation_report] = constellation_reports.as_slice() else {
+            return Err(command_audit_internal_error(format!(
+                "command audit constellation measurement returned {} reports for one row key_hex={key_hex}",
+                constellation_reports.len()
+            )));
+        };
+        if constellation_report.source_key_hex != key_hex {
+            return Err(command_audit_internal_error(format!(
+                "command audit constellation source key mismatch: row={key_hex} measured={}",
+                constellation_report.source_key_hex
+            )));
+        }
         let (readback_rows, _has_more) = runtime
             .storage_cf_rows_from(cf::CF_ACTION_LOG, &key, 1)
             .map_err(|error| {
@@ -1041,6 +1061,7 @@ impl SynapseService {
             key_hex,
             value_len_bytes: read_value.len() as u64,
             value_sha256: sha256_hex(read_value),
+            constellation_cx_id: Some(constellation_report.cx_id.clone()),
         };
         tracing::info!(
             code = "COMMAND_AUDIT_RECORDED",
