@@ -1020,26 +1020,53 @@ async fn run(
         "action crash recovery ledger configured"
     );
 
-    // #2082 fix 2 — the unconditional startup release sweep.
+    // #2082 fix 2 — the startup release sweep, gated on ownership since the
+    // 2026-08-25 operator-interference incident.
     //
     // The ledger-driven recovery above only knows about strands a previous
     // daemon managed to *write down*. A panic between the OS key-down and the
     // ledger append, a ledger on a different drive, or a `SYNAPSE_DB` that moved
     // all leave a real, system-wide stranded key that the ledger has no record
-    // of — and `SendInput` state does not die with the process that set it. This
-    // sweep asks the OS directly (`GetAsyncKeyState`), releases every modifier
-    // and mouse button whether or not anything looked stuck, and logs exactly
-    // what it found down so an inherited strand is visible rather than silently
-    // cleared. It runs before either transport can accept a request, and covers
-    // stdio and HTTP alike because it sits above the mode dispatch.
+    // of — and `SendInput` state does not die with the process that set it. So
+    // the sweep also asks the OS directly (`GetAsyncKeyState`) across the full
+    // virtual-key space, because the narrower modifier-only sweep let a stranded
+    // `VK_F13` survive boot while still logging `..._SWEEP_CLEAN` (#2082 A1).
     //
-    // Scope, after #2082 finding A1: this is the **full virtual-key-space**
-    // sweep, not the modifier-only one. The process-local strand mirror is empty
-    // at this point by construction — the strand, if any, belongs to a process
-    // that is already dead — so `GetAsyncKeyState` across `0x08..=0xfe` is the
-    // only evidence that can exist here. The narrower sweep let a stranded
-    // `VK_F13` survive boot while still logging `..._SWEEP_CLEAN`.
-    let _startup_sweep = synapse_action::release_all_synthetic_input_on_startup();
+    // What it may *emit* is a separate question from what it may *read*, and
+    // conflating the two is what broke. `GetAsyncKeyState` answers "what is
+    // down", never "who put it down": a key the operator is physically holding
+    // at the instant of boot reads exactly like an inherited strand. Releasing
+    // it is not a harmless no-op — it stops auto-repeat, delivers `WM_KEYUP`,
+    // and for a mouse button becomes a real click under the operator's cursor.
+    // The old code released anyway, on the premise that boots are rare. On
+    // 2026-08-25 the daemon OOM'd inside its Job memory cap and booted every ~85
+    // seconds for hours, and that premise inverted: it took the operator's `W`,
+    // `D`, `SPACE`, `1`, `LBUTTON` and `RBUTTON` out of their hands, several
+    // times a minute, across 34 boots on which the ledger reported
+    // `recovered_keys=0` — i.e. the daemon provably held nothing.
+    //
+    // So emission now requires positive proof of ownership: the durable ledger
+    // must show this daemon actually holding something, and this boot must not
+    // be part of a storm. Otherwise the scan still runs and still reports, and
+    // nothing is emitted. It runs before either transport can accept a request,
+    // and covers stdio and HTTP alike because it sits above the mode dispatch.
+    let boot_storm = synapse_action::record_boot_and_detect_storm()
+        .context("record daemon boot for synthetic-input storm detection")?;
+    if boot_storm.storm {
+        tracing::error!(
+            code = "SYNTHETIC_INPUT_BOOT_STORM_DETECTED",
+            history_file = %boot_storm.history_file.display(),
+            boots_in_window = boot_storm.boots_in_window,
+            window_ms = boot_storm.window_ms,
+            "the daemon is restarting fast enough to constitute a boot storm; the startup synthetic-input release sweep is withheld for this boot because a crash loop that repeatedly releases keys is operator interference, not strand recovery — investigate the restart cause"
+        );
+    }
+    let _startup_sweep =
+        synapse_action::release_all_synthetic_input_on_startup(synapse_action::StartupEvidence {
+            ledger_recovered_keys: recovery_report.recovered_keys,
+            ledger_recovered_buttons: recovery_report.recovered_buttons,
+            boot_storm: boot_storm.storm,
+        });
     // #2082 fix 4 — the watchdog. A dedicated OS thread, not a tokio task, so it
     // still runs when the runtime or the emitter actor is the thing that wedged.
     // Its `SYNTHETIC_INPUT_WATCHDOG_STARTED` line now also records which of the

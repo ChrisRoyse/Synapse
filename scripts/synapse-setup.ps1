@@ -319,9 +319,25 @@ $SynapseBindFinalDeadOwnerSettleSeconds = 15
 # host-isolated class-9 probes prove the privilege-dependent
 # JOB_OBJECT_LIMIT_WORKINGSET path is unavailable to the configured launch
 # token, while the exact 0x2300 committed-memory contract succeeds.
-$SynapseSupervisorMemoryLimitBytes = [uint64]949997568
-$SynapseDaemonProcessMemoryLimitBytes = [uint64]849997824
-$SynapseOwnedMemoryLimitBytes = [uint64]949997568
+#
+# Sizing (raised 2026-08-25 after the OOM crash-loop incident). The first cut of
+# these caps was ~810 MB for a daemon generation and ~950 MB for the whole tree.
+# That is below what a healthy daemon actually needs on this host: ordered Calyx
+# page scans over CF_AGENT_TRANSCRIPTS walk six-figure runs of TTL-expired rows
+# to return one 4,096-row page, and ambient agent ingestion re-reads multi-MB
+# session transcripts. The daemon went over the cap continuously and every
+# allocation past it failed - the observed signatures were "memory allocation of
+# 65536 bytes failed", "has overflowed its stack", and tokio "OS can not spawn
+# worker thread: The paging file is too small (os error 1455)", the last of which
+# is the Job commit limit rather than any real page-file shortage (the host had
+# ~210 GB of free commit at the time). The daemon crash-looped every ~85 seconds
+# for hours, and each boot re-ran the startup synthetic-input sweep, which is how
+# a memory cap turned into the operator losing control of their mouse and
+# keyboard. The bound is still a real bound and still fails closed; it is now set
+# where a working daemon fits under it rather than where it does not.
+$SynapseSupervisorMemoryLimitBytes = [uint64]6700000000
+$SynapseDaemonProcessMemoryLimitBytes = [uint64]6000000000
+$SynapseOwnedMemoryLimitBytes = [uint64]6700000000
 $SynapseBootstrapPreAssociationReserveBytes = [uint64]50002432
 $SynapseSupervisorCpuRate = [uint32]2500
 # Nested Job CPU rates are relative to the immediate parent. Give the daemon
@@ -7078,7 +7094,7 @@ $ExpectedEnableAudio = __EXPECTED_ENABLE_AUDIO__
 $ProcessMemoryLimitBytes = [uint64]__PROCESS_MEMORY_LIMIT_BYTES__
 $SupervisorMemoryLimitBytes = [uint64]__SUPERVISOR_MEMORY_LIMIT_BYTES__
 $BootstrapPreAssociationReserveBytes = [uint64]__BOOTSTRAP_PREASSOCIATION_RESERVE_BYTES__
-$CommittedPrivatePolicyCeilingBytes = [uint64]1000000000
+$CommittedPrivatePolicyCeilingBytes = [uint64]7000000000
 $DaemonCpuRate = [uint32]__DAEMON_CPU_RATE__
 $SupervisorCpuRate = [uint32]__SUPERVISOR_CPU_RATE__
 $OneShot = [System.Convert]::ToBoolean(__ONE_SHOT__)
@@ -7607,12 +7623,12 @@ namespace SynapseDaemonSupervisor
                 throw new ArgumentException(
                     "SYNAPSE_DAEMON_JOB_INPUT_INVALID application, working directory, stderr path, and unique Job name are required; remediation=regenerate the supervisor from complete setup paths");
             }
-            if (processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 1000000000UL ||
+            if (processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 7000000000UL ||
                 cpuRate == 0 || cpuRate > 10000)
             {
                 throw new ArgumentOutOfRangeException(
                     "processMemoryLimitBytes",
-                    "SYNAPSE_DAEMON_JOB_LIMIT_INVALID committed-memory limits must be positive and below decimal 1000000000 bytes, and CPU hard rate must be in 1..=10000; remediation=repair the setup-owned constants and regenerate the supervisor");
+                    "SYNAPSE_DAEMON_JOB_LIMIT_INVALID committed-memory limits must be positive and below decimal 7000000000 bytes, and CPU hard rate must be in 1..=10000; remediation=repair the setup-owned constants and regenerate the supervisor");
             }
 
             BoundedProcess owner = new BoundedProcess();
@@ -7879,7 +7895,7 @@ namespace SynapseDaemonSupervisor
             uint cpuRate)
         {
             if (String.IsNullOrWhiteSpace(jobName) ||
-                processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 1000000000UL ||
+                processMemoryLimitBytes == 0 || processMemoryLimitBytes >= 7000000000UL ||
                 cpuRate == 0 || cpuRate > 10000)
             {
                 throw new ArgumentOutOfRangeException(
@@ -9597,7 +9613,7 @@ namespace SynapseSetup
         private const uint EXPECTED_LIMIT_FLAGS = 0x00002300;
         private const uint EXPECTED_CPU_FLAGS = 0x00000005;
         private const uint EXPECTED_CPU_RATE = 2500;
-        private const ulong EXPECTED_MEMORY_LIMIT = 949997568;
+        private const ulong EXPECTED_MEMORY_LIMIT = 6700000000;
 
         [StructLayout(LayoutKind.Sequential)] private struct IO_COUNTERS { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; }
         [StructLayout(LayoutKind.Sequential)] private struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
@@ -10616,7 +10632,7 @@ namespace SynapseSetup
             if (String.IsNullOrWhiteSpace(applicationName) ||
                 String.IsNullOrWhiteSpace(workingDirectory) ||
                 String.IsNullOrWhiteSpace(jobName) ||
-                memoryLimitBytes == 0 || memoryLimitBytes >= 1000000000UL ||
+                memoryLimitBytes == 0 || memoryLimitBytes >= 7000000000UL ||
                 cpuRate == 0 || cpuRate > 10000)
             {
                 throw new ArgumentException(
@@ -12918,7 +12934,7 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         supervisor_job_cpu_rate = [string]$ExpectedSupervisorCpuRate
         owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
         bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
-        owned_committed_private_ceiling_bytes = '1000000000'
+        owned_committed_private_ceiling_bytes = '7000000000'
     }
     foreach ($resourceName in $resourceExpectations.Keys) {
         $actualResourceValue = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.$resourceName }
@@ -13040,7 +13056,7 @@ function Get-SynapseLiveSupervisorResourceContractDrift {
             supervisor_job_cpu_rate = [string]$ExpectedSupervisorCpuRate
             owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
             bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
-            owned_committed_private_ceiling_bytes = '1000000000'
+            owned_committed_private_ceiling_bytes = '7000000000'
         }
         foreach ($name in $expectations.Keys) {
             $actual = [string]$state.$name
@@ -13094,8 +13110,8 @@ function Get-SynapseLiveSupervisorResourceContractDrift {
                     $bootstrapPeakWorkingSetBytes = [uint64]($peakWorkingSetKb * 1024)
                     $bootstrapConservativeCommitBytes = if ($bootstrapPrivateBytes -ge $bootstrapPeakCommitBytes) { [uint64]$bootstrapPrivateBytes } else { [uint64]$bootstrapPeakCommitBytes }
                     if ($bootstrapConservativeCommitBytes -gt $SynapseBootstrapPreAssociationReserveBytes -or
-                        ($SynapseOwnedMemoryLimitBytes + $bootstrapConservativeCommitBytes) -gt [uint64]1000000000) {
-                        $drifts.Add("supervisor_bootstrap_preassociation_reserve outer_committed_limit=$SynapseOwnedMemoryLimitBytes reserve=$SynapseBootstrapPreAssociationReserveBytes private=$bootstrapPrivateBytes peak_commit=$bootstrapPeakCommitBytes conservative_commit=$bootstrapConservativeCommitBytes working_set=$bootstrapWorkingSetBytes peak_working_set=$bootstrapPeakWorkingSetBytes working_set_policy=measured_only committed_private_ceiling=1000000000")
+                        ($SynapseOwnedMemoryLimitBytes + $bootstrapConservativeCommitBytes) -gt [uint64]7000000000) {
+                        $drifts.Add("supervisor_bootstrap_preassociation_reserve outer_committed_limit=$SynapseOwnedMemoryLimitBytes reserve=$SynapseBootstrapPreAssociationReserveBytes private=$bootstrapPrivateBytes peak_commit=$bootstrapPeakCommitBytes conservative_commit=$bootstrapConservativeCommitBytes working_set=$bootstrapWorkingSetBytes peak_working_set=$bootstrapPeakWorkingSetBytes working_set_policy=measured_only committed_private_ceiling=7000000000")
                     }
                 } catch {
                     $drifts.Add("supervisor_bootstrap_memory_readback_invalid pid=$bootstrapPid error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
@@ -21314,7 +21330,7 @@ function Assert-SynapseBrokerDecommissionParkedRecord {
     foreach($control in @($p.parked_control_gate,$p.parked_roster)){Assert-SynapsePurgeExactPropertySet -Value $control -Expected @('path','file_id_128','sha256','length') -Context "${Context}_control";if([string]$control.file_id_128-notmatch'^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$'-or[string]$control.sha256-notmatch'^[0-9A-Fa-f]{64}$'-or[int64]$control.length-lt1){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_CONTROL_INVALID context=$Context"}}
     if([IO.Path]::GetFullPath([string]$p.parked_control_gate.path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.active_control_gate.path)-or[IO.Path]::GetFullPath([string]$p.parked_roster.path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.active_roster.path)-or(Get-SynapseCanonicalJson -Value $p.task)-cne(Get-SynapseCanonicalJson -Value $Authorized.Payload.task)){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_AUTHORITY_DRIFT context=$Context"}
     Assert-SynapsePurgeExactPropertySet -Value $p.task_instance -Expected @('instance_guid','engine_pid','task_state','instance_state','current_action','instance_count') -Context "${Context}_task_instance";if([string]$p.task_instance.instance_guid-notmatch'^[{]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[}]?$'-or[int]$p.task_instance.engine_pid-lt1-or[int]$p.task_instance.instance_count-ne1-or[int]$p.task_instance.task_state-ne4-or[int]$p.task_instance.instance_state-ne4-or[string]$p.task_instance.current_action-cne'exec'){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_INSTANCE_INVALID context=$Context"}
-    Assert-SynapsePurgeExactPropertySet -Value $p.outer_job -Expected @('schema','name','expected_security_descriptor_sddl','security_descriptor_observed','limit_flags','process_memory_limit_bytes','job_memory_limit_bytes','cpu_rate_control_flags','cpu_rate','member_pids') -Context "${Context}_job";if([string]$p.outer_job.schema-cne'synapse_broker_decommission_job/v1'-or[string]$p.outer_job.name-cne('Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid)-or[string]$p.outer_job.expected_security_descriptor_sddl-cne(Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor)-or-not($p.outer_job.security_descriptor_observed-is[bool])-or[bool]$p.outer_job.security_descriptor_observed-or[uint32]$p.outer_job.limit_flags-ne[uint32]0x2300-or[uint64]$p.outer_job.process_memory_limit_bytes-ne[uint64]949997568-or[uint64]$p.outer_job.job_memory_limit_bytes-ne[uint64]949997568-or[uint32]$p.outer_job.cpu_rate_control_flags-ne[uint32]5-or[uint32]$p.outer_job.cpu_rate-ne[uint32]2500){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_DESCRIPTOR_INVALID context=$Context"}
+    Assert-SynapsePurgeExactPropertySet -Value $p.outer_job -Expected @('schema','name','expected_security_descriptor_sddl','security_descriptor_observed','limit_flags','process_memory_limit_bytes','job_memory_limit_bytes','cpu_rate_control_flags','cpu_rate','member_pids') -Context "${Context}_job";if([string]$p.outer_job.schema-cne'synapse_broker_decommission_job/v1'-or[string]$p.outer_job.name-cne('Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid)-or[string]$p.outer_job.expected_security_descriptor_sddl-cne(Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor)-or-not($p.outer_job.security_descriptor_observed-is[bool])-or[bool]$p.outer_job.security_descriptor_observed-or[uint32]$p.outer_job.limit_flags-ne[uint32]0x2300-or[uint64]$p.outer_job.process_memory_limit_bytes-ne[uint64]6700000000-or[uint64]$p.outer_job.job_memory_limit_bytes-ne[uint64]6700000000-or[uint32]$p.outer_job.cpu_rate_control_flags-ne[uint32]5-or[uint32]$p.outer_job.cpu_rate-ne[uint32]2500){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_DESCRIPTOR_INVALID context=$Context"}
     [void](Assert-SynapseBrokerDecommissionProcessDescriptor -Descriptor $p.outer_bootstrap -ExpectedRole outer_bootstrap -Context "${Context}_outer");[void](Assert-SynapseBrokerDecommissionProcessDescriptor -Descriptor $p.broker_process -ExpectedRole broker_powershell -Context "${Context}_broker")
     $outerArgs=@($p.outer_bootstrap.arguments);$brokerArgs=@($p.broker_process.arguments);$expectedJob='Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid
     if([IO.Path]::GetFullPath([string]$p.outer_bootstrap.image_path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.bootstrap.path)-or[string]$p.outer_bootstrap.image_file_id_128-ine[string]$Authorized.Payload.bootstrap.file_id_128-or[string]$p.outer_bootstrap.image_sha256-ine[string]$Authorized.Payload.bootstrap.sha256-or[int64]$p.outer_bootstrap.image_length-ne[int64]$Authorized.Payload.bootstrap.length-or[IO.Path]::GetFullPath([string]$p.broker_process.image_path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.powershell.path)-or[string]$p.broker_process.image_file_id_128-ine[string]$Authorized.Payload.powershell.file_id_128-or[string]$p.broker_process.image_sha256-ine[string]$Authorized.Payload.powershell.sha256-or[int64]$p.broker_process.image_length-ne[int64]$Authorized.Payload.powershell.length){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_IMAGE_AUTHORITY_DRIFT context=$Context"}
@@ -21381,7 +21397,7 @@ function New-SynapseBrokerDecommissionParkedRecord {
         if($legacyParked){$gatePost=$physicalGate;$rosterPost=$physicalRoster;$operatorStop=$null;$provenanceKind='physical_parked_successor/v1'}
         else{$latest=$stopRecord.Journal.Slots[-1];$gatePost=[ordered]@{path=[IO.Path]::GetFullPath([string]$stopRecord.Validated.GateTransition.path);file_id_128=([string]$stopRecord.Validated.GateTransition.post_file_id_128).ToUpperInvariant();sha256=([string]$stopRecord.Validated.GateTransition.post_sha256).ToUpperInvariant();length=[int64]$stopRecord.Validated.GateTransition.post_length};$rosterPost=[ordered]@{path=[IO.Path]::GetFullPath([string]$stopRecord.Validated.RosterTransition.path);file_id_128=([string]$stopRecord.Validated.RosterTransition.post_file_id_128).ToUpperInvariant();sha256=([string]$stopRecord.Validated.RosterTransition.post_sha256).ToUpperInvariant();length=[int64]$stopRecord.Validated.RosterTransition.post_length};if((Get-SynapseCanonicalJson -Value $gatePost)-cne(Get-SynapseCanonicalJson -Value $physicalGate)-or(Get-SynapseCanonicalJson -Value $rosterPost)-cne(Get-SynapseCanonicalJson -Value $physicalRoster)){Die 'SYNAPSE_BROKER_DECOMMISSION_OPERATOR_STOP_POST_PHYSICAL_DRIFT'};$operatorStop=[ordered]@{root=[string]$stopRecord.Entry.Path;root_file_id_128=([string]$stopRecord.Journal.RootChain[-1].file_id_128).ToUpperInvariant();static_transaction_sha256=([string]$stopRecord.Journal.Initial.static_transaction_sha256).ToUpperInvariant();state='candidate_ready';sequence=[int]$latest.Sequence;latest_leaf=[string]$latest.Leaf;latest_file_id_128=([string]$latest.FileId128).ToUpperInvariant();latest_sha256=([string]$latest.RawSha256).ToUpperInvariant();latest_length=[int64]$latest.ByteLength;parked_control_gate_post=$gatePost;parked_roster_post=$rosterPost};$provenanceKind='operator_journal/v1'}
         $parkProvenance=[ordered]@{schema='synapse_broker_decommission_park_provenance/v1';kind=$provenanceKind;operator_stop=$operatorStop;parked_control_gate_payload=(ConvertTo-SynapseCanonicalValue -Value $pair.Gate.Payload);parked_roster_payload=(ConvertTo-SynapseCanonicalValue -Value $pair.Roster.Payload)}
-        $payload=[ordered]@{schema='synapse_broker_decommission_parked/v2';state='parked_before_task_mutation';decommission_id=[string]$Authorized.Payload.decommission_id;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $Authorized);generation_id=[string]$Authorized.Payload.generation_id;parked_control_gate=$gatePost;parked_roster=$rosterPost;task=(ConvertTo-SynapseCanonicalValue -Value $Authorized.Payload.task);task_instance=[ordered]@{instance_guid=[string]$instances[0].InstanceGuid;engine_pid=[int]$instances[0].EnginePID;task_state=$taskState;instance_state=[int]$instances[0].State;current_action=[string]$instances[0].CurrentAction;instance_count=1};outer_job=[ordered]@{schema='synapse_broker_decommission_job/v1';name=$jobName;expected_security_descriptor_sddl=$expectedSddl;security_descriptor_observed=$false;limit_flags=[uint32]0x2300;process_memory_limit_bytes=[uint64]949997568;job_memory_limit_bytes=[uint64]949997568;cpu_rate_control_flags=[uint32]5;cpu_rate=[uint32]2500;member_pids=@($members|Sort-Object)};outer_bootstrap=$outerProcess;broker_process=$brokerProcess;park_provenance=$parkProvenance;authority_tree=$authorityTree;target_process_count=0;listener_count=0;parked_at_utc=[DateTime]::UtcNow.ToString('o')}
+        $payload=[ordered]@{schema='synapse_broker_decommission_parked/v2';state='parked_before_task_mutation';decommission_id=[string]$Authorized.Payload.decommission_id;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $Authorized);generation_id=[string]$Authorized.Payload.generation_id;parked_control_gate=$gatePost;parked_roster=$rosterPost;task=(ConvertTo-SynapseCanonicalValue -Value $Authorized.Payload.task);task_instance=[ordered]@{instance_guid=[string]$instances[0].InstanceGuid;engine_pid=[int]$instances[0].EnginePID;task_state=$taskState;instance_state=[int]$instances[0].State;current_action=[string]$instances[0].CurrentAction;instance_count=1};outer_job=[ordered]@{schema='synapse_broker_decommission_job/v1';name=$jobName;expected_security_descriptor_sddl=$expectedSddl;security_descriptor_observed=$false;limit_flags=[uint32]0x2300;process_memory_limit_bytes=[uint64]6700000000;job_memory_limit_bytes=[uint64]6700000000;cpu_rate_control_flags=[uint32]5;cpu_rate=[uint32]2500;member_pids=@($members|Sort-Object)};outer_bootstrap=$outerProcess;broker_process=$brokerProcess;park_provenance=$parkProvenance;authority_tree=$authorityTree;target_process_count=0;listener_count=0;parked_at_utc=[DateTime]::UtcNow.ToString('o')}
         [void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_parked_retained_legacy_publish');if($null-ne$tokenAuthorityLease){$tokenAuthorityLease.RequireExact('broker_decommission_parked_token_publish')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $Authorized.Payload.token_authority -ExpectedPath ([string]$Authorized.Payload.token_path) -Context 'broker_decommission_parked_token_publish')}
         $opened=Write-SynapseBrokerDecommissionRecord -DecommissionId ([string]$Authorized.Payload.decommission_id) -Phase parked -ExpectedRecordRootFileId128 ([string]$Authorized.Payload.record_root_file_id_128) -RecordRootLease $Authorized.RecordRootLease -Payload $payload -Predecessors @($Authorized) -Context 'broker_decommission_parked';[void](Assert-SynapseBrokerDecommissionParkedRecord -Record $opened -Authorized $Authorized -Context 'broker_decommission_parked_readback')
         $Authorized.Lease.RequireExact('broker_decommission_parked_authorization_after');$opened.Lease.RequireExact('broker_decommission_parked_after');$pair.GateLease.RequireExact('broker_decommission_parked_gate_after');$pair.RosterLease.RequireExact('broker_decommission_parked_roster_after');$outerLease.RequireExact('broker_decommission_parked_outer_after');$brokerLease.RequireExact('broker_decommission_parked_broker_after');$jobLease.RequireExact($members,'broker_decommission_parked_job_after');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_parked_retained_legacy_after');if($null-ne$tokenAuthorityLease){$tokenAuthorityLease.RequireExact('broker_decommission_parked_token_after')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $Authorized.Payload.token_authority -ExpectedPath ([string]$Authorized.Payload.token_path) -Context 'broker_decommission_parked_token_after')};$returning=$true;return $opened
@@ -27881,7 +27897,7 @@ function New-SynapseBrokerSemanticContract {
         run_level=0
         multiple_instances='IgnoreNew'
         trigger_types=@('registration','logon','time_periodic_pt5m_indefinite')
-        outer_job_memory_limit_bytes=949997568
+        outer_job_memory_limit_bytes=6700000000
         outer_job_cpu_rate=2500
         inner_job_cpu_rate=10000
         native_bootstrap_outer_argument_abi='--outer-launch-capability,capability,powershell,supervisor,working_directory,log_path'
@@ -29824,8 +29840,8 @@ function Wait-SynapseBrokerGenerationOperational {
     # current producer default.  Only the two explicitly shipped bounded
     # contracts are admissible; unknown supervisor bytes remain fail-closed.
     $generationSupervisorText=[System.IO.File]::ReadAllText([string]$Generation.Supervisor.Path,[System.Text.UTF8Encoding]::new($false,$true))
-    if($generationSupervisorText.Contains('$ProcessMemoryLimitBytes = [uint64]849997824')){
-        $SynapseDaemonProcessMemoryLimitBytes=[uint64]849997824
+    if($generationSupervisorText.Contains('$ProcessMemoryLimitBytes = [uint64]6000000000')){
+        $SynapseDaemonProcessMemoryLimitBytes=[uint64]6000000000
     }elseif($generationSupervisorText.Contains('$ProcessMemoryLimitBytes = [uint64]789999616')){
         $SynapseDaemonProcessMemoryLimitBytes=[uint64]789999616
     }else{
@@ -29942,17 +29958,17 @@ function Wait-SynapseBrokerGenerationOperational {
             $expectedInnerMembers=@($expectedInnerMembers+$innerConsoleAdjuncts|Sort-Object)
             $expectedDaemonMembers=@($expectedDaemonMembers+$daemonConsoleAdjuncts|Sort-Object)
             if([uint32]$outerJob.LimitFlags -ne [uint32]0x00002300 -or
-                [uint64]$outerJob.ProcessMemoryLimitBytes -ne [uint64]949997568 -or
-                [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]949997568 -or
-                [uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]949997568 -or
-                [uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]1000000000 -or
+                [uint64]$outerJob.ProcessMemoryLimitBytes -ne [uint64]6700000000 -or
+                [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]6700000000 -or
+                [uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]6700000000 -or
+                [uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]7000000000 -or
                 [uint32]$outerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$outerJob.CpuRate -ne [uint32]2500 -or
                 (($expectedOuterMembers -join ',') -cne ($actualOuterMembers -join ','))){
                 throw "outer Job contract flags=0x$('{0:X8}'-f [uint32]$outerJob.LimitFlags) process_limit=$($outerJob.ProcessMemoryLimitBytes) job_limit=$($outerJob.JobMemoryLimitBytes) current=$($outerJob.CurrentJobMemoryUsedBytes) peak=$($outerJob.PeakJobMemoryUsedBytes) cpu_flags=0x$('{0:X8}'-f [uint32]$outerJob.CpuRateControlFlags) cpu_rate=$($outerJob.CpuRate) expected_members=$($expectedOuterMembers-join ',') actual_members=$($actualOuterMembers-join ',')"
             }
             if([uint32]$innerJob.LimitFlags -ne [uint32]0x00002300 -or
-                [uint64]$innerJob.ProcessMemoryLimitBytes -ne [uint64]949997568 -or [uint64]$innerJob.JobMemoryLimitBytes -ne [uint64]949997568 -or
-                [uint64]$innerJob.CurrentJobMemoryUsedBytes -gt [uint64]949997568 -or [uint64]$innerJob.PeakJobMemoryUsedBytes -gt [uint64]1000000000 -or
+                [uint64]$innerJob.ProcessMemoryLimitBytes -ne [uint64]6700000000 -or [uint64]$innerJob.JobMemoryLimitBytes -ne [uint64]6700000000 -or
+                [uint64]$innerJob.CurrentJobMemoryUsedBytes -gt [uint64]6700000000 -or [uint64]$innerJob.PeakJobMemoryUsedBytes -gt [uint64]7000000000 -or
                 [uint32]$innerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$innerJob.CpuRate -ne [uint32]10000 -or
                 (($expectedInnerMembers -join ',') -cne ($actualInnerMembers -join ','))){
                 throw "inner Job contract flags=0x$('{0:X8}'-f [uint32]$innerJob.LimitFlags) process_limit=$($innerJob.ProcessMemoryLimitBytes) job_limit=$($innerJob.JobMemoryLimitBytes) current=$($innerJob.CurrentJobMemoryUsedBytes) peak=$($innerJob.PeakJobMemoryUsedBytes) cpu_flags=0x$('{0:X8}'-f [uint32]$innerJob.CpuRateControlFlags) cpu_rate=$($innerJob.CpuRate) expected_members=$($expectedInnerMembers-join ',') actual_members=$($actualInnerMembers-join ',')"
@@ -30091,9 +30107,9 @@ function Assert-SynapseBrokerParkedNoAuthority {
                 $outerJob=Get-SynapseDaemonJobKernelReadback -JobName $outerJobName
                 $expectedMembers=@([uint64]$outerBootstrap.ProcessId,[uint64]$brokerProcess.ProcessId)+@($childClass.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId})|Sort-Object
                 $actualMembers=@($outerJob.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object)
-                if([uint32]$outerJob.LimitFlags -ne [uint32]0x00002300 -or [uint64]$outerJob.ProcessMemoryLimitBytes -ne [uint64]949997568 -or
-                    [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]949997568 -or [uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]949997568 -or
-                    [uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]1000000000 -or [uint32]$outerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or
+                if([uint32]$outerJob.LimitFlags -ne [uint32]0x00002300 -or [uint64]$outerJob.ProcessMemoryLimitBytes -ne [uint64]6700000000 -or
+                    [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]6700000000 -or [uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]6700000000 -or
+                    [uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]7000000000 -or [uint32]$outerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or
                     [uint32]$outerJob.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){
                     throw "parked outer Job contract invalid job=$outerJobName flags=$($outerJob.LimitFlags) rate=$($outerJob.CpuRate) members=$($actualMembers-join ',')"
                 }
@@ -30144,7 +30160,7 @@ function Assert-SynapseBrokerInertWithoutControls {
             $childClass=Get-SynapseBrokerChildClassification -Broker $broker;$children=@($childClass.AuthorityChildren)
             if($children.Count -ne 0){throw "inert broker retained children=$(@($children.ProcessId)-join ',')"}
             $job=Get-SynapseDaemonJobKernelReadback -JobName $jobName;$expectedMembers=@([uint64]$outer.ProcessId,[uint64]$broker.ProcessId)+@($childClass.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId})|Sort-Object;$actualMembers=@($job.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object)
-            if([uint32]$job.LimitFlags -ne [uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes -ne [uint64]949997568 -or [uint64]$job.JobMemoryLimitBytes -ne [uint64]949997568 -or [uint32]$job.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$job.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){throw "inert broker outer Job contract invalid job=$jobName"}
+            if([uint32]$job.LimitFlags -ne [uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes -ne [uint64]6700000000 -or [uint64]$job.JobMemoryLimitBytes -ne [uint64]6700000000 -or [uint32]$job.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$job.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){throw "inert broker outer Job contract invalid job=$jobName"}
             return [pscustomobject][ordered]@{TaskInstanceCount=1;BrokerProcessCount=1;OuterBootstrapPid=[int]$outer.ProcessId;BrokerPid=[int]$broker.ProcessId;TargetProcessCount=0;ListenerCount=0;OuterJob=$job}
         }catch{$last=(($_.Exception.Message-replace '\s+',' ').Trim())}
         Start-Sleep -Milliseconds 500
@@ -30197,7 +30213,7 @@ function Assert-SynapseBrokerInertAtFreshMonotonicFloor {
             [void](Assert-SynapseProcessCommandLineExact -Process $outer -ExpectedArguments @([string]$Infrastructure.Bootstrap.Path,'--outer-launch-capability',$outerCapability,[string]$Infrastructure.SemanticContract.powershell_path,[string]$Infrastructure.BrokerScript.Path,[string]$Infrastructure.SemanticContract.working_directory,[string]$Infrastructure.BootstrapLogPath) -PathArgumentIndexes @(0,3,4,5,6) -Context 'broker_fresh_floor_outer')
             [void](Assert-SynapseProcessCommandLineExact -Process $broker -ExpectedArguments @([string]$Infrastructure.SemanticContract.powershell_path,'-NoProfile','-ExecutionPolicy','Bypass','-File',[string]$Infrastructure.BrokerScript.Path,'-ParentJobName',$jobName) -PathArgumentIndexes @(0,5) -Context 'broker_fresh_floor_broker')
             $job=Get-SynapseDaemonJobKernelReadback -JobName $jobName;$expectedMembers=@([uint64]$outer.ProcessId,[uint64]$broker.ProcessId)+@($childClass.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId})|Sort-Object;$actualMembers=@($job.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object)
-            if([uint32]$job.LimitFlags-ne[uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes-ne[uint64]949997568 -or [uint64]$job.JobMemoryLimitBytes-ne[uint64]949997568 -or [uint32]$job.CpuRateControlFlags-ne[uint32]0x00000005 -or [uint32]$job.CpuRate-ne[uint32]2500 -or (($expectedMembers-join ',')-cne($actualMembers-join ','))){throw "inert broker outer Job contract invalid job=$jobName"}
+            if([uint32]$job.LimitFlags-ne[uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes-ne[uint64]6700000000 -or [uint64]$job.JobMemoryLimitBytes-ne[uint64]6700000000 -or [uint32]$job.CpuRateControlFlags-ne[uint32]0x00000005 -or [uint32]$job.CpuRate-ne[uint32]2500 -or (($expectedMembers-join ',')-cne($actualMembers-join ','))){throw "inert broker outer Job contract invalid job=$jobName"}
             $LegacyGateTransition.CanonicalLease.RequireExact('fresh_floor_gate')
             $LegacyDenialTransition.CanonicalLease.RequireExact('fresh_floor_denial')
             return [pscustomobject][ordered]@{LegacyTaskAbsent=$true;BrokerTaskInert=$true;TaskInstanceCount=1;BrokerProcessCount=1;OuterBootstrapPid=[int]$outer.ProcessId;BrokerPid=[int]$broker.ProcessId;ActionProcessCount=0;TargetProcessCount=0;ListenerCount=0;SupervisorProcessCount=0;ControlGateAbsent=$true;RosterAbsent=$true;OuterJob=$job}
@@ -30241,7 +30257,7 @@ function Wait-SynapseBrokerInnerAuthorityDrained {
             $job=Get-SynapseDaemonJobKernelReadback -JobName $jobName
             $expectedMembers=@([uint64]$outer.ProcessId,[uint64]$broker.ProcessId)+@($childClass.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId})|Sort-Object
             $actualMembers=@($job.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object)
-            if([uint32]$job.LimitFlags -ne [uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes -ne [uint64]949997568 -or [uint64]$job.JobMemoryLimitBytes -ne [uint64]949997568 -or [uint32]$job.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$job.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){throw "outer_job_contract_invalid job=$jobName flags=$($job.LimitFlags) process_memory=$($job.ProcessMemoryLimitBytes) job_memory=$($job.JobMemoryLimitBytes) cpu_flags=$($job.CpuRateControlFlags) cpu_rate=$($job.CpuRate) expected_members=$($expectedMembers-join',') actual_members=$($actualMembers-join',')"}
+            if([uint32]$job.LimitFlags -ne [uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes -ne [uint64]6700000000 -or [uint64]$job.JobMemoryLimitBytes -ne [uint64]6700000000 -or [uint32]$job.CpuRateControlFlags -ne [uint32]0x00000005 -or [uint32]$job.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){throw "outer_job_contract_invalid job=$jobName flags=$($job.LimitFlags) process_memory=$($job.ProcessMemoryLimitBytes) job_memory=$($job.JobMemoryLimitBytes) cpu_flags=$($job.CpuRateControlFlags) cpu_rate=$($job.CpuRate) expected_members=$($expectedMembers-join',') actual_members=$($actualMembers-join',')"}
             return [pscustomobject][ordered]@{BrokerPid=[int]$broker.ProcessId;OuterBootstrapPid=[int]$outer.ProcessId;InnerChildCount=0;TargetProcessCount=$targets.Count;ListenerCount=$listeners.Count;PriorAuthorityRetained=([bool]$AllowPriorAuthority-and$targets.Count-eq1);PriorAuthorityAbsent=([bool]$AllowPriorAuthority-and$targets.Count-eq0);OuterJob=$job}
         }catch{
             $last=(($_.Exception.Message-replace '\s+',' ').Trim())
@@ -34196,14 +34212,14 @@ function Read-SynapseDeploymentTransactionJournal {
                 [string]$detail.generation_id -ceq [string]$initial.prior_generation.generation_id -and [int]$detail.daemon_pid -gt 0 -and
                 [int]$detail.outer_bootstrap_pid -gt 0 -and [int]$detail.broker_pid -gt 0 -and [int]$detail.inner_bootstrap_pid -gt 0 -and [int]$detail.supervisor_pid -gt 0 -and
                 [int]$detail.tool_count -eq [int]$initial.prior_generation.expected_tool_count -and [string]$detail.tool_surface_sha256 -ieq [string]$initial.prior_generation.expected_tool_surface_sha256 -and
-                [uint64]$detail.outer_job_memory_limit_bytes -eq [uint64]949997568
+                [uint64]$detail.outer_job_memory_limit_bytes -eq [uint64]6700000000
             }else{
                 $expectedDetailNames=@('prior_authority','prior_production_rehearsed','legacy_denial_probe_receipts','rehearsal','broker_identity_sha256','task_instance_count','target_process_count','listener_count','broker_process_count','outer_bootstrap_pid','broker_pid','outer_job_memory_limit_bytes')
                 $detailNames.Count -eq $expectedDetailNames.Count -and @($detailNames|Where-Object{$expectedDetailNames -cnotcontains $_}).Count -eq 0 -and
                 [bool]$detail.prior_production_rehearsed -eq $false -and [string]$detail.prior_authority -ceq 'absent' -and [string]$detail.rehearsal -ceq 'not_applicable_fresh_host' -and
                 @($detail.legacy_denial_probe_receipts).Count -eq 0 -and
                 [int]$detail.task_instance_count -eq 1 -and [int]$detail.target_process_count -eq 0 -and [int]$detail.listener_count -eq 0 -and [int]$detail.broker_process_count -eq 1 -and
-                [int]$detail.outer_bootstrap_pid -gt 0 -and [int]$detail.broker_pid -gt 0 -and [uint64]$detail.outer_job_memory_limit_bytes -eq [uint64]949997568
+                [int]$detail.outer_bootstrap_pid -gt 0 -and [int]$detail.broker_pid -gt 0 -and [uint64]$detail.outer_job_memory_limit_bytes -eq [uint64]6700000000
             }
             if (-not $rehearsalValid -or [string]$detail.broker_identity_sha256 -ine [string]$initial.broker_identity_sha256) {
                 Die "SYNAPSE_BROKER_ADOPTION_JOURNAL_REHEARSAL_INVALID root=$root sequence=$($candidateReadySlot.Sequence) rehearsed=$($detail.prior_production_rehearsed)"
@@ -37878,7 +37894,7 @@ function Test-SynapseCandidateDaemon {
                     supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
                     owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
                     bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
-                    owned_committed_private_ceiling_bytes = '1000000000'
+                    owned_committed_private_ceiling_bytes = '7000000000'
                 }
                 $candidateResourceDrift = [System.Collections.Generic.List[string]]::new()
                 foreach ($resourceName in $candidateResourceExpectations.Keys) {
@@ -38527,7 +38543,7 @@ function Test-SynapseCandidateDaemon {
                 supervisor_job_cpu_rate = [string]$SynapseSupervisorCpuRate
                 owned_combined_memory_limit_bytes = [string]$SynapseOwnedMemoryLimitBytes
                 bootstrap_preassociation_reserve_bytes = [string]$SynapseBootstrapPreAssociationReserveBytes
-                owned_committed_private_ceiling_bytes = '1000000000'
+                owned_committed_private_ceiling_bytes = '7000000000'
             }
             foreach ($name in $candidateFinalExpectations.Keys) {
                 $actual = [string]$candidateFinalState.$name

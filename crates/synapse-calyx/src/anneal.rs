@@ -33,9 +33,14 @@ const SEARCH_REPLAY_QUERIES_PER_SLOT: usize = 8;
 const SEARCH_REPLAY_PASSES: usize = 9;
 const SEARCH_REPLAY_K: usize = 3;
 
-pub(crate) fn configure_legacy_pointer_preservation(
-    preserve: bool,
-) -> Result<(), SynapseCalyxError> {
+/// Fixes the process-wide Anneal legacy-pointer preservation policy.
+///
+/// # Errors
+///
+/// Returns an invalid-config error if the policy was already configured; it is
+/// a one-shot latch so a second, possibly conflicting, decision cannot silently
+/// win.
+pub fn configure_legacy_pointer_preservation(preserve: bool) -> Result<(), SynapseCalyxError> {
     PRESERVE_LEGACY_POINTER
         .set(preserve)
         .map_err(|_| invalid_config("Anneal legacy-pointer policy was configured more than once"))
@@ -1144,6 +1149,17 @@ impl SynapseCalyxVault {
     /// Restores the unique authenticated historical Auto/12-GiB tuning
     /// artifact after an interrupted pre-commit upgrade and verifies the live
     /// pointer and artifact bytes independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Calyx error if the vault cannot be scanned or written, and an
+    /// invalid-state error unless exactly one authenticated compatible legacy
+    /// artifact exists: rollback refuses both zero and ambiguous predecessors.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic. The single `pop` below is guarded by the length check
+    /// immediately above it.
     pub fn restore_legacy_anneal_pointer_for_rollback(
         &self,
     ) -> Result<([u8; 32], [u8; 32], usize), SynapseCalyxError> {
@@ -1188,7 +1204,18 @@ impl SynapseCalyxVault {
                 "inspect the content-addressed Anneal artifacts; rollback refuses zero or ambiguous predecessors",
             ));
         }
-        let (legacy_hash, legacy_bytes) = matches.pop().expect("length checked");
+        // The length check immediately above proved exactly one match, so this
+        // cannot be empty; handle it as an error anyway rather than panicking
+        // inside a rollback path whose whole purpose is recovering from a
+        // half-applied upgrade.
+        let Some((legacy_hash, legacy_bytes)) = matches.pop() else {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_LEGACY_ARTIFACT_AMBIGUOUS",
+                "authenticated legacy tuning artifact vanished between counting and selection"
+                    .to_owned(),
+                "retry the rollback; concurrent Anneal artifact mutation is not supported",
+            ));
+        };
         let clock = self.anneal_clock()?;
         let rollback = RollbackStore::open(
             &clock,
@@ -1291,6 +1318,7 @@ fn historical_resource_policy_effective(
     bytes: &[u8],
     hash: [u8; 32],
 ) -> Result<Option<SynapseCalyxTuningConfig>, SynapseCalyxError> {
+    const HISTORICAL_AUTO_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
     let mut value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
         anneal_error(
             "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
@@ -1315,7 +1343,6 @@ fn historical_resource_policy_effective(
     let Ok(tuning) = serde_json::from_value::<SynapseCalyxTuningConfig>(value) else {
         return Ok(None);
     };
-    const HISTORICAL_AUTO_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
     if tuning.math_backend != crate::SynapseCalyxMathBackend::Auto
         || tuning.vram_budget_bytes != HISTORICAL_AUTO_VRAM_BUDGET_BYTES
     {

@@ -4,6 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,20 @@ use crate::{
 const RECOVERY_FILE_ENV: &str = "SYNAPSE_ACTION_RECOVERY_FILE";
 const DB_ENV: &str = "SYNAPSE_DB";
 const RECOVERY_FILE_NAME: &str = "action_recovery.jsonl";
+/// Durable boot stamps, sibling to the recovery ledger.
+const BOOT_HISTORY_FILE_NAME: &str = "synthetic_input_boots.json";
+/// How far back [`record_boot_and_detect_storm`] looks: 10 minutes.
+const BOOT_STORM_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// Boots within the window that constitute a storm.
+///
+/// Three is deliberately tight. A healthy daemon is restarted by an operator or
+/// an upgrade, not three times inside ten minutes; the 2026-08-25 crash loop ran
+/// at roughly seven times that rate. Erring toward "storm" only ever costs a
+/// withheld release, which the watchdog and the next clean boot can still make
+/// good, while erring the other way costs the operator control of their input.
+const BOOT_STORM_MIN_BOOTS: usize = 3;
+/// Upper bound on retained stamps, so the file cannot grow without bound.
+const BOOT_HISTORY_MAX_ENTRIES: usize = 64;
 
 static RECOVERY_LOCK: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
@@ -29,6 +44,20 @@ pub struct ActionCrashRecoveryReport {
     pub recovered_buttons: usize,
     pub recovered_pads: usize,
     pub ignored_trailing_bytes: bool,
+}
+
+/// Outcome of [`record_boot_and_detect_storm`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootStormVerdict {
+    /// Durable file the stamps live in, named so callers can log the source of
+    /// truth alongside the verdict.
+    pub history_file: PathBuf,
+    /// Boots recorded inside [`BOOT_STORM_WINDOW_MS`], including this one.
+    pub boots_in_window: usize,
+    /// The window the count was taken over, in milliseconds.
+    pub window_ms: u64,
+    /// Whether this boot is part of a storm.
+    pub storm: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -106,6 +135,88 @@ pub fn configure_crash_recovery_file(db_path: Option<&Path>) -> ActionResult<Pat
 pub fn recover_stale_inputs_from_configured_path() -> ActionResult<ActionCrashRecoveryReport> {
     let path = configured_path();
     recover_stale_inputs_at(&path)
+}
+
+/// Records this daemon boot and reports whether boots are arriving in a storm.
+///
+/// # Why this exists (operator-interference incident, 2026-08-25)
+///
+/// The startup synthetic-input sweep trades "one interrupted auto-repeat" for
+/// "no strand survives a reboot". That trade is priced on boots being rare. When
+/// the daemon crash-loops — on 2026-08-25 it OOM'd inside its Job memory cap and
+/// rebooted every ~85 seconds for hours — the same sweep becomes a process that
+/// reaches into the operator's hands several times a minute. This verdict is the
+/// circuit breaker: a storm withholds emission outright, because a strand that
+/// outlives one boot is bounded and recoverable while sustained interference
+/// with a live human is neither.
+///
+/// The history is durable and sibling to the recovery ledger, because the fact
+/// being measured — how often *this machine's* daemon has restarted — cannot be
+/// observed from inside a single generation.
+///
+/// # Errors
+///
+/// Returns `ACTION_BACKEND_UNAVAILABLE` if the history file cannot be read or
+/// written, or if the ledger path lock is poisoned.
+pub fn record_boot_and_detect_storm() -> ActionResult<BootStormVerdict> {
+    let path = boot_history_path();
+    let now_ms = unix_now_ms()?;
+    ensure_parent_dir(&path)?;
+    let mut boots = read_boot_history(&path);
+    boots.retain(|stamp| now_ms.saturating_sub(*stamp) <= BOOT_STORM_WINDOW_MS);
+    boots.push(now_ms);
+    // Trim from the front so a long-running host cannot grow the file without
+    // bound; only the storm window is ever consulted.
+    if boots.len() > BOOT_HISTORY_MAX_ENTRIES {
+        let excess = boots.len() - BOOT_HISTORY_MAX_ENTRIES;
+        boots.drain(..excess);
+    }
+    write_boot_history(&path, &boots)?;
+    let boots_in_window = boots.len();
+    Ok(BootStormVerdict {
+        history_file: path,
+        boots_in_window,
+        window_ms: BOOT_STORM_WINDOW_MS,
+        storm: boots_in_window >= BOOT_STORM_MIN_BOOTS,
+    })
+}
+
+fn boot_history_path() -> PathBuf {
+    configured_path().with_file_name(BOOT_HISTORY_FILE_NAME)
+}
+
+fn unix_now_ms() -> ActionResult<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ActionError::BackendUnavailable {
+            detail: format!("system clock is before the unix epoch: {error}"),
+        })
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Reads the durable boot history, treating any unreadable or malformed file as
+/// "no history".
+///
+/// A corrupt history must never fail the boot: the worst consequence of losing
+/// it is that one storm goes undetected, whereas refusing to start over a
+/// scratch file would be a far larger regression.
+fn read_boot_history(path: &Path) -> Vec<u64> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<u64>>(&raw).unwrap_or_default()
+}
+
+fn write_boot_history(path: &Path, boots: &[u64]) -> ActionResult<()> {
+    let encoded = serde_json::to_vec(boots).map_err(|error| ActionError::BackendUnavailable {
+        detail: format!("encode synthetic-input boot history failed: {error}"),
+    })?;
+    fs::write(path, encoded).map_err(|error| ActionError::BackendUnavailable {
+        detail: format!(
+            "write synthetic-input boot history at {} failed: {error}",
+            path.display()
+        ),
+    })
 }
 
 pub(crate) fn record_held_key(key: &Key) -> ActionResult<()> {

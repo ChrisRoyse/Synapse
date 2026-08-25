@@ -95,8 +95,8 @@ pub use rate_limit::{
     SOFTWARE_RATE_LIMIT_PER_S, TokenBucket, TokenBucketSnapshot, VIGEM_RATE_LIMIT_PER_S,
 };
 pub use recovery::{
-    ActionCrashRecoveryReport, configure_crash_recovery_file,
-    recover_stale_inputs_from_configured_path,
+    ActionCrashRecoveryReport, BootStormVerdict, configure_crash_recovery_file,
+    record_boot_and_detect_storm, recover_stale_inputs_from_configured_path,
 };
 pub use safety::install_panic_hook;
 pub use stroke::{
@@ -104,7 +104,7 @@ pub use stroke::{
     screen_point_from_path_point,
 };
 pub use synthetic_input::{
-    HeldButtonStrand, HeldKeyStrand, MODIFIER_SWEEP, SyntheticReleaseReport,
+    HeldButtonStrand, HeldKeyStrand, MODIFIER_SWEEP, StartupEvidence, SyntheticReleaseReport,
     release_all_synthetic_input, release_all_synthetic_input_on_panic,
     release_all_synthetic_input_on_startup, spawn_synthetic_input_watchdog,
 };

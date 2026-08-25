@@ -12,6 +12,16 @@ use crate::{StorageError, StorageResult};
 // retention reclamation is completion-relative and may lag expiry by at most
 // one bounded six-hour window.
 const GC_INTERVAL: Duration = Duration::from_hours(6);
+/// How long after boot the first maintenance pass runs, instead of one full
+/// cadence.
+///
+/// Three minutes is chosen from both ends. It is past the boot burst — storage
+/// open, Calyx vault open, ambient ingestion catch-up — so the pass does not
+/// compete with the work that makes the daemon answerable in the first place.
+/// And it is far beyond any crash-loop generation lifetime, so a daemon that is
+/// failing every few seconds never starts a pass it cannot finish. See the
+/// commentary in [`spawn_runner`].
+const STARTUP_CATCHUP_DELAY: Duration = Duration::from_mins(3);
 const GC_RETRY_MAX_ATTEMPTS: u32 = 5;
 const GC_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const GC_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -457,8 +467,29 @@ pub fn spawn_runner(
     let task_state = Arc::clone(&state);
     let task = handle.spawn(async move {
         let cadence = interval;
+        // First tick is a short startup catch-up, not a full cadence (2026-08-25).
+        //
+        // Scheduling the first tick a whole `cadence` out means a maintenance
+        // pass only ever runs if one daemon generation survives that long
+        // uninterrupted. At the six-hour retention cadence that is a real
+        // precondition, not a formality: a host that reboots, upgrades, or
+        // crashes more often than every six hours never reclaims anything, and
+        // retention silently degrades from "lags expiry by at most one bounded
+        // window" to "never runs". That is what happened here — CF_AGENT_TRANSCRIPTS
+        // accumulated 129,584 unreclaimed TTL-expired rows, so an ordered page
+        // had to examine 133,680 candidates to return 4,096 live ones, and the
+        // cost of those scans is what pushed the daemon over its Job memory cap
+        // and into the crash loop that never let GC run in the first place.
+        //
+        // The catch-up delay doubles as the crash-loop guard. It is long enough
+        // that a daemon dying every few seconds never reaches it — so a sick
+        // daemon cannot spend its short life re-running a pass that can take
+        // minutes — and short enough that any daemon healthy enough to serve
+        // traffic reclaims its backlog early instead of six hours from now.
+        // Tasks whose own cadence is already shorter keep it.
+        let first_tick = cadence.min(STARTUP_CATCHUP_DELAY);
         let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+            tokio::time::interval_at(tokio::time::Instant::now() + first_tick, cadence);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {

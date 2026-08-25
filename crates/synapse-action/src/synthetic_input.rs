@@ -89,11 +89,30 @@
 //!   this process never pressed — i.e. keys the operator is holding — so it
 //!   stays [bounded](win32::sweep).
 //! * The **startup** sweep runs when the mirror is empty and the strand, if any,
-//!   belongs to a dead process. Its only possible evidence is
-//!   `GetAsyncKeyState`, so it scans the [whole virtual-key
-//!   space](win32::sweep_full) (#2082 finding A1: a stranded `VK_F13` survived
-//!   the old modifier-only boot sweep while a stranded `XBUTTON2` was correctly
-//!   released, and the log still said `..._SWEEP_CLEAN`).
+//!   belongs to a dead process. `GetAsyncKeyState` alone cannot tell that strand
+//!   apart from a key the operator's hand is on, so it is never sufficient
+//!   authority to emit: the startup path takes its *ownership* evidence from the
+//!   durable cross-generation ledger ([`crate::recovery`]) and uses the
+//!   [whole-virtual-key-space scan](win32::sweep_full) only to widen a release
+//!   the ledger has already justified (#2082 finding A1: a stranded `VK_F13`
+//!   survived the old modifier-only boot sweep while a stranded `XBUTTON2` was
+//!   correctly released, and the log still said `..._SWEEP_CLEAN`).
+//!
+//! # Why the startup sweep is gated (operator-interference incident, 2026-08-25)
+//!
+//! The startup path used to release every key the scan found down, on the
+//! recorded argument that "the worst case is one interrupted auto-repeat,
+//! against a strand that survives every reboot of the daemon". That trade is
+//! only sound while daemon boots are *rare*. On 2026-08-25 the daemon entered an
+//! out-of-memory crash loop inside its 810 MB Job cap and booted every ~85
+//! seconds for hours; each boot re-ran the blind sweep and released whatever the
+//! operator was physically holding. The recorded evidence is unambiguous — boots
+//! that released `W`+`RBUTTON`, `W`+`D`+`RBUTTON`, `SPACE`, `1` and `LBUTTON`
+//! straight out of the operator's hands, while the ownership ledger reported
+//! `recovered_keys=0` on all 34 of those boots, i.e. the daemon provably held
+//! nothing. A boot storm turns "one interrupted auto-repeat" into continuous
+//! input hijacking, so the rare-boot premise is now checked rather than assumed:
+//! see [`StartupEvidence`].
 
 use std::fmt::Write as _;
 use std::sync::{
@@ -961,6 +980,35 @@ mod win32 {
         release_scanned_keys(&mut report);
         report
     }
+
+    /// The same evidence [`sweep_full`] gathers, with **nothing emitted**.
+    ///
+    /// Used by the startup path when the durable ledger does not authorize a
+    /// release. Every `*_releases_emitted` counter stays zero, and — unlike
+    /// [`sweep`] — the process-local mirror is left untouched, because this
+    /// function releases nothing and so must not tell the watchdog that anything
+    /// was released. On a fresh boot that mirror is empty anyway; keeping the
+    /// read non-destructive is what makes this safe to call from any generation.
+    pub(super) fn scan_only() -> SyntheticReleaseReport {
+        let mut report = SyntheticReleaseReport::default();
+        for (index, (vkey, _label)) in MODIFIER_SWEEP.iter().enumerate() {
+            if is_down(*vkey) {
+                report.modifiers_found_down |= 1 << index;
+            }
+        }
+        for index in 0..BUTTON_SLOTS {
+            if let Some(button) = button_from_index(index)
+                && is_down(button_virtual_key(button))
+            {
+                report.buttons_found_down |= 1 << index;
+            }
+        }
+        let (scanned_keys_found_down, scanned_keys_found_down_count) = scan_virtual_key_space();
+        report.scanned_full_virtual_key_space = true;
+        report.scanned_keys_found_down = scanned_keys_found_down;
+        report.scanned_keys_found_down_count = scanned_keys_found_down_count;
+        report
+    }
 }
 
 #[cfg(not(windows))]
@@ -980,6 +1028,10 @@ mod win32 {
     }
 
     pub(super) fn sweep_full() -> SyntheticReleaseReport {
+        SyntheticReleaseReport::default()
+    }
+
+    pub(super) fn scan_only() -> SyntheticReleaseReport {
         SyntheticReleaseReport::default()
     }
 }
@@ -1050,29 +1102,89 @@ pub fn release_all_synthetic_input_full_scan() -> SyntheticReleaseReport {
     win32::sweep_full()
 }
 
-/// Startup sweep (#2082 fix 2): release unconditionally on daemon boot and log
-/// exactly what was found still down.
+/// What the boot path knows, before it decides whether it may emit anything.
+///
+/// The startup sweep is the one release path with no authority of its own: the
+/// process-local mirror is empty by construction, so nothing it can read tells
+/// it *who* pressed a key that reads down. This type carries the two facts that
+/// do, both established by the caller before the sweep runs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StartupEvidence {
+    /// Keys the durable cross-generation ledger proved the previous generation
+    /// was still holding ([`crate::recovery::ActionCrashRecoveryReport`]).
+    pub ledger_recovered_keys: usize,
+    /// Mouse buttons the same ledger proved were still held.
+    pub ledger_recovered_buttons: usize,
+    /// Set when this boot is one of a storm — see
+    /// [`crate::recovery::boot_storm_verdict`]. A daemon that is crash-looping
+    /// re-runs this path every few seconds, which is exactly the condition that
+    /// turns a single stray release into sustained operator interference.
+    pub boot_storm: bool,
+}
+
+impl StartupEvidence {
+    /// Whether the boot path is allowed to synthesize releases at all.
+    ///
+    /// Emission requires positive proof that the previous generation died
+    /// **holding** something. Absent that, every key and button the scan reports
+    /// down belongs to the operator, and a key-up for it is not a harmless
+    /// no-op: it stops auto-repeat, delivers `WM_KEYUP`, and for a button
+    /// becomes a real click under the operator's cursor.
+    ///
+    /// A boot storm withholds emission unconditionally. A strand that outlives
+    /// one boot is a bounded, recoverable defect; a sweep that fires every few
+    /// seconds against a live human is not.
+    #[must_use]
+    pub const fn authorizes_emission(&self) -> bool {
+        !self.boot_storm && (self.ledger_recovered_keys > 0 || self.ledger_recovered_buttons > 0)
+    }
+}
+
+/// Startup sweep (#2082 fix 2, re-gated 2026-08-25): release **only** what the
+/// durable ledger proves this daemon stranded, and log exactly what was found
+/// still down either way.
 ///
 /// A daemon that starts after any unclean exit inherits whatever synthetic state
 /// the previous generation stranded, and `SendInput` state does not die with the
-/// process. The evidence is `GetAsyncKeyState` at entry — the exact readback
-/// Microsoft's `SendInput` remarks point at for this problem.
+/// process. `GetAsyncKeyState` at entry is the readback Microsoft's `SendInput`
+/// remarks point at for that problem — but it answers "what is down", never "who
+/// put it down", so on its own it cannot authorize an emission.
 ///
 /// # Scope: the whole virtual-key space (#2082 finding A1)
 ///
-/// This path runs [`release_all_synthetic_input_full_scan`], not the bounded
-/// sweep. At startup the process-local mirror is empty by construction, so the
-/// only evidence that exists is `GetAsyncKeyState` — and reading it for the 11
-/// modifiers and 5 mouse buttons alone left a stranded `VK_F13` down through
-/// boot while the log said `..._SWEEP_CLEAN`. `CLEAN` now means the scan covered
-/// every scannable virtual key and found none of them down.
+/// When `evidence` does authorize emission, this path runs
+/// [`release_all_synthetic_input_full_scan`], not the bounded sweep: reading
+/// only the 11 modifiers and 5 mouse buttons once left a stranded `VK_F13` down
+/// through boot while the log said `..._SWEEP_CLEAN`. `CLEAN` means the scan
+/// covered every scannable virtual key and found none of them down.
 ///
-/// A key the **operator** happens to be physically holding at the instant of
-/// boot also reads down and will get a key-up. That is the documented lesser
-/// evil this whole module is built on (see the module header): the worst case is
-/// one interrupted auto-repeat, against a strand that survives every reboot of
-/// the daemon.
-pub fn release_all_synthetic_input_on_startup() -> SyntheticReleaseReport {
+/// # Withholding
+///
+/// When [`StartupEvidence::authorizes_emission`] is false the scan still runs
+/// and still reports, but nothing is emitted. That is the 2026-08-25 fix: the
+/// operator's physically-held keys are no longer collateral for a strand the
+/// ledger says does not exist.
+pub fn release_all_synthetic_input_on_startup(evidence: StartupEvidence) -> SyntheticReleaseReport {
+    if !evidence.authorizes_emission() {
+        let report = win32::scan_only();
+        tracing::warn!(
+            code = "SYNTHETIC_INPUT_STARTUP_SWEEP_WITHHELD",
+            modifiers_found_down = %report.modifiers_found_down_labels(),
+            buttons_found_down = %report.buttons_found_down_labels(),
+            scanned_keys_found_down = %report.scanned_keys_found_down_labels(),
+            scanned_keys_found_down_count = report.scanned_keys_found_down_count,
+            scanned_full_virtual_key_space = report.scanned_full_virtual_key_space,
+            ledger_recovered_keys = evidence.ledger_recovered_keys,
+            ledger_recovered_buttons = evidence.ledger_recovered_buttons,
+            boot_storm = evidence.boot_storm,
+            modifier_releases_emitted = 0,
+            button_releases_emitted = 0,
+            scanned_key_releases_emitted = 0,
+            source_of_truth = "durable action recovery ledger for ownership; GetAsyncKeyState for physical state",
+            "readback=synthetic_input edge=startup no synthetic release was emitted: the durable ledger does not show this daemon holding anything (or this boot is part of a storm), so everything reading down belongs to the operator and releasing it would be interference, not recovery"
+        );
+        return report;
+    }
     let report = release_all_synthetic_input_full_scan();
     if report.found_anything_down() {
         tracing::warn!(

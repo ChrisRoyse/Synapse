@@ -2258,14 +2258,25 @@ pub const SYNAPSE_CALYX_CUDA_COMPILED: bool = calyx_forge::CUDA_COMPILED;
 ///
 /// Setup uses v2 only for a pre-commit upgrade generation whose predecessor
 /// cannot read v3; committed current generations use v3 compression.
+///
+/// # Errors
+///
+/// Returns a Calyx error if the writer format has already been fixed for this
+/// process, or if the requested version is not a supported SST format.
 pub fn configure_sst_write_version(version: u32) -> Result<(), SynapseCalyxError> {
     calyx_aster::sst::configure_sst_write_version(version)
         .map_err(|error| SynapseCalyxError::from_calyx("configure SST write version", &error))
 }
 
 /// Fixes whether this process may publish a migrated Anneal live pointer.
+///
 /// Pre-commit v2 generations preserve the authenticated predecessor-readable
 /// pointer while still using the validated CPU-only effective policy in memory.
+///
+/// # Errors
+///
+/// Returns an invalid-config error if the policy was already configured for
+/// this process.
 pub fn configure_anneal_legacy_pointer_preservation(
     preserve: bool,
 ) -> Result<(), SynapseCalyxError> {
@@ -2274,6 +2285,11 @@ pub fn configure_anneal_legacy_pointer_preservation(
 
 /// Atomically converts pre-commit v3 SST output back to the v2 format accepted
 /// by a rollback predecessor, preserving and rereading every durable row.
+///
+/// # Errors
+///
+/// Returns a Calyx error if the vault root cannot be read, if any SST cannot be
+/// rewritten atomically, or if a rewritten file fails its readback check.
 pub fn downgrade_v3_ssts_to_v2(
     vault_root: impl AsRef<std::path::Path>,
 ) -> Result<(u64, u64, u64), SynapseCalyxError> {
