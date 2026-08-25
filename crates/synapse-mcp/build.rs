@@ -288,6 +288,8 @@ fn attest_inputs(source_dir: &Path, git_dir: Option<&Path>) -> Result<InputAttes
 
     let mut manifest = Sha256::new();
     manifest.update(ATTESTATION_SCHEMA.as_bytes());
+    let mut scoped_status = Sha256::new();
+    scoped_status.update(ATTESTATION_SCHEMA.as_bytes());
     let mut changes = Vec::new();
     let mut rerun_paths = Vec::with_capacity(candidates.len() + 32);
 
@@ -300,6 +302,8 @@ fn attest_inputs(source_dir: &Path, git_dir: Option<&Path>) -> Result<InputAttes
             .get(relative)
             .cloned()
             .unwrap_or_else(|| "  ".to_owned());
+        hash_manifest_field(&mut scoped_status, relative.as_bytes());
+        hash_manifest_field(&mut scoped_status, status.as_bytes());
         if !is_tracked && status != "??" {
             return Err(format!(
                 "SYNAPSE_BUILD_INPUT_STATUS_MISSING: non-indexed candidate {relative} did not \
@@ -394,7 +398,7 @@ fn attest_inputs(source_dir: &Path, git_dir: Option<&Path>) -> Result<InputAttes
         },
         file_count: candidates.len(),
         manifest_sha256: hex_digest(manifest.finalize().as_slice()),
-        git_status_sha256: sha256_hex(&status_output.stdout),
+        git_status_sha256: hex_digest(scoped_status.finalize().as_slice()),
         changed_input_count,
         changed_input_examples_json,
         changed_input_omitted,
@@ -420,24 +424,26 @@ fn is_build_input(path: &str) -> bool {
         return true;
     }
 
-    matches!(
-        name.rsplit_once('.').map(|(_, extension)| extension),
-        Some("rs" | "cu" | "cuh" | "h" | "c" | "cpp" | "html" | "js" | "css" | "json" | "ps1")
-    )
+    let under_compiled_source = path.starts_with("crates/") || path.starts_with("calyx/crates/");
+    let under_embedded_dashboard = path.starts_with("dashboard/dist/");
+    let chrome_identity_source = path == "extensions/synapse-chrome-debugger/service_worker.js";
+    (under_compiled_source
+        && matches!(
+            name.rsplit_once('.').map(|(_, extension)| extension),
+            Some("rs" | "cu" | "cuh" | "h" | "c" | "cpp" | "html" | "js" | "css" | "json" | "ps1")
+        ))
+        || (under_embedded_dashboard
+            && matches!(
+                name.rsplit_once('.').map(|(_, extension)| extension),
+                Some("html" | "js" | "css")
+            ))
+        || chrome_identity_source
 }
 
 fn add_safe_source_boundaries(source_dir: &Path, paths: &mut Vec<PathBuf>) {
     // Directories are intentionally limited to trees without multi-GB ignored
     // build products. Cargo recursively scans a watched directory by mtime.
-    for relative in [
-        ".cargo",
-        "crates",
-        "calyx/crates",
-        "dashboard/dist",
-        "scripts",
-        "extensions",
-        "models",
-    ] {
+    for relative in [".cargo", "crates", "calyx/crates", "dashboard/dist"] {
         let path = source_dir.join(relative);
         if path.is_dir() {
             paths.push(path);

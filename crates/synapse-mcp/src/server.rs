@@ -287,6 +287,10 @@ pub(crate) mod timeline_digest;
 mod timeline_facades;
 mod timeline_query;
 mod tool_profiles;
+
+pub(crate) fn offline_tool_surface_receipt() -> anyhow::Result<serde_json::Value> {
+    tool_profiles::ImmutableToolSurface::offline_receipt()
+}
 pub(crate) mod url_redaction;
 pub(crate) mod usage_writer;
 mod verification;

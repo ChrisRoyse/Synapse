@@ -5,7 +5,13 @@ use std::{
 
 use crate::{StorageError, StorageResult};
 
-const GC_INTERVAL: Duration = Duration::from_mins(5);
+// Retention is an hours-to-days policy, while one exact Calyx reachability
+// census can traverse millions of Base rows.  Running that census every five
+// minutes kept a CPU core busy for most of the daemon lifetime on mature
+// vaults.  Pressure remains monitored independently every 30 seconds; routine
+// retention reclamation is completion-relative and may lag expiry by at most
+// one bounded six-hour window.
+const GC_INTERVAL: Duration = Duration::from_hours(6);
 const GC_RETRY_MAX_ATTEMPTS: u32 = 5;
 const GC_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const GC_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);

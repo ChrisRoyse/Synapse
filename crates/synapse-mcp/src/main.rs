@@ -260,7 +260,7 @@ const TOKIO_MAX_BLOCKING_THREADS_ENV: &str = "SYNAPSE_TOKIO_MAX_BLOCKING_THREADS
 const RAYON_WORKER_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 const STDIO_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TOKIO_WORKER_THREADS: usize = 4;
-const MAX_TOKIO_BLOCKING_THREADS: usize = 16;
+const MAX_TOKIO_BLOCKING_THREADS: usize = 8;
 const MAX_RAYON_WORKER_THREADS: usize = 4;
 const MAX_CONFIGURED_RUNTIME_THREADS: usize = 1024;
 
@@ -368,6 +368,21 @@ enum CliTransportPreflight {
     Http(SocketAddr),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SstWriteVersion {
+    V2,
+    V3,
+}
+
+impl SstWriteVersion {
+    const fn number(self) -> u32 {
+        match self {
+            Self::V2 => 2,
+            Self::V3 => 3,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "synapse-mcp", version, about = "Synapse MCP daemon")]
 #[expect(
@@ -446,6 +461,31 @@ struct Cli {
         requires = "calyx_config"
     )]
     calyx_config_sha256: Option<String>,
+    /// SST format emitted by this process. Setup pins pre-commit upgrade
+    /// rehearsals to v2 so a v2-only predecessor remains a valid rollback;
+    /// committed generations use the compressed v3 default.
+    #[arg(
+        long,
+        env = "SYNAPSE_CALYX_SST_WRITE_VERSION",
+        value_enum,
+        default_value_t = SstWriteVersion::V3
+    )]
+    calyx_sst_write_version: SstWriteVersion,
+    /// Offline, atomic rollback repair for a vault touched by a pre-commit v3
+    /// candidate. Rewrites only v3 SSTs to v2, verifies every row, prints one
+    /// JSON receipt, and exits without starting any transport or subsystem.
+    #[arg(long, requires = "db", conflicts_with = "parent_pid")]
+    calyx_downgrade_sst_v2_and_exit: bool,
+    /// Offline, authenticated restoration of the unique historical Anneal
+    /// tuning pointer needed by a rollback predecessor.
+    #[arg(long, requires = "db", conflicts_with = "parent_pid")]
+    calyx_restore_legacy_anneal_pointer_and_exit: bool,
+    /// Print the exact immutable public MCP tool-surface fingerprint and exit.
+    /// This path constructs schemas only: it opens no DB, listener, model, or
+    /// capture subsystem. Setup uses it to seal a candidate's own surface into
+    /// the adoption journal before the incumbent authority is mutated.
+    #[arg(long, conflicts_with_all = ["parent_pid", "calyx_downgrade_sst_v2_and_exit", "calyx_restore_legacy_anneal_pointer_and_exit"])]
+    print_tool_surface_receipt_and_exit: bool,
     #[arg(
         long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
@@ -695,6 +735,77 @@ async fn run(
     }
 
     let cli = Cli::parse();
+    if cli.print_tool_surface_receipt_and_exit {
+        println!("{}", server::offline_tool_surface_receipt()?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    synapse_calyx::configure_sst_write_version(cli.calyx_sst_write_version.number())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    synapse_calyx::configure_anneal_legacy_pointer_preservation(
+        cli.calyx_sst_write_version == SstWriteVersion::V2,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if cli.calyx_downgrade_sst_v2_and_exit {
+        if cli.calyx_sst_write_version != SstWriteVersion::V2 {
+            anyhow::bail!(
+                "SYNAPSE_CALYX_SST_DOWNGRADE_WRITE_VERSION_INVALID: --calyx-downgrade-sst-v2-and-exit requires --calyx-sst-write-version v2"
+            );
+        }
+        let db = cli
+            .db
+            .as_deref()
+            .context("--db is required for --calyx-downgrade-sst-v2-and-exit")?;
+        let (rewritten_files, input_bytes, output_bytes) =
+            synapse_calyx::downgrade_v3_ssts_to_v2(db)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "synapse_calyx_sst_downgrade_receipt/v1",
+                "db": db,
+                "from_version": 3,
+                "to_version": 2,
+                "rewritten_files": rewritten_files,
+                "input_bytes": input_bytes,
+                "output_bytes": output_bytes,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if cli.calyx_restore_legacy_anneal_pointer_and_exit {
+        if cli.calyx_sst_write_version != SstWriteVersion::V2 {
+            anyhow::bail!(
+                "SYNAPSE_CALYX_ANNEAL_RESTORE_WRITE_VERSION_INVALID: --calyx-restore-legacy-anneal-pointer-and-exit requires --calyx-sst-write-version v2"
+            );
+        }
+        let db = cli
+            .db
+            .as_deref()
+            .context("--db is required for --calyx-restore-legacy-anneal-pointer-and-exit")?;
+        let vault = synapse_calyx::SynapseCalyxVault::open_latest_readback(
+            synapse_calyx::SynapseCalyxConfig::from_vault_dir(db.to_path_buf()),
+        )?;
+        let (from_hash, to_hash, artifact_bytes) =
+            vault.restore_legacy_anneal_pointer_for_rollback()?;
+        let encode_hash = |hash: [u8; 32]| {
+            use std::fmt::Write as _;
+            hash.iter()
+                .fold(String::with_capacity(64), |mut out, byte| {
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                })
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "synapse_calyx_anneal_legacy_pointer_restore_receipt/v1",
+                "db": db,
+                "from_artifact_sha256": encode_hash(from_hash),
+                "to_artifact_sha256": encode_hash(to_hash),
+                "artifact_bytes": artifact_bytes,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // Validate the only transport-specific daemon argument immediately after
     // CLI decoding. This must precede even telemetry initialization: rejected
@@ -967,7 +1078,15 @@ fn configure_telemetry_from_level(log_level: &str) -> anyhow::Result<TelemetryGu
     init_tracing(TelemetryConfig {
         log_dir,
         file_level: level,
-        console_level: level,
+        // The persistent supervisor redirects stderr to a separate crash log.
+        // Mirroring the INFO firehose there duplicated the complete structured
+        // log and produced 200-330 MiB single-generation stderr files. Preserve
+        // actionable warnings/errors on stderr while keeping routine evidence
+        // in the bounded hourly file sink.
+        console_level: match level {
+            LevelFilter::OFF | LevelFilter::ERROR => level,
+            _ => LevelFilter::WARN,
+        },
         ..TelemetryConfig::default()
     })
     .context("initialize telemetry")

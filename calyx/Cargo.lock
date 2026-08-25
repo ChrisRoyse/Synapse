@@ -398,6 +398,7 @@ dependencies = [
  "ulid",
  "windows-sys 0.61.2",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]

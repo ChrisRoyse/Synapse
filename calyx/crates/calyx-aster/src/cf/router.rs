@@ -18,7 +18,11 @@ use std::time::Instant;
 
 mod queries;
 
-const DEFAULT_MEMTABLE_BYTES: usize = 8 * 1024 * 1024;
+/// Per-CF cap chosen so a fully exercised ~100-family vault stays near the
+/// 128-MiB aggregate active-memtable budget. Large values here multiplied by
+/// column-family count and quietly turned a nominal 8-MiB setting into a
+/// several-hundred-MiB process commitment.
+const DEFAULT_MEMTABLE_BYTES: usize = 1024 * 1024;
 
 /// A poisoned shard names the column family that reached it, because "the
 /// router lock is poisoned" used to be true of one lock and is now true of one
@@ -90,7 +94,7 @@ impl RouterPutCost {
 /// unnoticed failure to drain becomes a loud, bounded error instead of
 /// unbounded memory growth — RocksDB's `max_write_buffer_number` stall serves
 /// the same purpose.
-const MAX_SEALED_MEMTABLES_PER_CF: usize = 8;
+const MAX_SEALED_MEMTABLES_PER_CF: usize = 2;
 
 /// How far below the configured cap a column family's own seal point may sit,
 /// as a percentage. See [`RouterConfig::cf_memtable_cap`].
@@ -313,9 +317,8 @@ impl RouterConfig {
     }
 
     pub(super) fn retains_lookup(&self, cf: ColumnFamily) -> bool {
-        cf == ColumnFamily::Kv
-            || (self.eager_lookup_on_open
-                && (self.selected_lookup_is_universal || cf.retains_eager_lookup()))
+        self.eager_lookup_on_open
+            && (self.selected_lookup_is_universal || cf.retains_eager_lookup())
     }
 
     pub(super) fn cf_dir(&self, cf: ColumnFamily) -> PathBuf {
@@ -968,6 +971,23 @@ impl CfRouter {
             .iter()
             .flat_map(|shard| shard.memtables.iter())
             .map(|(cf, table)| (*cf, table.usage()))
+            .collect::<Vec<_>>();
+        usage.sort_by_key(|left| left.0.name());
+        usage
+    }
+
+    /// Exact decoded full-index retention by column family.
+    pub fn retained_lookup_usage_by_cf(
+        &self,
+    ) -> Vec<(ColumnFamily, crate::sst::level::RetainedLookupStatus)> {
+        let guards = self
+            .read_all_shards()
+            .expect("CF router shard poisoned during retained lookup census");
+        let mut usage = guards
+            .iter()
+            .flat_map(|shard| shard.levels.iter())
+            .map(|(cf, level)| (*cf, level.retained_lookup_status()))
+            .filter(|(_cf, status)| status.files != 0)
             .collect::<Vec<_>>();
         usage.sort_by_key(|left| left.0.name());
         usage

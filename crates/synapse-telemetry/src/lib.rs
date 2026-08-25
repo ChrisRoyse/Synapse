@@ -19,7 +19,7 @@ use tracing_subscriber::{
 
 pub mod metrics;
 
-const DEFAULT_MAX_DIR_BYTES: u64 = 500 * 1024 * 1024;
+const DEFAULT_MAX_DIR_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_KEEP_DAYS: u32 = 7;
 // #1818: matched to the hourly rotation boundary. At six hours a crash loop
 // could add tens of gigabytes between collections even with a byte budget set.

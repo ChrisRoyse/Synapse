@@ -17,6 +17,16 @@ pub struct SstLevel {
     pub(super) files: Vec<LevelFile>,
 }
 
+/// Heap owned by decoded full-key lookup indexes retained in one router level.
+/// Bounds/Bloom/sparse metadata is deliberately excluded: this gauge exists to
+/// expose the unbounded representation whose size follows immutable history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainedLookupStatus {
+    pub files: usize,
+    pub entries: usize,
+    pub estimated_heap_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LevelFile {
     pub(super) path: PathBuf,
@@ -248,6 +258,24 @@ impl LevelFile {
 impl SstLevel {
     pub fn new() -> Self {
         Self { files: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn retained_lookup_status(&self) -> RetainedLookupStatus {
+        let mut status = RetainedLookupStatus::default();
+        for file in &self.files {
+            if !file.lookup_retained {
+                continue;
+            }
+            status.files = status.files.saturating_add(1);
+            if let Some(lookup) = &file.lookup {
+                status.entries = status.entries.saturating_add(lookup.len());
+                status.estimated_heap_bytes = status
+                    .estimated_heap_bytes
+                    .saturating_add(lookup.estimated_heap_bytes());
+            }
+        }
+        status
     }
 
     pub fn from_oldest_first(files: impl IntoIterator<Item = PathBuf>) -> Result<Self> {

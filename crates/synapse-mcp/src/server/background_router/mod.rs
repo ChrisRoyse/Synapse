@@ -8776,6 +8776,17 @@ fn target_act_input_provenance(
         if status == TARGET_ACT_STATUS_REFUSED {
             return Ok(Vec::new());
         }
+        if status == TARGET_ACT_STATUS_VERIFY_NEEDED {
+            tracing::warn!(
+                code = "TARGET_ACT_DELIVERY_UNVERIFIED",
+                verb,
+                delegated_tool,
+                status,
+                target = ?context.map(InputProvenanceContext::target),
+                "input may have been delivered, but no validated provenance record is available; preserve the delegated result and require an independent Source-of-Truth readback"
+            );
+            return Ok(Vec::new());
+        }
         return Err(input_provenance_error(
             "target_act_failed_input_delivery",
             format!(

@@ -35,7 +35,10 @@ pub const LIVE_COMPACTION_MAX_INPUT_FILES: usize = 32_768;
 /// Selection is bounded by both bytes and files. The byte bound controls
 /// checksum I/O and logical merge memory while the independent file bound
 /// protects metadata/heap growth for extremely small SSTs.
-pub const LIVE_COMPACTION_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+/// Bound each maintenance step independently of total vault size.  Two output
+/// targets provide useful fan-out reduction while leaving headroom for the
+/// router, ledger checkpoint, and output encoder under the hard Job cap.
+pub const LIVE_COMPACTION_MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 /// Proactive native-CF fan-out trigger. This intentionally leaves 25% of the
 /// range-page source budget as headroom for concurrent memtable flushes.
 pub const LIVE_COMPACTION_TRIGGER_FILES: usize =
@@ -65,6 +68,14 @@ pub const TINY_FILE_COMPACTION_AVG_BYTES_CEILING: u64 = 1024 * 1024;
 /// pass drains the same vault in under an hour; each CF fold is bounded by
 /// `LIVE_COMPACTION_MAX_INPUT_FILES`/`_BYTES` and runs off the commit lock.
 pub const ROUTINE_COMPACTION_CFS_PER_PASS: usize = 8;
+
+/// Aggregate active-SST footprint targets for a lightweight workstation.
+/// Maintenance remains single-threaded and rewrites at most one bounded
+/// 256-MiB window per selected CF, so crossing a limit increases progress,
+/// not instantaneous CPU/RAM fan-out.
+pub const VAULT_PHYSICAL_SOFT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+pub const VAULT_PHYSICAL_HARD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const VAULT_PHYSICAL_EMERGENCY_BYTES: u64 = 7 * 1024 * 1024 * 1024;
 
 /// Whether a CF's pending fan-out qualifies as tiny-file debt: enough files to
 /// matter and an average file size far below one rolled output.
@@ -173,7 +184,7 @@ where
             cf = cf.name(),
             "captured native compaction input view without retaining the durable commit lock"
         );
-        self.compact_catalog_cf_batch(durable, &catalog, durable_seq, cf, max_input_files)
+        self.compact_catalog_cf_batch(durable, &catalog, durable_seq, cf, max_input_files, false)
             .map(Some)
     }
 
@@ -320,13 +331,48 @@ where
             durable_seq,
         )?;
         let catalog_scan_ms = catalog_started.elapsed().as_millis();
-        let mut candidates = catalog
+        let all_debts = catalog
             .column_families()
             .into_iter()
             .map(|cf| (cf, catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES)))
+            .collect::<Vec<_>>();
+        let physical_sst_bytes = all_debts
+            .iter()
+            .map(|(_cf, debt)| debt.pending_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let pressure_cf_budget =
+            if readiness_only || physical_sst_bytes <= VAULT_PHYSICAL_SOFT_BYTES {
+                0
+            } else if physical_sst_bytes > VAULT_PHYSICAL_EMERGENCY_BYTES {
+                4
+            } else if physical_sst_bytes > VAULT_PHYSICAL_HARD_BYTES {
+                2
+            } else {
+                1
+            };
+        let mut pressure_ranked = all_debts
+            .iter()
+            .filter(|(_cf, debt)| debt.pending_files >= 2)
+            .cloned()
+            .collect::<Vec<_>>();
+        pressure_ranked.sort_by(|left, right| {
+            right
+                .1
+                .pending_bytes
+                .cmp(&left.1.pending_bytes)
+                .then_with(|| left.0.name().cmp(&right.0.name()))
+        });
+        let pressure_cfs = pressure_ranked
+            .into_iter()
+            .take(pressure_cf_budget)
+            .map(|(cf, _debt)| cf)
+            .collect::<Vec<_>>();
+        let mut candidates = all_debts
+            .into_iter()
             .filter(|(_cf, debt)| {
                 debt.score_milli >= 1_000
                     || is_tiny_file_fanout_debt(debt.pending_files, debt.pending_bytes)
+                    || pressure_cfs.contains(_cf)
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -350,7 +396,9 @@ where
         let selected = candidates
             .into_iter()
             .filter(|(cf, debt)| {
-                debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES || routine_cfs.contains(cf)
+                debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES
+                    || routine_cfs.contains(cf)
+                    || pressure_cfs.contains(cf)
             })
             .collect::<Vec<_>>();
         tracing::info!(
@@ -360,6 +408,12 @@ where
             catalog_scan_ms,
             readiness_only,
             selected_cfs = selected.len(),
+            physical_sst_bytes,
+            physical_soft_bytes = VAULT_PHYSICAL_SOFT_BYTES,
+            physical_hard_bytes = VAULT_PHYSICAL_HARD_BYTES,
+            physical_emergency_bytes = VAULT_PHYSICAL_EMERGENCY_BYTES,
+            pressure_cf_budget,
+            pressure_cfs = ?pressure_cfs.iter().map(|cf| cf.name()).collect::<Vec<_>>(),
             max_input_files_per_cf = LIVE_COMPACTION_MAX_INPUT_FILES,
             max_input_bytes_per_cf = LIVE_COMPACTION_MAX_INPUT_BYTES,
             target_files_per_cf = DEFAULT_COMPACTION_TARGET_FILES,
@@ -386,6 +440,7 @@ where
                     durable_seq,
                     cf,
                     LIVE_COMPACTION_MAX_INPUT_FILES,
+                    pressure_cfs.contains(&cf),
                 )?;
                 let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
                 let made_progress = after.pending_files < before.pending_files;
@@ -462,6 +517,7 @@ where
         durable_seq: u64,
         cf: ColumnFamily,
         max_input_files: usize,
+        allow_space_reclaim: bool,
     ) -> Result<CompactionResult> {
         let all_inputs = catalog.shards_for_cf(cf);
         let before_files = all_inputs.len();
@@ -470,6 +526,7 @@ where
             max_input_files,
             LIVE_COMPACTION_MAX_INPUT_BYTES,
             DEFAULT_COMPACTION_TARGET_BYTES,
+            allow_space_reclaim,
         ) else {
             tracing::info!(
                 code = "CALYX_ASTER_NATIVE_CF_COMPACTION_NO_PRODUCTIVE_WINDOW",
@@ -520,8 +577,24 @@ where
             selected_inputs.len(),
         )?;
         if let CompactionResult::Compacted(report) = &mut result {
-            if report.output_paths.len() >= report.input_files {
+            let reclaimed_meaningful_bytes =
+                report.output_bytes.saturating_mul(100) <= report.input_bytes.saturating_mul(95);
+            if report.output_paths.len() >= report.input_files && !reclaimed_meaningful_bytes {
                 cleanup_unproductive_outputs(report)?;
+                if allow_space_reclaim {
+                    tracing::info!(
+                        code = "CALYX_ASTER_SPACE_RECLAIM_NO_AMPLIFICATION",
+                        cf = cf.name(),
+                        input_files = report.input_files,
+                        input_bytes = report.input_bytes,
+                        output_files = report.output_paths.len(),
+                        output_bytes = report.output_bytes,
+                        "space-pressure probe found less than five percent reclaimable bytes; staged outputs were removed and authoritative inputs preserved"
+                    );
+                    return Ok(CompactionResult::Skipped {
+                        debt: catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES),
+                    });
+                }
                 return Err(CalyxError {
                     code: "CALYX_ASTER_COMPACTION_NO_FILE_REDUCTION",
                     message: format!(
@@ -769,6 +842,7 @@ where
                 durable_seq,
                 cf,
                 LIVE_COMPACTION_MAX_INPUT_FILES,
+                false,
             )?;
             let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
             if after.pending_files >= before.pending_files {
@@ -855,6 +929,7 @@ where
                     durable_seq,
                     cf,
                     LIVE_COMPACTION_MAX_INPUT_FILES,
+                    false,
                 )?;
                 let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
                 if after.pending_files >= before.pending_files {
@@ -1408,6 +1483,7 @@ fn productive_compaction_window(
     max_input_files: usize,
     max_input_bytes: u64,
     output_target_bytes: u64,
+    allow_space_reclaim: bool,
 ) -> Option<ProductiveCompactionWindow> {
     if inputs.len() < 2 || max_input_files < 2 || max_input_bytes == 0 {
         return None;
@@ -1454,7 +1530,7 @@ fn productive_compaction_window(
         let estimated_output_files_u64 = bytes.div_ceil(output_target_bytes).max(1);
         let estimated_output_files =
             usize::try_from(estimated_output_files_u64).unwrap_or(usize::MAX);
-        if estimated_output_files >= files {
+        if estimated_output_files >= files && !allow_space_reclaim {
             continue;
         }
         let candidate = ProductiveCompactionWindow {

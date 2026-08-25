@@ -275,6 +275,8 @@ pub struct SubsystemHealth {
     pub storage_pressure_probe_observed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_last_free_bytes: Option<u64>,
+    /// Total bytes on the volume used to derive percentage-aware pressure.
+    pub storage_pressure_last_total_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_last_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -568,6 +570,9 @@ pub struct SubsystemHealth {
     pub calyx_sst_reader_cache_max_estimated_heap_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_sst_reader_cache_max_mapped_bytes: Option<u64>,
+    pub calyx_retained_lookup_files: Option<u64>,
+    pub calyx_retained_lookup_entries: Option<u64>,
+    pub calyx_retained_lookup_estimated_heap_bytes: Option<u64>,
     /// #1883: every configurable Calyx tuning knob, each reported WITH whether
     /// anything actually reads it. The nine `calyx_*` knobs that used to be
     /// printed here as bare numbers were validated, lowered and echoed, and read

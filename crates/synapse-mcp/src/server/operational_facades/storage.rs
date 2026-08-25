@@ -999,6 +999,12 @@ pub(super) async fn handle(
                 published_after: report.published_after.clone(),
                 active_panel_version: report.active_panel_version,
             };
+            // The physical operation above has already re-enumerated the index
+            // root and proved this exact generation absent.  Converge the
+            // process-published health sweep immediately instead of reporting
+            // the deleted directory as retirable until the next maintenance
+            // tick.
+            synapse_storage::derived_state::note_search_generation_retired(panel_version);
             Ok(Json(storage_response(
                 operation,
                 format!(

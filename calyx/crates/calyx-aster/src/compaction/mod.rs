@@ -15,7 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// Default per-CF compaction target used for debt scoring (PRD 24 §8).
-pub const DEFAULT_COMPACTION_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Keep one rolled output small enough that the writer's row buffer plus its
+/// transient encoded/index representation cannot consume the daemon's entire
+/// runtime memory budget.  The old 64 MiB target allowed a single compaction
+/// to hold several target-sized representations concurrently and repeatedly
+/// hit the Windows Job commit limit on a large vault.
+pub const DEFAULT_COMPACTION_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 /// File-count ceiling used for live fan-out admission. Tiny commit SSTs can
 /// create severe read/recovery amplification while remaining far below the
 /// per-output byte target; total logical CF bytes are not themselves

@@ -541,6 +541,27 @@ impl ImmutableToolSurface {
             schema_parity,
         })
     }
+
+    pub(super) fn offline_receipt() -> anyhow::Result<Value> {
+        let router = SynapseService::tool_router();
+        let surface = Self::from_tool_router(&router)?;
+        let public_tools = surface
+            .tools
+            .iter()
+            .filter(|tool| PUBLIC_TOOL_NAMES.contains(&tool.name.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let public_fingerprint = super::health::tool_surface_fingerprint_for_tools(public_tools);
+        if let Some(error) = public_fingerprint.error.as_deref() {
+            anyhow::bail!("MCP_OFFLINE_PUBLIC_TOOL_SURFACE_BUILD_FAILED: {error}");
+        }
+        Ok(json!({
+            "schema": "synapse_mcp_offline_tool_surface_receipt/v1",
+            "tool_count": public_fingerprint.names.len(),
+            "tool_names": public_fingerprint.names,
+            "tool_surface_sha256": public_fingerprint.sha256,
+        }))
+    }
 }
 
 #[derive(Debug)]

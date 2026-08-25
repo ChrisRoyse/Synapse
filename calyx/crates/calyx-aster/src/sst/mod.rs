@@ -34,7 +34,14 @@ pub const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
 /// See issue #1809: two daemon crashes at the shared abort trampoline, both with
 /// `SstReader::range` -> `RawVec::grow_one` -> `handle_alloc_error` on the
 /// faulting rayon worker.
-pub(super) const MAX_RANGE_SCAN_BYTES: usize = 1 << 30;
+/// Hard ceiling for one materialized SST row/range/level merge.
+///
+/// The former 1 GiB limit allowed one malformed or unbounded request to consume
+/// the daemon's entire supported memory envelope before the allocation was
+/// refused. Normal SSTs target 64 MiB, so 128 MiB preserves room for one full
+/// input plus merge/output bookkeeping while keeping the process comfortably
+/// below the 1 GiB host budget.
+pub(super) const MAX_RANGE_SCAN_BYTES: usize = 128 << 20;
 
 /// Fail-closed error for a range scan that would exceed [`MAX_RANGE_SCAN_BYTES`].
 fn scan_budget_exceeded(scanned: usize, next_record: usize) -> CalyxError {
@@ -66,20 +73,50 @@ pub(super) fn scan_reserve_failed(err: std::collections::TryReserveError) -> Cal
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
 use calyx_core::{CalyxError, Result};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use io_helpers::{record_crc, section_crc};
 pub(crate) use point_read::{SstPageReader, SstPointReader, SstStreamingReader};
 
 const MAGIC: &[u8; 4] = b"CXS1";
 const LEGACY_VERSION: u32 = 1;
-const VERSION: u32 = 2;
+const CHECKSUMMED_VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_LEN: usize = 32;
 const RECORD_HEADER_LEN: usize = 12;
+const COMPRESSED_RECORD_HEADER_LEN: usize = 16;
 const INDEX_ENTRY_FIXED_LEN: usize = 12;
+const SST_ZSTD_LEVEL: i32 = 3;
+const MIN_COMPRESSION_INPUT_BYTES: usize = 256;
+const MIN_COMPRESSION_SAVINGS_BYTES: usize = 32;
+static SST_WRITE_VERSION: AtomicU32 = AtomicU32::new(VERSION);
+static SST_WRITES_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Selects the SST format emitted by this process before its first SST write.
+///
+/// Version 2 exists only as an upgrade-transaction compatibility fence: a
+/// pre-commit candidate can be rolled back to a v2-only predecessor without
+/// leaving unreadable v3 files behind. Readers always accept v1, v2, and v3;
+/// committed current generations use v3 compression.
+pub fn configure_sst_write_version(version: u32) -> Result<()> {
+    if version != CHECKSUMMED_VERSION && version != VERSION {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "unsupported configured SST write version {version}; expected 2 or 3"
+        )));
+    }
+    if SST_WRITES_STARTED.load(Ordering::Acquire) {
+        return Err(CalyxError::aster_corrupt_shard(
+            "SST write version cannot change after the first process write",
+        ));
+    }
+    SST_WRITE_VERSION.store(version, Ordering::Release);
+    Ok(())
+}
 
 /// Metadata returned after writing an SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +248,7 @@ impl SstLookupMetadata {
 #[derive(Debug)]
 pub struct SstReader {
     column: MmapColumn,
+    version: u32,
     index: Vec<IndexEntry>,
     bloom: BloomFilter,
 }
@@ -220,18 +258,35 @@ pub fn write_sst<'a>(
     path: impl AsRef<Path>,
     entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
 ) -> Result<SstSummary> {
+    SST_WRITES_STARTED.store(true, Ordering::Release);
+    let write_version = SST_WRITE_VERSION.load(Ordering::Acquire);
     let path = path.as_ref();
     let entries: Vec<_> = entries
         .into_iter()
         .map(|(key, value)| (key.to_vec(), value.to_vec()))
         .collect();
-    ensure_sorted(&entries)?;
+    let (bytes, index_offset, bloom_offset) = encode_sst(&entries, write_version)?;
+    crate::fsync::write_atomic_create_new(path, &bytes, "SST")?;
+
+    Ok(SstSummary {
+        path: path.to_path_buf(),
+        entries: entries.len(),
+        bytes: bytes.len() as u64,
+        index_offset,
+        bloom_offset,
+        first_key: entries.first().map(|(key, _)| key.clone()),
+        last_key: entries.last().map(|(key, _)| key.clone()),
+    })
+}
+
+fn encode_sst(entries: &[(Vec<u8>, Vec<u8>)], write_version: u32) -> Result<(Vec<u8>, u64, u64)> {
+    ensure_sorted(entries)?;
 
     let mut bytes = vec![0u8; HEADER_LEN];
     let mut index = Vec::with_capacity(entries.len());
-    for (key, value) in &entries {
+    for (key, value) in entries {
         let offset = bytes.len() as u64;
-        write_record(&mut bytes, key, value)?;
+        write_record(&mut bytes, key, value, write_version)?;
         index.push(IndexEntry {
             key: key.clone(),
             offset,
@@ -249,19 +304,105 @@ pub fn write_sst<'a>(
         index_offset,
         bloom_offset,
         body_crc,
+        write_version,
     );
 
-    crate::fsync::write_atomic_create_new(path, &bytes, "SST")?;
+    Ok((bytes, index_offset, bloom_offset))
+}
 
-    Ok(SstSummary {
-        path: path.to_path_buf(),
-        entries: entries.len(),
-        bytes: bytes.len() as u64,
-        index_offset,
-        bloom_offset,
-        first_key: entries.first().map(|(key, _)| key.clone()),
-        last_key: entries.last().map(|(key, _)| key.clone()),
-    })
+/// Atomically rewrites every v3 SST below a vault root into the v2 checksummed
+/// representation while preserving the complete ordered row stream.
+///
+/// This is the rollback half of the v3 compression migration contract.  A
+/// pre-commit candidate normally emits v2 directly; this operation repairs a
+/// vault touched by an older candidate that emitted v3 before authority
+/// transfer. Each file is fully CRC/decompression validated, encoded in
+/// memory under the ordinary 128 MiB SST scan ceiling, atomically replaced,
+/// reopened, and compared row-for-row before the next file is touched.
+pub fn downgrade_v3_ssts_to_v2(vault_root: impl AsRef<Path>) -> Result<(u64, u64, u64)> {
+    if SST_WRITES_STARTED.swap(true, Ordering::AcqRel) {
+        return Err(CalyxError::aster_corrupt_shard(
+            "SST downgrade must run before any process SST write",
+        ));
+    }
+    SST_WRITE_VERSION.store(CHECKSUMMED_VERSION, Ordering::Release);
+    let root = vault_root.as_ref();
+    let mut pending = Vec::new();
+    collect_sst_paths(root, &mut pending)?;
+    pending.sort();
+    let mut rewritten = 0_u64;
+    let mut input_bytes = 0_u64;
+    let mut output_bytes = 0_u64;
+    for path in pending {
+        let reader = SstReader::open(&path)?;
+        if reader.version != VERSION {
+            continue;
+        }
+        let rows = reader.iter()?;
+        let before = std::fs::metadata(&path)
+            .map_err(|error| {
+                CalyxError::disk_pressure(format!(
+                    "stat SST {} before downgrade: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        let owned = rows
+            .iter()
+            .map(|row| (row.key.clone(), row.value.clone()))
+            .collect::<Vec<_>>();
+        let (encoded, _, _) = encode_sst(&owned, CHECKSUMMED_VERSION)?;
+        drop(reader);
+        crate::fsync::write_atomic_replace(&path, &encoded, "SST v3 to v2 downgrade")?;
+        let verified = SstReader::open(&path)?;
+        if verified.version != CHECKSUMMED_VERSION || verified.iter()? != rows {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST downgrade readback mismatch: {}",
+                path.display()
+            )));
+        }
+        rewritten = rewritten.saturating_add(1);
+        input_bytes = input_bytes.saturating_add(before);
+        output_bytes = output_bytes.saturating_add(encoded.len() as u64);
+    }
+    Ok((rewritten, input_bytes, output_bytes))
+}
+
+fn collect_sst_paths(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(root).map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "read SST downgrade root {}: {error}",
+            root.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CalyxError::disk_pressure(format!("read SST downgrade entry: {error}"))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            CalyxError::disk_pressure(format!(
+                "read SST downgrade entry type {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if file_type.is_symlink() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST downgrade refuses symlink/reparse entry: {}",
+                entry.path().display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_sst_paths(&entry.path(), output)?;
+        } else if file_type.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"))
+        {
+            output.push(entry.path());
+        }
+    }
+    Ok(())
 }
 
 impl SstReader {
@@ -282,6 +423,7 @@ impl SstReader {
         let bloom = BloomFilter::decode(bloom_bytes)?;
         Ok(Self {
             column,
+            version: header.version,
             index,
             bloom,
         })
@@ -298,7 +440,12 @@ impl SstReader {
             return Ok(None);
         };
         Ok(Some(
-            read_record(self.column.as_bytes(), self.index[position].offset)?.value,
+            read_record(
+                self.column.as_bytes(),
+                self.index[position].offset,
+                self.version,
+            )?
+            .value,
         ))
     }
 
@@ -341,8 +488,8 @@ impl SstReader {
             if end.is_some_and(|end| entry.key.as_slice() >= end) {
                 break;
             }
-            let record = read_record_ref(self.column.as_bytes(), entry.offset)?;
-            visit(record.key, record.value)?;
+            let record = read_record_ref(self.column.as_bytes(), entry.offset, self.version)?;
+            visit(record.key, record.value.as_ref())?;
         }
         Ok(())
     }
@@ -384,7 +531,7 @@ impl SstReader {
             .map(|entry| {
                 Ok((
                     entry.offset,
-                    read_record(self.column.as_bytes(), entry.offset)?,
+                    read_record(self.column.as_bytes(), entry.offset, self.version)?,
                 ))
             })
             .collect()
@@ -669,11 +816,12 @@ pub(super) fn clone_scan_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
 
 struct SstRecordRef<'a> {
     key: &'a [u8],
-    value: &'a [u8],
+    value: Cow<'a, [u8]>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Header {
+    version: u32,
     entries: u32,
     index_offset: u64,
     bloom_offset: u64,
@@ -688,52 +836,124 @@ fn ensure_sorted(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
     Ok(())
 }
 
-fn write_record(out: &mut Vec<u8>, key: &[u8], value: &[u8]) -> Result<()> {
+fn write_record(out: &mut Vec<u8>, key: &[u8], value: &[u8], version: u32) -> Result<()> {
     let key_len = u32::try_from(key.len())
         .map_err(|_| CalyxError::disk_pressure("SST key length exceeds u32"))?;
     let value_len = u32::try_from(value.len())
         .map_err(|_| CalyxError::disk_pressure("SST value length exceeds u32"))?;
     let crc = record_crc(key, value);
+    let compressed = if version >= VERSION && value.len() >= MIN_COMPRESSION_INPUT_BYTES {
+        let candidate = zstd::bulk::compress(value, SST_ZSTD_LEVEL).map_err(|error| CalyxError {
+            code: "CALYX_ASTER_SST_COMPRESSION_FAILED",
+            message: format!("Zstandard failed while encoding an SST value: {error}"),
+            remediation: "preserve the memtable and inspect the exact compression failure; no SST was published",
+        })?;
+        (candidate
+            .len()
+            .saturating_add(MIN_COMPRESSION_SAVINGS_BYTES)
+            < value.len())
+        .then_some(candidate)
+    } else {
+        None
+    };
+    let stored = compressed.as_deref().unwrap_or(value);
+    let stored_len = u32::try_from(stored.len())
+        .map_err(|_| CalyxError::disk_pressure("compressed SST value length exceeds u32"))?;
     out.extend_from_slice(&key_len.to_le_bytes());
-    out.extend_from_slice(&value_len.to_le_bytes());
+    out.extend_from_slice(&stored_len.to_le_bytes());
+    if version >= VERSION {
+        out.extend_from_slice(&value_len.to_le_bytes());
+    }
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(key);
-    out.extend_from_slice(value);
+    out.extend_from_slice(stored);
     Ok(())
 }
 
-fn read_record(bytes: &[u8], offset: u64) -> Result<SstEntry> {
-    let record = read_record_ref(bytes, offset)?;
+fn read_record(bytes: &[u8], offset: u64, version: u32) -> Result<SstEntry> {
+    let record = read_record_ref(bytes, offset, version)?;
     Ok(SstEntry {
         key: record.key.to_vec(),
-        value: record.value.to_vec(),
+        value: record.value.into_owned(),
     })
 }
 
-fn read_record_ref(bytes: &[u8], offset: u64) -> Result<SstRecordRef<'_>> {
+fn read_record_ref(bytes: &[u8], offset: u64, version: u32) -> Result<SstRecordRef<'_>> {
     let offset = offset as usize;
+    let record_header_len = if version >= VERSION {
+        COMPRESSED_RECORD_HEADER_LEN
+    } else {
+        RECORD_HEADER_LEN
+    };
+    let header_end = offset
+        .checked_add(record_header_len)
+        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST record header offset overflow"))?;
     let header = bytes
-        .get(offset..offset + RECORD_HEADER_LEN)
+        .get(offset..header_end)
         .ok_or_else(|| CalyxError::aster_corrupt_shard("SST record header out of bounds"))?;
     let key_len = u32::from_le_bytes(header[0..4].try_into().expect("key len")) as usize;
-    let value_len = u32::from_le_bytes(header[4..8].try_into().expect("value len")) as usize;
-    let expected_crc = u32::from_le_bytes(header[8..12].try_into().expect("record crc"));
-    let key_start = offset + RECORD_HEADER_LEN;
-    let value_start = key_start + key_len;
-    let value_end = value_start + value_len;
+    let stored_value_len =
+        u32::from_le_bytes(header[4..8].try_into().expect("stored value len")) as usize;
+    let (value_len, expected_crc) = if version >= VERSION {
+        (
+            u32::from_le_bytes(header[8..12].try_into().expect("value len")) as usize,
+            u32::from_le_bytes(header[12..16].try_into().expect("record crc")),
+        )
+    } else {
+        (
+            stored_value_len,
+            u32::from_le_bytes(header[8..12].try_into().expect("record crc")),
+        )
+    };
+    if value_len > MAX_RANGE_SCAN_BYTES {
+        return Err(scan_budget_exceeded(value_len, value_len));
+    }
+    let key_start = header_end;
+    let value_start = key_start
+        .checked_add(key_len)
+        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST key length overflow"))?;
+    let value_end = value_start
+        .checked_add(stored_value_len)
+        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST value length overflow"))?;
     let key = bytes
         .get(key_start..value_start)
         .ok_or_else(|| CalyxError::aster_corrupt_shard("SST key out of bounds"))?;
-    let value = bytes
+    let stored_value = bytes
         .get(value_start..value_end)
         .ok_or_else(|| CalyxError::aster_corrupt_shard("SST value out of bounds"))?;
-    let actual_crc = record_crc(key, value);
+    let value = decode_record_value(stored_value, value_len)?;
+    let actual_crc = record_crc(key, value.as_ref());
     if actual_crc != expected_crc {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "SST record crc mismatch at {offset}: expected {expected_crc:08x}, got {actual_crc:08x}"
         )));
     }
     Ok(SstRecordRef { key, value })
+}
+
+fn decode_record_value(stored: &[u8], decoded_len: usize) -> Result<Cow<'_, [u8]>> {
+    if stored.len() == decoded_len {
+        return Ok(Cow::Borrowed(stored));
+    }
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(decoded_len)
+        .map_err(scan_reserve_failed)?;
+    decoded.resize(decoded_len, 0);
+    let mut decompressor = zstd::bulk::Decompressor::new().map_err(sst_decompression_error)?;
+    let written = decompressor
+        .decompress_to_buffer(stored, decoded.as_mut_slice())
+        .map_err(sst_decompression_error)?;
+    if written != decoded_len {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "SST Zstandard value decoded to {written} bytes, expected {decoded_len}"
+        )));
+    }
+    Ok(Cow::Owned(decoded))
+}
+
+fn sst_decompression_error(error: std::io::Error) -> CalyxError {
+    CalyxError::aster_corrupt_shard(format!("SST Zstandard value decode failed: {error}"))
 }
 
 fn write_index(out: &mut Vec<u8>, index: &[IndexEntry]) {
@@ -787,9 +1007,10 @@ fn write_header(
     index_offset: u64,
     bloom_offset: u64,
     body_crc: u32,
+    version: u32,
 ) {
     bytes[0..4].copy_from_slice(MAGIC);
-    bytes[4..8].copy_from_slice(&VERSION.to_le_bytes());
+    bytes[4..8].copy_from_slice(&version.to_le_bytes());
     bytes[8..12].copy_from_slice(&entries.to_le_bytes());
     bytes[12..20].copy_from_slice(&index_offset.to_le_bytes());
     bytes[20..28].copy_from_slice(&bloom_offset.to_le_bytes());
@@ -804,7 +1025,7 @@ fn parse_header_structure(header: &[u8], len: u64) -> Result<Header> {
         return Err(CalyxError::aster_corrupt_shard("SST magic mismatch"));
     }
     let version = u32::from_le_bytes(header[4..8].try_into().expect("version"));
-    if version != VERSION && version != LEGACY_VERSION {
+    if version != VERSION && version != CHECKSUMMED_VERSION && version != LEGACY_VERSION {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "unsupported SST version {version}"
         )));
@@ -822,6 +1043,7 @@ fn parse_header_structure(header: &[u8], len: u64) -> Result<Header> {
         ));
     }
     Ok(Header {
+        version,
         entries,
         index_offset,
         bloom_offset,
@@ -867,7 +1089,7 @@ fn read_header(bytes: &[u8]) -> Result<Header> {
         .get(0..HEADER_LEN)
         .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing"))?;
     let version = u32::from_le_bytes(header[4..8].try_into().expect("version"));
-    if version >= VERSION {
+    if version >= CHECKSUMMED_VERSION {
         let expected_crc = u32::from_le_bytes(header[28..32].try_into().expect("body crc"));
         let actual_crc = section_crc(
             bytes

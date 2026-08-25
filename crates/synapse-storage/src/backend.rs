@@ -4603,6 +4603,24 @@ impl StorageBackend for CalyxBackend {
                 // closed against.
                 let declared_queryable =
                     constellations::declared_queryable_panel_versions(created_at_ms);
+                let newest_closed_predecessor: std::collections::BTreeMap<&'static str, u32> =
+                    published
+                        .panels
+                        .iter()
+                        .filter_map(|version| {
+                            superseded_panel_lineage(*version)
+                                .map(|lineage| (lineage.panel_name, *version))
+                        })
+                        .fold(
+                            std::collections::BTreeMap::new(),
+                            |mut newest, (name, version)| {
+                                newest
+                                    .entry(name)
+                                    .and_modify(|current| *current = (*current).max(version))
+                                    .or_insert(version);
+                                newest
+                            },
+                        );
                 let mut targets = published.panels.clone();
                 if let Some(active) = active_panel_version
                     && !targets.contains(&active)
@@ -4694,36 +4712,56 @@ impl StorageBackend for CalyxBackend {
                         // a version nothing declares must be investigated before
                         // anything is deleted. The catalog already knows which
                         // is which, so this is a lookup rather than a judgement.
-                        let disposition =
-                            if let Some(lineage) = superseded_panel_lineage(panel_version) {
+                        let disposition = if let Some(lineage) =
+                            superseded_panel_lineage(panel_version)
+                        {
+                            let retain_for_rollback = newest_closed_predecessor
+                                .get(lineage.panel_name)
+                                .is_some_and(|newest| *newest == panel_version);
+                            if retain_for_rollback {
                                 tracing::info!(
-                                    code = "STORAGE_SEARCH_GENERATION_RETIRABLE_SUPERSEDED",
-                                    panel_version,
-                                    panel_name = lineage.panel_name,
-                                    live_panel_version = lineage.live_panel_version,
-                                    index_root = %published.index_root.display(),
-                                    "a search generation is published for a closed superseded \
-                                     version of a live panel; the live generation carries the \
-                                     corpus, so this directory is reclaimable through storage \
-                                     operation=retire_search_generation"
+                                code = "STORAGE_SEARCH_GENERATION_RETIRABLE_SUPERSEDED",
+                                panel_version,
+                                panel_name = lineage.panel_name,
+                                live_panel_version = lineage.live_panel_version,
+                                index_root = %published.index_root.display(),
+                                "a search generation is published for a closed superseded \
+                                 version of a live panel; the live generation carries the \
+                                 corpus, so this directory is reclaimable through storage \
+                                 operation=retire_search_generation"
                                 );
                                 GenerationDisposition::RetirableSupersededGeneration {
                                     panel_name: lineage.panel_name,
                                     live_panel_version: lineage.live_panel_version,
                                 }
                             } else {
-                                tracing::warn!(
-                                    code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
-                                    panel_version,
-                                    index_root = %published.index_root.display(),
-                                    "a search generation is published for a panel version with \
-                                     no code-declared slot contract and no place in any live \
-                                     panel's declared lineage; nothing can rebuild it, no query \
-                                     can measure through it, and nothing establishes what it is. \
-                                     Investigate before deleting anything"
-                                );
-                                GenerationDisposition::UnmaintainableNoContract
-                            };
+                                match vault.retire_search_generation(panel_version) {
+                                    Ok(_) => GenerationDisposition::RetiredSupersededGeneration {
+                                        panel_name: lineage.panel_name,
+                                        live_panel_version: lineage.live_panel_version,
+                                    },
+                                    Err(source) => GenerationDisposition::Failed {
+                                        code: source.code.to_string(),
+                                        detail: format!(
+                                            "{}: {}",
+                                            source.message, source.remediation
+                                        ),
+                                    },
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
+                                panel_version,
+                                index_root = %published.index_root.display(),
+                                "a search generation is published for a panel version with \
+                                 no code-declared slot contract and no place in any live \
+                                 panel's declared lineage; nothing can rebuild it, no query \
+                                 can measure through it, and nothing establishes what it is. \
+                                 Investigate before deleting anything"
+                            );
+                            GenerationDisposition::UnmaintainableNoContract
+                        };
                         generations.push(PanelGenerationMaintenance {
                             panel_version,
                             is_active_panel,

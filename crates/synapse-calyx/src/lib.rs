@@ -2254,6 +2254,34 @@ const DEFAULT_RNG_SEED: u64 = 0x5A17_5EED_CA1A_1696;
 /// inject a namespaced dependency feature outside its closed feature surface.
 pub const SYNAPSE_CALYX_CUDA_COMPILED: bool = calyx_forge::CUDA_COMPILED;
 
+/// Fixes the process SST writer format before any vault is opened.
+///
+/// Setup uses v2 only for a pre-commit upgrade generation whose predecessor
+/// cannot read v3; committed current generations use v3 compression.
+pub fn configure_sst_write_version(version: u32) -> Result<(), SynapseCalyxError> {
+    calyx_aster::sst::configure_sst_write_version(version)
+        .map_err(|error| SynapseCalyxError::from_calyx("configure SST write version", &error))
+}
+
+/// Fixes whether this process may publish a migrated Anneal live pointer.
+/// Pre-commit v2 generations preserve the authenticated predecessor-readable
+/// pointer while still using the validated CPU-only effective policy in memory.
+pub fn configure_anneal_legacy_pointer_preservation(
+    preserve: bool,
+) -> Result<(), SynapseCalyxError> {
+    anneal::configure_legacy_pointer_preservation(preserve)
+}
+
+/// Atomically converts pre-commit v3 SST output back to the v2 format accepted
+/// by a rollback predecessor, preserving and rereading every durable row.
+pub fn downgrade_v3_ssts_to_v2(
+    vault_root: impl AsRef<std::path::Path>,
+) -> Result<(u64, u64, u64), SynapseCalyxError> {
+    calyx_aster::sst::downgrade_v3_ssts_to_v2(vault_root).map_err(|error| {
+        SynapseCalyxError::from_calyx("downgrade Calyx SST v3 files to v2", &error)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SynapseCalyxMathBackend {
@@ -2665,6 +2693,15 @@ fn read_tuning_config(
             CONFIG_REMEDIATION,
         )
     })?;
+    tracing::info!(
+        code = "SYNAPSE_CALYX_CONFIG_DECODED",
+        config_path = %path.display(),
+        config_length = bytes.len(),
+        config_sha256 = %sha256_hex(&bytes),
+        math_backend = file.calyx.math_backend.as_str(),
+        vram_budget_bytes = file.calyx.vram_budget_bytes,
+        "decoded the hash-pinned Calyx tuning document before policy validation"
+    );
     file.calyx.validate()
 }
 
@@ -2884,6 +2921,10 @@ pub struct SynapseCalyxVaultStatus {
     pub sst_reader_cache_max_entries: Option<u64>,
     pub sst_reader_cache_max_estimated_heap_bytes: Option<u64>,
     pub sst_reader_cache_max_mapped_bytes: Option<u64>,
+    pub retained_lookup_files: Option<u64>,
+    pub retained_lookup_entries: Option<u64>,
+    pub retained_lookup_estimated_heap_bytes: Option<u64>,
+    pub retained_lookup_per_cf: Vec<SynapseCalyxRetainedLookupStatus>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
     pub anneal: Option<SynapseCalyxAnnealStatus>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
@@ -2894,6 +2935,14 @@ pub struct SynapseCalyxVaultStatus {
     /// is, including sites with zero holds — that zero is the observation
     /// #1952 ask 3 needed and could not get from an exception-only log.
     pub row_guard_census: Vec<SynapseCalyxRowGuardSiteCensus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxRetainedLookupStatus {
+    pub cf: String,
+    pub files: u64,
+    pub entries: u64,
+    pub estimated_heap_bytes: u64,
 }
 
 /// One row-guard call site's counters, as reported by `health`.
@@ -3945,11 +3994,11 @@ impl SynapseCalyxReadOnlyVault {
         let options = VaultOptions {
             read_only: true,
             restore_mvcc_rows: false,
-            // The public read-only handle exposes candidate-bounded paging for
-            // every selected native CF, so all selected SST indexes must be
-            // validated and retained at open. There is no page-time fallback
-            // to whole-file scanning.
-            eager_router_lookup_on_open: true,
+            // Candidate-bounded paging uses the SST reader's bounded sparse
+            // index/Bloom path. Retaining every decoded SST index here made a
+            // read-only inspection handle consume memory in proportion to the
+            // complete physical history it was meant to inspect.
+            eager_router_lookup_on_open: false,
             restore_ledger_hook: false,
             selected_cfs,
             ..VaultOptions::default()
@@ -10012,6 +10061,25 @@ fn status_from_vault(
     let mvcc_resident = vault.mvcc_resident_status();
     let memtable = vault.memtable_status();
     let reader_cache = vault.sst_reader_cache_status();
+    let retained_lookup_per_cf = vault
+        .retained_lookup_usage_by_cf()
+        .into_iter()
+        .map(|(cf, value)| SynapseCalyxRetainedLookupStatus {
+            cf: cf.name(),
+            files: value.files as u64,
+            entries: value.entries as u64,
+            estimated_heap_bytes: value.estimated_heap_bytes as u64,
+        })
+        .collect::<Vec<_>>();
+    let retained_lookup_files = retained_lookup_per_cf.iter().map(|value| value.files).sum();
+    let retained_lookup_entries = retained_lookup_per_cf
+        .iter()
+        .map(|value| value.entries)
+        .sum();
+    let retained_lookup_estimated_heap_bytes = retained_lookup_per_cf
+        .iter()
+        .map(|value| value.estimated_heap_bytes)
+        .sum();
     let mut status = SynapseCalyxVaultStatus {
         enabled: true,
         phase: "open".to_owned(),
@@ -10048,6 +10116,10 @@ fn status_from_vault(
             reader_cache.max_estimated_heap_bytes as u64,
         ),
         sst_reader_cache_max_mapped_bytes: Some(reader_cache.max_mapped_bytes as u64),
+        retained_lookup_files: Some(retained_lookup_files),
+        retained_lookup_entries: Some(retained_lookup_entries),
+        retained_lookup_estimated_heap_bytes: Some(retained_lookup_estimated_heap_bytes),
+        retained_lookup_per_cf,
         ..SynapseCalyxVaultStatus::default()
     };
     status.apply_paths(config);

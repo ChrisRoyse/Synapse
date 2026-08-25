@@ -13,7 +13,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SST_HEADER_LEN: u64 = 32;
-const SST_RECORD_HEADER_LEN: u64 = 12;
+// SST v3 adds the decoded value length to each record so compressed payloads
+// remain independently bounded and random-readable. The estimator deliberately
+// assumes the uncompressed payload; compression can make an output smaller but
+// can never make the physical file exceed this admission estimate.
+const SST_RECORD_HEADER_LEN: u64 = 16;
 const SST_INDEX_ENTRY_FIXED_LEN: u64 = 12;
 const SST_BLOOM_HEADER_LEN: u64 = 16;
 

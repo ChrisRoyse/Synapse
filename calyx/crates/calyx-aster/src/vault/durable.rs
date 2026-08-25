@@ -110,7 +110,10 @@ impl Default for VaultOptions {
             disk_pressure_guard: None,
             value_crypto: None,
             restore_mvcc_rows: true,
-            eager_router_lookup_on_open: true,
+            // Sparse validated SST bounds are the normal serving contract.
+            // Full decoded lookup retention scales with immutable history and
+            // made a sub-GiB logical vault consume GiB of private memory.
+            eager_router_lookup_on_open: false,
             restore_ledger_hook: true,
             read_only: false,
             selected_cfs: None,

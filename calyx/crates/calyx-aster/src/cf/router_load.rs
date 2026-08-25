@@ -206,7 +206,7 @@ impl CfRouter {
             // A selected-CF open with eager lookup explicitly requests that
             // every selected surface be pageable. The full-vault policy below
             // remains selective to avoid retaining every low-volume index.
-            let retain_lookup = *cf == ColumnFamily::Kv || eager_lookup_on_open;
+            let retain_lookup = eager_lookup_on_open;
             let shard = guards.shard_mut(*cf)?;
             self.load_cf_level(shard, *cf, files, retain_lookup)?;
             cfs_loaded += 1;
@@ -279,12 +279,6 @@ impl CfRouter {
 }
 
 fn should_build_eager_lookup_on_open(cf: ColumnFamily, eager_lookup_on_open: bool) -> bool {
-    // Candidate-bounded paging is a hard contract for the shared Synapse KV
-    // namespace. Its page path must never reopen and whole-file CRC-scan SSTs,
-    // so retain validated key/offset metadata even in latest-readback mode.
-    if cf == ColumnFamily::Kv {
-        return true;
-    }
     if !eager_lookup_on_open {
         return false;
     }

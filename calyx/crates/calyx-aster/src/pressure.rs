@@ -282,10 +282,46 @@ fn os_disk_sample(path: &Path) -> Result<DiskSample> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn os_disk_sample(path: &Path) -> Result<DiskSample> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let mut available = 0_u64;
+    let mut total = 0_u64;
+    let mut total_free = 0_u64;
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 path and every output
+    // points to a writable u64 for the complete call.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            &raw mut total,
+            &raw mut total_free,
+        )
+    };
+    if ok == 0 {
+        return Err(io_error(format!(
+            "GetDiskFreeSpaceExW {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(DiskSample {
+        // The fields are unitless to callers and only used as a ratio. Bytes
+        // preserve exactness and avoid a second filesystem query for cluster
+        // size.
+        blocks: total,
+        blocks_available: available,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_disk_sample(path: &Path) -> Result<DiskSample> {
     Err(io_error(format!(
-        "statvfs unsupported on this platform for {}",
+        "disk-space probing unsupported for {}",
         path.display()
     )))
 }

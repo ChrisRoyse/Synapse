@@ -13,11 +13,10 @@ use crate::{StorageError, StorageResult, cf};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const GB: u64 = 1_000_000_000;
-const MB: u64 = 1_000_000;
-const LEVEL_1_FREE_BYTES: u64 = 2 * GB;
-const LEVEL_2_FREE_BYTES: u64 = GB;
-const LEVEL_3_FREE_BYTES: u64 = 500 * MB;
-const LEVEL_4_FREE_BYTES: u64 = 200 * MB;
+const LEVEL_1_FREE_BYTES: u64 = 15 * GB;
+const LEVEL_2_FREE_BYTES: u64 = 12 * GB;
+const LEVEL_3_FREE_BYTES: u64 = 10 * GB;
+const LEVEL_4_FREE_BYTES: u64 = 5 * GB;
 pub const PRESSURE_CF: &str = "storage_disk_pressure";
 const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 
@@ -60,6 +59,7 @@ impl DiskPressureLevel {
 #[derive(Debug)]
 pub struct PressureReport {
     pub free_bytes: u64,
+    pub total_bytes: Option<u64>,
     pub previous_level: DiskPressureLevel,
     pub current_level: DiskPressureLevel,
     pub emitted_code: Option<&'static str>,
@@ -71,6 +71,7 @@ pub struct PressureReport {
 pub struct PressureProbeReadback {
     pub observed: bool,
     pub last_free_bytes: Option<u64>,
+    pub last_total_bytes: Option<u64>,
     pub last_level: Option<DiskPressureLevel>,
     pub last_started_unix_ms: Option<u64>,
     pub last_completed_unix_ms: Option<u64>,
@@ -178,14 +179,20 @@ struct PressureThresholds {
 }
 
 impl PressureThresholds {
-    const fn level_for(self, free_bytes: u64) -> DiskPressureLevel {
-        if free_bytes < self.level4 {
+    fn level_for(self, free_bytes: u64, total_bytes: Option<u64>) -> DiskPressureLevel {
+        let percent_floor = |percent: u64| {
+            total_bytes
+                .unwrap_or_default()
+                .saturating_mul(percent)
+                .saturating_div(100)
+        };
+        if free_bytes < self.level4.max(percent_floor(5)) {
             DiskPressureLevel::Level4
-        } else if free_bytes < self.level3 {
+        } else if free_bytes < self.level3.max(percent_floor(10)) {
             DiskPressureLevel::Level3
-        } else if free_bytes < self.level2 {
+        } else if free_bytes < self.level2.max(percent_floor(12)) {
             DiskPressureLevel::Level2
-        } else if free_bytes < self.level1 {
+        } else if free_bytes < self.level1.max(percent_floor(15)) {
             DiskPressureLevel::Level1
         } else {
             DiskPressureLevel::Normal
@@ -260,8 +267,8 @@ pub fn run_once(
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
     let result = Fs2DiskProbe
-        .available_space(path)
-        .and_then(|free_bytes| apply_free_bytes(state, config, free_bytes, compaction));
+        .sample(path)
+        .and_then(|sample| apply_disk_sample(state, config, sample, compaction));
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
@@ -273,7 +280,15 @@ pub fn run_once_with_free_bytes(
     compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
-    let result = apply_free_bytes(state, config, free_bytes, compaction);
+    let result = apply_disk_sample(
+        state,
+        config,
+        DiskSample {
+            free_bytes,
+            total_bytes: None,
+        },
+        compaction,
+    );
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
@@ -314,11 +329,11 @@ fn spawn_with_probe(
                     let tick_path = path.clone();
                     let result = crate::maintenance::run_background_admitted_maintenance(
                         "storage_disk_pressure",
-                        move || match tick_probe.available_space(&tick_path) {
-                            Ok(free_bytes) => apply_free_bytes(
+                        move || match tick_probe.sample(&tick_path) {
+                            Ok(sample) => apply_disk_sample(
                                 &tick_state,
                                 &tick_config,
-                                free_bytes,
+                                sample,
                                 tick_compaction.as_ref(),
                             ),
                             Err(error) => Err(error),
@@ -339,13 +354,14 @@ fn spawn_with_probe(
     })
 }
 
-fn apply_free_bytes(
+fn apply_disk_sample(
     state: &PressureState,
     config: &PressureConfig,
-    free_bytes: u64,
+    sample: DiskSample,
     compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
-    let current_level = config.thresholds.level_for(free_bytes);
+    let free_bytes = sample.free_bytes;
+    let current_level = config.thresholds.level_for(free_bytes, sample.total_bytes);
     synapse_telemetry::metrics::gauge!(STORAGE_DISK_PRESSURE_LEVEL)
         .set(f64::from(current_level as u8));
     let (previous_level, emitted_code) = state.transition_to(current_level)?;
@@ -376,6 +392,7 @@ fn apply_free_bytes(
 
     Ok(PressureReport {
         free_bytes,
+        total_bytes: sample.total_bytes,
         previous_level,
         current_level,
         emitted_code,
@@ -444,6 +461,7 @@ fn mark_pressure_probe_completed(
             Ok(report) => {
                 readback.observed = true;
                 readback.last_free_bytes = Some(report.free_bytes);
+                readback.last_total_bytes = report.total_bytes;
                 readback.last_level = Some(report.current_level);
                 readback.last_error = None;
             }
@@ -465,15 +483,27 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DiskSample {
+    free_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
 trait DiskProbe: Send + Sync {
-    fn available_space(&self, path: &Path) -> StorageResult<u64>;
+    fn sample(&self, path: &Path) -> StorageResult<DiskSample>;
 }
 
 struct Fs2DiskProbe;
 
 impl DiskProbe for Fs2DiskProbe {
-    fn available_space(&self, path: &Path) -> StorageResult<u64> {
-        fs2::available_space(path).map_err(|error| read_failed(error.to_string()))
+    fn sample(&self, path: &Path) -> StorageResult<DiskSample> {
+        let free_bytes =
+            fs2::available_space(path).map_err(|error| read_failed(error.to_string()))?;
+        let total_bytes = fs2::total_space(path).map_err(|error| read_failed(error.to_string()))?;
+        Ok(DiskSample {
+            free_bytes,
+            total_bytes: Some(total_bytes),
+        })
     }
 }
 

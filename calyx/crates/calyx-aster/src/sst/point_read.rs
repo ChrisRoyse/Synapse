@@ -6,8 +6,9 @@ use std::sync::Arc;
 use calyx_core::{CalyxError, Result};
 
 use super::{
-    HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN,
-    SstBounds, SstEntry, SstLookupMetadata, read_file_header_structure, scan_reserve_failed,
+    COMPRESSED_RECORD_HEADER_LEN, HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry,
+    MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN, SstBounds, SstEntry, SstLookupMetadata, VERSION,
+    read_file_header_structure, scan_reserve_failed, sst_decompression_error,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -565,12 +566,15 @@ pub(crate) struct SstPointReader {
     data_end: u64,
     index_end: u64,
     entries: usize,
+    version: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct IndexedRecordLayout {
     key_len: usize,
     value_len: usize,
+    stored_value_len: usize,
+    compressed: bool,
     key_start: u64,
     value_start: u64,
     expected_crc: u32,
@@ -634,6 +638,7 @@ impl SstPointReader {
             data_end: header.index_offset,
             index_end: header.bloom_offset,
             entries,
+            version: header.version,
         })
     }
 
@@ -690,8 +695,26 @@ impl SstPointReader {
         value
             .try_reserve_exact(layout.value_len)
             .map_err(scan_reserve_failed)?;
-        value.resize(layout.value_len, 0);
-        self.read_exact_at(value, layout.value_start)?;
+        if layout.compressed {
+            let mut stored = try_zeroed(layout.stored_value_len)?;
+            self.read_exact_at(&mut stored, layout.value_start)?;
+            value.resize(layout.value_len, 0);
+            let mut decompressor =
+                zstd::bulk::Decompressor::new().map_err(sst_decompression_error)?;
+            let written = decompressor
+                .decompress_to_buffer(&stored, value.as_mut_slice())
+                .map_err(sst_decompression_error)?;
+            if written != layout.value_len {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "SST Zstandard value at {}:{record_offset} decoded to {written} bytes, expected {}",
+                    self.path.display(),
+                    layout.value_len
+                )));
+            }
+        } else {
+            value.resize(layout.value_len, 0);
+            self.read_exact_at(value, layout.value_start)?;
+        }
         hasher.update(value);
         let actual_crc = hasher.finalize();
         if actual_crc != layout.expected_crc {
@@ -729,6 +752,11 @@ impl SstPointReader {
         expected_key: &[u8],
     ) -> Result<bool> {
         let layout = self.read_record_layout(record_offset, expected_key)?;
+        if layout.compressed {
+            let mut value = Vec::new();
+            self.read_value_into(record_offset, expected_key, &mut value)?;
+            return Ok(value == crate::mvcc::TOMBSTONE_VALUE);
+        }
         let mut hasher = crc32fast::Hasher::new();
         let mut buffer = [0_u8; RECORD_VALIDATION_BUFFER_BYTES];
         let mut cursor = layout.key_start;
@@ -746,7 +774,7 @@ impl SstPointReader {
             hasher.update(actual);
             cursor = cursor.saturating_add(expected.len() as u64);
         }
-        let mut remaining = layout.value_len;
+        let mut remaining = layout.stored_value_len;
         let mut value_position = 0_usize;
         let mut is_tombstone = layout.value_len == crate::mvcc::TOMBSTONE_VALUE.len();
         cursor = layout.value_start;
@@ -791,19 +819,35 @@ impl SstPointReader {
                 self.path.display()
             )));
         }
-        let mut header = [0_u8; RECORD_HEADER_LEN];
-        self.read_exact_at(&mut header, record_offset)?;
+        let record_header_len = if self.version >= VERSION {
+            COMPRESSED_RECORD_HEADER_LEN
+        } else {
+            RECORD_HEADER_LEN
+        };
+        let mut header = [0_u8; COMPRESSED_RECORD_HEADER_LEN];
+        self.read_exact_at(&mut header[..record_header_len], record_offset)?;
         let key_len = u32::from_le_bytes(header[0..4].try_into().expect("key len")) as usize;
-        let value_len = u32::from_le_bytes(header[4..8].try_into().expect("value len")) as usize;
-        let expected_crc = u32::from_le_bytes(header[8..12].try_into().expect("record crc"));
+        let stored_value_len =
+            u32::from_le_bytes(header[4..8].try_into().expect("stored value len")) as usize;
+        let (value_len, expected_crc) = if self.version >= VERSION {
+            (
+                u32::from_le_bytes(header[8..12].try_into().expect("value len")) as usize,
+                u32::from_le_bytes(header[12..16].try_into().expect("record crc")),
+            )
+        } else {
+            (
+                stored_value_len,
+                u32::from_le_bytes(header[8..12].try_into().expect("record crc")),
+            )
+        };
         let key_start = record_offset
-            .checked_add(RECORD_HEADER_LEN as u64)
+            .checked_add(record_header_len as u64)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("SST key offset overflow"))?;
         let value_start = key_start
             .checked_add(key_len as u64)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("SST value offset overflow"))?;
         let value_end = value_start
-            .checked_add(value_len as u64)
+            .checked_add(stored_value_len as u64)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("SST value length overflow"))?;
         if value_end > self.data_end {
             return Err(CalyxError::aster_corrupt_shard(format!(
@@ -822,6 +866,8 @@ impl SstPointReader {
         Ok(IndexedRecordLayout {
             key_len,
             value_len,
+            stored_value_len,
+            compressed: stored_value_len != value_len,
             key_start,
             value_start,
             expected_crc,

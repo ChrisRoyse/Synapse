@@ -258,10 +258,20 @@ debug = false
 # capability: `--profile release-max` below still ships whole-program fat LTO
 # for the case where the last few percent genuinely matter.
 [profile.release]
-opt-level = 3
+# The installed daemon is deliberately built at basic optimization.  This
+# keeps the source-install compiler inside the lightweight-host envelope; the
+# monolithic synapse-mcp crate made LLVM's level-3 optimizer consume multiple
+# gigabytes even with Cargo concurrency capped. Runtime-critical native Calyx
+# storage remains in its separately compiled crates. Use release-max only for
+# an explicitly measured, operator-approved maximum-runtime artifact.
+opt-level = 1
 debug = false
 incremental = false
 lto = false
+# Keep the documented non-incremental default. One unit did not lower the
+# measured hard-capped peak: calyx-aster still exhausted the 998,998,016-byte
+# Job, while serializing code generation made the build slower. The setup-owned
+# Windows Job remains the actual fail-closed memory boundary.
 codegen-units = 16
 strip = true
 panic = "abort"
@@ -271,6 +281,7 @@ panic = "abort"
 # last few % of runtime matters: `cargo build --profile release-max`.
 [profile.release-max]
 inherits = "release"
+opt-level = 3
 codegen-units = 1
 lto = "fat"
 

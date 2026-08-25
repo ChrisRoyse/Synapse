@@ -30,7 +30,7 @@ const MAX_CACHED_READERS: usize = 256;
 /// retained over a gigabyte while still appearing "within cap". This is an
 /// internal cache working-set budget, not a process memory limit: a caller can
 /// open any valid SST, but an oversized reader is not kept after that call.
-const MAX_CACHED_READER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHED_READER_HEAP_BYTES: usize = 32 * 1024 * 1024;
 
 /// File-backed mmap span retained by the cache.
 ///
@@ -39,7 +39,7 @@ const MAX_CACHED_READER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// set. The production cache in #2239 reported only 66 MiB of heap while 50
 /// retained 64 MiB mappings drove physical working set above 4 GiB. A cache is
 /// useful only when it accounts for every resource it retains.
-const MAX_CACHED_READER_MAPPED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHED_READER_MAPPED_BYTES: usize = 32 * 1024 * 1024;
 
 struct Entry {
     reader: Arc<SstReader>,

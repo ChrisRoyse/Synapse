@@ -33,9 +33,10 @@
                 not yet on any remote (genuinely unmerged work) — unless -Force.
     3. BRANCHES Delete local branches marked `[gone]` (their remote was pruned),
                 except protected / checked-out ones.
-    4. SWEEP    Run `cargo-sweep` to delete build artifacts not touched in
-                -SweepDays days across each repo's target/ (keeps current
-                toolchain + recently used artifacts so the next build is fast).
+    4. SWEEP    Run `cargo-sweep` twice: first remove artifacts not touched in
+                -SweepDays days, then enforce -MaxTargetGB for every discovered
+                Cargo target. Age keeps builds warm; size prevents frequently
+                touched artifacts from growing without bound.
     5. REPORT   Print disk free before/after and bytes reclaimed.
 
   SAFETY MODEL
@@ -55,12 +56,16 @@
   Actually perform removals/sweeps. Omit for a dry-run preview.
 
 .PARAMETER SweepDays
-  Delete build artifacts not accessed in this many days. Default 10.
+  Delete build artifacts not accessed in this many days. Default 7.
 
 .PARAMETER MinFreeGB
   If the system drive has less than this many GB free, escalate: sweep with a
   0-day threshold (everything not needed by the very latest build) on non-active
   worktrees. Default 80.
+
+.PARAMETER MaxTargetGB
+  Hard size ceiling applied independently to every Cargo target directory
+  discovered under a repo. Newest artifacts are retained. Default 4.
 
 .PARAMETER Force
   Also remove worktrees with unmerged/unpushed commits and dirty worktrees.
@@ -80,8 +85,10 @@
 param(
     [string]$Root,
     [switch]$Apply,
-    [int]$SweepDays = 10,
+    [int]$SweepDays = 7,
     [int]$MinFreeGB = 80,
+    [ValidateRange(1, 1024)]
+    [int]$MaxTargetGB = 4,
     [switch]$Force,
     [string]$BackupDir = 'C:\code\_repo_maintenance_backups'
 )
@@ -93,6 +100,29 @@ function Info($m) { Write-Host "[maint] $m" }
 function Act ($m) { if ($script:DidApply) { Write-Host "[maint][APPLY] $m" -ForegroundColor Green } else { Write-Host "[maint][dry-run] $m" -ForegroundColor Yellow } }
 function Warn($m) { Write-Host "[maint][WARN] $m" -ForegroundColor DarkYellow }
 function Die ($m) { throw "[maint] FATAL: $m" }
+
+function Test-RepoOwnedBuildActive {
+    param([Parameter(Mandatory=$true)][string]$Repo)
+    $repoFull = [IO.Path]::GetFullPath($Repo).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $setupLock = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'synapse\setup-maintenance.lock.json' } else { $null }
+    if ($setupLock -and (Test-Path -LiteralPath $setupLock -PathType Leaf)) {
+        try {
+            $record = Get-Content -LiteralPath $setupLock -Raw -ErrorAction Stop | ConvertFrom-Json -Depth 20
+            if ([string]$record.schema -eq 'synapse_setup_maintenance_lock/v2' -and
+                [string]$record.state -notin @('failed','released','completed') -and
+                [IO.Path]::GetFullPath([string]$record.source_dir).TrimEnd([IO.Path]::DirectorySeparatorChar) -eq $repoFull) {
+                $owner = @(Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$record.pid)" -ErrorAction Stop)
+                if ($owner.Count -eq 1 -and [string]$owner[0].CommandLine -match 'synapse-setup\.ps1') { return $true }
+            }
+        } catch { Warn "setup lock could not be classified safely for ${repoFull}: $($_.Exception.Message); Cargo cleanup will be skipped"; return $true }
+    }
+    $escaped = [regex]::Escape($repoFull + [IO.Path]::DirectorySeparatorChar)
+    $builders = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        [string]$_.Name -in @('cargo.exe','rustc.exe','rust-lld.exe','link.exe','cmake.exe','ninja.exe') -and
+        [string]$_.CommandLine -match $escaped
+    })
+    return ($builders.Count -gt 0)
+}
 
 # ---- preflight ------------------------------------------------------------
 foreach ($t in 'git') {
@@ -107,7 +137,7 @@ if ($script:DidApply -and -not (Test-Path $BackupDir)) { New-Item -ItemType Dire
 $drive = (Get-Item $Root).PSDrive.Name
 function Free-GB { [math]::Round((Get-PSDrive $drive).Free / 1GB, 1) }
 $freeBefore = Free-GB
-Info "Root=$Root  Apply=$($script:DidApply)  SweepDays=$SweepDays  gh=$HaveGh  cargo-sweep=$HaveSweep"
+Info "Root=$Root  Apply=$($script:DidApply)  SweepDays=$SweepDays  MaxTargetGB=$MaxTargetGB  gh=$HaveGh  cargo-sweep=$HaveSweep"
 Info "Disk $drive`: free before = $freeBefore GB"
 $stampDate = (Get-Date -Format 'yyyy-MM-dd')
 
@@ -254,15 +284,80 @@ foreach ($repo in $repos) {
 
     # --- step 4: cargo-sweep target/ --------------------------------------
     if (Test-Path (Join-Path $repo 'Cargo.toml')) {
+        if (Test-RepoOwnedBuildActive -Repo $repo) {
+            Warn "skip Cargo artifact cleanup while an exact setup/build owner is active: $repo"
+            continue
+        }
         if ($HaveSweep) {
             $days = $SweepDays
             if ((Free-GB) -lt $MinFreeGB) { Warn "low disk (<$MinFreeGB GB) — escalating sweep to 0-day on $repoName"; $days = 0 }
-            Act "cargo sweep --time $days (recursive) on $repo"
-            if ($script:DidApply) { & cargo-sweep sweep --time $days --recursive $repo 2>&1 | ForEach-Object { Info "  sweep: $_" } }
+            Act "cargo sweep --time $days then --maxsize $($MaxTargetGB)GB (recursive) on $repo"
+            if ($script:DidApply) {
+                & cargo-sweep sweep --time $days --recursive $repo 2>&1 | ForEach-Object { Info "  age-sweep: $_" }
+                if ($LASTEXITCODE -ne 0) { Die "cargo-sweep age pass failed for $repo with exit $LASTEXITCODE" }
+                & cargo-sweep sweep --maxsize "$($MaxTargetGB)GB" --recursive $repo 2>&1 | ForEach-Object { Info "  size-sweep: $_" }
+                if ($LASTEXITCODE -ne 0) { Die "cargo-sweep size pass failed for $repo with exit $LASTEXITCODE" }
+            }
         } else {
-            Warn "cargo-sweep not installed — target/ artifact GC skipped. Install once with:  cargo install cargo-sweep"
+            Die "cargo-sweep is required to enforce the target size invariant for $repo; install it with 'cargo install cargo-sweep' and rerun"
         }
     }
+}
+
+# --- bounded user-runtime diagnostics --------------------------------------
+# These are diagnostic copies, not authority files. Keep the newest artifact
+# even when over budget so a failure always leaves something actionable.
+function Prune-ManagedFileSet {
+    param(
+        [Parameter(Mandatory=$true)][string]$Directory,
+        [Parameter(Mandatory=$true)][string]$Filter,
+        [Parameter(Mandatory=$true)][int]$KeepDays,
+        [Parameter(Mandatory=$true)][uint64]$MaxBytes,
+        [int]$KeepNewest = 1
+    )
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    $root = [IO.Path]::GetFullPath($Directory).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $files = @(Get-ChildItem -LiteralPath $Directory -Filter $Filter -File -Force -ErrorAction Stop |
+        Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($file in $files) {
+        $full = [IO.Path]::GetFullPath($file.FullName)
+        if (-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or
+            ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Die "managed-file retention found an unsafe path: $full"
+        }
+    }
+    $keep = [Collections.Generic.List[object]]::new()
+    $remove = [Collections.Generic.List[object]]::new()
+    $cutoff = [DateTime]::UtcNow.AddDays(-$KeepDays)
+    for ($i=0; $i -lt $files.Count; $i++) {
+        if ($i -ge $KeepNewest -and $files[$i].LastWriteTimeUtc -lt $cutoff) {
+            $remove.Add($files[$i])
+        } else {
+            $keep.Add($files[$i])
+        }
+    }
+    [uint64]$retainedBytes = 0
+    foreach ($file in $keep) { $retainedBytes = [uint64]($retainedBytes + [uint64]$file.Length) }
+    for ($i=$keep.Count-1; $retainedBytes -gt $MaxBytes -and $i -ge $KeepNewest; $i--) {
+        $file = $keep[$i]
+        $remove.Add($file)
+        $retainedBytes = [uint64]($retainedBytes - [uint64]$file.Length)
+        $keep.RemoveAt($i)
+    }
+    foreach ($file in $remove) {
+        Act "prune managed diagnostic file: $($file.FullName) ($($file.Length) bytes)"
+        if ($script:DidApply) {
+            [IO.File]::Delete($file.FullName)
+            if ([IO.File]::Exists($file.FullName)) { Die "managed diagnostic file remained after delete: $($file.FullName)" }
+        }
+    }
+    Info "managed retention dir=$Directory filter=$Filter retained_files=$($keep.Count) retained_bytes=$retainedBytes removed_files=$($remove.Count) keep_days=$KeepDays max_bytes=$MaxBytes"
+}
+
+if ($env:LOCALAPPDATA) {
+    $synapseLocal = Join-Path $env:LOCALAPPDATA 'synapse'
+    Prune-ManagedFileSet -Directory (Join-Path $synapseLocal 'logs') -Filter 'daemon-stderr-gen*.log' -KeepDays 14 -MaxBytes ([uint64](128MB)) -KeepNewest 1
+    Prune-ManagedFileSet -Directory (Join-Path $synapseLocal 'codex-start-snapshots') -Filter 'codex-tool-surface-*.json' -KeepDays 14 -MaxBytes ([uint64](256MB)) -KeepNewest 16
 }
 
 # --- retention: never let the backup dir itself become buildup ------------

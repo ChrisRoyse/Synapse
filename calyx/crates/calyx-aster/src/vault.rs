@@ -2095,6 +2095,14 @@ where
         crate::sst::reader_cache_status()
     }
 
+    /// Decoded full-key indexes retained by live router levels. A lightweight
+    /// production open should report zero across every unbounded family.
+    pub fn retained_lookup_usage_by_cf(
+        &self,
+    ) -> Vec<(ColumnFamily, crate::sst::level::RetainedLookupStatus)> {
+        self.rows.retained_lookup_usage_by_cf()
+    }
+
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {
         self.rows.install_read_barrier(barrier);
     }

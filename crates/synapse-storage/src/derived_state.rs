@@ -60,7 +60,11 @@ use synapse_core::types::{AgentEventKind, AgentEventRecord, TimelineKind, Timeli
 /// queries fail, so the tick only has to be frequent enough that a burst of
 /// writes cannot cross the whole remaining half budget between two ticks. Five minutes matches the storage GC
 /// cadence and keeps the two heavy periodic passes on the same rhythm.
-pub const DERIVED_STATE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
+// A five-minute rebuild cadence repeatedly rescanned mature multi-million-row
+// panels even when the delta stayed well inside the 4,096-key reconciliation
+// bound.  Fifteen minutes keeps routine deltas bounded at the observed ingest
+// rate while cutting background scan duty cycle by two thirds.
+pub const DERIVED_STATE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(15);
 
 /// Idle/admission window between association-only recovery continuations.
 ///
@@ -885,6 +889,30 @@ pub fn derived_state_readback() -> DerivedStateReadback {
     readback.refresh_delta_keys_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS;
     readback.min_rebuild_interval_ms = SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS;
     readback
+}
+
+/// Removes one physically retired search generation from the process-published
+/// sweep readback.
+///
+/// `Db::retire_search_generation` already proves the exact directory absent by
+/// re-enumerating the index root.  Keeping that now-absent generation in
+/// `DERIVED_STATE_LAST` until the next five-minute maintenance tick makes
+/// `health` contradict the physical source of truth and invites a second,
+/// guaranteed-to-fail retirement attempt.  This is deliberately a narrow cache
+/// convergence operation: it never invents or reclassifies a generation and it
+/// removes only the exact panel version whose physical retirement succeeded.
+pub fn note_search_generation_retired(panel_version: u32) {
+    let mut readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(sweep) = readback.last_search_sweep.as_mut() else {
+        return;
+    };
+    sweep
+        .generations
+        .retain(|entry| entry.panel_version != panel_version);
+    readback.last_search_sweep_unix_ms = now_unix_ms();
 }
 
 /// Runs the same bounded pass owned by the periodic derived-state task and

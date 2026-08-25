@@ -113,6 +113,12 @@ pub enum GenerationDisposition {
         /// The generation that superseded it and is maintained today.
         live_panel_version: u32,
     },
+    /// A closed superseded generation was physically retired after the sweep
+    /// retained the newest closed predecessor for rollback diagnostics.
+    RetiredSupersededGeneration {
+        panel_name: &'static str,
+        live_panel_version: u32,
+    },
     /// Maintaining this one generation failed. Recorded per generation so a
     /// single bad generation cannot starve every other generation of
     /// maintenance, while still failing the pass as a whole.
@@ -126,6 +132,7 @@ impl GenerationDisposition {
             Self::Maintained(_) => "maintained",
             Self::UnmaintainableNoContract => "unmaintainable_no_contract",
             Self::RetirableSupersededGeneration { .. } => "retirable_superseded_generation",
+            Self::RetiredSupersededGeneration { .. } => "retired_superseded_generation",
             Self::Failed { .. } => "failed",
         }
     }
@@ -228,6 +235,7 @@ impl PanelGenerationMaintenance {
                 }),
             GenerationDisposition::UnmaintainableNoContract
             | GenerationDisposition::RetirableSupersededGeneration { .. }
+            | GenerationDisposition::RetiredSupersededGeneration { .. }
             | GenerationDisposition::Failed { .. } => self.manifest_present_at_start,
         }
     }
@@ -317,6 +325,13 @@ impl PanelGenerationMaintenance {
                  carries the corpus; no query can reach this one and no rebuild can reconstruct \
                  it; action=storage operation=retire_search_generation panel_version={}",
                 self.panel_version, self.panel_version,
+            ),
+            GenerationDisposition::RetiredSupersededGeneration {
+                panel_name,
+                live_panel_version,
+            } => format!(
+                "panel {}{active}{queryable} {disposition}: retired a closed superseded generation of {panel_name}; live generation={live_panel_version}; the newest closed predecessor remains available for rollback diagnostics",
+                self.panel_version,
             ),
             GenerationDisposition::Failed { code, detail } => {
                 format!(

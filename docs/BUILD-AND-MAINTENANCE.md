@@ -11,6 +11,7 @@ system disk again.
 | `rust-lld` linker | `.cargo/config.toml` | Replaces slow MSVC `link.exe` for faster Windows linking. Missing linker state fails loudly. |
 | Dev incremental compilation | `Cargo.toml [profile.dev]` | Rebuilds only changed codegen units during the edit loop. |
 | Dependency debuginfo off | `Cargo.toml [profile.dev.package."*"]` | Avoids large dependency debug artifacts while keeping workspace panic line tables. |
+| Lightweight release optimization | `Cargo.toml [profile.release]` | Uses basic optimization for the installed CPU-only daemon so source installation does not feed the monolithic MCP crate to LLVM's multi-gigabyte level-3 optimizer. `release-max` retains level 3 + fat LTO for an explicit measured exception. |
 | `jobs = 32` | user Cargo config | Uses the configured host's logical cores for local builds. |
 | Cohesive crate seams | workspace crates | Lets Cargo schedule independent stable-rustc front ends and prevents unrelated main-crate edits from recompiling large subsystems. The Chrome bridge and native-host runtime live in `synapse-chrome-bridge`; both daemon binaries consume that one compiled artifact. |
 
@@ -118,14 +119,25 @@ closed if that suppression changes.
 - prunes merged or remote-gone worktrees without touching active, dirty, or
   unmerged work;
 - deletes local branches whose remote branch is gone;
-- runs `cargo sweep` for stale build artifacts.
+- removes stale Cargo artifacts and then enforces a 4 GiB ceiling on every
+  discovered `target/`, retaining the newest incremental artifacts;
+- bounds daemon crash stderr to 14 days/128 MiB (always retaining the newest)
+  and Codex startup schema snapshots to 14 days/256 MiB (retaining 16 newest).
+
+Cargo's built-in global-cache collector is checked on every substantive Cargo
+invocation via `.cargo/config.toml`; its upstream last-use policy removes
+downloaded entries after three months and locally regenerable entries after one
+month. This complements `cargo-sweep`: Cargo GC owns `$CARGO_HOME`, while the
+scheduled task owns workspace `target/` directories.
 
 ```powershell
 pwsh -File .\scripts\repo-maintenance.ps1
 pwsh -File .\scripts\repo-maintenance.ps1 -Apply
+# Override the per-target ceiling only when a measured workload requires it:
+pwsh -File .\scripts\repo-maintenance.ps1 -Apply -MaxTargetGB 6
 ```
 
-`scripts/install-maintenance-task.ps1` registers or removes the weekly
+`scripts/install-maintenance-task.ps1` registers or removes the daily
 non-elevated Scheduled Task:
 
 ```powershell
@@ -166,7 +178,21 @@ git add --renormalize .
 Parallel issue work created many throwaway git worktrees, each with its own
 multi-GB Cargo `target/`. Git does not automatically remove worktrees, and Cargo
 does not garbage-collect old `target/` artifacts. Scheduled worktree pruning plus
-`cargo sweep` keeps the checkout set and build artifacts bounded.
+the age-and-size `cargo sweep` policy keeps the checkout set and build artifacts
+bounded. Age-only cleanup is insufficient because frequently rebuilt profiles
+remain "recent" indefinitely; the size pass is the hard recurrence-prevention
+invariant.
+
+The running daemon has a separate lightweight envelope: zero GPU/VRAM, bounded
+Tokio/Rayon pools, a 1 MiB per-family memtable cap (about 128 MiB aggregate for
+a fully exercised vault), a 64 MiB aggregate SST-reader cache, and no retained
+full decoded SST indexes. Logical storage uses tiered TTL/byte caps (14-day raw
+transcripts, seven-day detailed reality, 30-day audit, 90-day summaries).
+Physical SST maintenance begins above 3 GiB, accelerates sequentially above
+5/7 GiB, and accepts a rewrite only when it either reduces file fan-out or
+physically reclaims at least five percent of the selected bytes. Disk-pressure
+admission starts shedding rebuildable work below the larger of 10 GiB or 10%
+free space; warnings begin at 15 GiB/15% so reclamation has time to run first.
 
 ## MCP Helper Process Hygiene
 

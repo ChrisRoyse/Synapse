@@ -33,16 +33,16 @@ pub enum RetentionTtl {
 pub const DEFAULTS: [RetentionDefault; 20] = [
     RetentionDefault {
         cf: "CF_EVENTS",
-        ttl: RetentionTtl::Hours(24),
-        soft_cap_mb: 2048,
-        hard_cap_mb: 4096,
+        ttl: RetentionTtl::Days(3),
+        soft_cap_mb: 256,
+        hard_cap_mb: 512,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
         cf: "CF_OBSERVATIONS",
-        ttl: RetentionTtl::Hours(6),
-        soft_cap_mb: 500,
-        hard_cap_mb: 1000,
+        ttl: RetentionTtl::Hours(24),
+        soft_cap_mb: 128,
+        hard_cap_mb: 256,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
@@ -55,8 +55,8 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     RetentionDefault {
         cf: "CF_MODEL_CACHE",
         ttl: RetentionTtl::LruOnly,
-        soft_cap_mb: 1024,
-        hard_cap_mb: 2048,
+        soft_cap_mb: 256,
+        hard_cap_mb: 512,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
@@ -68,9 +68,9 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     },
     RetentionDefault {
         cf: "CF_REFLEX_AUDIT",
-        ttl: RetentionTtl::Days(7),
-        soft_cap_mb: 200,
-        hard_cap_mb: 500,
+        ttl: RetentionTtl::Days(14),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
         cap_eviction: RetentionCapEviction::LockstepWith("CF_REFLEX_AUDIT_ORDER"),
     },
     RetentionDefault {
@@ -82,23 +82,23 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     },
     RetentionDefault {
         cf: "CF_TELEMETRY",
-        ttl: RetentionTtl::Hours(6),
-        soft_cap_mb: 100,
-        hard_cap_mb: 200,
+        ttl: RetentionTtl::Days(3),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
         cf: "CF_ACTION_LOG",
-        ttl: RetentionTtl::Hours(24),
-        soft_cap_mb: 200,
-        hard_cap_mb: 500,
+        ttl: RetentionTtl::Days(14),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
         cf: "CF_PROCESS_HISTORY",
-        ttl: RetentionTtl::Hours(6),
-        soft_cap_mb: 20,
-        hard_cap_mb: 50,
+        ttl: RetentionTtl::Hours(24),
+        soft_cap_mb: 32,
+        hard_cap_mb: 64,
         cap_eviction: RetentionCapEviction::Independent,
     },
     RetentionDefault {
@@ -108,14 +108,13 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
         hard_cap_mb: 50,
         cap_eviction: RetentionCapEviction::Independent,
     },
-    // ADR 2026-06-11-timeline-data-model: long-retention operator activity
-    // timeline; TTL eviction additionally relies on periodic compaction so
-    // cold SST files still pass the TTL filter (see storage cf_options).
+    // Summarized operator activity remains useful for a month while detailed
+    // evidence expires much sooner.
     RetentionDefault {
         cf: "CF_TIMELINE",
-        ttl: RetentionTtl::Days(90),
-        soft_cap_mb: 4096,
-        hard_cap_mb: 8192,
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 256,
+        hard_cap_mb: 512,
         cap_eviction: RetentionCapEviction::Independent,
     },
     // Derived episodes (#846): same retention horizon as their source
@@ -123,9 +122,9 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     // per event). Rebuildable at any time by re-segmentation.
     RetentionDefault {
         cf: "CF_EPISODES",
-        ttl: RetentionTtl::Days(90),
-        soft_cap_mb: 256,
-        hard_cap_mb: 512,
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
         cap_eviction: RetentionCapEviction::Independent,
     },
     // Derived routines (#848): a few hundred small rows replaced wholesale
@@ -149,27 +148,22 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
         hard_cap_mb: 64,
         cap_eviction: RetentionCapEviction::Independent,
     },
-    // Durable agent-event journal (#897): the source of truth every Command
-    // Center panel reconciles against (fleet metrics, transcripts, cost).
-    // 30 days covers dashboard history without competing with CF_TIMELINE
-    // for disk; TTL eviction additionally relies on periodic compaction so
-    // cold SST files still pass the TTL filter (see storage cf_options).
+    // Durable agent-event journal: 30 days covers operational audit and
+    // dashboard reconciliation without competing with 90-day summaries.
     RetentionDefault {
         cf: "CF_AGENT_EVENTS",
-        ttl: RetentionTtl::Days(30),
-        soft_cap_mb: 512,
-        hard_cap_mb: 1024,
+        ttl: RetentionTtl::Days(14),
+        soft_cap_mb: 128,
+        hard_cap_mb: 256,
         cap_eviction: RetentionCapEviction::LockstepWith("CF_AGENT_EVENT_SPAWN_INDEX"),
     },
-    // Normalized spawned-agent transcripts (#900): one row per source JSONL
-    // line, re-ingestable from the spawn log files while those exist on
-    // disk and the durable record after they are cleaned. Same 30-day
-    // dashboard horizon as the agent-event journal it reconciles with.
+    // Normalized spawned-agent transcripts: raw/high-volume evidence gets a
+    // 14-day and 1-GiB envelope; durable summaries and event audit outlive it.
     RetentionDefault {
         cf: "CF_AGENT_TRANSCRIPTS",
-        ttl: RetentionTtl::Days(30),
-        soft_cap_mb: 512,
-        hard_cap_mb: 1024,
+        ttl: RetentionTtl::Days(7),
+        soft_cap_mb: 256,
+        hard_cap_mb: 512,
         cap_eviction: RetentionCapEviction::LockstepWith("CF_AGENT_TRANSCRIPT_ORDER"),
     },
     // Exact timestamp-order pointer index for transcript health/dashboard
@@ -177,18 +171,18 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     // source and index disappear at the same logical boundary.
     RetentionDefault {
         cf: "CF_AGENT_TRANSCRIPT_ORDER",
-        ttl: RetentionTtl::Days(30),
-        soft_cap_mb: 64,
-        hard_cap_mb: 128,
-        cap_eviction: RetentionCapEviction::LockstepWith("CF_AGENT_TRANSCRIPTS"),
-    },
-    // Exact timestamp-order pointer index for global reflex history (#2190).
-    // Keep this in lockstep with CF_REFLEX_AUDIT's seven-day contract.
-    RetentionDefault {
-        cf: "CF_REFLEX_AUDIT_ORDER",
         ttl: RetentionTtl::Days(7),
         soft_cap_mb: 32,
         hard_cap_mb: 64,
+        cap_eviction: RetentionCapEviction::LockstepWith("CF_AGENT_TRANSCRIPTS"),
+    },
+    // Exact timestamp-order pointer index for global reflex history (#2190).
+    // Keep this in lockstep with CF_REFLEX_AUDIT's 14-day contract.
+    RetentionDefault {
+        cf: "CF_REFLEX_AUDIT_ORDER",
+        ttl: RetentionTtl::Days(14),
+        soft_cap_mb: 16,
+        hard_cap_mb: 32,
         cap_eviction: RetentionCapEviction::LockstepWith("CF_REFLEX_AUDIT"),
     },
     // Exact spawn-scoped pointer index for the agent-event journal (#2140).
@@ -196,9 +190,9 @@ pub const DEFAULTS: [RetentionDefault; 20] = [
     // in non-expiring CF_KV would manufacture dangling index rows after day 30.
     RetentionDefault {
         cf: "CF_AGENT_EVENT_SPAWN_INDEX",
-        ttl: RetentionTtl::Days(30),
-        soft_cap_mb: 64,
-        hard_cap_mb: 128,
+        ttl: RetentionTtl::Days(14),
+        soft_cap_mb: 32,
+        hard_cap_mb: 64,
         cap_eviction: RetentionCapEviction::LockstepWith("CF_AGENT_EVENTS"),
     },
 ];

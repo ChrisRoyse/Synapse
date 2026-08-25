@@ -298,23 +298,17 @@ impl ColumnFamily {
     /// 5.0 s to 36.6 s and later grew into the multi-gigabyte resident set in
     /// #2239. Large cold families must remain pageable without being retained.
     pub const fn retains_eager_lookup(&self) -> bool {
-        matches!(
-            self,
-            // The shared Synapse KV namespace is retained unconditionally by
-            // RouterConfig; naming it here keeps the hot-family policy total.
-            Self::Kv
-            // Every constellation write lands in Base, and the slot CFs are the
-            // high-volume point-read surfaces (#1968).
-            | Self::Base
-            // The derived-association and maintenance readbacks #1973 bounded.
-            | Self::XTerm
-            | Self::Graph
-            | Self::Assay
-            | Self::Kernel
-            | Self::TemporalXTerm
-            | Self::Reactive
-            | Self::Guard
-        ) || self.is_slot()
+        // No unbounded family may retain a decoded entry for every immutable
+        // key. `SstBounds` already carries the validated Bloom filter and
+        // bounded sparse seek points needed by both point and paged reads, so
+        // retaining complete indexes is latency speculation whose heap grows
+        // with historical disk footprint. The production vault measured that
+        // amplification in GiB for Base/Graph/Kv/slot history (#2260).
+        //
+        // Keep this method explicit rather than deleting the policy seam: a
+        // future *provably bounded* family may opt in here after its maximum
+        // retained entries and bytes are part of the schema contract.
+        false
     }
 
     /// Which lock shard owns this family's state, in `0..`[`SHARDS`].

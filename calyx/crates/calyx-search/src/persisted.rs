@@ -62,8 +62,12 @@ const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v2";
 const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";
 const INDEX_ROOT: &str = "idx/search";
 const MANIFEST_NAME: &str = "manifest.json";
-const DEFAULT_OPEN_GENERATION_CACHE_ENTRIES: usize = 4;
-const MAX_OPEN_GENERATION_CACHE_ENTRIES: usize = 16;
+// Keep the currently queried generation plus one immediately prior runtime.
+// Larger defaults pin mmap-backed artifacts long after publication and delay
+// physical reclamation. An audited deployment may raise this, but the process
+// still refuses an unbounded generation cache.
+const DEFAULT_OPEN_GENERATION_CACHE_ENTRIES: usize = 2;
+const MAX_OPEN_GENERATION_CACHE_ENTRIES: usize = 4;
 const OPEN_GENERATION_CACHE_ENTRIES_ENV: &str = "CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES";
 static OPEN_GENERATION_CACHE: OnceLock<Mutex<OpenGenerationCache>> = OnceLock::new();
 pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
@@ -971,6 +975,89 @@ pub fn read_candidate_manifest_artifact(
 ) -> CliResult<PersistedSearchManifestArtifact> {
     PersistedSearchIndexes::open_candidate(vault_dir, panel_version, candidate_key, base_seq)?
         .manifest_artifact()
+}
+
+/// Reclaims one fully measured candidate after Anneal durably rejected it.
+///
+/// The exact candidate is reopened before deletion, the live manifest must be
+/// a different immutable artifact, and its mmap runtime must have no remaining
+/// borrowers. A live query therefore turns cleanup into a deferred outcome
+/// rather than allowing Windows path deletion to race mapped search state.
+pub fn retire_rejected_candidate_manifest_artifact(
+    vault_dir: &Path,
+    panel_version: u32,
+    candidate_key: [u8; 32],
+    artifact: &PersistedSearchManifestArtifact,
+) -> CliResult<bool> {
+    if artifact.panel_version != panel_version {
+        return Err(stale(format!(
+            "cannot retire rejected candidate for panel {panel_version}: artifact declares panel {}",
+            artifact.panel_version
+        )));
+    }
+    let reopened = read_candidate_manifest_artifact(
+        vault_dir,
+        panel_version,
+        candidate_key,
+        artifact.base_seq,
+    )?;
+    if reopened != *artifact {
+        return Err(stale(format!(
+            "rejected candidate readback differs from sealed artifact {}",
+            artifact.manifest_sha256
+        )));
+    }
+    let live_before = read_live_manifest_artifact(vault_dir, panel_version)?;
+    if live_before == *artifact {
+        return Err(stale(format!(
+            "refusing to retire candidate {} because it is the live search manifest",
+            artifact.manifest_sha256
+        )));
+    }
+    if !release_cached_generation_runtime(vault_dir, panel_version, &artifact.manifest_sha256)? {
+        return Ok(false);
+    }
+    let root = candidate_index_root(vault_dir, panel_version, candidate_key, artifact.base_seq);
+    rebuild_stream::remove_failed_candidate_generation(&root)?;
+    let live_after = read_live_manifest_artifact(vault_dir, panel_version)?;
+    if live_after != live_before {
+        return Err(stale(format!(
+            "live search manifest changed from {} to {} across rejected-candidate cleanup",
+            live_before.manifest_sha256, live_after.manifest_sha256
+        )));
+    }
+    Ok(true)
+}
+
+fn release_cached_generation_runtime(
+    vault_dir: &Path,
+    panel_version: u32,
+    manifest_sha256: &str,
+) -> CliResult<bool> {
+    let Some(cache) = OPEN_GENERATION_CACHE.get() else {
+        return Ok(true);
+    };
+    let key = OpenGenerationKey {
+        vault_dir: canonical_pin_vault_dir(vault_dir)?,
+        panel_version,
+        manifest_sha256: manifest_sha256.to_owned(),
+    };
+    let mut cache = cache.lock().map_err(|_| {
+        CliError::io(
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_POISONED: generation runtime cache lock was poisoned during rejected-candidate cleanup; remediation=restart the process and inspect the first panic",
+        )
+    })?;
+    let released = match cache.entries.remove(&key) {
+        Some(runtime) => {
+            let weak = Arc::downgrade(&runtime);
+            drop(runtime);
+            weak.upgrade().is_none()
+        }
+        None => true,
+    };
+    cache.order.retain(|candidate| candidate != &key);
+    cache.retired.retain(|runtime| runtime.strong_count() > 0);
+    Ok(released)
 }
 
 /// Validates every artifact referenced by `artifact`, durably publishes its

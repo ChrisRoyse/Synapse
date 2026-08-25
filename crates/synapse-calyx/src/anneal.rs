@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use calyx_anneal::{
@@ -20,16 +21,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::{SynapseCalyxError, SynapseCalyxTuningConfig, SynapseCalyxVault};
+use crate::{SynapseCalyxError, SynapseCalyxTuningConfig, SynapseCalyxVault, invalid_config};
 
 const TUNING_ARTIFACT_TAG: &[u8] = b"synapse-anneal-tuning-v1";
 const TUNING_ARTIFACT_KEY: &[u8] = b"synapse/live-tuning/v1";
+static PRESERVE_LEGACY_POINTER: OnceLock<bool> = OnceLock::new();
 const ARTIFACT_ROW_PREFIX: &[u8] = b"synapse/tuning-artifact/v1/";
 const SEARCH_BINDING_ROW_PREFIX: &[u8] = b"synapse/anneal-search-binding/v1/";
 const SEARCH_BINDING_SCHEMA: &str = "synapse_anneal_search_binding/v1";
 const SEARCH_REPLAY_QUERIES_PER_SLOT: usize = 8;
 const SEARCH_REPLAY_PASSES: usize = 9;
 const SEARCH_REPLAY_K: usize = 3;
+
+pub(crate) fn configure_legacy_pointer_preservation(
+    preserve: bool,
+) -> Result<(), SynapseCalyxError> {
+    PRESERVE_LEGACY_POINTER
+        .set(preserve)
+        .map_err(|_| invalid_config("Anneal legacy-pointer policy was configured more than once"))
+}
+
+fn preserve_legacy_pointer() -> bool {
+    PRESERVE_LEGACY_POINTER.get().copied().unwrap_or(false)
+}
 
 struct AnnealProposalOptions<'a> {
     metrics: Vec<TripwireMetric>,
@@ -197,7 +211,7 @@ impl SynapseCalyxVault {
                 "repair the validated tuning serializer before reopening the vault",
             )
         })?;
-        if canonical_bytes != prior_bytes {
+        if canonical_bytes != prior_bytes && !preserve_legacy_pointer() {
             let canonical_hash = tuning_artifact_hash(&canonical_bytes);
             self.persist_tuning_artifact(canonical_hash, &canonical_bytes)?;
             rollback
@@ -225,6 +239,12 @@ impl SynapseCalyxVault {
                 prior_artifact_sha256 = %hex32(prior_hash),
                 live_artifact_sha256 = %hex32(canonical_hash),
                 "migrated durable Anneal tuning artifact after retiring inert fields"
+            );
+        } else if canonical_bytes != prior_bytes {
+            tracing::info!(
+                code = "SYNAPSE_CALYX_ANNEAL_LEGACY_POINTER_PRESERVED",
+                prior_artifact_sha256 = %hex32(prior_hash),
+                "using the validated CPU-only policy in memory while preserving the rollback-readable live artifact"
             );
         }
         tracing::info!(
@@ -476,6 +496,31 @@ impl SynapseCalyxVault {
                 ),
                 "inspect the live Anneal pointer and exact manifest binding before allowing search",
             ));
+        }
+        // The paired measurement handles are no longer needed after the live
+        // manifest readback. Release them before reclaiming a rejected shadow
+        // so the exact mmap/runtime lease, not an age heuristic, decides when
+        // its immutable candidate files may disappear.
+        drop(candidate_indexes);
+        drop(incumbent_indexes);
+        if matches!(change.outcome, ChangeOutcome::Reverted { .. }) {
+            let reclaimed = calyx_search::retire_rejected_candidate_manifest_artifact(
+                &self.config.vault_dir,
+                panel.panel.version,
+                candidate_hash,
+                &candidate_artifact,
+            )
+            .map_err(|error| search_shadow_error("retire rejected candidate generation", &error))?;
+            if !reclaimed {
+                return Err(anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_REJECTED_CANDIDATE_RETAINED",
+                    format!(
+                        "rejected candidate {} remains borrowed after its live-manifest decision",
+                        candidate_artifact.manifest_sha256
+                    ),
+                    "finish the exact candidate reader and retry the proposal cleanup; never delete a mapped generation by age or pathname",
+                ));
+            }
         }
         Ok(SynapseCalyxAnnealSearchReport {
             change,
@@ -1096,6 +1141,83 @@ impl SynapseCalyxVault {
         Ok(())
     }
 
+    /// Restores the unique authenticated historical Auto/12-GiB tuning
+    /// artifact after an interrupted pre-commit upgrade and verifies the live
+    /// pointer and artifact bytes independently.
+    pub fn restore_legacy_anneal_pointer_for_rollback(
+        &self,
+    ) -> Result<([u8; 32], [u8; 32], usize), SynapseCalyxError> {
+        let (current_hash, _, current_effective) = self.read_live_tuning()?;
+        let mut matches = Vec::new();
+        for (key, bytes) in self
+            .vault
+            .scan_cf_range_latest(ColumnFamily::Kv, &prefix_range(ARTIFACT_ROW_PREFIX))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("scan Anneal tuning artifacts", &error)
+            })?
+        {
+            let Some(hash_bytes) = key.strip_prefix(ARTIFACT_ROW_PREFIX) else {
+                continue;
+            };
+            let Ok(hash) = <[u8; 32]>::try_from(hash_bytes) else {
+                continue;
+            };
+            if tuning_artifact_hash(&bytes) != hash {
+                return Err(anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_ARTIFACT_HASH_MISMATCH",
+                    format!(
+                        "stored tuning artifact {} fails its content-address",
+                        hex32(hash)
+                    ),
+                    "repair the corrupted content-addressed artifact before rollback",
+                ));
+            }
+            if historical_resource_policy_effective(&bytes, hash)?
+                .is_some_and(|effective| effective == current_effective)
+            {
+                matches.push((hash, bytes));
+            }
+        }
+        if matches.len() != 1 {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_LEGACY_ARTIFACT_AMBIGUOUS",
+                format!(
+                    "expected exactly one authenticated compatible legacy tuning artifact, found {}",
+                    matches.len()
+                ),
+                "inspect the content-addressed Anneal artifacts; rollback refuses zero or ambiguous predecessors",
+            ));
+        }
+        let (legacy_hash, legacy_bytes) = matches.pop().expect("length checked");
+        let clock = self.anneal_clock()?;
+        let rollback = RollbackStore::open(
+            &clock,
+            self.config.tuning.rng_seed,
+            AsterRollbackStorage::new(&self.vault),
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("open Anneal rollback store", &error))?;
+        rollback
+            .install_live_ptr(
+                tuning_artifact_key(),
+                ArtifactPtr::ConfigCacheKeyHash(legacy_hash),
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("restore legacy Anneal live pointer", &error)
+            })?;
+        let (observed_hash, observed_bytes, observed_effective) = self.read_live_tuning()?;
+        if observed_hash != legacy_hash
+            || observed_bytes != legacy_bytes
+            || observed_effective != current_effective
+        {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_LEGACY_RESTORE_READBACK_MISMATCH",
+                "legacy Anneal pointer did not read back with the exact artifact and effective policy",
+                "inspect the durable AnnealRollback pointer before restarting either generation",
+            ));
+        }
+        Ok((current_hash, legacy_hash, legacy_bytes.len()))
+    }
+
     fn anneal_clock(&self) -> Result<crate::SynapseCalyxClock, SynapseCalyxError> {
         crate::SynapseCalyxClock::from_tuning(&self.config.tuning)
     }
@@ -1106,7 +1228,7 @@ fn decode_tuning_artifact(
     hash: [u8; 32],
 ) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
     match serde_json::from_slice::<SynapseCalyxTuningConfig>(bytes) {
-        Ok(tuning) => tuning.validate(),
+        Ok(tuning) => validate_or_migrate_historical_resource_policy(tuning, hash),
         Err(direct_error) => {
             let mut value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
                 anneal_error(
@@ -1149,7 +1271,7 @@ fn decode_tuning_artifact(
                     "restore a valid versioned Synapse tuning artifact and pointer",
                 ));
             }
-            serde_json::from_value::<SynapseCalyxTuningConfig>(value)
+            let tuning = serde_json::from_value::<SynapseCalyxTuningConfig>(value)
                 .map_err(|error| {
                     anneal_error(
                         "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
@@ -1159,10 +1281,79 @@ fn decode_tuning_artifact(
                         ),
                         "restore a valid versioned Synapse tuning artifact and pointer; only the documented retired fields are migrated",
                     )
-                })?
-                .validate()
+                })?;
+            validate_or_migrate_historical_resource_policy(tuning, hash)
         }
     }
+}
+
+fn historical_resource_policy_effective(
+    bytes: &[u8],
+    hash: [u8; 32],
+) -> Result<Option<SynapseCalyxTuningConfig>, SynapseCalyxError> {
+    let mut value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        anneal_error(
+            "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
+            format!("decode stored tuning artifact {}: {error}", hex32(hash)),
+            "repair the malformed content-addressed Anneal artifact",
+        )
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    for key in [
+        "bit_floor_bits",
+        "correlation_ceiling",
+        "guard_cold_start_tau",
+        "kernel_fraction",
+        "kernel_recall_gate",
+        "temporal_boost_min",
+        "temporal_boost_max",
+    ] {
+        object.remove(key);
+    }
+    let Ok(tuning) = serde_json::from_value::<SynapseCalyxTuningConfig>(value) else {
+        return Ok(None);
+    };
+    const HISTORICAL_AUTO_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+    if tuning.math_backend != crate::SynapseCalyxMathBackend::Auto
+        || tuning.vram_budget_bytes != HISTORICAL_AUTO_VRAM_BUDGET_BYTES
+    {
+        return Ok(None);
+    }
+    validate_or_migrate_historical_resource_policy(tuning, hash).map(Some)
+}
+
+/// Migrates the one resource-policy tuple shipped before Synapse became
+/// CPU-only.  The artifact hash still authenticates the historical bytes; this
+/// function changes only the two retired device-selection fields, after which
+/// `initialize_anneal_tuning` publishes and reads back a new content-addressed
+/// artifact and live pointer.  No other invalid or non-zero device policy is
+/// admitted.
+fn validate_or_migrate_historical_resource_policy(
+    tuning: SynapseCalyxTuningConfig,
+    hash: [u8; 32],
+) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
+    const HISTORICAL_AUTO_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+    if tuning.math_backend == crate::SynapseCalyxMathBackend::Auto
+        && tuning.vram_budget_bytes == HISTORICAL_AUTO_VRAM_BUDGET_BYTES
+    {
+        let mut migrated = tuning;
+        migrated.math_backend = crate::SynapseCalyxMathBackend::Cpu;
+        migrated.vram_budget_bytes = 0;
+        let migrated = migrated.validate()?;
+        tracing::warn!(
+            code = "SYNAPSE_CALYX_ANNEAL_RESOURCE_POLICY_MIGRATED",
+            prior_artifact_sha256 = %hex32(hash),
+            prior_math_backend = "auto",
+            prior_vram_budget_bytes = HISTORICAL_AUTO_VRAM_BUDGET_BYTES,
+            math_backend = "cpu",
+            vram_budget_bytes = 0_u64,
+            "migrated the exact historical Anneal resource policy before publishing a new content-addressed live artifact"
+        );
+        return Ok(migrated);
+    }
+    tuning.validate()
 }
 
 fn tuning_artifact_key() -> ArtifactKey {

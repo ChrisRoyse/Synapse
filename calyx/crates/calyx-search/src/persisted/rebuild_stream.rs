@@ -337,7 +337,7 @@ where
     }
 }
 
-fn remove_failed_candidate_generation(root: &Path) -> CliResult {
+pub(super) fn remove_failed_candidate_generation(root: &Path) -> CliResult {
     match fs::symlink_metadata(root) {
         Ok(_) => fs::remove_dir_all(root).map_err(|error| {
             CliError::io(format!(

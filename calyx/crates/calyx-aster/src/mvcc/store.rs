@@ -2157,6 +2157,14 @@ impl VersionedCfStore {
         }
     }
 
+    pub fn retained_lookup_usage_by_cf(
+        &self,
+    ) -> Vec<(ColumnFamily, crate::sst::level::RetainedLookupStatus)> {
+        self.router
+            .as_ref()
+            .map_or_else(Vec::new, |router| router.retained_lookup_usage_by_cf())
+    }
+
     /// Exact logical payload currently owned by the in-memory MVCC delta.
     ///
     /// This is an O(1) telemetry read. It deliberately excludes allocator and
