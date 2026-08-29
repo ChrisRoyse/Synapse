@@ -104,7 +104,7 @@ mod windows_bootstrap {
     const MAX_PROCESS_SNAPSHOT_ENTRIES: usize = 16_384;
     const MAX_JOB_PROCESS_IDS: usize = 1_024;
     const JOB_PROCESS_LIST_STABILITY_ATTEMPTS: usize = 4;
-    const TOTAL_COMMITTED_PRIVATE_POLICY_CEILING_BYTES: u64 = 1_000_000_000;
+    const TOTAL_COMMITTED_PRIVATE_POLICY_CEILING_BYTES: u64 = 7_000_000_000;
     const NESTED_JOB_CPU_RATE: u32 = 10_000;
     const JOB_SECURITY_DESCRIPTOR_SDDL: &str = "D:P(A;;GA;;;SY)(A;;0x00100004;;;OW)";
     const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -150,7 +150,7 @@ mod windows_bootstrap {
     ];
     const EXPECTED_RATE_ENV_KEY: &str = "SYNAPSE_EXPECTED_JOB_CPU_RATE";
     const _: () = assert!(SYNAPSE_OWNED_TREE_CPU_RATE == 2_500);
-    const _: () = assert!(SYNAPSE_OWNED_TREE_HARD_LIMIT_BYTES == 949_997_568);
+    const _: () = assert!(SYNAPSE_OWNED_TREE_HARD_LIMIT_BYTES == 6_699_999_232);
 
     #[repr(C)]
     struct Guid {

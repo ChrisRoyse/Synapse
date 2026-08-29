@@ -25,25 +25,25 @@ pub const DEFAULT_AIM_TRACK_EMA_ALPHA: f32 = 0.7;
 /// Runtime ownership is nested beneath a separate supervisor Job.
 ///
 /// The long-lived supervisor tree is nested inside the page-aligned aggregate
-/// parent Job below. This lower 789,999,616-byte child boundary leaves
+/// parent Job below. This lower 5,999,996,928-byte child boundary leaves
 /// committed/private capacity for the native bootstrap and PowerShell
 /// supervisor while keeping every daemon shell descendant inside the same
 /// committed-memory contract. This value is shared by every Rust writer/decoder
 /// that seals pre-trigger resource state, and setup queries the same value from
 /// the kernel before resume.
-pub const SYNAPSE_PROCESS_HARD_LIMIT_BYTES: u64 = 789_999_616;
+pub const SYNAPSE_PROCESS_HARD_LIMIT_BYTES: u64 = 5_999_996_928;
 
 /// Aggregate committed-memory ceiling for the bound Synapse supervisor tree.
 ///
 /// Windows rounds committed-memory Job limits down to a page boundary. The
-/// compiled 949,997,568-byte value is already page aligned, so exact kernel
-/// readback is stable. The remaining 50,002,432 bytes below the operator's
-/// decimal 1 GB ceiling are a measured, fail-closed reserve for the tiny native
+/// compiled 6,699,999,232-byte value is already page aligned, so exact kernel
+/// readback is stable. The remaining 300,000,768 bytes below the operator's
+/// decimal 7 GB ceiling are a measured, fail-closed reserve for the tiny native
 /// bootstrap's pre-association peak, which Windows explicitly does not charge
 /// retroactively when it joins the Job. This is not an aggregate
 /// resident-working-set bound; Windows Job Objects do not expose an equivalent
 /// hard sum-of-resident-pages limit.
-pub const SYNAPSE_OWNED_TREE_HARD_LIMIT_BYTES: u64 = 949_997_568;
+pub const SYNAPSE_OWNED_TREE_HARD_LIMIT_BYTES: u64 = 6_699_999_232;
 
 /// Windows Job hard CPU-rate units are hundredths of one percent. `2500`
 /// therefore caps the complete owned tree at 25% of host CPU capacity.
