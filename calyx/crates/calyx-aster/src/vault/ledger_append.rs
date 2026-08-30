@@ -56,6 +56,21 @@ pub struct AsterRawCommitmentVerification {
     /// Computed here because it binds the failing seal's Ledger sequence to its
     /// byte-exact diagnostic, and this is the only place that holds both.
     pub failure_adjudication_sha256: Option<String>,
+    /// Every seal that did not match, counted without a cap.
+    ///
+    /// Deliberately separate from the bounded adjudication list. A verifier that
+    /// stops at the first failure - or at the 64th - cannot tell an operator
+    /// whether they are looking at one torn seal or ten thousand, and that is
+    /// the difference between adjudicating a cohort and restoring the vault.
+    pub failed_seal_count: u64,
+    /// Bounded, in Ledger order, so the shape of the damage is legible.
+    pub failed_seal_examples: Vec<String>,
+    /// Physical commitment rows that no cohort seal declares.
+    ///
+    /// Distinct from `pending_commitment_count`, which is the unsealed tail.
+    /// These sit *between* sealed cohorts - written without their seal reaching
+    /// the Ledger - and are unattested rather than merely not yet attested.
+    pub uncovered_commitment_count: u64,
     pub seal_count: u64,
     pub commitment_count: u64,
     pub sealed_commitment_count: u64,
@@ -855,6 +870,9 @@ struct RawCommitmentCursor<'a> {
     previous_seq: Option<u64>,
     count: u64,
     coverage_from_seq: Option<u64>,
+    /// One row of lookahead, so a cohort can be matched against the sequence
+    /// range its seal declares instead of being handed whatever rows come next.
+    peeked: Option<raw_commitment::RawCommitment>,
 }
 
 impl<'a> RawCommitmentCursor<'a> {
@@ -864,10 +882,26 @@ impl<'a> RawCommitmentCursor<'a> {
             previous_seq: None,
             count: 0,
             coverage_from_seq: None,
+            peeked: None,
         }
     }
 
+    /// The next row without consuming it.
+    fn peek(&mut self) -> Result<Option<&raw_commitment::RawCommitment>> {
+        if self.peeked.is_none() {
+            self.peeked = self.advance()?;
+        }
+        Ok(self.peeked.as_ref())
+    }
+
     fn next(&mut self) -> Result<Option<raw_commitment::RawCommitment>> {
+        if let Some(peeked) = self.peeked.take() {
+            return Ok(Some(peeked));
+        }
+        self.advance()
+    }
+
+    fn advance(&mut self) -> Result<Option<raw_commitment::RawCommitment>> {
         let mut decoded = None;
         let present = self.stream.next_with(|key, value| {
             decoded = Some(raw_commitment::decode_commitment(key, value)?);
@@ -900,6 +934,9 @@ impl<'a> RawCommitmentCursor<'a> {
     }
 }
 
+/// Bounded sample of failure diagnostics retained for the readback.
+const FAILED_SEAL_EXAMPLE_LIMIT: usize = 8;
+
 /// A seal that did not match its physical cohort, held until the walk has seen
 /// every adjudication the Ledger carries.
 ///
@@ -928,8 +965,14 @@ struct RawCommitmentVerificationState {
     adjudicated_exceptions: Vec<String>,
     /// Adjudication guard digest for `failure`, filled in with it.
     failure_adjudication_sha256: Option<String>,
+    /// Uncapped count of seals that did not match.
+    failed_seal_count: u64,
+    /// Bounded sample of failure diagnostics, in Ledger order.
+    failed_seal_examples: Vec<String>,
     /// Physical commitment rows consumed by cohorts that were not verified.
     unverified_commitment_count: u64,
+    /// Physical commitment rows that no cohort seal declares.
+    uncovered_commitment_count: u64,
 }
 
 impl RawCommitmentVerificationState {
@@ -1007,10 +1050,53 @@ impl RawCommitmentVerificationState {
         seal: raw_commitment::RawCommitmentSeal,
         cursor: &mut RawCommitmentCursor<'_>,
     ) {
+        let (first_seq, last_seq) = (seal.first_seq, seal.last_seq);
         let mut verifier = raw_commitment::StreamingSealVerifier::new(seal);
         let mut first_candidate_seq = None;
         let mut consumed = 0_u64;
+        // Align to the range this seal declares before comparing anything.
+        //
+        // The commitment stream is strictly increasing and the walk is forward
+        // only, so a row below `first_seq` belongs to no later seal either: it is
+        // a commitment that no seal ever covered. Handing such rows to this
+        // cohort - which is what consuming blindly by count does - shifts every
+        // later cohort by the same amount, so a couple of uncovered rows turn
+        // into an unbounded run of mismatches that look like independent damage.
+        // Skipping them here keeps each seal checked against exactly its own
+        // declared rows, and reports the uncovered ones as what they are.
+        loop {
+            match cursor.peek() {
+                Ok(Some(commitment)) if commitment.seq < first_seq => {}
+                Ok(_) => break,
+                Err(error) => {
+                    self.failure = Some(format!(
+                        "raw commitment CF decode/order failed while aligning Ledger seal {ledger_seq} with error[{}]: {}",
+                        error.code, error.message
+                    ));
+                    self.cursor_unreadable = true;
+                    return;
+                }
+            }
+            if cursor.next().is_ok() {
+                self.uncovered_commitment_count = self.uncovered_commitment_count.saturating_add(1);
+            }
+        }
         for _ in 0..verifier.expected_count() {
+            match cursor.peek() {
+                Ok(Some(commitment)) if commitment.seq <= last_seq => {}
+                // Beyond the declared range, or the stream ended. The cohort is
+                // short; `finish` reports that against the sealed count rather
+                // than silently borrowing a later cohort's rows.
+                Ok(_) => break,
+                Err(error) => {
+                    self.failure = Some(format!(
+                        "raw commitment CF decode/order failed while matching Ledger seal {ledger_seq} with error[{}]: {}",
+                        error.code, error.message
+                    ));
+                    self.cursor_unreadable = true;
+                    return;
+                }
+            }
             let commitment = match cursor.next() {
                 Ok(Some(commitment)) => commitment,
                 Ok(None) => break,
@@ -1050,25 +1136,28 @@ impl RawCommitmentVerificationState {
                     .failure
                     .unwrap_or_else(|| "streaming seal mismatch had no diagnostic".to_owned())
             );
-            // Held, not latched. `finish` decides whether an operator has
-            // adjudicated this exact seal and this exact diagnostic; if not, this
-            // becomes the walk failure with byte-identical text to before.
-            if self.provisional.len() >= seal_adjudication::MAX_SEAL_ADJUDICATIONS {
-                self.first_pending_seq = first_candidate_seq;
-                self.failure = Some(format!(
-                    "raw commitment seal failures exceed the {} the verifier will hold for adjudication; the vault is damaged beyond individual review. Latest: {diagnostic}",
-                    seal_adjudication::MAX_SEAL_ADJUDICATIONS
-                ));
-                return;
+            // Count every failure, cap only what is held for adjudication. The
+            // count is what tells an operator whether this is a torn seal or a
+            // ruined vault; the walk continues either way so the count is real.
+            self.failed_seal_count = self.failed_seal_count.saturating_add(1);
+            if self.failed_seal_examples.len() < FAILED_SEAL_EXAMPLE_LIMIT {
+                self.failed_seal_examples.push(diagnostic.clone());
             }
             // The cohort is not verified, so its rows are not sealed rows.
             self.unverified_commitment_count =
                 self.unverified_commitment_count.saturating_add(consumed);
-            self.provisional.push(ProvisionalSealFailure {
-                ledger_seq,
-                diagnostic,
-                first_candidate_seq,
-            });
+            // Held, not latched. `finish` decides whether an operator has
+            // adjudicated this exact seal and this exact diagnostic; if not, this
+            // becomes the walk failure with byte-identical text to before.
+            if self.provisional.len() < seal_adjudication::MAX_SEAL_ADJUDICATIONS {
+                self.provisional.push(ProvisionalSealFailure {
+                    ledger_seq,
+                    diagnostic,
+                    first_candidate_seq,
+                });
+            } else if self.first_pending_seq.is_none() {
+                self.first_pending_seq = first_candidate_seq;
+            }
             return;
         }
         self.seal_count = match self.seal_count.checked_add(1) {
@@ -1085,7 +1174,10 @@ impl RawCommitmentVerificationState {
         // only valid cumulative count; sequence distance is not a substitute.
         // Rows consumed by cohorts that did not verify are inside that running
         // total and must not be reported as sealed.
-        self.sealed_commitment_count = cursor.count.saturating_sub(self.unverified_commitment_count);
+        self.sealed_commitment_count = cursor
+            .count
+            .saturating_sub(self.unverified_commitment_count)
+            .saturating_sub(self.uncovered_commitment_count);
         self.sealed_through_seq = verdict.last_physical_seq;
     }
 
@@ -1100,6 +1192,7 @@ impl RawCommitmentVerificationState {
             self.provisional.clear();
             return;
         }
+        let held_count = self.provisional.len() as u64;
         for held in core::mem::take(&mut self.provisional) {
             let adjudicated = self
                 .adjudications
@@ -1116,6 +1209,20 @@ impl RawCommitmentVerificationState {
                 ));
                 self.failure = Some(held.diagnostic);
             }
+        }
+        // More seals failed than may ever be adjudicated. Damage at that scale
+        // is not a reviewable exception, and no adjudication can clear it: the
+        // walk fails closed and says how far the damage actually runs.
+        if self.failed_seal_count > held_count && self.failure.is_none() {
+            self.failure_adjudication_sha256 = None;
+            self.failure = Some(format!(
+                "{} raw commitment cohort seals do not match the physical commitment stream, beyond the {} the verifier will hold for individual adjudication; damage at this scale must be restored rather than adjudicated. First: {}",
+                self.failed_seal_count,
+                seal_adjudication::MAX_SEAL_ADJUDICATIONS,
+                self.failed_seal_examples
+                    .first()
+                    .map_or("<none>", String::as_str)
+            ));
         }
     }
 
@@ -1149,6 +1256,9 @@ impl RawCommitmentVerificationState {
             adjudicated_exception_count: self.adjudicated_exceptions.len() as u64,
             adjudicated_exceptions: self.adjudicated_exceptions,
             failure_adjudication_sha256: self.failure_adjudication_sha256,
+            failed_seal_count: self.failed_seal_count,
+            failed_seal_examples: self.failed_seal_examples,
+            uncovered_commitment_count: self.uncovered_commitment_count,
             seal_count: self.seal_count,
             commitment_count: cursor.count,
             sealed_commitment_count: self.sealed_commitment_count,

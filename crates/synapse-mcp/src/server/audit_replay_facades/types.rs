@@ -427,6 +427,13 @@ pub struct AuditVerifyChainResponse {
     pub raw_commitment_adjudicated_count: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw_commitment_adjudicated_exceptions: Vec<String>,
+    /// Every cohort seal that did not match, counted without a cap: the number
+    /// that separates a reviewable exception from a vault to restore.
+    pub raw_commitment_failed_seal_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub raw_commitment_failed_seal_examples: Vec<String>,
+    /// Commitment rows no cohort seal declares.
+    pub raw_commitment_uncovered_count: u64,
     /// Bounded stall window used by the exact-snapshot integrity scan.
     pub reader_lease_duration_ms: u64,
     /// Successful renewals of that same pinned snapshot while rows advanced.

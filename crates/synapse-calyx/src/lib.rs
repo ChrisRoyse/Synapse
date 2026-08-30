@@ -1786,6 +1786,17 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub raw_commitment_adjudicated_count: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw_commitment_adjudicated_exceptions: Vec<String>,
+    /// Every cohort seal that did not match, counted without a cap.
+    ///
+    /// The number an operator actually needs: it separates one torn seal from
+    /// systemic damage, and the old verifier could not report it because it
+    /// stopped at the first failure.
+    pub raw_commitment_failed_seal_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub raw_commitment_failed_seal_examples: Vec<String>,
+    /// Commitment rows no cohort seal declares - unattested, as distinct from
+    /// the not-yet-attested tail in `raw_commitment_pending_count`.
+    pub raw_commitment_uncovered_count: u64,
     /// Bounded stall window for the exact-snapshot integrity scan.
     pub reader_lease_duration_ms: u64,
     /// Successful same-snapshot renewals across physical Ledger and raw
@@ -1926,6 +1937,12 @@ impl SynapseCalyxVaultVerifyReport {
         for exception in &self.chain.raw_commitment_adjudicated_exceptions {
             reasons.push(format!("raw_commitments: adjudicated {exception}"));
         }
+        if self.chain.raw_commitment_uncovered_count > 0 {
+            reasons.push(format!(
+                "raw_commitments: {} committed rows are declared by no cohort seal, so nothing attests them; they sit between sealed cohorts rather than in the unsealed tail",
+                self.chain.raw_commitment_uncovered_count
+            ));
+        }
         reasons
     }
 
@@ -1967,6 +1984,12 @@ impl SynapseCalyxVaultVerifyReport {
         self.restore.success
             && self.chain.intact
             && self.chain.raw_commitments_intact
+            // A commitment no seal declares was never attested by anything, so
+            // nothing proves it. That is not damage - no integrity evidence
+            // failed - but it is not a verified vault either, and it must not
+            // be able to hide: losing a seal outright would otherwise read as
+            // clean now that cohorts are matched by their declared range.
+            && self.chain.raw_commitment_uncovered_count == 0
             && self.lineage_present
     }
 
@@ -2052,6 +2075,9 @@ impl SynapseCalyxLedgerVerifyReport {
             raw_commitment_failure_sha256: raw_commitments.failure_adjudication_sha256.clone(),
             raw_commitment_adjudicated_count: raw_commitments.adjudicated_exception_count,
             raw_commitment_adjudicated_exceptions: raw_commitments.adjudicated_exceptions.clone(),
+            raw_commitment_failed_seal_count: raw_commitments.failed_seal_count,
+            raw_commitment_failed_seal_examples: raw_commitments.failed_seal_examples.clone(),
+            raw_commitment_uncovered_count: raw_commitments.uncovered_commitment_count,
             reader_lease_duration_ms,
             reader_lease_renewal_count,
             covers_full_history: lineage.chain_covers_full_history(),
