@@ -1081,6 +1081,30 @@ impl Db {
         self.backend.verify_calyx_ledger_chain(range)
     }
 
+    /// Records that one damaged raw-commitment cohort seal is permanently
+    /// unverifiable, so verification of every later seal can resume.
+    ///
+    /// Appends one `Admin` Ledger entry. It repairs nothing, erases nothing,
+    /// and cannot make a vault report `verified`; it only stops one reviewed,
+    /// unrepairable cohort from suppressing verification of the whole vault.
+    /// Guarded on the vault currently failing exactly that seal with exactly
+    /// the diagnostic whose digest the caller presents. As heavy as a full
+    /// `verify_calyx_ledger_chain` and must be driven off the async runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the guard does not hold or the append fails.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn adjudicate_calyx_raw_commitment_seal(
+        &self,
+        ledger_seq: u64,
+        expected_failure_sha256: &str,
+        reason: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSealAdjudicationReceipt> {
+        self.backend
+            .adjudicate_calyx_raw_commitment_seal(ledger_seq, expected_failure_sha256, reason)
+    }
+
     /// Reads and decodes one physical provenance-ledger entry by sequence for
     /// provenance readback.
     ///

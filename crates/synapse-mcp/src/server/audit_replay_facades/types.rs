@@ -28,6 +28,7 @@ pub enum AuditOperation {
     ExportBundle,
     VerifyChain,
     Reproduce,
+    AdjudicateRawCommitmentSeal,
 }
 
 impl AuditOperation {
@@ -41,6 +42,7 @@ impl AuditOperation {
             Self::ExportBundle => "export_bundle",
             Self::VerifyChain => "verify_chain",
             Self::Reproduce => "reproduce",
+            Self::AdjudicateRawCommitmentSeal => "adjudicate_raw_commitment_seal",
         }
     }
 
@@ -54,6 +56,7 @@ impl AuditOperation {
             "export_bundle" => Ok(Self::ExportBundle),
             "verify_chain" => Ok(Self::VerifyChain),
             "reproduce" => Ok(Self::Reproduce),
+            "adjudicate_raw_commitment_seal" => Ok(Self::AdjudicateRawCommitmentSeal),
             other => Err(invalid_operation(
                 AUDIT_TOOL,
                 other,
@@ -66,6 +69,7 @@ impl AuditOperation {
                     "export_bundle",
                     "verify_chain",
                     "reproduce",
+                    "adjudicate_raw_commitment_seal",
                 ],
                 AUDIT_SOT,
             )),
@@ -117,6 +121,22 @@ impl ReplayOperation {
     }
 }
 
+/// Operator authorization for one permanently unverifiable cohort seal.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSealAdjudicationParams {
+    /// Ledger sequence of the damaged `batch_commitment` seal.
+    pub ledger_seq: u64,
+    /// `raw_commitment_failure_sha256` exactly as verify_chain reported it.
+    ///
+    /// This is a revision guard, not a formality: it proves the operator
+    /// authorized the damage that is actually there right now.
+    pub expected_failure_sha256: String,
+    /// Why this cohort is accepted as permanently unverifiable. Recorded
+    /// durably in the Ledger and never erasable.
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuditParams {
@@ -138,6 +158,8 @@ pub struct AuditParams {
     pub verify_chain: Option<AuditVerifyChainParams>,
     #[serde(default)]
     pub reproduce: Option<AuditReproduceParams>,
+    #[serde(default)]
+    pub adjudicate_raw_commitment_seal: Option<AuditSealAdjudicationParams>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -168,7 +190,8 @@ fn audit_operation_schema(_: &mut SchemaGenerator) -> Schema {
             "profile_intelligence",
             "export_bundle",
             "verify_chain",
-            "reproduce"
+            "reproduce",
+            "adjudicate_raw_commitment_seal"
         ]
     })
 }
@@ -297,6 +320,19 @@ pub struct ReplayArtifactInspectParams {
     pub max_records: usize,
 }
 
+/// Physical receipt for one appended cohort-seal adjudication.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSealAdjudicationResponse {
+    pub adjudicated_ledger_seq: u64,
+    pub diagnostic: String,
+    pub diagnostic_sha256: String,
+    pub reason: String,
+    /// Ledger sequence of the appended `Admin` governance entry.
+    pub adjudication_ledger_seq: u64,
+    pub adjudication_entry_hash: String,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuditResponse {
@@ -319,6 +355,8 @@ pub struct AuditResponse {
     pub verify_chain: Option<AuditVerifyChainResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reproduce: Option<AuditReproduceResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudicate_raw_commitment_seal: Option<AuditSealAdjudicationResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -381,6 +419,14 @@ pub struct AuditVerifyChainResponse {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// Digest to present to `adjudicate_raw_commitment_seal` for this failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_failure_sha256: Option<String>,
+    /// Cohort seals already recorded as permanently unverifiable. Non-zero keeps
+    /// the vault out of a `verified` verdict without calling it corrupt.
+    pub raw_commitment_adjudicated_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub raw_commitment_adjudicated_exceptions: Vec<String>,
     /// Bounded stall window used by the exact-snapshot integrity scan.
     pub reader_lease_duration_ms: u64,
     /// Successful renewals of that same pinned snapshot while rows advanced.

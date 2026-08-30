@@ -1771,6 +1771,21 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// Digest an operator must present to adjudicate `raw_commitment_failure`.
+    ///
+    /// Published so the guard for an irreversible governance write is read
+    /// straight off the readback that reported the damage, rather than being
+    /// recomputed by hand from a diagnostic that must match byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_failure_sha256: Option<String>,
+    /// Cohort seals an operator has recorded as permanently unverifiable.
+    ///
+    /// Never counted as verified. While this is non-zero the vault can never
+    /// report `verified`, but the damage it names is reviewed and recorded
+    /// rather than newly discovered.
+    pub raw_commitment_adjudicated_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub raw_commitment_adjudicated_exceptions: Vec<String>,
     /// Bounded stall window for the exact-snapshot integrity scan.
     pub reader_lease_duration_ms: u64,
     /// Successful same-snapshot renewals across physical Ledger and raw
@@ -1863,6 +1878,20 @@ impl SynapseCalyxVaultVerifyVerdict {
     }
 }
 
+impl SynapseCalyxLedgerVerifyReport {
+    /// True when the raw-commitment walk carries only recorded, reviewed damage.
+    ///
+    /// This is the raw-commitment analogue of `restore.unverifiable_only()`: no
+    /// seal failed unexpectedly, and at least one cohort is one an operator has
+    /// already adjudicated as permanently unverifiable. Such a vault is not
+    /// verified - it can never be, while the exception stands - but it is also
+    /// not newly damaged, and the corruption alarm belongs to damage.
+    #[must_use]
+    pub const fn raw_commitments_adjudicated_only(&self) -> bool {
+        self.raw_commitment_failure.is_none() && self.raw_commitment_adjudicated_count > 0
+    }
+}
+
 impl SynapseCalyxVaultVerifyReport {
     /// Classifies the verdict from the evidence, fail-closed on integrity.
     ///
@@ -1875,7 +1904,8 @@ impl SynapseCalyxVaultVerifyReport {
             return SynapseCalyxVaultVerifyVerdict::Verified;
         }
         let integrity_failed = !self.chain.intact
-            || !self.chain.raw_commitments_intact
+            || (!self.chain.raw_commitments_intact
+                && !self.chain.raw_commitments_adjudicated_only())
             || !self.lineage_present
             || (!self.restore.success && !self.restore.unverifiable_only());
         if integrity_failed {
@@ -1887,11 +1917,16 @@ impl SynapseCalyxVaultVerifyReport {
     /// Names every scan that was refused rather than answered.
     #[must_use]
     pub fn unverifiable_reasons(&self) -> Vec<String> {
-        self.restore
+        let mut reasons = self
+            .restore
             .unverifiable_reason
             .iter()
             .map(|reason| format!("restore_verify: {reason}"))
-            .collect()
+            .collect::<Vec<_>>();
+        for exception in &self.chain.raw_commitment_adjudicated_exceptions {
+            reasons.push(format!("raw_commitments: adjudicated {exception}"));
+        }
+        reasons
     }
 
     /// Fraction of the durable ledger the chain re-walk actually covered.
@@ -1954,7 +1989,7 @@ impl SynapseCalyxVaultVerifyReport {
                 self.chain.corrupt_reason.as_deref().unwrap_or("none")
             ));
         }
-        if !self.chain.raw_commitments_intact {
+        if !self.chain.raw_commitments_intact && !self.chain.raw_commitments_adjudicated_only() {
             reasons.push(format!(
                 "raw_commitments: seals={} commitments={} sealed={} pending={} failure={}",
                 self.chain.raw_commitment_seal_count,
@@ -2014,6 +2049,9 @@ impl SynapseCalyxLedgerVerifyReport {
             raw_commitment_sealed_through_seq: raw_commitments.sealed_through_seq,
             raw_commitment_first_pending_seq: raw_commitments.first_pending_seq,
             raw_commitment_failure: raw_commitments.failure.clone(),
+            raw_commitment_failure_sha256: raw_commitments.failure_adjudication_sha256.clone(),
+            raw_commitment_adjudicated_count: raw_commitments.adjudicated_exception_count,
+            raw_commitment_adjudicated_exceptions: raw_commitments.adjudicated_exceptions.clone(),
             reader_lease_duration_ms,
             reader_lease_renewal_count,
             covers_full_history: lineage.chain_covers_full_history(),
@@ -2051,12 +2089,33 @@ impl SynapseCalyxLedgerVerifyReport {
             },
         };
         if report.intact && !raw_commitments_intact {
-            report.intact = false;
-            "corrupt".clone_into(&mut report.verdict);
-            report.corrupt_reason = raw_commitments.failure;
+            // A raw-commitment failure is a chain-level corruption verdict.
+            // Cohorts an operator has adjudicated are not a failure: the hash
+            // chain re-walked intact, and those cohorts are unverified rather
+            // than damaged. `raw_commitments_intact` stays false either way, so
+            // `green()` still refuses to call such a vault verified.
+            if let Some(failure) = raw_commitments.failure {
+                report.intact = false;
+                "corrupt".clone_into(&mut report.verdict);
+                report.corrupt_reason = Some(failure);
+            }
         }
         report
     }
+}
+
+/// Physical receipt for one appended raw-commitment seal adjudication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxSealAdjudicationReceipt {
+    /// The damaged cohort seal this exception covers.
+    pub adjudicated_ledger_seq: u64,
+    /// The byte-exact diagnostic the exception is bound to.
+    pub diagnostic: String,
+    pub diagnostic_sha256: String,
+    pub reason: String,
+    /// Ledger sequence of the appended `Admin` governance entry.
+    pub adjudication_ledger_seq: u64,
+    pub adjudication_entry_hash: String,
 }
 
 /// Decoded readback of one physical provenance-ledger entry.
@@ -8184,6 +8243,86 @@ impl SynapseCalyxVault {
         self.vault
             .purge_tombstoned_cfs(&[ColumnFamily::Kv])
             .map_err(|error| SynapseCalyxError::from_calyx("purge Calyx KV tombstones", &error))
+    }
+
+    /// Records that one damaged raw-commitment cohort seal is permanently
+    /// unverifiable, so verification of every later seal can resume.
+    ///
+    /// A cohort seal is the payload of an append-only Ledger entry whose hash
+    /// every later entry chains to, so a seal torn by a crash can never be
+    /// repaired in place. Left unrecorded it is not merely one lost cohort: the
+    /// verifier latches on its first failure, so the vault stops being verified
+    /// at all, permanently, including everything written afterwards.
+    ///
+    /// This appends one `Admin` governance entry. It repairs nothing and hides
+    /// nothing - the damage stays in the chain and in every readback, and the
+    /// vault can never again report `verified` while the exception stands.
+    ///
+    /// The write is guarded three ways. The vault must currently be failing on
+    /// exactly `ledger_seq`; the failure's adjudication digest must equal
+    /// `expected_failure_sha256`, which the caller must have read from a
+    /// verification readback; and the recorded digest binds the sequence to the
+    /// byte-exact diagnostic, so the exception dies the moment the damage
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the vault is not currently failing on
+    /// that seal, when the presented digest does not match, or when the Ledger
+    /// append fails.
+    pub fn adjudicate_raw_commitment_seal(
+        &self,
+        ledger_seq: u64,
+        expected_failure_sha256: &str,
+        reason: &str,
+    ) -> Result<SynapseCalyxSealAdjudicationReceipt, SynapseCalyxError> {
+        let report = self.verify_ledger_chain(None)?;
+        let Some(diagnostic) = report.raw_commitment_failure.clone() else {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEAL_ADJUDICATION_NO_FAILURE",
+                format!(
+                    "the vault reports no raw-commitment seal failure to adjudicate; verdict={} adjudicated_count={}",
+                    report.verdict, report.raw_commitment_adjudicated_count
+                ),
+                "re-run audit operation=verify_chain; only a seal the verifier is currently failing on may be adjudicated",
+            ));
+        };
+        let actual_sha256 = report.raw_commitment_failure_sha256.unwrap_or_default();
+        // The operator must present the exact digest of the exact damage they
+        // reviewed. A stale guard means the vault moved under them, and the
+        // write must not proceed on a diagnostic nobody read.
+        if !actual_sha256.eq_ignore_ascii_case(expected_failure_sha256.trim()) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEAL_ADJUDICATION_GUARD_MISMATCH",
+                format!(
+                    "presented failure digest does not match the vault's current raw-commitment failure; expected_failure_sha256={expected_failure_sha256} actual_failure_sha256={actual_sha256} failing_diagnostic={diagnostic}"
+                ),
+                "re-run audit operation=verify_chain and pass the raw_commitment_failure_sha256 it reports",
+            ));
+        }
+        if !diagnostic.contains(&format!("Ledger seal {ledger_seq} ")) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEAL_ADJUDICATION_SEQ_MISMATCH",
+                format!(
+                    "the vault is not currently failing on Ledger seal {ledger_seq}; failing_diagnostic={diagnostic}"
+                ),
+                "adjudicate the exact seal named in the current raw_commitment_failure",
+            ));
+        }
+        let ledger_ref = self
+            .vault
+            .adjudicate_raw_commitment_seal(ledger_seq, &diagnostic, reason)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("append raw-commitment seal adjudication", &error)
+            })?;
+        Ok(SynapseCalyxSealAdjudicationReceipt {
+            adjudicated_ledger_seq: ledger_seq,
+            diagnostic,
+            diagnostic_sha256: actual_sha256,
+            reason: reason.to_owned(),
+            adjudication_ledger_seq: ledger_ref.seq,
+            adjudication_entry_hash: hex_bytes(&ledger_ref.hash),
+        })
     }
 
     /// Verifies the live provenance-ledger hash chain against the exact stored

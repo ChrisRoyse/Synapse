@@ -818,6 +818,15 @@ pub trait StorageBackend: Send + Sync {
         &self,
         range: Option<(u64, u64)>,
     ) -> StorageResult<SynapseCalyxLedgerVerifyReport>;
+    /// Records one permanently unverifiable raw-commitment cohort seal so
+    /// verification of every later seal can resume. Appends an `Admin` Ledger
+    /// entry; repairs and hides nothing.
+    fn adjudicate_calyx_raw_commitment_seal(
+        &self,
+        ledger_seq: u64,
+        expected_failure_sha256: &str,
+        reason: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSealAdjudicationReceipt>;
     /// Reads and decodes one physical provenance-ledger entry by sequence.
     fn read_calyx_ledger_entry(&self, seq: u64) -> StorageResult<SynapseCalyxLedgerEntryReadback>;
     /// Re-derives a record's recorded provenance binding and bounds drift.
@@ -5605,6 +5614,33 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn adjudicate_calyx_raw_commitment_seal(
+        &self,
+        ledger_seq: u64,
+        expected_failure_sha256: &str,
+        reason: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSealAdjudicationReceipt> {
+        self.with_vault(
+            "calyx_ledger",
+            "adjudicate Calyx raw-commitment cohort seal",
+            true,
+            |vault| {
+                vault
+                    .adjudicate_raw_commitment_seal(ledger_seq, expected_failure_sha256, reason)
+                    .map_err(|source| {
+                        calyx_operation_failed(
+                            "calyx_ledger",
+                            true,
+                            format!(
+                                "adjudicate Calyx raw-commitment cohort seal {ledger_seq}: {}",
+                                source.message
+                            ),
+                        )
+                    })
             },
         )
     }

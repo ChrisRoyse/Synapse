@@ -19,6 +19,7 @@ pub(super) fn audit_response(
         export_bundle: None,
         verify_chain: None,
         reproduce: None,
+        adjudicate_raw_commitment_seal: None,
     };
     fill(&mut response);
     response

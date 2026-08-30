@@ -29,7 +29,8 @@ use super::{
     response::{audit_response, replay_response},
     types::{
         AuditLedgerEntryReadback, AuditLegacyProbeRepairResponse, AuditOperation, AuditParams,
-        AuditRepairRowReadback, AuditReproduceResponse, AuditResponse, AuditVerifyChainResponse,
+        AuditRepairRowReadback, AuditReproduceResponse, AuditResponse,
+        AuditSealAdjudicationResponse, AuditVerifyChainResponse,
         ReplayArtifactInspectParams, ReplayOperation, ReplayParams, ReplayResponse,
     },
     validation::{validate_audit_params, validate_replay_params},
@@ -41,7 +42,7 @@ const LEDGER_SOT: &str =
 #[tool_router(router = audit_replay_facade_tool_router, vis = "pub(in crate::server)")]
 impl SynapseService {
     #[tool(
-        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging) and fails closed with bounded key/value hash, length, and physical-revision diagnostics for every invalid row; repair_legacy_probe_row is an explicit maintenance-only, exact revision-guarded cleanup for positively identified #1540 synthetic envelopes and atomically appends a canonical repair audit row; lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain, then verifies every raw_commitment Merkle cohort seal against the physical commitment CF (full or an incremental Ledger from_seq/to_seq window, with optional read_seq entry readback), and returns a fail-closed intact/broken/corrupt verdict plus the unsealed checkpoint-tail count; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
+        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging) and fails closed with bounded key/value hash, length, and physical-revision diagnostics for every invalid row; repair_legacy_probe_row is an explicit maintenance-only, exact revision-guarded cleanup for positively identified #1540 synthetic envelopes and atomically appends a canonical repair audit row; lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain, then verifies every raw_commitment Merkle cohort seal against the physical commitment CF (full or an incremental Ledger from_seq/to_seq window, with optional read_seq entry readback), and returns a fail-closed intact/broken/corrupt verdict plus the unsealed checkpoint-tail count; adjudicate_raw_commitment_seal is a maintenance-only, digest-guarded governance write for a cohort seal that is damaged beyond repair: a seal lives in the payload of an append-only Ledger entry, so a torn one can never be rewritten without breaking the chain it protects, and the verifier latches on its first seal failure - meaning one torn seal silently stops every later seal from being checked at all, forever. Adjudicating appends an Admin entry naming that one seal and the byte-exact diagnostic, after which verification of every later cohort resumes. It repairs nothing and hides nothing: the damage stays in the chain and in every readback, the cohort is never counted as verified, and the vault can never again report verified while the exception stands. It requires the exact raw_commitment_failure_sha256 that verify_chain currently reports, so an exception cannot outlive the exact damage it was authorized against; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
     )]
     pub async fn audit(
         &self,
@@ -238,6 +239,81 @@ impl SynapseService {
                         response.manifest_path, response.rows_exported, response.redacted_fields
                     ),
                     |out| out.export_bundle = Some(response),
+                )))
+            }
+            AuditOperation::AdjudicateRawCommitmentSeal => {
+                let spec = params
+                    .0
+                    .adjudicate_raw_commitment_seal
+                    .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), LEDGER_SOT))?;
+                crate::server::operational_facades::policy::require_maintenance_profile(
+                    self,
+                    &request_context,
+                    AUDIT_TOOL,
+                    operation.as_str(),
+                    &spec.expected_failure_sha256,
+                    LEDGER_SOT,
+                )?;
+                self.require_m3_permissions(
+                    AUDIT_TOOL,
+                    &crate::m3::permissions::required([
+                        crate::m3::permissions::Permission::ReadStorage,
+                        crate::m3::permissions::Permission::WriteStorage,
+                    ]),
+                )?;
+                let db = self.m3_storage()?;
+                let ledger_seq = spec.ledger_seq;
+                let expected = spec.expected_failure_sha256.clone();
+                let reason = spec.reason.clone();
+                // The guard re-verifies the whole chain before writing, so this
+                // is as heavy as a full verify_chain and must not sit on a
+                // runtime worker serving MCP.
+                let receipt = tokio::task::spawn_blocking(move || {
+                    db.adjudicate_calyx_raw_commitment_seal(ledger_seq, &expected, &reason)
+                })
+                .await
+                .map_err(|join_error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        "calyx_ledger",
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "adjudicate_raw_commitment_seal blocking task failed to join: {join_error}"
+                            ),
+                        ),
+                        "inspect daemon logs; the seal adjudication task terminated abnormally",
+                    )
+                })?
+                .map_err(|error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        "calyx_ledger",
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(error.code(), error.to_string()),
+                        "re-run audit operation=verify_chain and adjudicate the exact seal and raw_commitment_failure_sha256 it reports",
+                    )
+                })?;
+                let response = AuditSealAdjudicationResponse {
+                    adjudicated_ledger_seq: receipt.adjudicated_ledger_seq,
+                    diagnostic: receipt.diagnostic,
+                    diagnostic_sha256: receipt.diagnostic_sha256,
+                    reason: receipt.reason,
+                    adjudication_ledger_seq: receipt.adjudication_ledger_seq,
+                    adjudication_entry_hash: receipt.adjudication_entry_hash,
+                };
+                Ok(Json(audit_response(
+                    operation,
+                    format!(
+                        "CF_LEDGER adjudicated_seal_seq={} adjudication_ledger_seq={} adjudication_entry_hash={}",
+                        response.adjudicated_ledger_seq,
+                        response.adjudication_ledger_seq,
+                        response.adjudication_entry_hash
+                    ),
+                    |out| out.adjudicate_raw_commitment_seal = Some(response),
                 )))
             }
             AuditOperation::VerifyChain => {
@@ -706,6 +782,11 @@ fn verify_chain_response(
         raw_commitment_sealed_through_seq: verify.raw_commitment_sealed_through_seq,
         raw_commitment_first_pending_seq: verify.raw_commitment_first_pending_seq,
         raw_commitment_failure: verify.raw_commitment_failure.clone(),
+        raw_commitment_failure_sha256: verify.raw_commitment_failure_sha256.clone(),
+        raw_commitment_adjudicated_count: verify.raw_commitment_adjudicated_count,
+        raw_commitment_adjudicated_exceptions: verify
+            .raw_commitment_adjudicated_exceptions
+            .clone(),
         reader_lease_duration_ms: verify.reader_lease_duration_ms,
         reader_lease_renewal_count: verify.reader_lease_renewal_count,
         covers_full_history: verify.covers_full_history,

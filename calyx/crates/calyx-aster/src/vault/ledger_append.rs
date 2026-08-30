@@ -1,4 +1,4 @@
-use super::{AsterVault, encode, ledger_hook, raw_commitment};
+use super::{AsterVault, encode, ledger_hook, raw_commitment, seal_adjudication};
 use crate::cf::{ColumnFamily, KeyRange, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
 use crate::mvcc::SnapshotCfRowStream;
@@ -42,6 +42,20 @@ pub struct AsterLedgerChainVerification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsterRawCommitmentVerification {
     pub intact: bool,
+    /// Cohort seals an operator has recorded as permanently unverifiable.
+    ///
+    /// These are never counted as verified. Their presence keeps `intact` false
+    /// so the vault can never report a clean verdict, but it does not by itself
+    /// mean the vault is damaged now - see `failure`, which stays `None` only
+    /// when every seal either verified or was adjudicated.
+    pub adjudicated_exception_count: u64,
+    /// One diagnostic per adjudicated cohort, in Ledger order.
+    pub adjudicated_exceptions: Vec<String>,
+    /// Digest an operator must present to adjudicate `failure`.
+    ///
+    /// Computed here because it binds the failing seal's Ledger sequence to its
+    /// byte-exact diagnostic, and this is the only place that holds both.
+    pub failure_adjudication_sha256: Option<String>,
     pub seal_count: u64,
     pub commitment_count: u64,
     pub sealed_commitment_count: u64,
@@ -886,6 +900,18 @@ impl<'a> RawCommitmentCursor<'a> {
     }
 }
 
+/// A seal that did not match its physical cohort, held until the walk has seen
+/// every adjudication the Ledger carries.
+///
+/// The verifier cannot decide a seal failure the moment it happens: an
+/// adjudication for it is appended *after* the damage, so it is reached later in
+/// the same forward pass. Failures are therefore provisional until `finish`.
+struct ProvisionalSealFailure {
+    ledger_seq: u64,
+    diagnostic: String,
+    first_candidate_seq: Option<u64>,
+}
+
 #[derive(Default)]
 struct RawCommitmentVerificationState {
     seal_count: u64,
@@ -894,6 +920,16 @@ struct RawCommitmentVerificationState {
     first_pending_seq: Option<u64>,
     failure: Option<String>,
     cursor_unreadable: bool,
+    /// Seal failures awaiting adjudication, bounded by `MAX_SEAL_ADJUDICATIONS`.
+    provisional: Vec<ProvisionalSealFailure>,
+    /// Adjudications collected anywhere in this pass.
+    adjudications: Vec<seal_adjudication::SealAdjudication>,
+    /// Resolved exceptions, filled in by `finish`.
+    adjudicated_exceptions: Vec<String>,
+    /// Adjudication guard digest for `failure`, filled in with it.
+    failure_adjudication_sha256: Option<String>,
+    /// Physical commitment rows consumed by cohorts that were not verified.
+    unverified_commitment_count: u64,
 }
 
 impl RawCommitmentVerificationState {
@@ -903,7 +939,11 @@ impl RawCommitmentVerificationState {
         bytes: &[u8],
         cursor: &mut RawCommitmentCursor<'_>,
     ) -> Result<()> {
-        if self.failure.is_some() {
+        // Only an unrecoverable fault stops the walk. A seal that failed to
+        // match is provisional until every adjudication has been seen, so the
+        // walk must keep going past it - that is what restores verification of
+        // everything written after a torn seal.
+        if self.cursor_unreadable || self.failure.is_some() {
             return Ok(());
         }
         let entry = match decode_ledger_entry_ref(bytes) {
@@ -922,6 +962,29 @@ impl RawCommitmentVerificationState {
                 entry.seq()
             ));
             return Ok(());
+        }
+        match seal_adjudication::ledger_adjudication_ref(&entry) {
+            Ok(Some(adjudication)) => {
+                if self.adjudications.len() >= seal_adjudication::MAX_SEAL_ADJUDICATIONS {
+                    self.failure = Some(format!(
+                        "raw commitment seal adjudications exceed the {} the verifier will honor; a vault needing more than that must be restored rather than adjudicated",
+                        seal_adjudication::MAX_SEAL_ADJUDICATIONS
+                    ));
+                    return Ok(());
+                }
+                self.adjudications.push(adjudication);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A row on the reserved adjudication subject that does not
+                // decode cannot be skipped: it claims to grant an exception.
+                self.failure = Some(format!(
+                    "raw commitment seal adjudication at Ledger entry {ledger_seq} failed decode with error[{}]: {}",
+                    error.code, error.message
+                ));
+                return Ok(());
+            }
         }
         let seal = match raw_commitment::ledger_seal_ref(&entry) {
             Ok(Some(seal)) => seal,
@@ -946,6 +1009,7 @@ impl RawCommitmentVerificationState {
     ) {
         let mut verifier = raw_commitment::StreamingSealVerifier::new(seal);
         let mut first_candidate_seq = None;
+        let mut consumed = 0_u64;
         for _ in 0..verifier.expected_count() {
             let commitment = match cursor.next() {
                 Ok(Some(commitment)) => commitment,
@@ -960,6 +1024,7 @@ impl RawCommitmentVerificationState {
                 }
             };
             first_candidate_seq.get_or_insert(commitment.seq);
+            consumed = consumed.saturating_add(1);
             if let Err(error) = verifier.push(&commitment) {
                 self.failure = Some(format!(
                     "raw commitment Merkle stream failed while matching Ledger seal {ledger_seq} with error[{}]: {}",
@@ -979,13 +1044,31 @@ impl RawCommitmentVerificationState {
             }
         };
         if !verdict.intact {
-            self.first_pending_seq = first_candidate_seq;
-            self.failure = Some(format!(
+            let diagnostic = format!(
                 "raw commitment Ledger seal {ledger_seq} does not match the physical commitment stream: {}",
                 verdict
                     .failure
                     .unwrap_or_else(|| "streaming seal mismatch had no diagnostic".to_owned())
-            ));
+            );
+            // Held, not latched. `finish` decides whether an operator has
+            // adjudicated this exact seal and this exact diagnostic; if not, this
+            // becomes the walk failure with byte-identical text to before.
+            if self.provisional.len() >= seal_adjudication::MAX_SEAL_ADJUDICATIONS {
+                self.first_pending_seq = first_candidate_seq;
+                self.failure = Some(format!(
+                    "raw commitment seal failures exceed the {} the verifier will hold for adjudication; the vault is damaged beyond individual review. Latest: {diagnostic}",
+                    seal_adjudication::MAX_SEAL_ADJUDICATIONS
+                ));
+                return;
+            }
+            // The cohort is not verified, so its rows are not sealed rows.
+            self.unverified_commitment_count =
+                self.unverified_commitment_count.saturating_add(consumed);
+            self.provisional.push(ProvisionalSealFailure {
+                ledger_seq,
+                diagnostic,
+                first_candidate_seq,
+            });
             return;
         }
         self.seal_count = match self.seal_count.checked_add(1) {
@@ -1000,11 +1083,44 @@ impl RawCommitmentVerificationState {
         // An intact verdict consumed exactly the next sealed cohort. The raw
         // commit sequence is sparse, so the cursor's physical row count is the
         // only valid cumulative count; sequence distance is not a substitute.
-        self.sealed_commitment_count = cursor.count;
+        // Rows consumed by cohorts that did not verify are inside that running
+        // total and must not be reported as sealed.
+        self.sealed_commitment_count = cursor.count.saturating_sub(self.unverified_commitment_count);
         self.sealed_through_seq = verdict.last_physical_seq;
     }
 
+    /// Decides every held seal failure against the adjudications this pass saw.
+    ///
+    /// A failure survives as *the* walk failure unless an operator authorized
+    /// exactly it: same Ledger sequence, byte-identical diagnostic. The first
+    /// unadjudicated failure wins, and its text is identical to what the
+    /// verifier produced before adjudication existed.
+    fn resolve_provisional_failures(&mut self) {
+        if self.failure.is_some() {
+            self.provisional.clear();
+            return;
+        }
+        for held in core::mem::take(&mut self.provisional) {
+            let adjudicated = self
+                .adjudications
+                .iter()
+                .any(|adjudication| adjudication.covers(held.ledger_seq, &held.diagnostic));
+            if adjudicated {
+                self.adjudicated_exceptions.push(held.diagnostic);
+                continue;
+            }
+            if self.failure.is_none() {
+                self.first_pending_seq = held.first_candidate_seq;
+                self.failure_adjudication_sha256 = Some(seal_adjudication::hex32(
+                    &seal_adjudication::diagnostic_digest(held.ledger_seq, &held.diagnostic),
+                ));
+                self.failure = Some(held.diagnostic);
+            }
+        }
+    }
+
     fn finish(mut self, cursor: &mut RawCommitmentCursor<'_>) -> AsterRawCommitmentVerification {
+        self.resolve_provisional_failures();
         if !self.cursor_unreadable {
             loop {
                 match cursor.next() {
@@ -1026,7 +1142,13 @@ impl RawCommitmentVerificationState {
             }
         }
         AsterRawCommitmentVerification {
-            intact: self.failure.is_none(),
+            // An adjudicated cohort was never verified, so a walk carrying one
+            // is never intact. `failure` is what separates "damaged now" from
+            // "carrying recorded, reviewed damage".
+            intact: self.failure.is_none() && self.adjudicated_exceptions.is_empty(),
+            adjudicated_exception_count: self.adjudicated_exceptions.len() as u64,
+            adjudicated_exceptions: self.adjudicated_exceptions,
+            failure_adjudication_sha256: self.failure_adjudication_sha256,
             seal_count: self.seal_count,
             commitment_count: cursor.count,
             sealed_commitment_count: self.sealed_commitment_count,

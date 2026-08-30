@@ -44,6 +44,7 @@ mod raw_commitment;
 mod retention_horizon;
 mod router_bridge;
 mod scan;
+mod seal_adjudication;
 mod seq_readback;
 mod slot_backfill;
 mod slot_column;
