@@ -7239,7 +7239,7 @@ function Write-SupervisorState {
         stt_backend = 'cpu'
         capture_backend = 'gdi_bitblt'
         capture_force_dxgi = $false
-        search_open_generation_cache_entries = 1
+        search_open_generation_cache_entries = 6
         job_limit_flags_expected_hex = '0x00002300'
         job_cpu_rate_control_flags_expected_hex = '0x00000005'
         daemon_cpu_rate = $DaemonCpuRate
@@ -8869,7 +8869,7 @@ $env:SYNAPSE_DETECTION_BACKEND = 'cpu'
 $env:SYNAPSE_STT_BACKEND = 'cpu'
 $env:SYNAPSE_CAPTURE_BACKEND = 'gdi_bitblt'
 $env:SYNAPSE_CAPTURE_FORCE_DXGI = 'false'
-$env:CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES = '1'
+$env:CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES = '6'
 if ($AuthorityMode -eq 'probe') {
     $env:SYNAPSE_SHELL_JOB_ROOT = $AuthorityShellJobRoot
     if ([string]::IsNullOrWhiteSpace($AuthorityReplacementReservationId)) {
@@ -8893,7 +8893,7 @@ $supervisorJobLimitFlagsHex = '0x{0:X8}' -f $supervisorResourceJob.JobLimitFlags
 $supervisorCpuRateFlagsHex = '0x{0:X8}' -f $supervisorResourceJob.CpuRateControlFlags
 $initialCalyxConfigSha256 = Assert-SynapseDaemonCalyxConfigIdentity
 $bindParts = Get-BindParts
-Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_START supervisor_pid=$PID bind=$Bind db=$DbPath exe=$ExePath calyx_config=$ExpectedCalyxConfigPath calyx_config_sha256=$initialCalyxConfigSha256 math_backend=cpu vram_budget_bytes=0 detection_backend=cpu stt_backend=cpu capture_backend=gdi_bitblt capture_force_dxgi=false search_open_generation_cache_entries=1 parent_job_name=$supervisorJobName parent_job_limit_flags=$supervisorJobLimitFlagsHex parent_cpu_rate_flags=$supervisorCpuRateFlagsHex parent_cpu_rate=$($supervisorResourceJob.CpuRate) parent_job_memory_limit_bytes=$SupervisorMemoryLimitBytes supervisor_private_bytes=$($supervisorMemory.PrivateBytes) supervisor_working_set_bytes=$($supervisorMemory.WorkingSetBytes) working_set_policy=measured_only daemon_job_limit_flags=0x00002300 daemon_cpu_rate=$DaemonCpuRate daemon_memory_limit_bytes=$ProcessMemoryLimitBytes owned_combined_memory_limit_bytes=$SupervisorMemoryLimitBytes bootstrap_preassociation_reserve_bytes=$BootstrapPreAssociationReserveBytes owned_committed_private_ceiling_bytes=$CommittedPrivatePolicyCeilingBytes"
+Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_START supervisor_pid=$PID bind=$Bind db=$DbPath exe=$ExePath calyx_config=$ExpectedCalyxConfigPath calyx_config_sha256=$initialCalyxConfigSha256 math_backend=cpu vram_budget_bytes=0 detection_backend=cpu stt_backend=cpu capture_backend=gdi_bitblt capture_force_dxgi=false search_open_generation_cache_entries=6 parent_job_name=$supervisorJobName parent_job_limit_flags=$supervisorJobLimitFlagsHex parent_cpu_rate_flags=$supervisorCpuRateFlagsHex parent_cpu_rate=$($supervisorResourceJob.CpuRate) parent_job_memory_limit_bytes=$SupervisorMemoryLimitBytes supervisor_private_bytes=$($supervisorMemory.PrivateBytes) supervisor_working_set_bytes=$($supervisorMemory.WorkingSetBytes) working_set_policy=measured_only daemon_job_limit_flags=0x00002300 daemon_cpu_rate=$DaemonCpuRate daemon_memory_limit_bytes=$ProcessMemoryLimitBytes owned_combined_memory_limit_bytes=$SupervisorMemoryLimitBytes bootstrap_preassociation_reserve_bytes=$BootstrapPreAssociationReserveBytes owned_committed_private_ceiling_bytes=$CommittedPrivatePolicyCeilingBytes"
 Write-SupervisorEvent 'supervisor_start' @{
     generation = $generation
     exe_path = $ExePath
@@ -8905,7 +8905,7 @@ Write-SupervisorEvent 'supervisor_start' @{
     stt_backend = 'cpu'
     capture_backend = 'gdi_bitblt'
     capture_force_dxgi = $false
-    search_open_generation_cache_entries = 1
+    search_open_generation_cache_entries = 6
     job_limit_flags_expected_hex = '0x00002300'
     job_cpu_rate_control_flags_expected_hex = '0x00000005'
     daemon_cpu_rate = $DaemonCpuRate
@@ -12947,7 +12947,7 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         stt_backend = 'cpu'
         capture_backend = 'gdi_bitblt'
         capture_force_dxgi = 'False'
-        search_open_generation_cache_entries = '1'
+        search_open_generation_cache_entries = '6'
         job_limit_flags_expected_hex = '0x00002300'
         job_cpu_rate_control_flags_expected_hex = '0x00000005'
         daemon_cpu_rate = [string]$SynapseDaemonCpuRate
@@ -13067,7 +13067,7 @@ function Get-SynapseLiveSupervisorResourceContractDrift {
             stt_backend = 'cpu'
             capture_backend = 'gdi_bitblt'
             capture_force_dxgi = 'False'
-            search_open_generation_cache_entries = '1'
+            search_open_generation_cache_entries = '6'
             job_limit_flags_expected_hex = '0x00002300'
             job_cpu_rate_control_flags_expected_hex = '0x00000005'
             daemon_cpu_rate = [string]$SynapseDaemonCpuRate
@@ -37916,7 +37916,7 @@ function Test-SynapseCandidateDaemon {
                     stt_backend = 'cpu'
                     capture_backend = 'gdi_bitblt'
                     capture_force_dxgi = 'False'
-                    search_open_generation_cache_entries = '1'
+                    search_open_generation_cache_entries = '6'
                     job_limit_flags_expected_hex = '0x00002300'
                     job_cpu_rate_control_flags_expected_hex = '0x00000005'
                     daemon_cpu_rate = [string]$SynapseDaemonCpuRate
@@ -38564,7 +38564,7 @@ function Test-SynapseCandidateDaemon {
                 stt_backend = 'cpu'
                 capture_backend = 'gdi_bitblt'
                 capture_force_dxgi = 'False'
-                search_open_generation_cache_entries = '1'
+                search_open_generation_cache_entries = '6'
                 job_limit_flags_expected_hex = '0x00002300'
                 job_cpu_rate_control_flags_expected_hex = '0x00000005'
                 daemon_cpu_rate = [string]$SynapseDaemonCpuRate
