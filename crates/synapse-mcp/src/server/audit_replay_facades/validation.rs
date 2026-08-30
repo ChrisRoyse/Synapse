@@ -33,6 +33,10 @@ pub(super) fn validate_audit_params(params: &AuditParams) -> Result<AuditOperati
             ("export_bundle", params.export_bundle.is_some()),
             ("verify_chain", params.verify_chain.is_some()),
             ("reproduce", params.reproduce.is_some()),
+            (
+                "adjudicate_raw_commitment_seal",
+                params.adjudicate_raw_commitment_seal.is_some(),
+            ),
         ],
         AUDIT_SOT,
     )?;

@@ -3124,6 +3124,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "inspect the physical CF_LEDGER hash chain and restore from a verified backup before trusting audit output",
             ),
             op(
+                "adjudicate_raw_commitment_seal",
+                true,
+                false,
+                "CF_LEDGER Admin governance entry recording one permanently unverifiable raw-commitment cohort seal",
+                Some(
+                    "adjudicated seal seq + byte-exact diagnostic and its digest + appended Admin entry seq/hash",
+                ),
+                error_codes::STORAGE_WRITE_FAILED,
+                "re-run audit operation=verify_chain and adjudicate the exact seal and raw_commitment_failure_sha256 it reports",
+            ),
+            op(
                 "reproduce",
                 false,
                 false,
