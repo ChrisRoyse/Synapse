@@ -67,7 +67,15 @@ const MANIFEST_NAME: &str = "manifest.json";
 // physical reclamation. An audited deployment may raise this, but the process
 // still refuses an unbounded generation cache.
 const DEFAULT_OPEN_GENERATION_CACHE_ENTRIES: usize = 2;
-const MAX_OPEN_GENERATION_CACHE_ENTRIES: usize = 4;
+// Raised 4 -> 8 (operator-interference / OOM incident, 2026-08-30). A host with
+// five declared-queryable panels could not fit its hot set in a 4-entry cache,
+// so every maintenance walk evicted and re-materialized a generation. Eviction
+// keeps the retired runtime alive until its last strong reference drops, so a
+// fast evict/reopen cycle piles several multi-hundred-MB generations up at once:
+// the observed daemon went from ~460 MB to 5.7 GB in ten seconds and was killed
+// by its Job commit cap. Residency is bounded by the generations themselves
+// (~2.5 GB for this host's whole set), which is far cheaper than the churn.
+const MAX_OPEN_GENERATION_CACHE_ENTRIES: usize = 8;
 const OPEN_GENERATION_CACHE_ENTRIES_ENV: &str = "CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES";
 static OPEN_GENERATION_CACHE: OnceLock<Mutex<OpenGenerationCache>> = OnceLock::new();
 pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
