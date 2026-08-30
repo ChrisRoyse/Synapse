@@ -53,9 +53,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v26";
+    "synapse-chrome-bridge-2026-08-30-terminal-discard-v27";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "fb7ba5c83b01ec7c7e8be32a620f882fbefbc152da810e53b66abcf60902cf24";
+    "7fe3e0ca82e0ba6083f25221b29cbfab5d03af63ad25253b6c37e1c92c6fe1cf";
 
 /// Physical proof that a caller-supplied Chromium extension directory is the
 /// installed, debugger-free Synapse normal bridge rather than an arbitrary
@@ -214,6 +214,10 @@ pub const NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES: usize =
     PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
 const COMMAND_TERMINAL_RECEIPT_LIMIT: usize = 64;
+/// Every Chrome command id is minted as `chrome-cdp-{daemon_pid}-{seq}`. The
+/// embedded pid is the only generational discriminator the extension carries
+/// back in a durable terminal, so minting and parsing share this prefix.
+const COMMAND_ID_PREFIX: &str = "chrome-cdp-";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -6264,7 +6268,7 @@ impl ChromeDebuggerBridge {
         command_timeout: Duration,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
         let id = format!(
-            "chrome-cdp-{}-{}",
+            "{COMMAND_ID_PREFIX}{}-{}",
             std::process::id(),
             self.command_seq.fetch_add(1, Ordering::Relaxed)
         );
@@ -6606,12 +6610,76 @@ impl ChromeDebuggerBridge {
                 "deduplicated": true,
             });
         }
+        if !inner.pending.contains_key(&command_id) {
+            // A terminal with neither a pending command nor a receipt is not by
+            // itself extension misbehavior, and answering every one of them with
+            // a fail-closed socket drop produced a livelock: the extension
+            // reconnects, replays the same durable terminal, and gets dropped
+            // again, forever. One dead-generation command id sustained 3,460
+            // register/hello/connect/reject/disconnect cycles in a single hour
+            // of daemon log at a flat 1 Hz.
+            //
+            // Two benign causes reach here, and both are provable rather than
+            // assumed:
+            //   * the command was issued by a previous daemon generation, whose
+            //     in-memory pending map died with it -- the command id carries
+            //     the issuing pid;
+            //   * the terminal was already accepted by this generation and its
+            //     receipt has since aged out of the bounded receipt ring, which
+            //     the browser-session high-water mark still remembers.
+            //
+            // Neither has a caller left to answer, so the daemon tells the
+            // extension to drop the terminal from its durable outbox and keeps
+            // the socket open. Every other shape stays fail-closed.
+            let issuing_daemon_pid = command_id_issuing_daemon_pid(&command_id);
+            let daemon_pid = std::process::id();
+            let high_water = inner
+                .command_terminal_high_water
+                .get(&envelope.browser_session_id)
+                .copied()
+                .unwrap_or(0);
+            let discard_reason = match issuing_daemon_pid {
+                Some(pid) if pid != daemon_pid => Some("stale_daemon_generation"),
+                _ if envelope.terminal_sequence <= high_water => Some("receipt_ring_evicted"),
+                _ => None,
+            };
+            let Some(discard_reason) = discard_reason else {
+                return nack(
+                    &command_id,
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    "command terminal has neither a pending delivered command nor a matching receipt"
+                        .to_owned(),
+                );
+            };
+            tracing::warn!(
+                code = "CHROME_DEBUGGER_COMMAND_TERMINAL_DISCARDED",
+                host_id = %socket_host_id,
+                command_id = %command_id,
+                command_kind = %envelope.command_kind,
+                discard_reason,
+                issuing_daemon_pid = issuing_daemon_pid.unwrap_or(0),
+                daemon_pid,
+                terminal_sequence = envelope.terminal_sequence,
+                high_water,
+                "unowned Chrome command terminal discarded; extension instructed to drop it from its durable outbox and keep the socket"
+            );
+            return json!({
+                "type": "command_terminal_discard",
+                "ok": true,
+                "host_id": socket_host_id,
+                "command_id": command_id,
+                "command_kind": envelope.command_kind,
+                "terminal_sequence": envelope.terminal_sequence,
+                "payload_sha256": envelope.payload_sha256,
+                "payload_bytes": envelope.payload_bytes,
+                "discard_reason": discard_reason,
+            });
+        }
         let Some(pending) = inner.pending.get(&command_id) else {
             return nack(
                 &command_id,
                 error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
-                "command terminal has neither a pending delivered command nor a matching receipt"
-                    .to_owned(),
+                "pending command disappeared while classifying its terminal".to_owned(),
             );
         };
         if !pending.delivered
@@ -9799,6 +9867,22 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+/// Recover the daemon pid a Chrome command id was minted under.
+///
+/// Ids are `chrome-cdp-{daemon_pid}-{seq}`, so a durable terminal replayed by
+/// the extension carries proof of which daemon generation issued it even after
+/// that generation's in-memory state is gone. Returns `None` for any id that
+/// does not match the minted shape, which callers must treat as unproven rather
+/// than as belonging to this generation.
+fn command_id_issuing_daemon_pid(command_id: &str) -> Option<u32> {
+    let rest = command_id.strip_prefix(COMMAND_ID_PREFIX)?;
+    let (pid, seq) = rest.split_once('-')?;
+    if pid.is_empty() || seq.is_empty() || !seq.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok()
 }
 
 fn daemon_instance_id() -> &'static str {

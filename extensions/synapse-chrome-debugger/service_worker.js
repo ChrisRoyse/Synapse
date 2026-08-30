@@ -1,6 +1,10 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v26";
-const BRIDGE_DECLARED_BUILD_SHA256 = "fb7ba5c83b01ec7c7e8be32a620f882fbefbc152da810e53b66abcf60902cf24";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-30-terminal-discard-v27";
+// Declared build metadata, not a physical integrity check -- the installer and
+// the daemon compare the deployed file's own service_worker_sha256 for that.
+// crates/synapse-mcp/build.rs enforces declared == sha256(BRIDGE_BUILD_ID) and
+// enforces that the daemon's EXPECTED_EXTENSION_* constants carry the same pair.
+const BRIDGE_DECLARED_BUILD_SHA256 = "7fe3e0ca82e0ba6083f25221b29cbfab5d03af63ad25253b6c37e1c92c6fe1cf";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -177,6 +181,13 @@ const BRIDGE_REGISTER_TOKEN_HEADER = "X-Synapse-Bridge-Register-Token";
 const BRIDGE_REGISTER_TOKEN = "";
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+// A WebSocket that opens and is then dropped before it does any useful work is
+// not a healthy connection, and treating it as one is what turned a single
+// unowned durable terminal into a flat 1 Hz reconnect livelock: onopen zeroed
+// the backoff counter, the replayed terminal was rejected, the daemon dropped
+// the socket, and the next attempt was always the 1000 ms floor. The counter now
+// only clears once a connection has survived long enough to be productive.
+const RECONNECT_PRODUCTIVE_CONNECTION_MS = 10000;
 const DISCONNECTED_KEEPALIVE_MS = 20000;
 const RECONNECT_WAKE_ALARM_NAME = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_DELAY_MINUTES = 0.5;
@@ -528,6 +539,7 @@ const COMMAND_TERMINAL_ACK_WAITERS = new Map();
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
+let productiveConnectionTimer = null;
 let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
 let maintenanceReconnectPauseUntilMs = 0;
@@ -943,6 +955,7 @@ async function registerDaemon() {
 
 function disableBridgePermanently(detail, code) {
   closeWebSocket();
+  clearProductiveConnectionTimer();
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
   permanentlyDisabled = true;
@@ -978,6 +991,7 @@ function scheduleReconnect(detail, code) {
     );
     return;
   }
+  clearProductiveConnectionTimer();
   const delayMs = Math.min(
     RECONNECT_MAX_MS,
     RECONNECT_INITIAL_MS * 2 ** Math.min(reconnectAttempt, 5)
@@ -1004,11 +1018,39 @@ function clearReconnectTimer() {
   }
 }
 
+function clearProductiveConnectionTimer() {
+  if (productiveConnectionTimer) {
+    clearTimeout(productiveConnectionTimer);
+    productiveConnectionTimer = null;
+  }
+}
+
 function resetReconnectState() {
   reconnectAttempt = 0;
+  clearProductiveConnectionTimer();
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
   void requireReconnectWakeAlarm("resetReconnectState").catch((error) => {
+    disableBridgePermanently(
+      `reconnect alarm verification failed after connection: ${errorMessage(error)}`,
+      error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
+    );
+  });
+}
+
+/// A socket just opened. Stop the reconnect machinery, but keep the accumulated
+/// backoff until this connection proves it can stay up: a connection that dies
+/// again inside RECONNECT_PRODUCTIVE_CONNECTION_MS escalates the delay instead of
+/// restarting the ladder at its 1000 ms floor.
+function noteWebSocketOpen() {
+  clearProductiveConnectionTimer();
+  clearReconnectTimer();
+  stopDisconnectedKeepAlive();
+  productiveConnectionTimer = setTimeout(() => {
+    productiveConnectionTimer = null;
+    reconnectAttempt = 0;
+  }, RECONNECT_PRODUCTIVE_CONNECTION_MS);
+  void requireReconnectWakeAlarm("noteWebSocketOpen").catch((error) => {
     disableBridgePermanently(
       `reconnect alarm verification failed after connection: ${errorMessage(error)}`,
       error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
@@ -1134,7 +1176,7 @@ function connectWebSocket() {
   const socket = new WebSocket(url.toString());
   webSocket = socket;
   socket.onopen = () => {
-    resetReconnectState();
+    noteWebSocketOpen();
     console.info(`Synapse daemon bridge connected: host_id=${hostId}`);
     startWebSocketKeepAlive(socket);
     flushCommandTerminalOutbox(socket).catch((error) => {
@@ -1178,22 +1220,32 @@ async function handleWebSocketMessage(raw) {
   } catch (_) {
     throw new Error(`daemon websocket returned non-JSON payload=${JSON.stringify(raw.slice(0, 512))}`);
   }
-  if (message?.ok === false) {
-    throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
-  }
-  if (message?.type === "command_terminal_ack") {
+  // Typed terminal replies are dispatched before the generic ok:false check.
+  // A command_terminal_nack carries ok:false, so the generic check used to
+  // swallow it and rethrow it as an ordinary "daemon unavailable" reconnect --
+  // which is why the fail-closed nack branch below was unreachable and why a
+  // rejected terminal came straight back on the next socket.
+  const messageType = String(message?.type || "");
+  if (messageType === "command_terminal_ack") {
     await acknowledgeCommandTerminal(message);
     return;
   }
-  if (message?.type === "command_diagnostic_ack") {
+  if (messageType === "command_terminal_discard") {
+    await discardCommandTerminal(message);
     return;
   }
-  if (message?.type === "command_terminal_nack") {
+  if (messageType === "command_diagnostic_ack") {
+    return;
+  }
+  if (messageType === "command_terminal_nack") {
     disableBridgePermanently(
       `daemon rejected a durable command terminal: ${JSON.stringify(message)}`,
       ERROR_TERMINAL_PROTOCOL
     );
     return;
+  }
+  if (message?.ok === false) {
+    throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
   }
   if (message?.command) {
     message.command.__synapseOriginalHostId = hostId;
@@ -29573,6 +29625,99 @@ async function acknowledgeCommandTerminal(message) {
     clearTimeout(waiter.timeoutId);
     COMMAND_TERMINAL_ACK_WAITERS.delete(commandId);
     waiter.resolve(DURABLE_OWNER_LEDGER.lastCommandTerminalAck);
+  }
+}
+
+/// The daemon proved it can never own this terminal -- it was minted by a dead
+/// daemon generation, or it was already accepted and its receipt has aged out of
+/// the daemon's bounded receipt ring. Either way no caller is left to answer, so
+/// the entry leaves the durable outbox instead of being replayed on every future
+/// socket. The daemon keeps the connection open across a discard, so this is the
+/// step that turns an endless reconnect cycle into exactly one.
+async function discardCommandTerminal(message) {
+  await DURABLE_OWNER_STATE_READY;
+  const commandId = String(message?.command_id || "").trim();
+  const terminalSequence = Number(message?.terminal_sequence);
+  const payloadSha256 = String(message?.payload_sha256 || "").toLowerCase();
+  const payloadBytes = Number(message?.payload_bytes);
+  const discardReason = String(message?.discard_reason || "").trim();
+  if (!commandId || !discardReason) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon discard directive is incomplete; command_id=${commandId || "missing"} ` +
+        `discard_reason=${discardReason || "missing"}`
+    );
+  }
+  const index = DURABLE_OWNER_LEDGER.commandTerminalOutbox.findIndex(
+    (entry) => entry.commandId === commandId
+  );
+  if (index < 0) {
+    // Nothing to drop. A repeated directive for an already-dropped terminal is
+    // idempotent, not a contradiction.
+    return;
+  }
+  const entry = DURABLE_OWNER_LEDGER.commandTerminalOutbox[index];
+  // The directive must describe the exact bytes this extension is holding.
+  // Otherwise a discard could be used to make the extension forget a terminal
+  // the daemon never actually saw.
+  if (entry.terminalSequence !== terminalSequence || entry.payloadSha256 !== payloadSha256 ||
+      entry.payloadBytes !== payloadBytes) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon discard directive contradicted durable storage; command_id=${commandId} ` +
+        `expected_sequence=${entry.terminalSequence} actual_sequence=${String(terminalSequence)} ` +
+        `expected_sha256=${entry.payloadSha256} actual_sha256=${payloadSha256 || "missing"} ` +
+        `expected_bytes=${entry.payloadBytes} actual_bytes=${String(payloadBytes)}`
+    );
+  }
+  const priorRevision = DURABLE_OWNER_LEDGER.revision;
+  const priorInFlightMutation = DURABLE_OWNER_LEDGER.inFlightMutation;
+  const priorRuntimeEnabled = DURABLE_MUTATION_OWNERS_ENABLED;
+  const priorLedgerEnabled = DURABLE_OWNER_LEDGER.enabled;
+  const priorUnresolvedCount = UNRESOLVED_WORKER_RESTART_MUTATION_COUNT;
+  DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 1);
+  if (DURABLE_OWNER_LEDGER.inFlightMutation?.id === commandId) {
+    DURABLE_OWNER_LEDGER.inFlightMutation = null;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+  }
+  if (DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
+      DURABLE_OWNER_LEDGER.disableSequence === 0 &&
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0) {
+    DURABLE_MUTATION_OWNERS_ENABLED = true;
+  }
+  try {
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 0, entry);
+    DURABLE_OWNER_LEDGER.inFlightMutation = priorInFlightMutation;
+    DURABLE_OWNER_LEDGER.revision = priorRevision;
+    DURABLE_OWNER_LEDGER.enabled = priorLedgerEnabled;
+    DURABLE_MUTATION_OWNERS_ENABLED = priorRuntimeEnabled;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = priorUnresolvedCount;
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon discarded command ${commandId}, but chrome.storage.local could not persist ` +
+        `the removal; payload_sha256=${payloadSha256} storage_error=${errorMessage(error)}; ` +
+        "the durable terminal remains pending for exact replay"
+    );
+  }
+  console.warn(
+    `Synapse daemon bridge discarded an unowned durable command terminal: ` +
+      `command_id=${commandId} terminal_sequence=${entry.terminalSequence} ` +
+      `payload_sha256=${entry.payloadSha256} discard_reason=${discardReason}`
+  );
+  // Any caller still awaiting this terminal is settled rather than left to time
+  // out: the daemon has told us its side is final.
+  const waiter = COMMAND_TERMINAL_ACK_WAITERS.get(commandId);
+  if (waiter && waiter.entry.terminalSequence === terminalSequence &&
+      waiter.entry.payloadSha256 === payloadSha256) {
+    clearTimeout(waiter.timeoutId);
+    COMMAND_TERMINAL_ACK_WAITERS.delete(commandId);
+    waiter.reject(bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon discarded the durable command terminal instead of acknowledging it; ` +
+        `command_id=${commandId} discard_reason=${discardReason}`
+    ));
   }
 }
 
