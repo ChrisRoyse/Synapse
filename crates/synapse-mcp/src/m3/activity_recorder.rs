@@ -142,7 +142,24 @@ impl RecorderConfig {
         Ok(Self {
             idle_timeout_ms,
             idle_poll_interval_ms,
-            interaction_hook_enabled: true,
+            // OFF by default (operator-interference incident, 2026-08-30).
+            //
+            // This installs process-global WH_MOUSE_LL and WH_KEYBOARD_LL
+            // hooks. Windows calls a low-level hook SYNCHRONOUSLY for every
+            // mouse and key event on the desktop, and if the hook thread does
+            // not return within LowLevelHooksTimeout the OS stalls and drops
+            // input. So any stall inside this daemon - a 60 s maintenance
+            // tick, a Calyx scan holding a lock, a GC pause - is converted
+            // into a visible system-wide cursor stutter for the human, on the
+            // daemon's tick cadence.
+            //
+            // What it buys is counts-only interaction cadence for the
+            // timeline: useful telemetry, but not worth putting Synapse in
+            // the OS input path of a machine a person is using. The recorder
+            // treats this as a fully supported off state (see the
+            // `!config.interaction_hook_enabled` branch in `start`) and keeps
+            // recording everything else.
+            interaction_hook_enabled: false,
             assist: AssistDetectorConfig::from_env()?,
         })
     }
