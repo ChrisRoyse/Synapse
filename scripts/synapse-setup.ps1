@@ -2891,10 +2891,22 @@ namespace SynapseSetup
                     SafeFileHandle handle;
                     if (index == 0)
                     {
+                        // Share DELETE as well. The live daemon holds the
+                        // deployed profiles directory open, so withholding it
+                        // failed the pinned chain with
+                        // STATUS_SHARING_VIOLATION (0xC0000043) on
+                        // leaf=profiles at the end of every otherwise
+                        // successful deployment. This costs no TOCTOU
+                        // protection: the chain's guarantee comes from
+                        // handle-rooted relative opens plus the per-entry
+                        // file-id and final-path verification below, not from
+                        // denying delete sharing. A concurrent rename cannot
+                        // redirect a handle-rooted open, and the final-path
+                        // check fails LOUDLY if one happens.
                         handle = OpenPhysicalHandleWithShare(
                             path,
                             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE);
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
                     }
                     else
                     {
@@ -2905,7 +2917,7 @@ namespace SynapseSetup
                             handles[index - 1],
                             Path.GetFileName(path),
                             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             NT_FILE_OPEN,
                             true,
                             false);
