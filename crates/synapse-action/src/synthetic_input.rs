@@ -862,12 +862,33 @@ mod win32 {
             report.masked_lone_modifier_tap = true;
         }
 
-        // 4. Every modifier, unconditionally. Release-only; nothing is re-pressed.
-        for (vkey, _label) in &MODIFIER_SWEEP {
-            if len < MAX_BATCH {
-                batch[len] = key_input(*vkey, 0, KEYEVENTF_KEYUP);
-                len += 1;
-                report.modifier_releases_emitted += 1;
+        // 4. Every modifier - but ONLY on evidence that there is something to
+        //    release. Operator-interference incident, 2026-08-30.
+        //
+        //    Step 5 below justifies an unconditional sweep with "a key-up for a
+        //    key that is already up is inert". That is not true for a LONE Alt
+        //    or Win key-up: Windows turns it into an Alt tap (menu-bar focus
+        //    steal) or a Win tap (Start menu). Step 3 is the mask that makes it
+        //    inert - and step 3 only arms when `alt_or_win_down`. So in exactly
+        //    the case where nothing is down, this loop emitted unmasked lone
+        //    Alt and Win key-ups into the global input queue.
+        //
+        //    That is what the operator felt: the daemon OOM-panicked in a
+        //    restart loop, and every panic ran this sweep with
+        //    modifiers_found_down=0 and tracked_strands_released=0, emitting 11
+        //    modifier key-ups - two of them unmasked Win taps - each time.
+        //
+        //    Releasing what this process cannot prove it holds is interference,
+        //    not recovery: the same rule the startup sweep already applies.
+        let has_release_evidence =
+            report.modifiers_found_down != 0 || report.tracked_strands_released != 0;
+        if has_release_evidence {
+            for (vkey, _label) in &MODIFIER_SWEEP {
+                if len < MAX_BATCH {
+                    batch[len] = key_input(*vkey, 0, KEYEVENTF_KEYUP);
+                    len += 1;
+                    report.modifier_releases_emitted += 1;
+                }
             }
         }
 
