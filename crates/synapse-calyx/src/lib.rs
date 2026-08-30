@@ -5021,6 +5021,29 @@ impl SynapseCalyxVault {
             })
     }
 
+    /// Per-CF memtable ceiling handed to Aster's router.
+    ///
+    /// Aster's own default is 1 MiB (`DEFAULT_MEMTABLE_BYTES`), and Synapse
+    /// never overrode it, so every column family ran with a 0.75-1.0 MiB cap
+    /// after the deterministic per-CF stagger. Synapse writes rows far larger
+    /// than that: a single observed causal-map row was 7,428,289 bytes against
+    /// a cap of 891,301. A row that cannot fit its own memtable cannot be
+    /// admitted at all, so writes backed up until `base` held its maximum two
+    /// sealed memtables, the next flush was refused
+    /// (CALYX_ASTER_ROUTER_SEALED_MEMTABLE_BACKLOG), restoring the sealed
+    /// memtable then failed too (CALYX_BACKPRESSURE, "memtable byte cap 859846
+    /// exceeded by projected 862164 bytes"), and the shard was declared
+    /// corrupt. The vault then re-opened and replayed manifested durable
+    /// batches, which drove private commit from ~460 MB to 5.7 GB in seconds,
+    /// hit the Job process cap and killed the daemon - about every five
+    /// minutes, indefinitely, because each restart re-entered the same state.
+    ///
+    /// 16 MiB clears the largest row observed on this corpus with roughly 2x
+    /// headroom. This is a ceiling, not an allocation: a memtable only grows
+    /// with the rows actually written to that CF, and only the few hot CFs
+    /// approach it, so steady-state residency stays in the tens of megabytes.
+    const SYNAPSE_MEMTABLE_BYTE_CAP: usize = 16 * 1024 * 1024;
+
     /// Opens the configured durable Aster vault after acquiring the Synapse
     /// process lock and loading the stable vault identity.
     ///
@@ -5029,7 +5052,10 @@ impl SynapseCalyxVault {
     /// Returns an error when directories, identity files, the machine-local
     /// salt, the single-instance lock, or Calyx recovery/open fail.
     pub fn open(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
-        let options = VaultOptions::default();
+        let options = VaultOptions {
+            memtable_byte_cap: Self::SYNAPSE_MEMTABLE_BYTE_CAP,
+            ..VaultOptions::default()
+        };
         Self::open_with_mode(config, &options, SynapseCalyxVaultOpenMode::FullMvccRestore)
     }
 
@@ -5047,6 +5073,7 @@ impl SynapseCalyxVault {
         let options = VaultOptions {
             restore_mvcc_rows: false,
             eager_router_lookup_on_open: false,
+            memtable_byte_cap: Self::SYNAPSE_MEMTABLE_BYTE_CAP,
             ..VaultOptions::default()
         };
         Self::open_with_mode(config, &options, SynapseCalyxVaultOpenMode::LatestReadback)
