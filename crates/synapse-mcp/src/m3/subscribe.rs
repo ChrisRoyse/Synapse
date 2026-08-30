@@ -40,8 +40,14 @@ pub struct SubscribeParams {
     #[serde(default = "default_snapshot_first")]
     #[schemars(default = "default_snapshot_first")]
     pub snapshot_first: bool,
+    /// Fixed SSE ring capacity. The only accepted value is 4096: the buffer is
+    /// never actually resized (this field is not forwarded to the subscription),
+    /// and `subscribe_to_events` rejects anything else. The schema therefore
+    /// pins it rather than advertising the full u32 range it does not honour --
+    /// a client that trusted the open range got TOOL_PARAMS_INVALID.
     #[serde(default = "default_buffer_size")]
     #[schemars(default = "default_buffer_size")]
+    #[schemars(range(min = 4096, max = 4096))]
     pub buffer_size: u32,
 }
 

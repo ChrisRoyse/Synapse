@@ -966,7 +966,13 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
 fn autostart_readback() -> super::types::SetupAutostartReadback {
     use super::types::SetupAutostartReadback;
 
-    const TASK_NAME: &str = "SynapseMcpDaemon";
+    // The legacy single-task name. Autostart now normally belongs to an
+    // immutable broker task (`SynapseMcpBroker-<capability sha>`), so this name
+    // alone is NOT evidence of anything: reporting it missing while an enabled
+    // broker task owns the logon trigger told operators "the daemon will not
+    // start at logon" when it demonstrably does, and sent them to re-run setup.
+    const LEGACY_TASK_NAME: &str = "SynapseMcpDaemon";
+    const BROKER_TASK_PREFIX: &str = "SynapseMcpBroker-";
     let log_dir = localappdata_path(["synapse", "logs"]);
     let mut problems = Vec::new();
 
@@ -976,10 +982,14 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
             "-NonInteractive",
             "-Command",
             &format!(
-                "$t = Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue; \
+                "$t = Get-ScheduledTask -TaskName '{LEGACY_TASK_NAME}' -ErrorAction \
+                 SilentlyContinue; \
+                 if (-not $t) {{ $t = @(Get-ScheduledTask -ErrorAction SilentlyContinue | \
+                 Where-Object {{ $_.TaskName -like '{BROKER_TASK_PREFIX}*' -and \
+                 $_.Settings.Enabled }}) | Sort-Object TaskName | Select-Object -First 1 }}; \
                  if (-not $t) {{ 'NOTREGISTERED' }} else {{ \
                  $a = @($t.Actions)[0]; \
-                 \"$($t.State)`n$($a.Execute)`n$($a.Arguments)\" }}"
+                 \"$($t.TaskName)`n$($t.State)`n$($a.Execute)`n$($a.Arguments)\" }}"
             ),
         ])
         .creation_flags(CREATE_NO_WINDOW)
@@ -1012,12 +1022,14 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
     if trimmed.is_empty() || trimmed == "NOTREGISTERED" {
         if trimmed == "NOTREGISTERED" {
             problems.push(format!(
-                "SYNAPSE_AUTOSTART_TASK_MISSING task={TASK_NAME} remediation=the daemon will not \
+                "SYNAPSE_AUTOSTART_TASK_MISSING legacy_task={LEGACY_TASK_NAME} \
+                 broker_task_prefix={BROKER_TASK_PREFIX} remediation=neither the legacy autostart \
+                 task nor an enabled immutable broker task is registered, so the daemon will not \
                  start at logon; re-run scripts/synapse-setup.ps1 to register it"
             ));
         }
         return SetupAutostartReadback {
-            task_name: TASK_NAME.to_owned(),
+            task_name: LEGACY_TASK_NAME.to_owned(),
             task_registered: false,
             task_state: None,
             action_execute: None,
@@ -1031,14 +1043,26 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
     }
 
     let mut lines = trimmed.lines();
+    let task_name = lines.next().unwrap_or_default().trim().to_owned();
     let task_state = lines.next().unwrap_or_default().trim().to_owned();
     let action_execute = lines.next().unwrap_or_default().trim().to_owned();
     let action_arguments = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
 
+    // The legacy model launched through a quoted .vbs named in the arguments.
+    // The immutable-broker model has no .vbs at all: the action executable is
+    // the native broker bootstrap and the supervisor is a .ps1 argument, so
+    // requiring a .vbs reported ACTION_UNPARSEABLE against healthy autostart.
     let launcher_path = action_arguments
         .split('"')
         .find(|segment| segment.to_ascii_lowercase().ends_with(".vbs"))
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            if task_name.starts_with(BROKER_TASK_PREFIX) && !action_execute.is_empty() {
+                Some(action_execute.clone())
+            } else {
+                None
+            }
+        });
 
     let (launcher_file, can_start_daemon, launcher_in_log_dir) = match &launcher_path {
         Some(path) => {
@@ -1046,7 +1070,7 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
             let exists = readback.exists;
             if !exists {
                 problems.push(format!(
-                    "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task={TASK_NAME} task_state={task_state} \
+                    "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task={task_name} task_state={task_state} \
                      launcher={path} remediation=the task is registered and reports \
                      State={task_state}, but its launcher file does not exist so it can never \
                      start the daemon; re-run scripts/synapse-setup.ps1"
@@ -1055,7 +1079,7 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
             let in_log_dir = Path::new(path).starts_with(&log_dir);
             if in_log_dir {
                 problems.push(format!(
-                    "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task={TASK_NAME} launcher={path} \
+                    "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task={task_name} launcher={path} \
                      log_dir={} remediation=the launcher lives in the log directory, so routine \
                      log cleanup will delete it and silently disable autostart; re-run \
                      scripts/synapse-setup.ps1 to move it into the runtime bin directory",
@@ -1066,7 +1090,7 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
         }
         None => {
             problems.push(format!(
-                "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task={TASK_NAME} \
+                "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task={task_name} \
                  arguments={action_arguments} remediation=the registered action does not name a \
                  quoted .vbs launcher; re-run scripts/synapse-setup.ps1"
             ));
@@ -1075,7 +1099,7 @@ fn autostart_readback() -> super::types::SetupAutostartReadback {
     };
 
     SetupAutostartReadback {
-        task_name: TASK_NAME.to_owned(),
+        task_name,
         task_registered: true,
         task_state: Some(task_state),
         action_execute: Some(action_execute),
