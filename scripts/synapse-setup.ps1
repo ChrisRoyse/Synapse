@@ -327,7 +327,7 @@ $SynapseBindFinalDeadOwnerSettleSeconds = 15
 # to return one 4,096-row page, and ambient agent ingestion re-reads multi-MB
 # session transcripts. The daemon went over the cap continuously and every
 # allocation past it failed - the observed signatures were "memory allocation of
-# 65536 bytes failed", "has overflowed its stack", and tokio "OS can not spawn
+# 65536 bytes failed", "has overflowed its stack", and tokio's "OS can't spawn
 # worker thread: The paging file is too small (os error 1455)", the last of which
 # is the Job commit limit rather than any real page-file shortage (the host had
 # ~210 GB of free commit at the time). The daemon crash-looped every ~85 seconds
@@ -4616,14 +4616,22 @@ namespace SynapseSetup
                     }
                 }
 
-                char[] destinationName = destinationLeafName.ToCharArray();
+                // SetFileInformationByHandle(FileRenameInfo) requires
+                // RootDirectory to be NULL.  Unlike NtSetInformationFile, the
+                // Win32 surface does not accept a directory handle as the
+                // relative-name root; use the already-normalized full path.
+                char[] destinationName = destinationPath.ToCharArray();
                 int fileNameLength = checked(destinationName.Length * 2);
                 int fileNameOffset = checked((int)Marshal.OffsetOf(
                     typeof(FILE_RENAME_INFO_HEADER),
                     "FileNameLength") + sizeof(uint));
+                // Although FileNameLength excludes a terminator, the Win32
+                // implementation reads the variable member as a WCHAR string
+                // on this supported host.  Keep an explicit zero WCHAR beyond
+                // the counted bytes so it cannot consume adjacent heap data.
                 int bufferSize = Math.Max(
                     Marshal.SizeOf(typeof(FILE_RENAME_INFO_HEADER)),
-                    checked(fileNameOffset + fileNameLength));
+                    checked(fileNameOffset + fileNameLength + sizeof(char)));
                 renameBuffer = Marshal.AllocHGlobal(bufferSize);
                 for (int index = 0; index < bufferSize; index++) Marshal.WriteByte(renameBuffer, index, 0);
                 Marshal.WriteInt32(renameBuffer, 0, 0);
@@ -4633,33 +4641,20 @@ namespace SynapseSetup
                 int fileNameLengthOffset = checked((int)Marshal.OffsetOf(
                     typeof(FILE_RENAME_INFO_HEADER),
                     "FileNameLength"));
-                bool destinationReferenced = false;
-                try
+                Marshal.WriteIntPtr(renameBuffer, rootDirectoryOffset, IntPtr.Zero);
+                Marshal.WriteInt32(renameBuffer, fileNameLengthOffset, fileNameLength);
+                Marshal.Copy(destinationName, 0, IntPtr.Add(renameBuffer, fileNameOffset), destinationName.Length);
+                if (!SetFileInformationByHandleBuffer(
+                    source,
+                    FILE_RENAME_INFO_CLASS,
+                    renameBuffer,
+                    (uint)bufferSize))
                 {
-                    destinationPins[destinationPins.Count - 1].DangerousAddRef(ref destinationReferenced);
-                    Marshal.WriteIntPtr(
-                        renameBuffer,
-                        rootDirectoryOffset,
-                        destinationPins[destinationPins.Count - 1].DangerousGetHandle());
-                    Marshal.WriteInt32(renameBuffer, fileNameLengthOffset, fileNameLength);
-                    Marshal.Copy(destinationName, 0, IntPtr.Add(renameBuffer, fileNameOffset), destinationName.Length);
-                    if (!SetFileInformationByHandleBuffer(
-                        source,
-                        FILE_RENAME_INFO_CLASS,
-                        renameBuffer,
-                        (uint)bufferSize))
-                    {
-                        int error = Marshal.GetLastWin32Error();
-                        throw new Win32Exception(
-                            error,
-                            "SYNAPSE_PHYSICAL_RELATIVE_RENAME_FAILED source=" + sourcePath +
-                            " destination=" + destinationPath + " replace=false win32=" + error);
-                    }
-                }
-                finally
-                {
-                    if (destinationReferenced)
-                        destinationPins[destinationPins.Count - 1].DangerousRelease();
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(
+                        error,
+                        "SYNAPSE_PHYSICAL_RELATIVE_RENAME_FAILED source=" + sourcePath +
+                        " destination=" + destinationPath + " replace=false win32=" + error);
                 }
 
                 string destinationFinal = Path.GetFullPath(ReadFinalPath(source, destinationPath)).TrimEnd(
@@ -5267,7 +5262,10 @@ namespace SynapseSetup
                             " attributes=" + information.FileAttributes +
                             " expected_directory=" + directory);
                     }
-                    openedIdentity = ReadPhysicalIdentity(handle, entryFull);
+                    openedIdentity = ReadIdentityInExpectedProjection(
+                        handle,
+                        entryFull,
+                        expectedEntryIdentity);
                 }
                 else
                 {
@@ -5284,7 +5282,10 @@ namespace SynapseSetup
                 string finalPath = Path.GetFullPath(ReadFinalPath(handle, entryFull)).TrimEnd(
                     Path.DirectorySeparatorChar,
                     Path.AltDirectorySeparatorChar);
-                string finalIdentity = ReadPhysicalIdentity(handle, entryFull);
+                string finalIdentity = ReadIdentityInExpectedProjection(
+                    handle,
+                    entryFull,
+                    expectedEntryIdentity);
                 string finalFileId128 = directory ? String.Empty : ReadPhysicalFileId128(handle, entryFull);
                 if (!finalPath.Equals(entryFull, StringComparison.OrdinalIgnoreCase) ||
                     !finalIdentity.Equals(openedIdentity, StringComparison.OrdinalIgnoreCase) ||
@@ -9709,7 +9710,7 @@ namespace SynapseSetup
 
         private ulong[] ReadProcessIdsOnce(string context)
         {
-            const int maximum = 2;
+            const int maximum = 4;
             int size = checked((2 * sizeof(uint)) + (maximum * IntPtr.Size));
             IntPtr buffer = Marshal.AllocHGlobal(size);
             try
@@ -9734,7 +9735,7 @@ namespace SynapseSetup
                     ids[index] = unchecked((ulong)raw);
                 }
                 Array.Sort(ids);
-                if (ids.Length == 2 && ids[0] == ids[1]) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_PROCESS_ID_DUPLICATE context=" + context);
+                for (int index = 1; index < ids.Length; index++) if (ids[index] == ids[index - 1]) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_PROCESS_ID_DUPLICATE context=" + context);
                 return ids;
             }
             finally { Marshal.FreeHGlobal(buffer); }
@@ -9749,6 +9750,8 @@ namespace SynapseSetup
             for (int index = 0; index < first.Length; index++) if (first[index] != second[index]) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_PROCESS_LIST_UNSTABLE context=" + context);
             return second;
         }
+
+        private bool allowHistoricalPeak;
 
         private void RequireLimits(string context)
         {
@@ -9767,13 +9770,23 @@ namespace SynapseSetup
                 JOBOBJECT_MEMORY_USAGE_INFORMATION usage = (JOBOBJECT_MEMORY_USAGE_INFORMATION)Marshal.PtrToStructure(memory, typeof(JOBOBJECT_MEMORY_USAGE_INFORMATION));
                 JOBOBJECT_BASIC_LIMIT_INFORMATION basic = limits.BasicLimitInformation;
                 uint uiFlags = unchecked((uint)Marshal.ReadInt32(ui));
-                if (basic.LimitFlags != EXPECTED_LIMIT_FLAGS || basic.PerProcessUserTimeLimit != 0 || basic.PerJobUserTimeLimit != 0 || basic.MinimumWorkingSetSize != UIntPtr.Zero || basic.MaximumWorkingSetSize != UIntPtr.Zero || basic.ActiveProcessLimit != 0 || basic.Affinity != UIntPtr.Zero || basic.PriorityClass != 0 || basic.SchedulingClass != 0 || limits.ProcessMemoryLimit.ToUInt64() != EXPECTED_MEMORY_LIMIT || limits.JobMemoryLimit.ToUInt64() != EXPECTED_MEMORY_LIMIT || usage.JobMemory > EXPECTED_MEMORY_LIMIT || usage.PeakJobMemoryUsed > EXPECTED_MEMORY_LIMIT || usage.PeakJobMemoryUsed < usage.JobMemory || rate.ControlFlags != EXPECTED_CPU_FLAGS || rate.CpuRate != EXPECTED_CPU_RATE || uiFlags != 0)
-                    throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_CONTRACT_MISMATCH context=" + context);
+                if (basic.LimitFlags != EXPECTED_LIMIT_FLAGS || basic.PerProcessUserTimeLimit != 0 || basic.PerJobUserTimeLimit != 0 || basic.MinimumWorkingSetSize != UIntPtr.Zero || basic.MaximumWorkingSetSize != UIntPtr.Zero || basic.ActiveProcessLimit != 0 || basic.Affinity != UIntPtr.Zero || basic.PriorityClass != 32 || basic.SchedulingClass != 5 || limits.ProcessMemoryLimit.ToUInt64() != EXPECTED_MEMORY_LIMIT || limits.JobMemoryLimit.ToUInt64() != EXPECTED_MEMORY_LIMIT || usage.JobMemory > EXPECTED_MEMORY_LIMIT || (!allowHistoricalPeak && usage.PeakJobMemoryUsed > EXPECTED_MEMORY_LIMIT) || usage.PeakJobMemoryUsed < usage.JobMemory || rate.ControlFlags != EXPECTED_CPU_FLAGS || rate.CpuRate != EXPECTED_CPU_RATE || uiFlags != 0)
+                    throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_CONTRACT_MISMATCH context=" + context +
+                        " limit_flags=0x" + basic.LimitFlags.ToString("X8") +
+                        " process_limit=" + limits.ProcessMemoryLimit.ToUInt64() +
+                        " job_limit=" + limits.JobMemoryLimit.ToUInt64() +
+                        " current_job_memory=" + usage.JobMemory +
+                        " peak_job_memory=" + usage.PeakJobMemoryUsed +
+                        " allow_historical_peak=" + allowHistoricalPeak +
+                        " cpu_flags=0x" + rate.ControlFlags.ToString("X8") +
+                        " cpu_rate=" + rate.CpuRate + " ui_flags=0x" + uiFlags.ToString("X8") +
+                        " active_process_limit=" + basic.ActiveProcessLimit + " affinity=" + basic.Affinity.ToUInt64() +
+                        " priority=" + basic.PriorityClass + " scheduling=" + basic.SchedulingClass);
             }
             finally { Marshal.FreeHGlobal(limit); Marshal.FreeHGlobal(cpu); Marshal.FreeHGlobal(ui); Marshal.FreeHGlobal(memory); }
         }
 
-        private static BrokerDecommissionJobLease OpenCoreOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, bool requireExact, string context)
+        private static BrokerDecommissionJobLease OpenCoreOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, bool requireExact, bool allowHistoricalPeak, string context)
         {
             string capability = (expectedCapabilitySha256 ?? String.Empty).ToUpperInvariant();
             if (capability.Length != 64) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_CAPABILITY_INVALID context=" + context);
@@ -9789,7 +9802,7 @@ namespace SynapseSetup
             // not grant and never fall back to a PID-only kill.
             IntPtr opened = OpenJobObject(JOB_OBJECT_QUERY | SYNCHRONIZE, false, name);
             if (opened == IntPtr.Zero) { uint error = unchecked((uint)Marshal.GetLastWin32Error()); if (error == ERROR_FILE_NOT_FOUND) return null; throw new Win32Exception(unchecked((int)error), "SYNAPSE_BROKER_DECOMMISSION_JOB_OPEN_FAILED context=" + context + " name=" + name); }
-            BrokerDecommissionJobLease result = new BrokerDecommissionJobLease(); result.handle = opened; result.JobName = name;
+            BrokerDecommissionJobLease result = new BrokerDecommissionJobLease(); result.handle = opened; result.JobName = name; result.allowHistoricalPeak = allowHistoricalPeak;
             try
             {
                 result.SecurityDescriptorSddl = expectedSecuritySddl;
@@ -9800,14 +9813,14 @@ namespace SynapseSetup
             catch (Exception primary) { try { result.Dispose(); } catch (Exception cleanup) { Environment.FailFast("SYNAPSE_BROKER_DECOMMISSION_JOB_OPEN_CLEANUP_UNPROVEN context=" + context + " primary=[" + primary.Message + "]", cleanup); } throw; }
         }
 
-        public static BrokerDecommissionJobLease OpenOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, string context)
+        public static BrokerDecommissionJobLease OpenOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, bool allowHistoricalPeak, string context)
         {
-            return OpenCoreOrNull(name, expectedCapabilitySha256, expectedOuterPid, expectedSecuritySddl, expectedProcessIds, true, context);
+            return OpenCoreOrNull(name, expectedCapabilitySha256, expectedOuterPid, expectedSecuritySddl, expectedProcessIds, true, allowHistoricalPeak, context);
         }
 
-        public static BrokerDecommissionJobLease OpenSubsetOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, string context)
+        public static BrokerDecommissionJobLease OpenSubsetOrNull(string name, string expectedCapabilitySha256, uint expectedOuterPid, string expectedSecuritySddl, ulong[] expectedProcessIds, bool allowHistoricalPeak, string context)
         {
-            return OpenCoreOrNull(name, expectedCapabilitySha256, expectedOuterPid, expectedSecuritySddl, expectedProcessIds, false, context);
+            return OpenCoreOrNull(name, expectedCapabilitySha256, expectedOuterPid, expectedSecuritySddl, expectedProcessIds, false, allowHistoricalPeak, context);
         }
 
         public void RequireExact(ulong[] expectedProcessIds, string context)
@@ -9816,9 +9829,11 @@ namespace SynapseSetup
             RequireLimits(context);
             if (expectedProcessIds == null) throw new ArgumentNullException("expectedProcessIds");
             ulong[] wanted = (ulong[])expectedProcessIds.Clone(); Array.Sort(wanted);
-            if (wanted.Length != 2 || wanted[0] == 0 || wanted[1] == 0 || wanted[0] > UInt32.MaxValue || wanted[1] > UInt32.MaxValue || wanted[0] == wanted[1]) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            if (wanted.Length < 2 || wanted.Length > 4) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            for (int index = 0; index < wanted.Length; index++) if (wanted[index] == 0 || wanted[index] > UInt32.MaxValue || (index > 0 && wanted[index] == wanted[index - 1])) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
             ulong[] actual = ReadStableProcessIds(context + "_members");
-            if (actual.Length != wanted.Length || actual[0] != wanted[0] || actual[1] != wanted[1]) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_MEMBERS_MISMATCH context=" + context + " expected=" + String.Join(",", wanted) + " actual=" + String.Join(",", actual));
+            if (actual.Length != wanted.Length) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_MEMBERS_MISMATCH context=" + context + " expected=" + String.Join(",", wanted) + " actual=" + String.Join(",", actual));
+            for (int index = 0; index < actual.Length; index++) if (actual[index] != wanted[index]) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_MEMBERS_MISMATCH context=" + context + " expected=" + String.Join(",", wanted) + " actual=" + String.Join(",", actual));
         }
 
         public void RequireSubset(ulong[] expectedProcessIds, string context)
@@ -9826,7 +9841,8 @@ namespace SynapseSetup
             if (disposed || handle == IntPtr.Zero) throw new ObjectDisposedException("BrokerDecommissionJobLease");
             if (expectedProcessIds == null) throw new ArgumentNullException("expectedProcessIds");
             ulong[] expected = (ulong[])expectedProcessIds.Clone(); Array.Sort(expected);
-            if (expected.Length != 2 || expected[0] == 0 || expected[1] == 0 || expected[0] > UInt32.MaxValue || expected[1] > UInt32.MaxValue || expected[0] == expected[1]) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            if (expected.Length < 2 || expected.Length > 4) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            for (int index = 0; index < expected.Length; index++) if (expected[index] == 0 || expected[index] > UInt32.MaxValue || (index > 0 && expected[index] == expected[index - 1])) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
             RequireLimits(context);
             ulong[] actual = ReadStableProcessIds(context + "_members");
             for (int index = 0; index < actual.Length; index++) if (!Contains(expected, actual[index])) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_REPLACEMENT_MEMBER_REFUSED context=" + context + " pid=" + actual[index]);
@@ -9837,7 +9853,8 @@ namespace SynapseSetup
             if (disposed || handle == IntPtr.Zero) throw new ObjectDisposedException("BrokerDecommissionJobLease");
             if (expectedProcessIds == null) throw new ArgumentNullException("expectedProcessIds");
             ulong[] expected = (ulong[])expectedProcessIds.Clone(); Array.Sort(expected);
-            if (expected.Length != 2 || expected[0] == 0 || expected[1] == 0 || expected[0] > UInt32.MaxValue || expected[1] > UInt32.MaxValue || expected[0] == expected[1]) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            if (expected.Length < 2 || expected.Length > 4) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            for (int index = 0; index < expected.Length; index++) if (expected[index] == 0 || expected[index] > UInt32.MaxValue || (index > 0 && expected[index] == expected[index - 1])) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
             RequireLimits(context);
             ulong[] actual = ReadStableProcessIds(context + "_members");
             for (int index = 0; index < actual.Length; index++) if (!Contains(expected, actual[index])) throw new InvalidOperationException("SYNAPSE_BROKER_DECOMMISSION_JOB_REPLACEMENT_MEMBER_REFUSED context=" + context + " pid=" + actual[index]);
@@ -9856,7 +9873,8 @@ namespace SynapseSetup
             if (timeoutMilliseconds < 1) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
             if (expectedProcessIds == null) throw new ArgumentNullException("expectedProcessIds");
             ulong[] expected = (ulong[])expectedProcessIds.Clone(); Array.Sort(expected);
-            if (expected.Length != 2 || expected[0] == 0 || expected[1] == 0 || expected[0] > UInt32.MaxValue || expected[1] > UInt32.MaxValue || expected[0] == expected[1]) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            if (expected.Length < 2 || expected.Length > 4) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
+            for (int index = 0; index < expected.Length; index++) if (expected[index] == 0 || expected[index] > UInt32.MaxValue || (index > 0 && expected[index] == expected[index - 1])) throw new ArgumentException("SYNAPSE_BROKER_DECOMMISSION_JOB_EXPECTED_MEMBERS_INVALID context=" + context);
             System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
             do
             {
@@ -15092,6 +15110,37 @@ function Get-SynapseCanonicalJson {
     return ($canonical | ConvertTo-Json -Depth 100 -Compress)
 }
 
+function ConvertTo-SynapsePersistedAuthorityHashValue {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.DateTime]) {
+        return $Value.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $ordered=[ordered]@{}
+        foreach($key in @($Value.Keys|Sort-Object { [string]$_ })) {
+            $ordered[[string]$key]=ConvertTo-SynapsePersistedAuthorityHashValue -Value $Value[$key]
+        }
+        return $ordered
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $ordered=[ordered]@{}
+        foreach($property in @($Value.PSObject.Properties|Sort-Object Name)) {
+            $ordered[$property.Name]=ConvertTo-SynapsePersistedAuthorityHashValue -Value $property.Value
+        }
+        return $ordered
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items=[System.Collections.ArrayList]::new()
+        foreach($item in $Value) {
+            [void]$items.Add((ConvertTo-SynapsePersistedAuthorityHashValue -Value $item))
+        }
+        return ,($items.ToArray())
+    }
+    return $Value
+}
+
 function Get-SynapsePersistedCanonicalSha256 {
     param(
         [Parameter(Mandatory=$true)]$Value,
@@ -16741,6 +16790,7 @@ function Convert-SynapsePhysicalTransitionLeaseToReadLease {
         $readLease = Open-SynapsePhysicalFileReadLease -ParentPath $ParentPath -ParentChain $ParentChain -Leaf $Leaf -ExpectedFileId128 $ExpectedFileId128 -ExpectedSha256 $ExpectedSha256 -ExpectedLength $ExpectedLength -Context $Context
         $guard.RequireCleanCheckpoint("${Context}_after_read_seal")
         $guard.CompleteCleanGuard()
+        $guard.Dispose()
         $guard = $null
         return $readLease
     } finally {
@@ -16775,6 +16825,7 @@ function Convert-SynapsePhysicalReadLeaseToTransitionLease {
         $transitionLease = Open-SynapsePhysicalFileTransitionLease -ParentPath $ParentPath -ParentChain $ParentChain -Leaf $Leaf -ExpectedFileId128 $ExpectedFileId128 -ExpectedSha256 $ExpectedSha256 -ExpectedLength $ExpectedLength -Context $Context
         $guard.RequireCleanCheckpoint("${Context}_after_transition_seal")
         $guard.CompleteCleanGuard()
+        $guard.Dispose()
         $guard = $null
         return $transitionLease
     } finally {
@@ -17103,6 +17154,22 @@ function Move-SynapsePhysicalRelativeEntryNoReplace {
 
     Ensure-SynapseAtomicFileType
     try {
+        if(-not [bool]$Directory -and $null-ne$script:SynapseDeploymentAllocationContext){
+            $retained=@($script:SynapseDeploymentAllocationContext.ArtifactOrder|ForEach-Object{$script:SynapseDeploymentAllocationContext.Artifacts[$_]}|Where-Object{
+                [string]$_.file_id_128 -ieq $ExpectedSourceFileId128 -and $null-ne$_.handle
+            })
+            if($retained.Count-gt1){Die "SYNAPSE_PHYSICAL_RELATIVE_MOVE_RETAINED_OWNER_AMBIGUOUS context=$Context file_id_128=$ExpectedSourceFileId128 count=$($retained.Count)"}
+            if($retained.Count-eq1){
+                $retained[0].handle.RequireExact("${Context}_retained_before")
+                $moved=$retained[0].handle.MoveNoReplace(
+                    (Get-SynapseNormalizedDirectoryPath -Path $DestinationParentPath),
+                    (Get-SynapsePhysicalChainPaths -Chain $DestinationParentChain),
+                    (Get-SynapsePhysicalChainFileIds -Chain $DestinationParentChain),
+                    $DestinationLeaf)
+                $retained[0].handle.RequireExact("${Context}_retained_after")
+                return $moved
+            }
+        }
         return [SynapseSetup.AtomicFileV2]::RenamePhysicalEntryRelativeNoReplace(
             (Get-SynapseNormalizedDirectoryPath -Path $SourceParentPath),
             (Get-SynapsePhysicalChainPaths -Chain $SourceParentChain),
@@ -17890,12 +17957,6 @@ function Publish-SynapseProfileRootGeneration {
     Ensure-SynapseAtomicFileType
     $bridge = $null
     try {
-        $bridge = [SynapseSetup.AtomicFileV2]::BeginPhysicalPublicationBridge(
-            $ProfilePlan.TransactionRoot,
-            (Get-SynapsePhysicalChainPaths -Chain $ProfilePlan.TransactionRootChain),
-            (Get-SynapsePhysicalChainFileIds -Chain $ProfilePlan.TransactionRootChain),
-            $ProfilePlan.WorkLeaf,
-            $ProfilePlan.RootFileId128)
         if ($null -ne $AllocationContext) {
             $workPath = Get-SynapseNormalizedDirectoryPath -Path (Join-Path $ProfilePlan.TransactionRoot $ProfilePlan.WorkLeaf)
             $workPrefix = $workPath + [System.IO.Path]::DirectorySeparatorChar
@@ -17910,6 +17971,12 @@ function Publish-SynapseProfileRootGeneration {
                 }
             }
         }
+        $bridge = [SynapseSetup.AtomicFileV2]::BeginPhysicalPublicationBridge(
+            $ProfilePlan.TransactionRoot,
+            (Get-SynapsePhysicalChainPaths -Chain $ProfilePlan.TransactionRootChain),
+            (Get-SynapsePhysicalChainFileIds -Chain $ProfilePlan.TransactionRootChain),
+            $ProfilePlan.WorkLeaf,
+            $ProfilePlan.RootFileId128)
         if (@($ProfilePlan.RetiredEntries).Count -gt 0 -and $Candidate) {
             $quarantinePath = Join-Path (Join-Path $ProfilePlan.TransactionRoot $ProfilePlan.WorkLeaf) ([string]$ProfilePlan.Descriptor.quarantine_final_leaf)
             $quarantineChain = @(Get-SynapsePhysicalDirectoryChainDescriptor -Path $quarantinePath)
@@ -18045,6 +18112,23 @@ function Invoke-SynapseBundledProfilesTransactionRollback {
     }
     $location = Get-SynapseProfileRootLocation -ProfilePlan $plan
     if ($location.Location -eq 'canonical') {
+        $priorAlreadyExact=$true
+        $canonicalPath=[string]$plan.ProfilesDir
+        $canonicalChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $canonicalPath)
+        foreach($record in @($plan.SourceEntries)+@($plan.RetiredEntries)){
+            $state=Get-SynapsePhysicalRelativeState -ParentPath $canonicalPath -ParentChain $canonicalChain -Leaf ([string]$record.relative_path)
+            $expectedExists=[bool]$record.pre_existed
+            if(-not(Test-SynapsePhysicalStateExact -State $state -ExpectedExists $expectedExists -ExpectedFileId128 ([string]$record.pre_file_id_128) -ExpectedSha256 ([string]$record.pre_sha256) -ExpectedLength ([int64]$record.pre_length))){$priorAlreadyExact=$false;break}
+        }
+        if($priorAlreadyExact){
+            $manifest=$plan.ManifestEntry
+            $manifestState=Get-SynapsePhysicalRelativeState -ParentPath $canonicalPath -ParentChain $canonicalChain -Leaf ([string]$manifest.relative_path)
+            $priorAlreadyExact=Test-SynapsePhysicalStateExact -State $manifestState -ExpectedExists ([bool]$manifest.pre_existed) -ExpectedFileId128 ([string]$manifest.pre_file_id_128) -ExpectedSha256 ([string]$manifest.pre_sha256) -ExpectedLength ([int64]$manifest.pre_length)
+        }
+        if($priorAlreadyExact){
+            Info "SYNAPSE_PROFILE_ROLLBACK_PRIOR_ALREADY_EXACT profiles_dir=$canonicalPath root_file_id_128=$($plan.RootFileId128)"
+            return [pscustomobject]@{RestoredFileCount=0;ArtifactCount=0;PriorRootAbsent=$false;PriorAlreadyExact=$true;Lease=$null}
+        }
         [void](Move-SynapsePhysicalRelativeEntryNoReplace -SourceParentPath $plan.ProfilesParent -SourceParentChain $plan.ProfilesParentChain -SourceLeaf $plan.ProfilesLeaf -ExpectedSourceFileId128 $plan.RootFileId128 -DestinationParentPath $plan.TransactionRoot -DestinationParentChain $plan.TransactionRootChain -DestinationLeaf $plan.WorkLeaf -Directory -Context 'rollback_isolate_profile_root')
         $location = Get-SynapseProfileRootLocation -ProfilePlan $plan
     }
@@ -18147,7 +18231,7 @@ function Invoke-SynapseBundledProfilesTransactionRollback {
     } elseif ($manifestTarget.Exists) { Die 'SYNAPSE_PROFILE_ROLLBACK_MANIFEST_ABSENCE_COLLISION' }
 
     if ($plan.RootPreExisted) {
-        $lease = Publish-SynapseProfileRootGeneration -ProfilePlan $plan -OwnedEntries $plan.PriorOwnedEntries -Context 'rollback_prior'
+        $lease = Publish-SynapseProfileRootGeneration -ProfilePlan $plan -OwnedEntries $plan.PriorOwnedEntries -AllocationContext $script:SynapseDeploymentAllocationContext -Context 'rollback_prior'
         if ($null -ne $script:SynapseDeploymentTransaction) { $script:SynapseDeploymentTransaction.ProfileGenerationLease = $lease }
         return [pscustomobject]@{ RestoredFileCount=$restored; ArtifactCount=$plan.ProfileArtifacts.Count; PriorRootAbsent=$false; Lease=$lease }
     }
@@ -20105,7 +20189,7 @@ function Open-SynapsePurgeRecordExact {
     $state=Get-SynapsePhysicalRelativeState -ParentPath $RecordRoot -ParentChain $RecordRootChain -Leaf $Leaf
     if(-not[bool]$state.Exists-or[int64]$state.Length-lt1-or[int64]$state.Length-gt16777216){Die "SYNAPSE_PURGE_RECORD_STATE_INVALID context=$Context leaf=$Leaf length=$($state.Length)"}
     $lease=Open-SynapsePhysicalFileReadLease -ParentPath $RecordRoot -ParentChain $RecordRootChain -Leaf $Leaf -ExpectedFileId128 ([string]$state.FileId128) -ExpectedSha256 ([string]$state.Sha256) -ExpectedLength ([int64]$state.Length) -Context $Context
-    try{$text=[string]$lease.ReadUtf8(16777216).Content;try{$payload=$text|ConvertFrom-Json -ErrorAction Stop}catch{Die "SYNAPSE_PURGE_RECORD_JSON_INVALID context=$Context leaf=$Leaf error=$($_.Exception.Message)"};if(((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $payload))+"`n")-cne$text){Die "SYNAPSE_PURGE_RECORD_CANONICAL_INVALID context=$Context leaf=$Leaf"};$lease.RequireExact("${Context}_readback");return [pscustomobject][ordered]@{Leaf=$Leaf;Path=(Join-Path $RecordRoot $Leaf);State=$state;Payload=$payload;Lease=$lease}}catch{try{$lease.Dispose()}catch{};throw}
+    try{$text=[string]$lease.ReadUtf8(16777216).Content;try{$payload=ConvertTo-SynapseCanonicalValue -Value (ConvertFrom-SynapseJsonPreservingStrings -Json $text -MaximumJsonLength 16777216)}catch{Die "SYNAPSE_PURGE_RECORD_JSON_INVALID context=$Context leaf=$Leaf error=$($_.Exception.Message)"};if(((Get-SynapseCanonicalJson -Value $payload)+"`n")-cne$text){Die "SYNAPSE_PURGE_RECORD_CANONICAL_INVALID context=$Context leaf=$Leaf"};$lease.RequireExact("${Context}_readback");return [pscustomobject][ordered]@{Leaf=$Leaf;Path=(Join-Path $RecordRoot $Leaf);State=$state;Payload=$payload;Lease=$lease}}catch{try{$lease.Dispose()}catch{};throw}
 }
 
 function Open-SynapsePurgeRecordFromBoundedState {
@@ -20118,7 +20202,7 @@ function Open-SynapsePurgeRecordFromBoundedState {
     )
     if(-not[bool]$State.Exists-or[string]$State.FileId128-notmatch'^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$'-or[string]$State.Sha256-notmatch'^[0-9A-Fa-f]{64}$'-or[int64]$State.Length-lt1-or[int64]$State.Length-gt16777216){Die "SYNAPSE_PURGE_BOUNDED_RECORD_STATE_INVALID context=$Context leaf=$Leaf length=$($State.Length)"}
     $lease=Open-SynapsePhysicalFileReadLease -ParentPath $RecordRoot -ParentChain $RecordRootChain -Leaf $Leaf -ExpectedFileId128 ([string]$State.FileId128) -ExpectedSha256 ([string]$State.Sha256) -ExpectedLength ([int64]$State.Length) -Context $Context
-    try{$text=[string]$lease.ReadUtf8(16777216).Content;try{$payload=$text|ConvertFrom-Json -ErrorAction Stop}catch{Die "SYNAPSE_PURGE_RECORD_JSON_INVALID context=$Context leaf=$Leaf error=$($_.Exception.Message)"};if(((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $payload))+"`n")-cne$text){Die "SYNAPSE_PURGE_RECORD_CANONICAL_INVALID context=$Context leaf=$Leaf"};$lease.RequireExact("${Context}_readback");return [pscustomobject][ordered]@{Leaf=$Leaf;Path=(Join-Path $RecordRoot $Leaf);State=$State;Payload=$payload;Lease=$lease}}catch{try{$lease.Dispose()}catch{};throw}
+    try{$text=[string]$lease.ReadUtf8(16777216).Content;try{$payload=ConvertTo-SynapseCanonicalValue -Value (ConvertFrom-SynapseJsonPreservingStrings -Json $text -MaximumJsonLength 16777216)}catch{Die "SYNAPSE_PURGE_RECORD_JSON_INVALID context=$Context leaf=$Leaf error=$($_.Exception.Message)"};if(((Get-SynapseCanonicalJson -Value $payload)+"`n")-cne$text){Die "SYNAPSE_PURGE_RECORD_CANONICAL_INVALID context=$Context leaf=$Leaf"};$lease.RequireExact("${Context}_readback");return [pscustomobject][ordered]@{Leaf=$Leaf;Path=(Join-Path $RecordRoot $Leaf);State=$State;Payload=$payload;Lease=$lease}}catch{try{$lease.Dispose()}catch{};throw}
 }
 
 function Assert-SynapsePurgeExactPropertySet {
@@ -20869,6 +20953,10 @@ function Assert-SynapseBrokerDecommissionRecordHash {
 
 function Assert-SynapseBrokerDecommissionUtcTimestamp {
     param([Parameter(Mandatory=$true)]$Value,[Parameter(Mandatory=$true)][string]$Context)
+    if($Value-is[datetime]){
+        if(([datetime]$Value).Kind-ne[DateTimeKind]::Utc){Die "SYNAPSE_BROKER_DECOMMISSION_TIMESTAMP_INVALID context=$Context kind=$(([datetime]$Value).Kind)"}
+        return [datetime]$Value
+    }
     if(-not($Value-is[string])-or[string]::IsNullOrWhiteSpace([string]$Value)){Die "SYNAPSE_BROKER_DECOMMISSION_TIMESTAMP_INVALID context=$Context"}
     $parsed=[datetime]::MinValue
     if(-not[datetime]::TryParseExact([string]$Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed)-or$parsed.Kind-ne[DateTimeKind]::Utc-or$parsed.ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne[string]$Value){Die "SYNAPSE_BROKER_DECOMMISSION_TIMESTAMP_INVALID context=$Context value=$Value"}
@@ -20878,7 +20966,7 @@ function Assert-SynapseBrokerDecommissionUtcTimestamp {
 function Write-SynapseBrokerDecommissionRecord {
     param(
         [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$DecommissionId,
-        [Parameter(Mandatory=$true)][ValidateSet('authorized','confirmation','parked','task-absent','drained','cleanup-ready','completed')][string]$Phase,
+        [Parameter(Mandatory=$true)][ValidateSet('authorized','confirmation','parked','task-absent','drained','cleanup-ready','quiesced','completed')][string]$Phase,
         [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$')][string]$ExpectedRecordRootFileId128,
         [Parameter(Mandatory=$true)]$RecordRootLease,
         [Parameter(Mandatory=$true)]$Payload,
@@ -20933,7 +21021,7 @@ function Get-SynapseBrokerDecommissionCompletedHistory {
             if(-not[bool]$state.Exists-or[string]$state.FileId128-ine[string]$entry.FileId128){Die "SYNAPSE_BROKER_DECOMMISSION_HISTORY_ENTRY_DRIFT context=$Context leaf=$($entry.Name)"}
             $record=Open-SynapsePurgeRecordFromBoundedState -RecordRoot $RecordRoot -RecordRootChain $RecordRootChain -Leaf ([string]$entry.Name) -State $state -Context "${Context}_record"
             $p=$record.Payload
-            Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','history_sequence','previous_completed','authorization','parked','task_absent','drained','cleanup_ready','mode','deletion_plan_sha256','task_absent_proven','job_absent_proven','outer_identity_gone','broker_identity_gone','authority_root_disposition','runtime_artifacts_disposition','database_disposition','profiles_disposition','token_disposition','completed_at_utc','record_sha256') -Context "${Context}_shape"
+            Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','history_sequence','previous_completed','authorization','parked','task_absent','drained','cleanup_ready','quiesced','mode','deletion_plan_sha256','task_absent_proven','job_absent_proven','outer_identity_gone','broker_identity_gone','authority_root_disposition','runtime_artifacts_disposition','database_disposition','profiles_disposition','token_disposition','completed_at_utc','record_sha256') -Context "${Context}_shape"
             if([string]$p.schema-cne'synapse_broker_decommission_completed/v2'-or[string]$p.state-cne'completed'-or[string]$p.decommission_id-notmatch'^[0-9A-Fa-f]{64}$'-or[string]$record.Leaf-cne("decommission-$($p.decommission_id)-completed.json")-or[int64]$p.history_sequence-lt1){Die "SYNAPSE_BROKER_DECOMMISSION_HISTORY_RECORD_INVALID context=$Context leaf=$($entry.Name)"}
             Assert-SynapseBrokerDecommissionRecordHash -Record $record -Context "${Context}_hash"
             $records.Add($record)
@@ -20997,6 +21085,7 @@ function ConvertTo-SynapseBrokerDecommissionRetainedLegacyAuthority {
 
 function Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityDescriptor {
     param([Parameter(Mandatory=$true)]$Descriptor,[Parameter(Mandatory=$true)]$AuthorizedPayload,[Parameter(Mandatory=$true)][string]$Context)
+    $normalizedDescriptor=$Descriptor;$legacyVbsProjectedLengthMigrated=$false
     Assert-SynapsePurgeExactPropertySet -Value $Descriptor -Expected @('schema','policy','prior_authority','source','legacy_task','legacy_gate','legacy_denial_stub') -Context $Context
     $prior=[string]$Descriptor.prior_authority;$expectedPolicy=if($prior-ceq'legacy'){'retain_exact_legacy_task_under_permanent_denial'}elseif($prior-ceq'absent'){'retain_fresh_monotonic_floor'}else{''}
     if([string]$Descriptor.schema-cne'synapse_broker_decommission_retained_legacy_authority/v1'-or[string]$Descriptor.policy-cne$expectedPolicy){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_POLICY_INVALID context=$Context prior=$prior"}
@@ -21016,7 +21105,12 @@ function Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityDescriptor {
     if($prior-ceq'absent'){
         if($null-ne$Descriptor.legacy_task){Die "SYNAPSE_BROKER_DECOMMISSION_FRESH_LEGACY_TASK_INVALID context=$Context"}
     }else{
-        $task=$Descriptor.legacy_task;$expected=@('name','xml','xml_sha256','security_descriptor','security_descriptor_sha256','execute','arguments','working_directory','state','enabled','scheduler_contract','supervisor_compatibility_contract','native_bootstrap','launcher_objects');Assert-SynapsePurgeExactPropertySet -Value $task -Expected $expected -Context "${Context}_legacy_task"
+        $task=$Descriptor.legacy_task;$expected=@('name','xml','xml_sha256','security_descriptor','security_descriptor_sha256','execute','arguments','working_directory','state','enabled','scheduler_contract','supervisor_compatibility_contract','native_bootstrap','launcher_objects')
+        $hasLegacyToolCount=$null-ne(Get-SynapseObjectPropertyValue -Object $task -Names @('expected_tool_count'));$hasLegacyToolSha=$null-ne(Get-SynapseObjectPropertyValue -Object $task -Names @('expected_tool_surface_sha256'))
+        if($hasLegacyToolCount-xor$hasLegacyToolSha){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_TOOL_SURFACE_PARTIAL context=$Context"}
+        if($hasLegacyToolCount){$expected+=@('expected_tool_count','expected_tool_surface_sha256')}
+        Assert-SynapsePurgeExactPropertySet -Value $task -Expected $expected -Context "${Context}_legacy_task"
+        if($hasLegacyToolCount-and([int]$task.expected_tool_count-ne40-or[string]$task.expected_tool_surface_sha256-notmatch'^[0-9A-Fa-f]{64}$')){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_TOOL_SURFACE_INVALID context=$Context count=$($task.expected_tool_count) sha=$($task.expected_tool_surface_sha256)"}
         if([string]$task.name-cne[string]$AuthorizedPayload.legacy_task_name-or-not[bool]$task.enabled-or[bool]$task.native_bootstrap-or(Get-SynapseSha256Hex -Text ([string]$task.xml))-ine[string]$task.xml_sha256-or(Get-SynapseSha256Hex -Text ([string]$task.security_descriptor))-ine[string]$task.security_descriptor_sha256){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_TASK_INVALID context=$Context task=$($task.name)"}
         [void](Assert-SynapseLegacyDirectRescueSchedulerContractDescriptor -Contract $task.scheduler_contract -Context "${Context}_legacy_scheduler")
         $launchers=@($task.launcher_objects);$roles=@($launchers|ForEach-Object{[string]$_.role}|Sort-Object);$expectedRoles=@('legacy_supervisor','legacy_supervisor_interpreter','legacy_task_interpreter','legacy_vbs_launcher')|Sort-Object
@@ -21025,9 +21119,17 @@ function Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityDescriptor {
         $supervisor=@($launchers|Where-Object role -CEQ 'legacy_supervisor')[0];$vbs=@($launchers|Where-Object role -CEQ 'legacy_vbs_launcher')[0];$wscript=@($launchers|Where-Object role -CEQ 'legacy_task_interpreter')[0];$powerShell=@($launchers|Where-Object role -CEQ 'legacy_supervisor_interpreter')[0]
         if(-not[bool]$source.legacy_denial_pre_existed-or[string]$supervisor.path-ine[string]$Descriptor.legacy_denial_stub.path-or[string]$supervisor.file_id_128-ine[string]$source.legacy_denial_pre_file_id_128-or[string]$supervisor.sha256-ine[string]$source.legacy_denial_pre_sha256-or[int64]$supervisor.length-ne[int64]$source.legacy_denial_pre_length-or[IO.Path]::GetFullPath([string]$task.execute)-ine[IO.Path]::GetFullPath([string]$wscript.path)-or[string]$task.arguments-cne("//B //Nologo `"$([IO.Path]::GetFullPath([string]$vbs.path))`"") ){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_LAUNCH_CHAIN_INVALID context=$Context"}
         [void](Assert-SynapseLegacySupervisorCompatibilityContractDescriptor -Contract $task.supervisor_compatibility_contract -SupervisorDescriptor $supervisor -Context "${Context}_supervisor_compatibility")
-        $assignments=$task.supervisor_compatibility_contract.assignments;$expectedVbs=New-SynapseLegacyVbsLauncherContent -LauncherLogPath ([string]$assignments.LauncherLog) -SupervisorPath ([string]$Descriptor.legacy_denial_stub.path) -PowerShellPath ([string]$powerShell.path);if((Get-SynapseSha256Hex -Text $expectedVbs)-ine[string]$vbs.sha256-or[Text.UTF8Encoding]::new($false,$true).GetByteCount($expectedVbs)-ne[int64]$vbs.length){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_VBS_INVALID context=$Context"}
+        $assignments=$task.supervisor_compatibility_contract.assignments;$expectedVbs=New-SynapseLegacyVbsLauncherContent -LauncherLogPath ([string]$assignments.LauncherLog) -SupervisorPath ([string]$Descriptor.legacy_denial_stub.path) -PowerShellPath ([string]$powerShell.path);$expectedVbsSha=(Get-SynapseSha256Hex -Text $expectedVbs).ToUpperInvariant();$expectedVbsLength=[Text.UTF8Encoding]::new($false,$true).GetByteCount($expectedVbs)
+        if([int64]$vbs.length-eq1-and[string]$vbs.sha256-ieq$expectedVbsSha-and$expectedVbsLength-gt1){
+            $vbsParent=Get-SynapseNormalizedDirectoryPath -Path ([string]$vbs.parent_path);$vbsParentChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $vbsParent);$vbsState=Get-SynapsePhysicalRelativeState -ParentPath $vbsParent -ParentChain $vbsParentChain -Leaf (Split-Path -Leaf ([string]$vbs.path))
+            if(-not[bool]$vbsState.Exists-or[bool]$vbsState.IsDirectory-or[string]$vbsParentChain[-1].file_id_128-ine[string]$vbs.parent_file_id_128-or[string]$vbsState.FileId128-ine[string]$vbs.file_id_128-or[string]$vbsState.Sha256-ine$expectedVbsSha-or[int64]$vbsState.Length-ne$expectedVbsLength){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_VBS_PROJECTION_MIGRATION_INVALID context=$Context"}
+            Info "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_VBS_LENGTH_PROJECTION_MIGRATION context=$Context path=$($vbs.path) projected_length=1 physical_length=$expectedVbsLength sha256=$expectedVbsSha"
+            $legacyVbsProjectedLengthMigrated=$true
+        }
+        if($expectedVbsSha-ine[string]$vbs.sha256-or(-not$legacyVbsProjectedLengthMigrated-and$expectedVbsLength-ne[int64]$vbs.length)){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_VBS_INVALID context=$Context"}
+        if($legacyVbsProjectedLengthMigrated){$normalizedDescriptor=ConvertTo-SynapseCanonicalValue -Value $Descriptor;$normalizedVbs=@($normalizedDescriptor.legacy_task.launcher_objects|Where-Object role -CEQ 'legacy_vbs_launcher');if($normalizedVbs.Count-ne1){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_VBS_PROJECTION_ROSTER_INVALID context=$Context"};$normalizedVbs[0].length=[int64]$expectedVbsLength}
     }
-    return $Descriptor
+    return $normalizedDescriptor
 }
 
 function Open-SynapseBrokerDecommissionRetainedLegacyAuthorityLeases {
@@ -21086,11 +21188,13 @@ function Assert-SynapseBrokerDecommissionTaskReceiptEvidence {
     if([string]$Evidence.slot1.state-cne'armed'-or[string]$Evidence.slot1.schema-cne'synapse_broker_task_create_transaction/v1'-or[string]$Evidence.slot1.transaction_kind-cne'synapse_broker_task_create/v1'-or[string]$Evidence.slot1.task_capability_sha256-ine$TaskCapabilitySha256-or[string]$Evidence.slot1.task.name-cne$TaskName-or[string]$Evidence.slot2.state-cne'candidate_ready'-or[string]$Evidence.slot2.detail.task_capability_sha256-ine$TaskCapabilitySha256-or[string]$Evidence.slot2.detail.task_name-cne$TaskName-or[string]$Evidence.slot3.state-cne'commit_decided'-or[string]$Evidence.slot3.detail.task_capability_sha256-ine$TaskCapabilitySha256-or[string]$Evidence.slot3.detail.task_name-cne$TaskName){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_CROSSBIND_INVALID context=$Context"}
     $invocationId=[string]$Evidence.slot1.invocation_id
     if([string]::IsNullOrWhiteSpace($invocationId)){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_INVOCATION_INVALID context=$Context"}
-    foreach($binding in @(@{Name='slot1';Sequence=1;Previous=''},@{Name='slot2';Sequence=2;Previous=([string]$ReceiptDescriptor.slot1.sha256)},@{Name='slot3';Sequence=3;Previous=([string]$ReceiptDescriptor.slot2.sha256)})){
-        $rebuilt=New-SynapseDeploymentTransactionJournalSlotText -Sequence ([int]$binding.Sequence) -InvocationId $invocationId -TransactionRoot ([string]$ReceiptDescriptor.task_epoch_root) -PreviousSlotSha256 ([string]$binding.Previous) -Payload $Evidence.($binding.Name);$slotSha=(Get-SynapseSha256Hex -Text ([string]$rebuilt.Text)).ToUpperInvariant();$declared=$ReceiptDescriptor.($binding.Name)
-        if([int]$declared.sequence-ne[int]$binding.Sequence-or[string]$declared.sha256-ine$slotSha-or[int64]$declared.length-ne[int64]$rebuilt.ByteLength){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_SLOT_BIND_INVALID context=$Context slot=$($binding.Sequence)"}
+    if(-not$StructuralOnly){
+        foreach($binding in @(@{Name='slot1';Sequence=1},@{Name='slot2';Sequence=2},@{Name='slot3';Sequence=3})){
+            $declared=$ReceiptDescriptor.($binding.Name);$physical=@($Receipt.Journal.Slots|Where-Object Sequence -EQ ([int]$binding.Sequence))
+            if($physical.Count-ne1-or[int]$declared.sequence-ne[int]$binding.Sequence-or[string]$declared.leaf-cne[string]$physical[0].Leaf-or[string]$declared.file_id_128-ine[string]$physical[0].FileId128-or[string]$declared.sha256-ine[string]$physical[0].RawSha256-or[int64]$declared.length-ne[int64]$physical[0].ByteLength){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_SLOT_BIND_INVALID context=$Context slot=$($binding.Sequence) physical_count=$($physical.Count) declared_sequence=$($declared.sequence) declared_leaf=$($declared.leaf) physical_leaf=$($physical[0].Leaf) declared_file_id=$($declared.file_id_128) physical_file_id=$($physical[0].FileId128) declared_sha=$($declared.sha256) physical_sha=$($physical[0].RawSha256) declared_length=$($declared.length) physical_length=$($physical[0].ByteLength)"}
+        }
+        if((Get-SynapseCanonicalJson -Value $Evidence.slot1)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[0].Payload)-or(Get-SynapseCanonicalJson -Value $Evidence.slot2)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[1].Payload)-or(Get-SynapseCanonicalJson -Value $Evidence.slot3)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[2].Payload)){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_PHYSICAL_DRIFT context=$Context"}
     }
-    if(-not$StructuralOnly){if((Get-SynapseCanonicalJson -Value $Evidence.slot1)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[0].Payload)-or(Get-SynapseCanonicalJson -Value $Evidence.slot2)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[1].Payload)-or(Get-SynapseCanonicalJson -Value $Evidence.slot3)-cne(Get-SynapseCanonicalJson -Value $Receipt.Journal.Slots[2].Payload)){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_EVIDENCE_PHYSICAL_DRIFT context=$Context"}}
     return $Evidence
 }
 
@@ -21204,7 +21308,8 @@ function Assert-SynapseBrokerDecommissionAuthorizedRecord {
     }
     if(-not$StructuralOnly){if([string]$p.mode-ceq'remove_purge'){$currentProfiles=Get-SynapsePurgeDirectorySnapshot -Path ([string]$p.profiles_dir) -Context "${Context}_profiles_physical";if((Get-SynapseCanonicalJson -Value $currentProfiles)-cne(Get-SynapseCanonicalJson -Value $p.profiles)){Die "SYNAPSE_BROKER_DECOMMISSION_PROFILES_DRIFT context=$Context"}};$currentToken=Get-SynapsePurgeFileSnapshot -Path ([string]$p.token_path) -Context "${Context}_token_physical";if((Get-SynapseCanonicalJson -Value $currentToken)-cne(Get-SynapseCanonicalJson -Value $p.token)){Die "SYNAPSE_BROKER_DECOMMISSION_TOKEN_DRIFT context=$Context"}}
     Assert-SynapseBrokerDecommissionRecordHash -Record $Record -Context $Context
-    $seed=[ordered]@{history_sequence=[int64]$p.history_sequence;previous_completed=$(if($null-eq$p.previous_completed){$null}else{ConvertTo-SynapseCanonicalValue -Value $p.previous_completed});mode=[string]$p.mode;authority_source=$source;record_root_file_id_128=([string]$p.record_root_file_id_128).ToUpperInvariant();broker_identity_sha256=([string]$p.broker_identity_sha256).ToUpperInvariant();task_capability_sha256=([string]$p.task_capability_sha256).ToUpperInvariant();task_name=[string]$p.task.name;legacy_task_name=[string]$p.legacy_task_name;authority_epoch=[int64]$p.authority_epoch;generation_id=[string]$p.generation_id;runtime_bin_dir=[IO.Path]::GetFullPath([string]$p.runtime_bin_dir);exe_path=[IO.Path]::GetFullPath([string]$p.exe_path);bind=[string]$p.bind;db_path=[IO.Path]::GetFullPath([string]$p.db_path);profiles_dir=[IO.Path]::GetFullPath([string]$p.profiles_dir);token_path=[IO.Path]::GetFullPath([string]$p.token_path);log_dir=[IO.Path]::GetFullPath([string]$p.log_dir);maintenance_lock_path=[IO.Path]::GetFullPath([string]$p.maintenance_lock_path);bootstrap_log_path=[IO.Path]::GetFullPath([string]$p.bootstrap_log_path);authority_root_file_id_128=([string]$p.authority_root.file_id_128).ToUpperInvariant();task_receipt_slot3_sha256=([string]$p.task_receipt.slot3.sha256).ToUpperInvariant();retained_legacy_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $p.retained_legacy_authority)).ToUpperInvariant();runtime_artifacts_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value @($p.runtime_artifacts))).ToUpperInvariant();token_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $p.token_authority)).ToUpperInvariant()}
+    $runtimeArtifactsCanonical=if(@($p.runtime_artifacts).Count-eq0){'[]'}else{Get-SynapseCanonicalJson -Value @($p.runtime_artifacts)}
+    $seed=[ordered]@{history_sequence=[int64]$p.history_sequence;previous_completed=$(if($null-eq$p.previous_completed){$null}else{ConvertTo-SynapseCanonicalValue -Value $p.previous_completed});mode=[string]$p.mode;authority_source=$source;record_root_file_id_128=([string]$p.record_root_file_id_128).ToUpperInvariant();broker_identity_sha256=([string]$p.broker_identity_sha256).ToUpperInvariant();task_capability_sha256=([string]$p.task_capability_sha256).ToUpperInvariant();task_name=[string]$p.task.name;legacy_task_name=[string]$p.legacy_task_name;authority_epoch=[int64]$p.authority_epoch;generation_id=[string]$p.generation_id;runtime_bin_dir=[IO.Path]::GetFullPath([string]$p.runtime_bin_dir);exe_path=[IO.Path]::GetFullPath([string]$p.exe_path);bind=[string]$p.bind;db_path=[IO.Path]::GetFullPath([string]$p.db_path);profiles_dir=[IO.Path]::GetFullPath([string]$p.profiles_dir);token_path=[IO.Path]::GetFullPath([string]$p.token_path);log_dir=[IO.Path]::GetFullPath([string]$p.log_dir);maintenance_lock_path=[IO.Path]::GetFullPath([string]$p.maintenance_lock_path);bootstrap_log_path=[IO.Path]::GetFullPath([string]$p.bootstrap_log_path);authority_root_file_id_128=([string]$p.authority_root.file_id_128).ToUpperInvariant();task_receipt_slot3_sha256=([string]$p.task_receipt.slot3.sha256).ToUpperInvariant();retained_legacy_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $p.retained_legacy_authority)).ToUpperInvariant();runtime_artifacts_sha256=(Get-SynapseSha256Hex -Text $runtimeArtifactsCanonical).ToUpperInvariant();token_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $p.token_authority)).ToUpperInvariant()}
     $expectedId=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $seed)).ToUpperInvariant();if($expectedId-ine[string]$p.decommission_id){Die "SYNAPSE_BROKER_DECOMMISSION_ID_INVALID context=$Context expected=$expectedId actual=$($p.decommission_id)"}
     return $p
 }
@@ -21252,6 +21357,7 @@ function New-SynapseBrokerDecommissionAuthorizedRecord {
     if($Purge-and-not(Test-SynapsePathWithinOrEqual -Ancestor ([string]$Authority.Layout.Root) -Candidate ([string]$Authority.Infrastructure.Bootstrap.Path))){$runtimeArtifactSources+=,[pscustomobject]@{Identity=$Authority.Infrastructure.Bootstrap;Role='broker_bootstrap'}}
     $runtimeArtifacts=@();$runtimeSeen=New-SynapseCaseInsensitiveMap
     foreach($source in $runtimeArtifactSources){$descriptor=ConvertTo-SynapseAuthorityFileDescriptor -Identity $source.Identity -Role ([string]$source.Role);$path=[IO.Path]::GetFullPath([string]$descriptor.path);if($runtimeSeen.ContainsKey($path)){continue};$runtimeSeen[$path]=$true;$runtimeArtifacts+=,$descriptor};$runtimeArtifacts=@($runtimeArtifacts|Sort-Object path)
+    $runtimeArtifactsCanonical=if($runtimeArtifacts.Count-eq0){'[]'}else{Get-SynapseCanonicalJson -Value $runtimeArtifacts}
     $databasePlan=$null;$profilesPlan=$null;$profilesOwnership=$null;$vault=$null
     if($Purge){$databasePlan=Get-SynapsePurgeDirectorySnapshot -Path ([string]$generation.RosterPayload.db_path) -Context 'broker_decommission_authorize_database';$profilesPlan=Get-SynapsePurgeDirectorySnapshot -Path ([string]$generation.RosterPayload.profiles_dir) -Context 'broker_decommission_authorize_profiles';$profilesOwnership=Get-SynapsePurgeProfilesOwnershipDescriptor -ProfilesPlan ([pscustomobject]$profilesPlan) -Generation $generation -Context 'broker_decommission_authorize_profiles_ownership'}
     $tokenPlan=Get-SynapsePurgeFileSnapshot -Path ([string]$rp.token_path) -Context 'broker_decommission_authorize_token'
@@ -21272,7 +21378,7 @@ function New-SynapseBrokerDecommissionAuthorizedRecord {
     try{
         $rootLease=[SynapseAuthorityRuntime.ExactDirectory]::Open($root,$rootFileId)
         $authorizationHistory=Get-SynapseBrokerDecommissionCompletedHistory -RecordRoot $root -RecordRootChain $rootChain -RecordRootLease $rootLease -Context 'broker_decommission_authorization_history';$historySequence=[int64]$authorizationHistory.Sequence+1L;$previousCompleted=if($null-eq$authorizationHistory.Head){$null}else{Get-SynapseBrokerDecommissionRecordReference -Record $authorizationHistory.Head}
-        $seed=[ordered]@{history_sequence=$historySequence;previous_completed=$previousCompleted;mode=$mode;authority_source=$authoritySource;record_root_file_id_128=$rootFileId;broker_identity_sha256=([string]$Authority.Infrastructure.BrokerIdentitySha256).ToUpperInvariant();task_capability_sha256=([string]$Authority.Infrastructure.TaskCapabilitySha256).ToUpperInvariant();task_name=[string]$task.name;legacy_task_name=$legacyTaskName;authority_epoch=[int64]$Authority.AuthorityEpoch;generation_id=$generationId;runtime_bin_dir=[IO.Path]::GetFullPath([string]$Authority.Layout.RuntimeBinDir);exe_path=$authorizedExePath;bind=[string]$rp.bind;db_path=[IO.Path]::GetFullPath([string]$rp.db_path);profiles_dir=[IO.Path]::GetFullPath([string]$rp.profiles_dir);token_path=[IO.Path]::GetFullPath([string]$rp.token_path);log_dir=$logDir;maintenance_lock_path=$lockPath;bootstrap_log_path=$bootstrapLogPath;authority_root_file_id_128=[string]$authorityRoot.file_id_128;task_receipt_slot3_sha256=([string]$taskReceipt.slot3.sha256).ToUpperInvariant();retained_legacy_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $retainedLegacy)).ToUpperInvariant();runtime_artifacts_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value @($runtimeArtifacts))).ToUpperInvariant();token_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $tokenAuthority)).ToUpperInvariant()}
+        $seed=[ordered]@{history_sequence=$historySequence;previous_completed=$previousCompleted;mode=$mode;authority_source=$authoritySource;record_root_file_id_128=$rootFileId;broker_identity_sha256=([string]$Authority.Infrastructure.BrokerIdentitySha256).ToUpperInvariant();task_capability_sha256=([string]$Authority.Infrastructure.TaskCapabilitySha256).ToUpperInvariant();task_name=[string]$task.name;legacy_task_name=$legacyTaskName;authority_epoch=[int64]$Authority.AuthorityEpoch;generation_id=$generationId;runtime_bin_dir=[IO.Path]::GetFullPath([string]$Authority.Layout.RuntimeBinDir);exe_path=$authorizedExePath;bind=[string]$rp.bind;db_path=[IO.Path]::GetFullPath([string]$rp.db_path);profiles_dir=[IO.Path]::GetFullPath([string]$rp.profiles_dir);token_path=[IO.Path]::GetFullPath([string]$rp.token_path);log_dir=$logDir;maintenance_lock_path=$lockPath;bootstrap_log_path=$bootstrapLogPath;authority_root_file_id_128=[string]$authorityRoot.file_id_128;task_receipt_slot3_sha256=([string]$taskReceipt.slot3.sha256).ToUpperInvariant();retained_legacy_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $retainedLegacy)).ToUpperInvariant();runtime_artifacts_sha256=(Get-SynapseSha256Hex -Text $runtimeArtifactsCanonical).ToUpperInvariant();token_authority_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $tokenAuthority)).ToUpperInvariant()}
         $id=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $seed)).ToUpperInvariant();$leaf="decommission-$id-authorized.json"
         $record=[ordered]@{schema='synapse_broker_decommission_authorized/v2';state='authorized_before_mutation';decommission_id=$id;history_sequence=$historySequence;previous_completed=$previousCompleted;mode=$mode;authority_source=$authoritySource;record_root_file_id_128=$rootFileId;broker_identity_sha256=([string]$Authority.Infrastructure.BrokerIdentitySha256).ToUpperInvariant();task_capability_sha256=([string]$Authority.Infrastructure.TaskCapabilitySha256).ToUpperInvariant();authority_epoch=[int64]$Authority.AuthorityEpoch;control_nonce=([string]$Authority.ControlNonce).ToUpperInvariant();generation_id=$generationId;legacy_task_name=$legacyTaskName;runtime_bin_dir=[string]$Authority.Layout.RuntimeBinDir;exe_path=$authorizedExePath;log_dir=$logDir;maintenance_lock_path=$lockPath;bootstrap_log_path=$bootstrapLogPath;authority_root=$authorityRoot;task=$task;task_receipt=$taskReceipt;task_receipt_evidence=(ConvertTo-SynapseBrokerDecommissionTaskReceiptEvidence -Infrastructure $Authority.Infrastructure);bootstrap=(ConvertTo-SynapseAuthorityFileDescriptor -Identity $Authority.Infrastructure.Bootstrap -Role broker_bootstrap);powershell=(ConvertTo-SynapseBrokerDecommissionPowerShellDescriptor -PowerShell $Authority.Infrastructure.PowerShell);broker_script=(ConvertTo-SynapseAuthorityFileDescriptor -Identity $Authority.Infrastructure.BrokerScript -Role broker_script);active_control_gate=$sourceGate;active_roster=$sourceRoster;retained_legacy_authority=$retainedLegacy;bind=[string]$rp.bind;db_path=[IO.Path]::GetFullPath([string]$rp.db_path);profiles_dir=[IO.Path]::GetFullPath([string]$rp.profiles_dir);token_path=[IO.Path]::GetFullPath([string]$rp.token_path);runtime_artifacts=$runtimeArtifacts;database=$databasePlan;profiles=$profilesPlan;profiles_ownership=$profilesOwnership;token_authority=(ConvertTo-SynapseCanonicalValue -Value $tokenAuthority);token=$tokenPlan;vault_snapshot=$vault;confirmed=[bool]$Confirmed;authorized_at_utc=[DateTime]::UtcNow.ToString('o');authorized_by_pid=$PID;authorized_by_user="$env:USERDOMAIN\$env:USERNAME"}
         if($null-ne$tokenAuthorityBoundaryLease){$tokenAuthorityBoundaryLease.RequireExact('broker_decommission_authorization_before_publish')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $tokenAuthority -ExpectedPath ([string]$rp.token_path) -Context 'broker_decommission_authorization_before_publish')}
@@ -21284,29 +21390,32 @@ function New-SynapseBrokerDecommissionAuthorizedRecord {
 }
 
 function Assert-SynapseBrokerDecommissionAuthorizationAuthorityBoundary {
-    param([Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Authority,[Parameter(Mandatory=$true)][string]$Context)
+    param([Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Authority,[Parameter(Mandatory=$true)][string]$Context,[switch]$AllowActiveSourceParkedSuccessor)
     [void](Assert-SynapseBrokerDecommissionAuthorizedRecord -Record $Authorized -Context "${Context}_authorization")
     if($null-eq$Authority-or$null-eq$Authority.Infrastructure){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_MISSING context=$Context"}
     $p=$Authorized.Payload;$generation=$Authority.CurrentGeneration;$source=[string]$p.authority_source
-    if(($source-ceq'active_generation'-and$null-eq$generation)-or($source-ceq'legacy_parked_no_journal'-and$null-ne$generation)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_SOURCE_STATE_DRIFT context=$Context source=$source current_generation_present=$($null-ne$generation)"}
+    $activeSourceParkedSuccessor=($source-ceq'active_generation'-and$null-eq$generation-and[bool]$AllowActiveSourceParkedSuccessor)
+    if(($source-ceq'active_generation'-and$null-eq$generation-and-not$activeSourceParkedSuccessor)-or($source-ceq'legacy_parked_no_journal'-and$null-ne$generation)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_SOURCE_STATE_DRIFT context=$Context source=$source current_generation_present=$($null-ne$generation) allow_active_parked_successor=$([bool]$AllowActiveSourceParkedSuccessor)"}
     if($null-eq$Authority.PSObject.Properties['TokenAuthority']-or$null-eq$Authority.TokenAuthority-or(Get-SynapseCanonicalJson -Value $Authority.TokenAuthority)-cne(Get-SynapseCanonicalJson -Value $p.token_authority)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TOKEN_DESCRIPTOR_DRIFT context=$Context"}
     $tokenBoundaryLease=$null;$pair=$null
     try{
     $tokenBoundaryLease=Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $p.token_authority -ExpectedPath ([string]$p.token_path) -Context "${Context}_token_before"
     $task=ConvertTo-SynapseAuthorityTaskDescriptor -Task $Authority.BrokerTask;$receipt=ConvertTo-SynapseBrokerTaskReceiptDescriptor -Infrastructure $Authority.Infrastructure;$bootstrap=ConvertTo-SynapseAuthorityFileDescriptor -Identity $Authority.Infrastructure.Bootstrap -Role broker_bootstrap;$powerShell=ConvertTo-SynapseBrokerDecommissionPowerShellDescriptor -PowerShell $Authority.Infrastructure.PowerShell;$brokerScript=ConvertTo-SynapseAuthorityFileDescriptor -Identity $Authority.Infrastructure.BrokerScript -Role broker_script;$gate=ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $Authority.ActiveControlGate;$roster=ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $Authority.ActiveRoster;$retained=ConvertTo-SynapseBrokerDecommissionRetainedLegacyAuthority -Authority $Authority
-    if([string]$Authority.Infrastructure.BrokerIdentitySha256-ine[string]$p.broker_identity_sha256-or[string]$Authority.Infrastructure.TaskCapabilitySha256-ine[string]$p.task_capability_sha256-or[int64]$Authority.AuthorityEpoch-ne[int64]$p.authority_epoch-or[string]$Authority.ControlNonce-ine[string]$p.control_nonce-or($source-ceq'active_generation'-and[string]$generation.GenerationId-cne[string]$p.generation_id)-or[IO.Path]::GetFullPath([string]$Authority.Layout.Root)-ine[IO.Path]::GetFullPath([string]$p.authority_root.path)-or[string]$Authority.Layout.RootChain[-1].file_id_128-ine[string]$p.authority_root.file_id_128){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_IDENTITY_DRIFT context=$Context"}
-    $descriptorChecks=@([pscustomobject]@{Name='task';Actual=$task;Expected=$p.task},[pscustomobject]@{Name='task_receipt';Actual=$receipt;Expected=$p.task_receipt},[pscustomobject]@{Name='bootstrap';Actual=$bootstrap;Expected=$p.bootstrap},[pscustomobject]@{Name='powershell';Actual=$powerShell;Expected=$p.powershell},[pscustomobject]@{Name='broker_script';Actual=$brokerScript;Expected=$p.broker_script},[pscustomobject]@{Name='active_gate';Actual=$gate;Expected=$p.active_control_gate},[pscustomobject]@{Name='retained_legacy';Actual=$retained;Expected=$p.retained_legacy_authority})
-    if($source-ceq'active_generation'){$descriptorChecks+=,[pscustomobject]@{Name='active_roster';Actual=$roster;Expected=$p.active_roster}}
+    if([string]$Authority.Infrastructure.BrokerIdentitySha256-ine[string]$p.broker_identity_sha256-or[string]$Authority.Infrastructure.TaskCapabilitySha256-ine[string]$p.task_capability_sha256-or[int64]$Authority.AuthorityEpoch-ne[int64]$p.authority_epoch-or[string]$Authority.ControlNonce-ine[string]$p.control_nonce-or($source-ceq'active_generation'-and-not$activeSourceParkedSuccessor-and[string]$generation.GenerationId-cne[string]$p.generation_id)-or[IO.Path]::GetFullPath([string]$Authority.Layout.Root)-ine[IO.Path]::GetFullPath([string]$p.authority_root.path)-or[string]$Authority.Layout.RootChain[-1].file_id_128-ine[string]$p.authority_root.file_id_128){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_IDENTITY_DRIFT context=$Context active_source_parked_successor=$activeSourceParkedSuccessor"}
+    $descriptorChecks=@([pscustomobject]@{Name='task';Actual=$task;Expected=$p.task},[pscustomobject]@{Name='task_receipt';Actual=$receipt;Expected=$p.task_receipt},[pscustomobject]@{Name='bootstrap';Actual=$bootstrap;Expected=$p.bootstrap},[pscustomobject]@{Name='powershell';Actual=$powerShell;Expected=$p.powershell},[pscustomobject]@{Name='broker_script';Actual=$brokerScript;Expected=$p.broker_script},[pscustomobject]@{Name='retained_legacy';Actual=$retained;Expected=$p.retained_legacy_authority})
+    if(-not$activeSourceParkedSuccessor){$descriptorChecks+=,[pscustomobject]@{Name='active_gate';Actual=$gate;Expected=$p.active_control_gate}}
+    if($source-ceq'active_generation'-and-not$activeSourceParkedSuccessor){$descriptorChecks+=,[pscustomobject]@{Name='active_roster';Actual=$roster;Expected=$p.active_roster}}
     foreach($item in $descriptorChecks){if((Get-SynapseCanonicalJson -Value $item.Actual)-cne(Get-SynapseCanonicalJson -Value $item.Expected)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_DESCRIPTOR_DRIFT context=$Context descriptor=$($item.Name)"}}
-        if($source-ceq'active_generation'){$rp=$generation.RosterPayload}
+        if($source-ceq'active_generation'-and-not$activeSourceParkedSuccessor){$rp=$generation.RosterPayload}
         else{
             $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context "${Context}_parked_pair"
-            [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$p.bind) -DbPath ([string]$p.db_path))
+            [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$p.bind) -DbPath ([string]$p.db_path) -AllowHistoricalPeakForDecommission:$activeSourceParkedSuccessor -TimeoutSeconds $(if($activeSourceParkedSuccessor){30}else{360}))
             $rp=$pair.Roster.Payload
             $parkedRosterPayload=$pair.Roster.Payload
-            if((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $pair.Gate))-cne(Get-SynapseCanonicalJson -Value $p.active_control_gate)-or[IO.Path]::GetFullPath([string]$pair.Roster.Path)-ine[IO.Path]::GetFullPath([string]$p.active_roster.path)-or[string]$parkedRosterPayload.previous_file_id_128-ine[string]$p.active_roster.file_id_128-or[string]$parkedRosterPayload.previous_sha256-ine[string]$p.active_roster.sha256-or[int64]$parkedRosterPayload.previous_length-ne[int64]$p.active_roster.length){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_SOURCE_CONTROL_DRIFT context=$Context"}
+            $parkedGateMatchesAuthorized=if($activeSourceParkedSuccessor){[string]$pair.Gate.Payload.state-ceq'parked'-and[string]$pair.Gate.Payload.broker_identity_sha256-ieq[string]$p.broker_identity_sha256-and[int64]$pair.Gate.Payload.authority_epoch-eq[int64]$p.authority_epoch-and[string]$pair.Gate.Payload.control_nonce-ieq[string]$p.control_nonce}else{(Get-SynapseCanonicalJson -Value (ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $pair.Gate))-ceq(Get-SynapseCanonicalJson -Value $p.active_control_gate)}
+            if(-not$parkedGateMatchesAuthorized-or[IO.Path]::GetFullPath([string]$pair.Roster.Path)-ine[IO.Path]::GetFullPath([string]$p.active_roster.path)-or[string]$parkedRosterPayload.previous_file_id_128-ine[string]$p.active_roster.file_id_128-or[string]$parkedRosterPayload.previous_sha256-ine[string]$p.active_roster.sha256-or[int64]$parkedRosterPayload.previous_length-ne[int64]$p.active_roster.length){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_SOURCE_CONTROL_DRIFT context=$Context active_source_parked_successor=$activeSourceParkedSuccessor"}
         }
-        if([string]$rp.bind-cne[string]$p.bind-or[IO.Path]::GetFullPath([string]$rp.db_path)-ine[IO.Path]::GetFullPath([string]$p.db_path)-or[IO.Path]::GetFullPath([string]$rp.profiles_dir)-ine[IO.Path]::GetFullPath([string]$p.profiles_dir)-or[IO.Path]::GetFullPath([string]$rp.token_path)-ine[IO.Path]::GetFullPath([string]$p.token_path)-or[IO.Path]::GetFullPath([string]$rp.log_dir)-ine[IO.Path]::GetFullPath([string]$p.log_dir)-or[IO.Path]::GetFullPath([string]$rp.maintenance_lock_path)-ine[IO.Path]::GetFullPath([string]$p.maintenance_lock_path)-or($source-ceq'active_generation'-and[IO.Path]::GetFullPath([string]$generation.Executable.Path)-ine[IO.Path]::GetFullPath([string]$p.exe_path))-or[IO.Path]::GetFullPath([string]$Authority.Infrastructure.BootstrapLogPath)-ine[IO.Path]::GetFullPath([string]$p.bootstrap_log_path)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TARGET_DRIFT context=$Context"}
+        if([string]$rp.bind-cne[string]$p.bind-or[IO.Path]::GetFullPath([string]$rp.db_path)-ine[IO.Path]::GetFullPath([string]$p.db_path)-or[IO.Path]::GetFullPath([string]$rp.profiles_dir)-ine[IO.Path]::GetFullPath([string]$p.profiles_dir)-or[IO.Path]::GetFullPath([string]$rp.token_path)-ine[IO.Path]::GetFullPath([string]$p.token_path)-or[IO.Path]::GetFullPath([string]$rp.log_dir)-ine[IO.Path]::GetFullPath([string]$p.log_dir)-or[IO.Path]::GetFullPath([string]$rp.maintenance_lock_path)-ine[IO.Path]::GetFullPath([string]$p.maintenance_lock_path)-or($source-ceq'active_generation'-and-not$activeSourceParkedSuccessor-and[IO.Path]::GetFullPath([string]$generation.Executable.Path)-ine[IO.Path]::GetFullPath([string]$p.exe_path))-or[IO.Path]::GetFullPath([string]$Authority.Infrastructure.BootstrapLogPath)-ine[IO.Path]::GetFullPath([string]$p.bootstrap_log_path)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TARGET_DRIFT context=$Context"}
         $Authorized.Lease.RequireExact("${Context}_authorization_boundary");if($null-eq$Authorized.RetainedLegacyLeases){Die "SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_LEASES_MISSING context=$Context"};[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context "${Context}_retained_legacy")
         if($null-ne$tokenBoundaryLease){$tokenBoundaryLease.RequireExact("${Context}_token_after")}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $p.token_authority -ExpectedPath ([string]$p.token_path) -Context "${Context}_token_after")}
     }finally{Close-SynapseAuthorityActiveControlPair -Pair $pair;if($null-ne$tokenBoundaryLease){try{$tokenBoundaryLease.Dispose()}catch{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TOKEN_LEASE_RELEASE_UNPROVEN',$_.Exception)}}}
@@ -21361,19 +21470,23 @@ function Assert-SynapseBrokerDecommissionParkedRecord {
     $p=$Record.Payload;$schema=[string]$p.schema
     $phaseProperty=if($schema-ceq'synapse_broker_decommission_parked/v1'){'operator_stop'}elseif($schema-ceq'synapse_broker_decommission_parked/v2'){'park_provenance'}else{''}
     Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','authorization','generation_id','parked_control_gate','parked_roster','task','task_instance','outer_job','outer_bootstrap','broker_process',$phaseProperty,'authority_tree','target_process_count','listener_count','parked_at_utc','record_sha256') -Context $Context
-    if(-not$phaseProperty-or[string]$p.state-cne'parked_before_task_mutation'-or[string]$p.decommission_id-ine[string]$Authorized.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-parked.json")-or[string]$p.generation_id-cne[string]$Authorized.Payload.generation_id-or-not($p.target_process_count-is[int])-or-not($p.listener_count-is[int])-or[int]$p.target_process_count-ne0-or[int]$p.listener_count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_INVALID context=$Context schema=$schema"}
+    $targetIntegral=$p.target_process_count-is[int]-or$p.target_process_count-is[long];$listenerIntegral=$p.listener_count-is[int]-or$p.listener_count-is[long]
+    if(-not$phaseProperty-or[string]$p.state-cne'parked_before_task_mutation'-or[string]$p.decommission_id-ine[string]$Authorized.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-parked.json")-or[string]$p.generation_id-cne[string]$Authorized.Payload.generation_id-or-not$targetIntegral-or-not$listenerIntegral-or[int64]$p.target_process_count-ne0-or[int64]$p.listener_count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_INVALID context=$Context schema=$schema phase_property=$phaseProperty state=$($p.state) record_leaf=$($Record.Leaf) expected_leaf=decommission-$($p.decommission_id)-parked.json generation=$($p.generation_id) expected_generation=$($Authorized.Payload.generation_id) target_type=$($p.target_process_count.GetType().FullName) target=$($p.target_process_count) listener_type=$($p.listener_count.GetType().FullName) listener=$($p.listener_count)"}
     [void](Assert-SynapseBrokerDecommissionUtcTimestamp -Value $p.parked_at_utc -Context "${Context}_parked_at")
     Assert-SynapseBrokerDecommissionRecordReference -Reference $p.authorization -Record $Authorized -Context "${Context}_authorization"
     foreach($control in @($p.parked_control_gate,$p.parked_roster)){Assert-SynapsePurgeExactPropertySet -Value $control -Expected @('path','file_id_128','sha256','length') -Context "${Context}_control";if([string]$control.file_id_128-notmatch'^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$'-or[string]$control.sha256-notmatch'^[0-9A-Fa-f]{64}$'-or[int64]$control.length-lt1){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_CONTROL_INVALID context=$Context"}}
     if([IO.Path]::GetFullPath([string]$p.parked_control_gate.path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.active_control_gate.path)-or[IO.Path]::GetFullPath([string]$p.parked_roster.path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.active_roster.path)-or(Get-SynapseCanonicalJson -Value $p.task)-cne(Get-SynapseCanonicalJson -Value $Authorized.Payload.task)){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_AUTHORITY_DRIFT context=$Context"}
-    Assert-SynapsePurgeExactPropertySet -Value $p.task_instance -Expected @('instance_guid','engine_pid','task_state','instance_state','current_action','instance_count') -Context "${Context}_task_instance";if([string]$p.task_instance.instance_guid-notmatch'^[{]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[}]?$'-or[int]$p.task_instance.engine_pid-lt1-or[int]$p.task_instance.instance_count-ne1-or[int]$p.task_instance.task_state-ne4-or[int]$p.task_instance.instance_state-ne4-or[string]$p.task_instance.current_action-cne'exec'){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_INSTANCE_INVALID context=$Context"}
-    Assert-SynapsePurgeExactPropertySet -Value $p.outer_job -Expected @('schema','name','expected_security_descriptor_sddl','security_descriptor_observed','limit_flags','process_memory_limit_bytes','job_memory_limit_bytes','cpu_rate_control_flags','cpu_rate','member_pids') -Context "${Context}_job";if([string]$p.outer_job.schema-cne'synapse_broker_decommission_job/v1'-or[string]$p.outer_job.name-cne('Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid)-or[string]$p.outer_job.expected_security_descriptor_sddl-cne(Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor)-or-not($p.outer_job.security_descriptor_observed-is[bool])-or[bool]$p.outer_job.security_descriptor_observed-or[uint32]$p.outer_job.limit_flags-ne[uint32]0x2300-or[uint64]$p.outer_job.process_memory_limit_bytes-ne[uint64]6699999232-or[uint64]$p.outer_job.job_memory_limit_bytes-ne[uint64]6699999232-or[uint32]$p.outer_job.cpu_rate_control_flags-ne[uint32]5-or[uint32]$p.outer_job.cpu_rate-ne[uint32]2500){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_DESCRIPTOR_INVALID context=$Context"}
+    Assert-SynapsePurgeExactPropertySet -Value $p.task_instance -Expected @('observation','instance_guid','engine_pid','task_state','instance_state','current_action','instance_count') -Context "${Context}_task_instance"
+    $runningInstance=([string]$p.task_instance.observation-ceq'scheduler_instance'-and[string]$p.task_instance.instance_guid-match'^[{]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[}]?$'-and[int]$p.task_instance.engine_pid-gt0-and[int]$p.task_instance.instance_count-eq1-and[int]$p.task_instance.task_state-eq4-and[int]$p.task_instance.instance_state-eq4-and[string]$p.task_instance.current_action-ceq'exec')
+    $jobSurvivor=($schema-ceq'synapse_broker_decommission_parked/v2'-and[string]$p.park_provenance.kind-ceq'physical_parked_successor/v1'-and[string]$p.task_instance.observation-ceq'physical_job_survivor'-and[string]$p.task_instance.instance_guid-ceq''-and[int]$p.task_instance.engine_pid-eq0-and[int]$p.task_instance.instance_count-eq0-and[int]$p.task_instance.task_state-eq4-and[int]$p.task_instance.instance_state-eq0-and[string]$p.task_instance.current_action-ceq'')
+    if(-not($runningInstance-or$jobSurvivor)){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_INSTANCE_INVALID context=$Context observation=$($p.task_instance.observation) task_state=$($p.task_instance.task_state) instances=$($p.task_instance.instance_count)"}
+    Assert-SynapsePurgeExactPropertySet -Value $p.outer_job -Expected @('schema','name','expected_security_descriptor_sddl','security_descriptor_observed','limit_flags','process_memory_limit_bytes','job_memory_limit_bytes','cpu_rate_control_flags','cpu_rate','historical_peak_exceeded_before_decommission','member_pids') -Context "${Context}_job";if([string]$p.outer_job.schema-cne'synapse_broker_decommission_job/v1'-or[string]$p.outer_job.name-cne('Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid)-or[string]$p.outer_job.expected_security_descriptor_sddl-cne(Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor)-or-not($p.outer_job.security_descriptor_observed-is[bool])-or[bool]$p.outer_job.security_descriptor_observed-or[uint32]$p.outer_job.limit_flags-ne[uint32]0x2300-or[uint64]$p.outer_job.process_memory_limit_bytes-ne[uint64]6699999232-or[uint64]$p.outer_job.job_memory_limit_bytes-ne[uint64]6699999232-or[uint32]$p.outer_job.cpu_rate_control_flags-ne[uint32]5-or[uint32]$p.outer_job.cpu_rate-ne[uint32]2500-or-not($p.outer_job.historical_peak_exceeded_before_decommission-is[bool])){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_DESCRIPTOR_INVALID context=$Context"}
     [void](Assert-SynapseBrokerDecommissionProcessDescriptor -Descriptor $p.outer_bootstrap -ExpectedRole outer_bootstrap -Context "${Context}_outer");[void](Assert-SynapseBrokerDecommissionProcessDescriptor -Descriptor $p.broker_process -ExpectedRole broker_powershell -Context "${Context}_broker")
     $outerArgs=@($p.outer_bootstrap.arguments);$brokerArgs=@($p.broker_process.arguments);$expectedJob='Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$p.outer_bootstrap.pid
     if([IO.Path]::GetFullPath([string]$p.outer_bootstrap.image_path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.bootstrap.path)-or[string]$p.outer_bootstrap.image_file_id_128-ine[string]$Authorized.Payload.bootstrap.file_id_128-or[string]$p.outer_bootstrap.image_sha256-ine[string]$Authorized.Payload.bootstrap.sha256-or[int64]$p.outer_bootstrap.image_length-ne[int64]$Authorized.Payload.bootstrap.length-or[IO.Path]::GetFullPath([string]$p.broker_process.image_path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.powershell.path)-or[string]$p.broker_process.image_file_id_128-ine[string]$Authorized.Payload.powershell.file_id_128-or[string]$p.broker_process.image_sha256-ine[string]$Authorized.Payload.powershell.sha256-or[int64]$p.broker_process.image_length-ne[int64]$Authorized.Payload.powershell.length){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_IMAGE_AUTHORITY_DRIFT context=$Context"}
     if($outerArgs.Count-ne7-or[IO.Path]::GetFullPath([string]$outerArgs[0])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.bootstrap.path)-or[string]$outerArgs[1]-cne'--outer-launch-capability'-or[string]$outerArgs[2]-ine[string]$Authorized.Payload.task_capability_sha256-or[IO.Path]::GetFullPath([string]$outerArgs[3])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.powershell.path)-or[IO.Path]::GetFullPath([string]$outerArgs[4])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.broker_script.path)-or[IO.Path]::GetFullPath([string]$outerArgs[5])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.task.working_directory)-or[IO.Path]::GetFullPath([string]$outerArgs[6])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.bootstrap_log_path)-or$brokerArgs.Count-ne8-or[IO.Path]::GetFullPath([string]$brokerArgs[0])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.powershell.path)-or[string]$brokerArgs[1]-cne'-NoProfile'-or[string]$brokerArgs[2]-cne'-ExecutionPolicy'-or[string]$brokerArgs[3]-cne'Bypass'-or[string]$brokerArgs[4]-cne'-File'-or[IO.Path]::GetFullPath([string]$brokerArgs[5])-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.broker_script.path)-or[string]$brokerArgs[6]-cne'-ParentJobName'-or[string]$brokerArgs[7]-cne$expectedJob){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_ARGV_AUTHORITY_DRIFT context=$Context"}
-    Ensure-SynapseWindowsCommandLineArgvType;foreach($item in @([pscustomobject]@{D=$p.outer_bootstrap;A=$outerArgs;Role='outer'},[pscustomobject]@{D=$p.broker_process;A=$brokerArgs;Role='broker'})){$parsed=@([SynapseSetup.WindowsCommandLineArgv]::Parse([string]$item.D.native_command_line));if((Get-SynapseCanonicalJson -Value $parsed)-cne(Get-SynapseCanonicalJson -Value $item.A)){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_NATIVE_ARGV_INVALID context=$Context role=$($item.Role)"}}
-    $members=@($p.outer_job.member_pids|ForEach-Object{[uint64]$_}|Sort-Object);$expectedMembers=@([uint64]$p.outer_bootstrap.pid,[uint64]$p.broker_process.pid|Sort-Object);if($members.Count-ne2-or($members-join',')-cne($expectedMembers-join',')-or[string]$p.outer_job.name-cne$expectedJob-or[int]$p.broker_process.parent_pid-ne[int]$p.outer_bootstrap.pid-or[int]$p.task_instance.engine_pid-ne[int]$p.outer_bootstrap.pid-or[int]$p.outer_bootstrap.session_id-ne[int]$p.broker_process.session_id){Die "SYNAPSE_BROKER_DECOMMISSION_LINEAGE_INVALID context=$Context"}
+    Ensure-SynapseWindowsCommandLineArgvType;foreach($item in @([pscustomobject]@{D=$p.outer_bootstrap;A=$outerArgs;Paths=@(0,3,4,5,6);Role='outer'},[pscustomobject]@{D=$p.broker_process;A=$brokerArgs;Paths=@(0,5);Role='broker'})){$parsed=@([SynapseSetup.WindowsCommandLineArgv]::Parse([string]$item.D.native_command_line));if($parsed.Count-ne$item.A.Count){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_NATIVE_ARGV_INVALID context=$Context role=$($item.Role) reason=count expected=$($item.A.Count) actual=$($parsed.Count)"};for($i=0;$i-lt$parsed.Count;$i++){$match=if($item.Paths-contains$i){[IO.Path]::GetFullPath([string]$parsed[$i])-ieq[IO.Path]::GetFullPath([string]$item.A[$i])}else{[string]$parsed[$i]-ceq[string]$item.A[$i]};if(-not$match){Die "SYNAPSE_BROKER_DECOMMISSION_PROCESS_NATIVE_ARGV_INVALID context=$Context role=$($item.Role) index=$i expected=$($item.A[$i]) actual=$($parsed[$i])"}}}
+    $members=@($p.outer_job.member_pids|ForEach-Object{[uint64]$_}|Sort-Object);$requiredMembers=@([uint64]$p.outer_bootstrap.pid,[uint64]$p.broker_process.pid|Sort-Object);if($members.Count-lt2-or$members.Count-gt4-or@($members|Select-Object -Unique).Count-ne$members.Count-or@($requiredMembers|Where-Object{$_-notin$members}).Count-ne0-or[string]$p.outer_job.name-cne$expectedJob-or[int]$p.broker_process.parent_pid-ne[int]$p.outer_bootstrap.pid-or($runningInstance-and[int]$p.task_instance.engine_pid-ne[int]$p.outer_bootstrap.pid)-or[int]$p.outer_bootstrap.session_id-ne[int]$p.broker_process.session_id){Die "SYNAPSE_BROKER_DECOMMISSION_LINEAGE_INVALID context=$Context members=$($members-join',') required=$($requiredMembers-join',')"}
     $assertOperatorStop={param($stop,[string]$stopContext)
         Assert-SynapsePurgeExactPropertySet -Value $stop -Expected @('root','root_file_id_128','static_transaction_sha256','state','sequence','latest_leaf','latest_file_id_128','latest_sha256','latest_length','parked_control_gate_post','parked_roster_post') -Context $stopContext
         $operations=Get-SynapseNormalizedDirectoryPath -Path (Join-Path ([string]$Authorized.Payload.authority_root.path) 'operations');$stopRoot=Get-SynapseNormalizedDirectoryPath -Path ([string]$stop.root);$stopLeaf=Split-Path -Leaf $stopRoot
@@ -21387,13 +21500,13 @@ function Assert-SynapseBrokerDecommissionParkedRecord {
         $provenance=$p.park_provenance;Assert-SynapsePurgeExactPropertySet -Value $provenance -Expected @('schema','kind','operator_stop','parked_control_gate_payload','parked_roster_payload') -Context "${Context}_provenance"
         if([string]$provenance.schema-cne'synapse_broker_decommission_park_provenance/v1'-or[string]$provenance.kind-cnotin@('operator_journal/v1','physical_parked_successor/v1')){Die "SYNAPSE_BROKER_DECOMMISSION_PARK_PROVENANCE_INVALID context=$Context"}
         $rosterEnvelope=New-SynapseAuthorityRosterEnvelope -Payload $provenance.parked_roster_payload;$gateEnvelope=New-SynapseBrokerDecommissionControlGateEnvelopeFromPayload -Payload $provenance.parked_control_gate_payload
-        [void](Read-SynapseAuthorityRosterEnvelopeText -Text ([string]$rosterEnvelope.Text) -ExpectedPath ([string]$p.parked_roster.path) -Context "${Context}_roster_payload");[void](Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$gateEnvelope.Text) -ExpectedPath ([string]$p.parked_control_gate.path) -Context "${Context}_gate_payload")
+        [void](Read-SynapseAuthorityRosterEnvelopeText -Text ([string]$rosterEnvelope.Text) -Context "${Context}_roster_payload");[void](Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$gateEnvelope.Text) -ExpectedPath ([string]$p.parked_roster.path) -Context "${Context}_gate_payload")
         if([string]$rosterEnvelope.Sha256-ine[string]$p.parked_roster.sha256-or[int64]$rosterEnvelope.Length-ne[int64]$p.parked_roster.length-or[string]$gateEnvelope.Sha256-ine[string]$p.parked_control_gate.sha256-or[int64]$gateEnvelope.Length-ne[int64]$p.parked_control_gate.length){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_ENVELOPE_DRIFT context=$Context"}
         $rp=$provenance.parked_roster_payload;$gp=$provenance.parked_control_gate_payload
         if([string]$rp.mode-cne'parked'-or[string]$rp.role-cne'none'-or[string]$rp.broker_identity_sha256-ine[string]$Authorized.Payload.broker_identity_sha256-or[string]$rp.broker_task_capability_sha256-ine[string]$Authorized.Payload.task_capability_sha256-or[string]$rp.broker_task_name-cne[string]$Authorized.Payload.task.name-or[int64]$rp.authority_epoch-ne[int64]$Authorized.Payload.authority_epoch-or[string]$rp.control_nonce-ine[string]$Authorized.Payload.control_nonce-or[string]$rp.bind-cne[string]$Authorized.Payload.bind-or[IO.Path]::GetFullPath([string]$rp.db_path)-ine[IO.Path]::GetFullPath([string]$Authorized.Payload.db_path)-or[string]$gp.state-cne'parked'-or[string]$gp.broker_identity_sha256-ine[string]$Authorized.Payload.broker_identity_sha256-or[int64]$gp.authority_epoch-ne[int64]$Authorized.Payload.authority_epoch-or[string]$gp.control_nonce-ine[string]$Authorized.Payload.control_nonce-or[IO.Path]::GetFullPath([string]$gp.roster_path)-ine[IO.Path]::GetFullPath([string]$p.parked_roster.path)-or[string]$gp.roster_file_id_128-ine[string]$p.parked_roster.file_id_128-or[string]$gp.roster_sha256-ine[string]$p.parked_roster.sha256-or[int64]$gp.roster_length-ne[int64]$p.parked_roster.length){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_PAYLOAD_CROSSBIND_INVALID context=$Context"}
         if([string]$rp.previous_file_id_128-ine[string]$Authorized.Payload.active_roster.file_id_128-or[string]$rp.previous_sha256-ine[string]$Authorized.Payload.active_roster.sha256-or[int64]$rp.previous_length-ne[int64]$Authorized.Payload.active_roster.length){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_PREDECESSOR_DRIFT context=$Context"}
         if([string]$provenance.kind-ceq'operator_journal/v1'){if([string]$Authorized.Payload.authority_source-cne'active_generation'-or$null-eq$provenance.operator_stop){Die "SYNAPSE_BROKER_DECOMMISSION_OPERATOR_PROVENANCE_SOURCE_INVALID context=$Context"};& $assertOperatorStop $provenance.operator_stop "${Context}_operator_stop"}
-        elseif([string]$Authorized.Payload.authority_source-cne'legacy_parked_no_journal'-or$null-ne$provenance.operator_stop){Die "SYNAPSE_BROKER_DECOMMISSION_PHYSICAL_PARKED_PROVENANCE_SOURCE_INVALID context=$Context"}
+        elseif([string]$Authorized.Payload.authority_source-cnotin@('legacy_parked_no_journal','active_generation')-or$null-ne$provenance.operator_stop){Die "SYNAPSE_BROKER_DECOMMISSION_PHYSICAL_PARKED_PROVENANCE_SOURCE_INVALID context=$Context source=$($Authorized.Payload.authority_source)"}
     }
     Assert-SynapsePurgeDirectoryDescriptor -Descriptor $p.authority_tree -ExpectedPath ([string]$Authorized.Payload.authority_root.path) -Context "${Context}_authority_tree";if(-not[bool]$p.authority_tree.exists-or[string]$p.authority_tree.root_file_id_128-ine[string]$Authorized.Payload.authority_root.file_id_128){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TREE_INVALID context=$Context"}
     Assert-SynapseBrokerDecommissionRecordHash -Record $Record -Context $Context;return $p
@@ -21405,13 +21518,21 @@ function New-SynapseBrokerDecommissionParkedRecord {
     if($null-eq$Authorized.RetainedLegacyLeases){Die 'SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_LEASES_MISSING phase=parked'}
     [void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_parked_retained_legacy_before')
     $legacyParked=([string]$Authorized.Payload.authority_source-ceq'legacy_parked_no_journal')
-    if($legacyParked-ne[bool]$AlreadyParked-or($legacyParked-and$null-ne$StopResult)-or(-not$legacyParked-and($null-eq$StopResult-or[string]$StopResult.GenerationId-cne[string]$Authorized.Payload.generation_id))){Die "SYNAPSE_BROKER_DECOMMISSION_STOP_SOURCE_DRIFT source=$($Authorized.Payload.authority_source) already_parked=$([bool]$AlreadyParked) expected_generation=$($Authorized.Payload.generation_id) actual_generation=$($StopResult.GenerationId)"}
+    $resumedActiveParked=([string]$Authorized.Payload.authority_source-ceq'active_generation'-and[bool]$AlreadyParked)
+    $physicalParked=$legacyParked-or$resumedActiveParked
+    if($physicalParked-ne[bool]$AlreadyParked-or($physicalParked-and$null-ne$StopResult)-or(-not$physicalParked-and($null-eq$StopResult-or[string]$StopResult.GenerationId-cne[string]$Authorized.Payload.generation_id))){Die "SYNAPSE_BROKER_DECOMMISSION_STOP_SOURCE_DRIFT source=$($Authorized.Payload.authority_source) already_parked=$([bool]$AlreadyParked) expected_generation=$($Authorized.Payload.generation_id) actual_generation=$($StopResult.GenerationId)"}
     $pair=$null;$outerLease=$null;$brokerLease=$null;$jobLease=$null;$tokenAuthorityLease=$null;$stopRecord=$null;$opened=$null;$primary='';$returning=$false
     try{
+        if($physicalParked){
+            $inventory=Get-SynapseGlobalRecoveryInventory -LogDir ([string]$Authorized.Payload.log_dir) -ProfilesDir ([string]$Authorized.Payload.profiles_dir) -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir)
+            [void](Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $inventory -TaskInfrastructure $Authority.Infrastructure -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir) -RequestedLegacyTaskName ([string]$Authorized.Payload.legacy_task_name) -DecommissionStructuralOnly)
+            $selection=Select-SynapseGlobalRecoveryAction -Inventory $inventory -Mode stop
+            if(-not[bool]$selection.Allowed-or[string]$selection.Action-cne'none'){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_GLOBAL_INVENTORY_INVALID source=$($Authorized.Payload.authority_source) action=$($selection.Action) root=$($selection.Record.Root)"}
+        }
         $tokenAuthorityLease=Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $Authorized.Payload.token_authority -ExpectedPath ([string]$Authorized.Payload.token_path) -Context 'broker_decommission_parked_token_before'
         $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'broker_decommission_parked_pair'
-        $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$Authorized.Payload.bind) -DbPath ([string]$Authorized.Payload.db_path)
-        if(-not$legacyParked){$stopRecord=Get-SynapseBrokerOperatorStopRecord -Authority $Authority;if($null-eq$stopRecord-or[string]$stopRecord.Journal.State-cne'candidate_ready'-or$null-ne$stopRecord.Journal.TornTail){Die "SYNAPSE_BROKER_DECOMMISSION_OPERATOR_STOP_NOT_CLEAN state=$($stopRecord.Journal.State)"};[void](Assert-SynapseBrokerTaskDescriptorAuthorityCrossbind -Descriptor $stopRecord.Journal.Initial.broker_task -BrokerIdentitySha256 ([string]$Authorized.Payload.broker_identity_sha256) -TaskCapabilitySha256 ([string]$Authorized.Payload.task_capability_sha256) -Infrastructure $Authority.Infrastructure -Context 'broker_decommission_operator_stop_task')}
+        $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$Authorized.Payload.bind) -DbPath ([string]$Authorized.Payload.db_path) -AllowHistoricalPeakForDecommission:$resumedActiveParked -TimeoutSeconds $(if($resumedActiveParked){30}else{360})
+        if(-not$physicalParked){$stopRecord=Get-SynapseBrokerOperatorStopRecord -Authority $Authority;if($null-eq$stopRecord-or[string]$stopRecord.Journal.State-cne'candidate_ready'-or$null-ne$stopRecord.Journal.TornTail){Die "SYNAPSE_BROKER_DECOMMISSION_OPERATOR_STOP_NOT_CLEAN state=$($stopRecord.Journal.State)"};[void](Assert-SynapseBrokerTaskDescriptorAuthorityCrossbind -Descriptor $stopRecord.Journal.Initial.broker_task -BrokerIdentitySha256 ([string]$Authorized.Payload.broker_identity_sha256) -TaskCapabilitySha256 ([string]$Authorized.Payload.task_capability_sha256) -Infrastructure $Authority.Infrastructure -Context 'broker_decommission_operator_stop_task')}
         $outerCim=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$proof.OuterBootstrapPid)" -ErrorAction Stop;$brokerCim=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$proof.BrokerPid)" -ErrorAction Stop
         if([int]$brokerCim.ParentProcessId-ne[int]$outerCim.ProcessId){Die 'SYNAPSE_BROKER_DECOMMISSION_PROCESS_PARENT_DRIFT'}
         $outerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$outerCim.ProcessId,0L,[string]$Authorized.Payload.bootstrap.path,[string]$Authorized.Payload.bootstrap.file_id_128,[string]$Authorized.Payload.bootstrap.sha256,[int64]$Authorized.Payload.bootstrap.length,'broker_decommission_outer')
@@ -21420,21 +21541,23 @@ function New-SynapseBrokerDecommissionParkedRecord {
         $jobName='Local\SynapseOwned-{0}-{1}'-f([string]$Authorized.Payload.task_capability_sha256).ToUpperInvariant(),[int]$outerCim.ProcessId
         $brokerArgv=@([string]$Authorized.Payload.powershell.path,'-NoProfile','-ExecutionPolicy','Bypass','-File',[string]$Authorized.Payload.broker_script.path,'-ParentJobName',$jobName)
         foreach($check in @([pscustomobject]@{Lease=$outerLease;Cim=$outerCim;Args=$outerArgv;Paths=@(0,3,4,5,6);Role='outer'},[pscustomobject]@{Lease=$brokerLease;Cim=$brokerCim;Args=$brokerArgv;Paths=@(0,5);Role='broker'})){[void](Assert-SynapseMappedProcessMetadataUnderLease -Lease $check.Lease -ExpectedProcessId ([int]$check.Cim.ProcessId) -ExpectedParentProcessId ([int]$check.Cim.ParentProcessId) -ExpectedSessionId ([int]$check.Cim.SessionId) -ExpectedImagePath ([string]$check.Args[0]) -ExpectedCommandLine ([string]$check.Cim.CommandLine) -ExpectedCreationDate ([string]$check.Cim.CreationDate) -Context "broker_decommission_$($check.Role)_metadata");$native=$check.Lease.ReadCommandLine("broker_decommission_$($check.Role)_native");Ensure-SynapseWindowsCommandLineArgvType;$parsed=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));if($parsed.Count-ne$check.Args.Count){Die "SYNAPSE_BROKER_DECOMMISSION_ARGV_COUNT_INVALID role=$($check.Role)"};for($i=0;$i-lt$parsed.Count;$i++){$match=if($check.Paths-contains$i){[IO.Path]::GetFullPath([string]$parsed[$i])-ieq[IO.Path]::GetFullPath([string]$check.Args[$i])}else{[string]$parsed[$i]-ceq[string]$check.Args[$i]};if(-not$match){Die "SYNAPSE_BROKER_DECOMMISSION_ARGV_INVALID role=$($check.Role) index=$i"}};$check|Add-Member -NotePropertyName Native -NotePropertyValue $native}
-        $expectedSddl=Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor;$members=[uint64[]]@([uint64]$outerCim.ProcessId,[uint64]$brokerCim.ProcessId);$jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull($jobName,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outerCim.ProcessId,$expectedSddl,$members,'broker_decommission_job')
+        $expectedSddl=Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor;$members=[uint64[]]@($proof.OuterJob.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object);$historicalPeakExceeded=[uint64]$proof.OuterJob.PeakJobMemoryUsedBytes-gt[uint64]6699999232;$jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull($jobName,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outerCim.ProcessId,$expectedSddl,$members,$historicalPeakExceeded,'broker_decommission_job')
         if($null-eq$jobLease){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_MISSING name=$jobName"}
         $scheduler=Get-SynapseScheduledTaskComRoot;$lookup=Get-SynapseScheduledTaskLookupExact -Name ([string]$Authorized.Payload.task.name) -Scheduler $scheduler;if(-not[bool]$lookup.Exists){Die 'SYNAPSE_BROKER_DECOMMISSION_TASK_MISSING_BEFORE_PARKED_RECORD'}
         $receipt=Assert-SynapseBrokerTaskReceiptDescriptor -Descriptor $Authorized.Payload.task_receipt -ExpectedAuthorityRoot ([string]$Authorized.Payload.authority_root.path) -ExpectedBrokerIdentitySha256 ([string]$Authorized.Payload.broker_identity_sha256) -ExpectedTaskName ([string]$Authorized.Payload.task.name)
         [void](Get-SynapseTaskDefinitionReadback -RegisteredTask $lookup.Task -Kind broker -ExpectedName ([string]$Authorized.Payload.task.name) -ExpectedExecute ([string]$Authorized.Payload.task.execute) -ExpectedArguments ([string]$Authorized.Payload.task.arguments) -ExpectedWorkingDirectory ([string]$Authorized.Payload.task.working_directory) -ExpectedUserSid (Get-SynapseCurrentUserSid) -ExpectedXmlSha256 ([string]$Authorized.Payload.task.xml_sha256) -ExpectedSecurityDescriptorSha256 ([string]$Authorized.Payload.task.security_descriptor_sha256) -ExpectedSemanticSha256 ([string]$receipt.Initial.task.submitted_semantic_sha256))
-        $instances=@($lookup.Task.GetInstances(0));$taskState=[int]$lookup.Task.State;if($instances.Count-ne1-or[int]$instances[0].EnginePID-ne[int]$outerCim.ProcessId-or$taskState-ne4-or[int]$instances[0].State-ne4-or[string]$instances[0].CurrentAction-cne'exec'){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RUNTIME_INVALID state=$taskState instances=$($instances.Count)"}
-        $inventory=Get-SynapseGlobalRecoveryInventory -LogDir ([string]$Authorized.Payload.log_dir) -ProfilesDir ([string]$Authorized.Payload.profiles_dir) -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir);[void](Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $inventory -TaskInfrastructure $Authority.Infrastructure -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir) -RequestedLegacyTaskName ([string]$Authorized.Payload.legacy_task_name));$selection=Select-SynapseGlobalRecoveryAction -Inventory $inventory -Mode stop
-        if(-not[bool]$selection.Allowed-or(-not$legacyParked-and([string]$selection.Action-cne'operator'-or[IO.Path]::GetFullPath([string]$selection.Record.Root)-ine[IO.Path]::GetFullPath([string]$stopRecord.Entry.Path)))-or($legacyParked-and[string]$selection.Action-cne'none')){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_GLOBAL_INVENTORY_INVALID source=$($Authorized.Payload.authority_source) action=$($selection.Action) root=$($selection.Record.Root)"}
+        $instances=@($lookup.Task.GetInstances(0));$taskState=[int]$lookup.Task.State
+        if($instances.Count-eq1-and[int]$instances[0].EnginePID-eq[int]$outerCim.ProcessId-and$taskState-eq4-and[int]$instances[0].State-eq4-and[string]$instances[0].CurrentAction-ceq'exec'){$taskInstance=[ordered]@{observation='scheduler_instance';instance_guid=[string]$instances[0].InstanceGuid;engine_pid=[int]$instances[0].EnginePID;task_state=$taskState;instance_state=[int]$instances[0].State;current_action=[string]$instances[0].CurrentAction;instance_count=1}}
+        elseif($physicalParked-and$instances.Count-eq0-and$taskState-eq4){$taskInstance=[ordered]@{observation='physical_job_survivor';instance_guid='';engine_pid=0;task_state=$taskState;instance_state=0;current_action='';instance_count=0}}
+        else{Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RUNTIME_INVALID state=$taskState instances=$($instances.Count) physical_parked=$physicalParked"}
+        if(-not$physicalParked){$inventory=Get-SynapseGlobalRecoveryInventory -LogDir ([string]$Authorized.Payload.log_dir) -ProfilesDir ([string]$Authorized.Payload.profiles_dir) -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir);[void](Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $inventory -TaskInfrastructure $Authority.Infrastructure -RuntimeBinDir ([string]$Authorized.Payload.runtime_bin_dir) -RequestedLegacyTaskName ([string]$Authorized.Payload.legacy_task_name) -DecommissionStructuralOnly);$selection=Select-SynapseGlobalRecoveryAction -Inventory $inventory -Mode stop;if(-not[bool]$selection.Allowed-or[string]$selection.Action-cne'operator'-or[IO.Path]::GetFullPath([string]$selection.Record.Root)-ine[IO.Path]::GetFullPath([string]$stopRecord.Entry.Path)){Die "SYNAPSE_BROKER_DECOMMISSION_PARKED_GLOBAL_INVENTORY_INVALID source=$($Authorized.Payload.authority_source) action=$($selection.Action) root=$($selection.Record.Root)"}}
         $authorityTree=Get-SynapsePurgeDirectorySnapshot -Path ([string]$Authorized.Payload.authority_root.path) -Context 'broker_decommission_parked_authority_tree'
         $outerProcess=ConvertTo-SynapseBrokerDecommissionProcessDescriptor -Role outer_bootstrap -Lease $outerLease -NativeCommandLine ([string]$outerCim.CommandLine) -Arguments $outerArgv -ParentPid ([int]$outerCim.ParentProcessId) -SessionId ([int]$outerCim.SessionId);$brokerProcess=ConvertTo-SynapseBrokerDecommissionProcessDescriptor -Role broker_powershell -Lease $brokerLease -NativeCommandLine ([string]$brokerCim.CommandLine) -Arguments $brokerArgv -ParentPid ([int]$brokerCim.ParentProcessId) -SessionId ([int]$brokerCim.SessionId)
         $physicalGate=ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $pair.Gate;$physicalRoster=ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $pair.Roster
-        if($legacyParked){$gatePost=$physicalGate;$rosterPost=$physicalRoster;$operatorStop=$null;$provenanceKind='physical_parked_successor/v1'}
+        if($physicalParked){$gatePost=$physicalGate;$rosterPost=$physicalRoster;$operatorStop=$null;$provenanceKind='physical_parked_successor/v1'}
         else{$latest=$stopRecord.Journal.Slots[-1];$gatePost=[ordered]@{path=[IO.Path]::GetFullPath([string]$stopRecord.Validated.GateTransition.path);file_id_128=([string]$stopRecord.Validated.GateTransition.post_file_id_128).ToUpperInvariant();sha256=([string]$stopRecord.Validated.GateTransition.post_sha256).ToUpperInvariant();length=[int64]$stopRecord.Validated.GateTransition.post_length};$rosterPost=[ordered]@{path=[IO.Path]::GetFullPath([string]$stopRecord.Validated.RosterTransition.path);file_id_128=([string]$stopRecord.Validated.RosterTransition.post_file_id_128).ToUpperInvariant();sha256=([string]$stopRecord.Validated.RosterTransition.post_sha256).ToUpperInvariant();length=[int64]$stopRecord.Validated.RosterTransition.post_length};if((Get-SynapseCanonicalJson -Value $gatePost)-cne(Get-SynapseCanonicalJson -Value $physicalGate)-or(Get-SynapseCanonicalJson -Value $rosterPost)-cne(Get-SynapseCanonicalJson -Value $physicalRoster)){Die 'SYNAPSE_BROKER_DECOMMISSION_OPERATOR_STOP_POST_PHYSICAL_DRIFT'};$operatorStop=[ordered]@{root=[string]$stopRecord.Entry.Path;root_file_id_128=([string]$stopRecord.Journal.RootChain[-1].file_id_128).ToUpperInvariant();static_transaction_sha256=([string]$stopRecord.Journal.Initial.static_transaction_sha256).ToUpperInvariant();state='candidate_ready';sequence=[int]$latest.Sequence;latest_leaf=[string]$latest.Leaf;latest_file_id_128=([string]$latest.FileId128).ToUpperInvariant();latest_sha256=([string]$latest.RawSha256).ToUpperInvariant();latest_length=[int64]$latest.ByteLength;parked_control_gate_post=$gatePost;parked_roster_post=$rosterPost};$provenanceKind='operator_journal/v1'}
         $parkProvenance=[ordered]@{schema='synapse_broker_decommission_park_provenance/v1';kind=$provenanceKind;operator_stop=$operatorStop;parked_control_gate_payload=(ConvertTo-SynapseCanonicalValue -Value $pair.Gate.Payload);parked_roster_payload=(ConvertTo-SynapseCanonicalValue -Value $pair.Roster.Payload)}
-        $payload=[ordered]@{schema='synapse_broker_decommission_parked/v2';state='parked_before_task_mutation';decommission_id=[string]$Authorized.Payload.decommission_id;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $Authorized);generation_id=[string]$Authorized.Payload.generation_id;parked_control_gate=$gatePost;parked_roster=$rosterPost;task=(ConvertTo-SynapseCanonicalValue -Value $Authorized.Payload.task);task_instance=[ordered]@{instance_guid=[string]$instances[0].InstanceGuid;engine_pid=[int]$instances[0].EnginePID;task_state=$taskState;instance_state=[int]$instances[0].State;current_action=[string]$instances[0].CurrentAction;instance_count=1};outer_job=[ordered]@{schema='synapse_broker_decommission_job/v1';name=$jobName;expected_security_descriptor_sddl=$expectedSddl;security_descriptor_observed=$false;limit_flags=[uint32]0x2300;process_memory_limit_bytes=[uint64]6699999232;job_memory_limit_bytes=[uint64]6699999232;cpu_rate_control_flags=[uint32]5;cpu_rate=[uint32]2500;member_pids=@($members|Sort-Object)};outer_bootstrap=$outerProcess;broker_process=$brokerProcess;park_provenance=$parkProvenance;authority_tree=$authorityTree;target_process_count=0;listener_count=0;parked_at_utc=[DateTime]::UtcNow.ToString('o')}
+        $payload=[ordered]@{schema='synapse_broker_decommission_parked/v2';state='parked_before_task_mutation';decommission_id=[string]$Authorized.Payload.decommission_id;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $Authorized);generation_id=[string]$Authorized.Payload.generation_id;parked_control_gate=$gatePost;parked_roster=$rosterPost;task=(ConvertTo-SynapseCanonicalValue -Value $Authorized.Payload.task);task_instance=$taskInstance;outer_job=[ordered]@{schema='synapse_broker_decommission_job/v1';name=$jobName;expected_security_descriptor_sddl=$expectedSddl;security_descriptor_observed=$false;limit_flags=[uint32]0x2300;process_memory_limit_bytes=[uint64]6699999232;job_memory_limit_bytes=[uint64]6699999232;cpu_rate_control_flags=[uint32]5;cpu_rate=[uint32]2500;historical_peak_exceeded_before_decommission=[bool]$historicalPeakExceeded;member_pids=@($members|Sort-Object)};outer_bootstrap=$outerProcess;broker_process=$brokerProcess;park_provenance=$parkProvenance;authority_tree=$authorityTree;target_process_count=0;listener_count=0;parked_at_utc=[DateTime]::UtcNow.ToString('o')}
         [void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_parked_retained_legacy_publish');if($null-ne$tokenAuthorityLease){$tokenAuthorityLease.RequireExact('broker_decommission_parked_token_publish')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $Authorized.Payload.token_authority -ExpectedPath ([string]$Authorized.Payload.token_path) -Context 'broker_decommission_parked_token_publish')}
         $opened=Write-SynapseBrokerDecommissionRecord -DecommissionId ([string]$Authorized.Payload.decommission_id) -Phase parked -ExpectedRecordRootFileId128 ([string]$Authorized.Payload.record_root_file_id_128) -RecordRootLease $Authorized.RecordRootLease -Payload $payload -Predecessors @($Authorized) -Context 'broker_decommission_parked';[void](Assert-SynapseBrokerDecommissionParkedRecord -Record $opened -Authorized $Authorized -Context 'broker_decommission_parked_readback')
         $Authorized.Lease.RequireExact('broker_decommission_parked_authorization_after');$opened.Lease.RequireExact('broker_decommission_parked_after');$pair.GateLease.RequireExact('broker_decommission_parked_gate_after');$pair.RosterLease.RequireExact('broker_decommission_parked_roster_after');$outerLease.RequireExact('broker_decommission_parked_outer_after');$brokerLease.RequireExact('broker_decommission_parked_broker_after');$jobLease.RequireExact($members,'broker_decommission_parked_job_after');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_parked_retained_legacy_after');if($null-ne$tokenAuthorityLease){$tokenAuthorityLease.RequireExact('broker_decommission_parked_token_after')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $Authorized.Payload.token_authority -ExpectedPath ([string]$Authorized.Payload.token_path) -Context 'broker_decommission_parked_token_after')};$returning=$true;return $opened
@@ -21443,15 +21566,16 @@ function New-SynapseBrokerDecommissionParkedRecord {
 
 function Open-SynapseBrokerDecommissionParkedLeases {
     param([Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Parked,[Parameter(Mandatory=$true)][string]$Context)
+    Ensure-SynapseDaemonJobReadbackType
     [void](Assert-SynapseBrokerDecommissionParkedRecord -Record $Parked -Authorized $Authorized -Context "${Context}_record")
-    $result=[pscustomobject][ordered]@{Gate=$null;Roster=$null;Outer=$null;Broker=$null;Job=$null;Members=[uint64[]]@([uint64]$Parked.Payload.outer_bootstrap.pid,[uint64]$Parked.Payload.broker_process.pid)};$returning=$false
+    $result=[pscustomobject][ordered]@{Gate=$null;Roster=$null;Outer=$null;Broker=$null;Job=$null;Members=[uint64[]]@($Parked.Payload.outer_job.member_pids|ForEach-Object{[uint64]$_}|Sort-Object)};$returning=$false
     try{
         foreach($item in @([pscustomobject]@{Role='Gate';D=$Parked.Payload.parked_control_gate},[pscustomobject]@{Role='Roster';D=$Parked.Payload.parked_roster})){$parent=Get-SynapseNormalizedDirectoryPath -Path (Split-Path -Parent ([string]$item.D.path));$chain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $parent);$lease=Open-SynapsePhysicalFileReadLease -ParentPath $parent -ParentChain $chain -Leaf (Split-Path -Leaf ([string]$item.D.path)) -ExpectedFileId128 ([string]$item.D.file_id_128) -ExpectedSha256 ([string]$item.D.sha256) -ExpectedLength ([int64]$item.D.length) -Context "${Context}_$($item.Role)";$result.($item.Role)=$lease}
         $outer=$Parked.Payload.outer_bootstrap;$broker=$Parked.Payload.broker_process
         $result.Outer=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$outer.pid,[int64]$outer.creation_time_filetime_utc,[string]$outer.image_path,[string]$outer.image_file_id_128,[string]$outer.image_sha256,[int64]$outer.image_length,"${Context}_outer")
         $po=$Authorized.Payload.powershell.protected_os;$result.Broker=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination([uint32]$broker.pid,[int64]$broker.creation_time_filetime_utc,[string]$broker.image_path,[string]$broker.image_file_id_128,[string]$broker.image_sha256,[int64]$broker.image_length,[uint32]$po.link_count,[string]$po.security_descriptor_sddl,[string[]]@($po.hardlink_paths),"${Context}_broker")
-        foreach($check in @([pscustomobject]@{Lease=$result.Outer;D=$outer;Role='outer'},[pscustomobject]@{Lease=$result.Broker;D=$broker;Role='broker'})){$native=$check.Lease.ReadCommandLine("${Context}_$($check.Role)_argv");if([string]$native-cne[string]$check.D.native_command_line){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_COMMAND_LINE_DRIFT context=$Context role=$($check.Role)"};Ensure-SynapseWindowsCommandLineArgvType;$argv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));if((Get-SynapseCanonicalJson -Value $argv)-cne(Get-SynapseCanonicalJson -Value @($check.D.arguments))){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($check.Role)"}}
-        $job=$Parked.Payload.outer_job;$result.Job=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$result.Members,"${Context}_job")
+        foreach($check in @([pscustomobject]@{Lease=$result.Outer;D=$outer;Paths=@(0,3,4,5,6);Role='outer'},[pscustomobject]@{Lease=$result.Broker;D=$broker;Paths=@(0,5);Role='broker'})){$native=$check.Lease.ReadCommandLine("${Context}_$($check.Role)_argv");if([string]$native-cne[string]$check.D.native_command_line){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_COMMAND_LINE_DRIFT context=$Context role=$($check.Role)"};Ensure-SynapseWindowsCommandLineArgvType;$argv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));$expected=@($check.D.arguments);if($argv.Count-ne$expected.Count){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($check.Role) reason=count"};for($i=0;$i-lt$argv.Count;$i++){$match=if($check.Paths-contains$i){[IO.Path]::GetFullPath([string]$argv[$i])-ieq[IO.Path]::GetFullPath([string]$expected[$i])}else{[string]$argv[$i]-ceq[string]$expected[$i]};if(-not$match){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($check.Role) index=$i expected=$($expected[$i]) actual=$($argv[$i])"}}}
+        $job=$Parked.Payload.outer_job;$result.Job=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$result.Members,[bool]$job.historical_peak_exceeded_before_decommission,"${Context}_job")
         if($null-eq$result.Job){Die "SYNAPSE_BROKER_DECOMMISSION_JOB_MISSING context=$Context name=$($job.name)"}
         $result.Gate.RequireExact("${Context}_gate_final");$result.Roster.RequireExact("${Context}_roster_final");$result.Outer.RequireExact("${Context}_outer_final");$result.Broker.RequireExact("${Context}_broker_final");$result.Job.RequireExact($result.Members,"${Context}_job_final");$Authorized.Lease.RequireExact("${Context}_authorization_final");$Parked.Lease.RequireExact("${Context}_parked_final")
         $returning=$true;return $result
@@ -21460,15 +21584,16 @@ function Open-SynapseBrokerDecommissionParkedLeases {
 
 function Open-SynapseBrokerDecommissionParkedSubsetLeases {
     param([Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Parked,[Parameter(Mandatory=$true)][string]$Context)
+    Ensure-SynapseDaemonJobReadbackType
     [void](Assert-SynapseBrokerDecommissionParkedRecord -Record $Parked -Authorized $Authorized -Context "${Context}_record")
-    $result=[pscustomobject][ordered]@{Gate=$null;Roster=$null;Outer=$null;Broker=$null;Job=$null;Members=[uint64[]]@([uint64]$Parked.Payload.outer_bootstrap.pid,[uint64]$Parked.Payload.broker_process.pid);Present=[uint64[]]@()};$returning=$false
+    $result=[pscustomobject][ordered]@{Gate=$null;Roster=$null;Outer=$null;Broker=$null;Job=$null;Members=[uint64[]]@($Parked.Payload.outer_job.member_pids|ForEach-Object{[uint64]$_}|Sort-Object);Present=[uint64[]]@()};$returning=$false
     try{
         foreach($item in @([pscustomobject]@{Role='Gate';D=$Parked.Payload.parked_control_gate},[pscustomobject]@{Role='Roster';D=$Parked.Payload.parked_roster})){$parent=Get-SynapseNormalizedDirectoryPath -Path (Split-Path -Parent ([string]$item.D.path));$chain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $parent);$result.($item.Role)=Open-SynapsePhysicalFileReadLease -ParentPath $parent -ParentChain $chain -Leaf (Split-Path -Leaf ([string]$item.D.path)) -ExpectedFileId128 ([string]$item.D.file_id_128) -ExpectedSha256 ([string]$item.D.sha256) -ExpectedLength ([int64]$item.D.length) -Context "${Context}_$($item.Role)"}
         $outer=$Parked.Payload.outer_bootstrap;$broker=$Parked.Payload.broker_process;$job=$Parked.Payload.outer_job
-        $result.Job=[SynapseSetup.BrokerDecommissionJobLease]::OpenSubsetOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$result.Members,"${Context}_job")
+        $result.Job=[SynapseSetup.BrokerDecommissionJobLease]::OpenSubsetOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$result.Members,[bool]$job.historical_peak_exceeded_before_decommission,"${Context}_job")
         if($null-ne$result.Job){$result.Present=[uint64[]]@($result.Job.ReadSubset($result.Members,"${Context}_members")|ForEach-Object{[uint64]$_})}
         foreach($entry in @([pscustomobject]@{Name='Outer';D=$outer;Protected=$false},[pscustomobject]@{Name='Broker';D=$broker;Protected=$true})){
-            if([uint64]$entry.D.pid-in$result.Present){if([bool]$entry.Protected){$po=$Authorized.Payload.powershell.protected_os;$result.($entry.Name)=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination([uint32]$entry.D.pid,[int64]$entry.D.creation_time_filetime_utc,[string]$entry.D.image_path,[string]$entry.D.image_file_id_128,[string]$entry.D.image_sha256,[int64]$entry.D.image_length,[uint32]$po.link_count,[string]$po.security_descriptor_sddl,[string[]]@($po.hardlink_paths),"${Context}_$($entry.Name)")}else{$result.($entry.Name)=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$entry.D.pid,[int64]$entry.D.creation_time_filetime_utc,[string]$entry.D.image_path,[string]$entry.D.image_file_id_128,[string]$entry.D.image_sha256,[int64]$entry.D.image_length,"${Context}_$($entry.Name)")};$native=$result.($entry.Name).ReadCommandLine("${Context}_$($entry.Name)_argv");if([string]$native-cne[string]$entry.D.native_command_line){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_COMMAND_LINE_DRIFT context=$Context role=$($entry.Name)"};Ensure-SynapseWindowsCommandLineArgvType;$argv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));if((Get-SynapseCanonicalJson -Value $argv)-cne(Get-SynapseCanonicalJson -Value @($entry.D.arguments))){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($entry.Name)"}}
+            if([uint64]$entry.D.pid-in$result.Present){if([bool]$entry.Protected){$po=$Authorized.Payload.powershell.protected_os;$result.($entry.Name)=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination([uint32]$entry.D.pid,[int64]$entry.D.creation_time_filetime_utc,[string]$entry.D.image_path,[string]$entry.D.image_file_id_128,[string]$entry.D.image_sha256,[int64]$entry.D.image_length,[uint32]$po.link_count,[string]$po.security_descriptor_sddl,[string[]]@($po.hardlink_paths),"${Context}_$($entry.Name)")}else{$result.($entry.Name)=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$entry.D.pid,[int64]$entry.D.creation_time_filetime_utc,[string]$entry.D.image_path,[string]$entry.D.image_file_id_128,[string]$entry.D.image_sha256,[int64]$entry.D.image_length,"${Context}_$($entry.Name)")};$native=$result.($entry.Name).ReadCommandLine("${Context}_$($entry.Name)_argv");if([string]$native-cne[string]$entry.D.native_command_line){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_COMMAND_LINE_DRIFT context=$Context role=$($entry.Name)"};Ensure-SynapseWindowsCommandLineArgvType;$argv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));$expected=@($entry.D.arguments);$paths=if([string]$entry.Name-ceq'Outer'){@(0,3,4,5,6)}else{@(0,5)};if($argv.Count-ne$expected.Count){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($entry.Name) reason=count"};for($i=0;$i-lt$argv.Count;$i++){$match=if($paths-contains$i){[IO.Path]::GetFullPath([string]$argv[$i])-ieq[IO.Path]::GetFullPath([string]$expected[$i])}else{[string]$argv[$i]-ceq[string]$expected[$i]};if(-not$match){Die "SYNAPSE_BROKER_DECOMMISSION_NATIVE_ARGV_DRIFT context=$Context role=$($entry.Name) index=$i expected=$($expected[$i]) actual=$($argv[$i])"}}}
             else{[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$entry.D.pid,[int64]$entry.D.creation_time_filetime_utc,"${Context}_$($entry.Name)_gone")}
         }
         $result.Gate.RequireExact("${Context}_gate_final");$result.Roster.RequireExact("${Context}_roster_final");if($null-ne$result.Job){$result.Job.RequireSubset($result.Members,"${Context}_job_final")};foreach($lease in @($result.Outer,$result.Broker)){if($null-ne$lease){[void]$lease.RequireExactOrTerminal("${Context}_process_final")}};$Authorized.Lease.RequireExact("${Context}_authorization_final");$Parked.Lease.RequireExact("${Context}_parked_final")
@@ -21509,14 +21634,15 @@ function Remove-SynapseBrokerTaskForDecommissionExact {
             $instances=@($lookup.Task.GetInstances(0));$taskState=[int]$lookup.Task.State
             $runningExact=$instances.Count-eq1-and$taskState-eq4-and$outerLive-and[int]$instances[0].EnginePID-eq[int]$Parked.Payload.task_instance.engine_pid-and[string]$instances[0].InstanceGuid-ceq[string]$Parked.Payload.task_instance.instance_guid-and[int]$instances[0].State-eq4-and[string]$instances[0].CurrentAction-ceq'exec'
             $inertExact=$instances.Count-eq0-and$taskState-eq3
-            if(-not$runningExact-and-not$inertExact){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_DELETE_RUNTIME_DRIFT task=$($Authorized.Payload.task.name) state=$taskState instances=$($instances.Count) outer_live=$outerLive"}
+            $survivorExact=$instances.Count-eq0-and$taskState-eq4-and$outerLive-and[string]$Parked.Payload.task_instance.observation-ceq'physical_job_survivor'
+            if(-not$runningExact-and-not$inertExact-and-not$survivorExact){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_DELETE_RUNTIME_DRIFT task=$($Authorized.Payload.task.name) state=$taskState instances=$($instances.Count) outer_live=$outerLive observation=$($Parked.Payload.task_instance.observation)"}
             $Authorized.Lease.RequireExact('broker_decommission_task_delete_authorization_boundary');$Parked.Lease.RequireExact('broker_decommission_task_delete_parked_boundary')
             $leases.Gate.RequireExact('broker_decommission_task_delete_gate_boundary');$leases.Roster.RequireExact('broker_decommission_task_delete_roster_boundary');if($null-ne$leases.Job){$leases.Job.RequireSubset($leases.Members,'broker_decommission_task_delete_job_boundary')}
             $readback2=Get-SynapseTaskDefinitionReadback -RegisteredTask $lookup.Task -Kind broker -ExpectedName ([string]$Authorized.Payload.task.name) -ExpectedExecute ([string]$Authorized.Payload.task.execute) -ExpectedArguments ([string]$Authorized.Payload.task.arguments) -ExpectedWorkingDirectory ([string]$Authorized.Payload.task.working_directory) -ExpectedUserSid (Get-SynapseCurrentUserSid) -ExpectedXmlSha256 ([string]$Authorized.Payload.task.xml_sha256) -ExpectedSecurityDescriptorSha256 ([string]$Authorized.Payload.task.security_descriptor_sha256) -ExpectedSemanticSha256 ([string]$receipt.Initial.task.submitted_semantic_sha256)
             if([string]$readback2.Xml-cne[string]$observed.observed_xml-or[string]$readback2.SecurityDescriptor-cne[string]$observed.observed_security_descriptor-or(Get-SynapseCanonicalJson -Value $readback2.SemanticContract)-cne(Get-SynapseCanonicalJson -Value $observed.observed_semantic_contract)){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_RECEIPT_DEFINITION_DRIFT boundary=delete task=$($Authorized.Payload.task.name)"}
             $outerLive2=if($null-ne$leases.Outer){[bool]$leases.Outer.RequireExactOrTerminal('broker_decommission_task_delete_outer_final')}else{$false};if($null-ne$leases.Broker){[void]$leases.Broker.RequireExactOrTerminal('broker_decommission_task_delete_broker_final')}
-            $instances2=@($lookup.Task.GetInstances(0));$taskState2=[int]$lookup.Task.State;$runningExact2=$instances2.Count-eq1-and$taskState2-eq4-and$outerLive2-and[int]$instances2[0].EnginePID-eq[int]$Parked.Payload.task_instance.engine_pid-and[string]$instances2[0].InstanceGuid-ceq[string]$Parked.Payload.task_instance.instance_guid-and[int]$instances2[0].State-eq4-and[string]$instances2[0].CurrentAction-ceq'exec';$inertExact2=$instances2.Count-eq0-and$taskState2-eq3
-            if(-not$runningExact2-and-not$inertExact2){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_DELETE_FINAL_RUNTIME_DRIFT task=$($Authorized.Payload.task.name) state=$taskState2 instances=$($instances2.Count) outer_live=$outerLive2"};if($null-ne$leases.Job){$leases.Job.RequireSubset($leases.Members,'broker_decommission_task_delete_final_job_boundary')}
+            $instances2=@($lookup.Task.GetInstances(0));$taskState2=[int]$lookup.Task.State;$runningExact2=$instances2.Count-eq1-and$taskState2-eq4-and$outerLive2-and[int]$instances2[0].EnginePID-eq[int]$Parked.Payload.task_instance.engine_pid-and[string]$instances2[0].InstanceGuid-ceq[string]$Parked.Payload.task_instance.instance_guid-and[int]$instances2[0].State-eq4-and[string]$instances2[0].CurrentAction-ceq'exec';$inertExact2=$instances2.Count-eq0-and$taskState2-eq3;$survivorExact2=$instances2.Count-eq0-and$taskState2-eq4-and$outerLive2-and[string]$Parked.Payload.task_instance.observation-ceq'physical_job_survivor'
+            if(-not$runningExact2-and-not$inertExact2-and-not$survivorExact2){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_DELETE_FINAL_RUNTIME_DRIFT task=$($Authorized.Payload.task.name) state=$taskState2 instances=$($instances2.Count) outer_live=$outerLive2 observation=$($Parked.Payload.task_instance.observation)"};if($null-ne$leases.Job){$leases.Job.RequireSubset($leases.Members,'broker_decommission_task_delete_final_job_boundary')}
             [void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_task_delete_retained_legacy_boundary')
             $scheduler.Root.DeleteTask([string]$Authorized.Payload.task.name,0)
             $deletedExact=$true
@@ -21533,28 +21659,31 @@ function Assert-SynapseBrokerDecommissionDrainedRecord {
     param([Parameter(Mandatory=$true)]$Record,[Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Parked,[Parameter(Mandatory=$true)]$TaskAbsent,[Parameter(Mandatory=$true)][string]$Context)
     $p=$Record.Payload;Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','authorization','parked','task_absent','outer_job_absent','outer_identity_gone','broker_identity_gone','target_process_count','listener_count','drained_at_utc','record_sha256') -Context $Context
     foreach($flag in @('outer_job_absent','outer_identity_gone','broker_identity_gone')){if(-not($p.$flag-is[bool])-or-not[bool]$p.$flag){Die "SYNAPSE_BROKER_DECOMMISSION_DRAINED_PROOF_INVALID context=$Context field=$flag"}}
-    if([string]$p.schema-cne'synapse_broker_decommission_drained/v1'-or[string]$p.state-cne'broker_tree_drained'-or[string]$p.decommission_id-ine[string]$Authorized.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-drained.json")-or-not($p.target_process_count-is[int])-or-not($p.listener_count-is[int])-or[int]$p.target_process_count-ne0-or[int]$p.listener_count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_DRAINED_RECORD_INVALID context=$Context"}
+    $targetIntegral=$p.target_process_count-is[int]-or$p.target_process_count-is[long];$listenerIntegral=$p.listener_count-is[int]-or$p.listener_count-is[long]
+    if([string]$p.schema-cne'synapse_broker_decommission_drained/v1'-or[string]$p.state-cne'broker_tree_drained'-or[string]$p.decommission_id-ine[string]$Authorized.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-drained.json")-or-not$targetIntegral-or-not$listenerIntegral-or[int64]$p.target_process_count-ne0-or[int64]$p.listener_count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_DRAINED_RECORD_INVALID context=$Context target_type=$($p.target_process_count.GetType().FullName) listener_type=$($p.listener_count.GetType().FullName)"}
     [void](Assert-SynapseBrokerDecommissionUtcTimestamp -Value $p.drained_at_utc -Context "${Context}_drained_at")
     Assert-SynapseBrokerDecommissionRecordReference -Reference $p.authorization -Record $Authorized -Context "${Context}_authorization";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.parked -Record $Parked -Context "${Context}_parked";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.task_absent -Record $TaskAbsent -Context "${Context}_task_absent";Assert-SynapseBrokerDecommissionRecordHash -Record $Record -Context $Context;return $p
 }
 
 function Stop-SynapseBrokerDecommissionProcessTreeExact {
     param([Parameter(Mandatory=$true)]$Authorized,[Parameter(Mandatory=$true)]$Parked,[Parameter(Mandatory=$true)]$TaskAbsent,[ValidateRange(10,300)][int]$TimeoutSeconds=60)
+    Ensure-SynapseDaemonJobReadbackType
     [void](Assert-SynapseBrokerDecommissionTaskAbsentRecord -Record $TaskAbsent -Authorized $Authorized -Parked $Parked -Context 'broker_decommission_drain_task_absent')
     if($null-eq$Authorized.RetainedLegacyLeases){Die 'SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_LEASES_MISSING phase=drain'}
     [void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_drain_retained_legacy_before')
     $scheduler=Get-SynapseScheduledTaskComRoot;$lookup=Get-SynapseScheduledTaskLookupExact -Name ([string]$Authorized.Payload.task.name) -Scheduler $scheduler;if([bool]$lookup.Exists){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_REAPPEARED task=$($Authorized.Payload.task.name)"}
-    $outer=$Parked.Payload.outer_bootstrap;$broker=$Parked.Payload.broker_process;$job=$Parked.Payload.outer_job;$members=[uint64[]]@([uint64]$outer.pid,[uint64]$broker.pid);$outerLease=$null;$brokerLease=$null;$jobLease=$null;$record=$null;$returning=$false;$primary=''
+    $outer=$Parked.Payload.outer_bootstrap;$broker=$Parked.Payload.broker_process;$job=$Parked.Payload.outer_job;$members=[uint64[]]@($job.member_pids|ForEach-Object{[uint64]$_}|Sort-Object);$outerLease=$null;$brokerLease=$null;$jobLease=$null;$record=$null;$returning=$false;$primary=''
     try{
-        $jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenSubsetOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$members,'broker_decommission_drain_job')
+        $jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenSubsetOrNull([string]$job.name,[string]$Authorized.Payload.task_capability_sha256,[uint32]$outer.pid,[string]$job.expected_security_descriptor_sddl,$members,[bool]$job.historical_peak_exceeded_before_decommission,'broker_decommission_drain_job')
         if($null-ne$jobLease){
+            $requireStableSubset={param([string]$Boundary)$clock=[Diagnostics.Stopwatch]::StartNew();while($true){try{$jobLease.RequireSubset($members,$Boundary);break}catch{if($_.Exception.Message-notlike'*SYNAPSE_BROKER_DECOMMISSION_JOB_PROCESS_LIST_UNSTABLE*'-or$clock.ElapsedMilliseconds-ge5000){throw};Start-Sleep -Milliseconds 50}}}
             $present=@($jobLease.ReadSubset($members,'broker_decommission_drain_initial_members')|ForEach-Object{[uint64]$_})
             if([uint64]$outer.pid-in$present){$outerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$outer.pid,[int64]$outer.creation_time_filetime_utc,[string]$outer.image_path,[string]$outer.image_file_id_128,[string]$outer.image_sha256,[int64]$outer.image_length,'broker_decommission_drain_outer')}else{[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$outer.pid,[int64]$outer.creation_time_filetime_utc,'broker_decommission_drain_outer_already_gone')}
             if([uint64]$broker.pid-in$present){$po=$Authorized.Payload.powershell.protected_os;$brokerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination([uint32]$broker.pid,[int64]$broker.creation_time_filetime_utc,[string]$broker.image_path,[string]$broker.image_file_id_128,[string]$broker.image_sha256,[int64]$broker.image_length,[uint32]$po.link_count,[string]$po.security_descriptor_sddl,[string[]]@($po.hardlink_paths),'broker_decommission_drain_broker')}else{[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$broker.pid,[int64]$broker.creation_time_filetime_utc,'broker_decommission_drain_broker_already_gone')}
             foreach($check in @([pscustomobject]@{Lease=$outerLease;D=$outer;Role='outer'},[pscustomobject]@{Lease=$brokerLease;D=$broker;Role='broker'})){if($null-ne$check.Lease-and[string]$check.Lease.ReadCommandLine("broker_decommission_drain_$($check.Role)_argv")-cne[string]$check.D.native_command_line){Die "SYNAPSE_BROKER_DECOMMISSION_DRAIN_ARGV_DRIFT role=$($check.Role)"}}
             $Authorized.Lease.RequireExact('broker_decommission_drain_authorization_boundary');$Parked.Lease.RequireExact('broker_decommission_drain_parked_boundary');$TaskAbsent.Lease.RequireExact('broker_decommission_drain_task_boundary');$jobLease.RequireSubset($members,'broker_decommission_drain_job_boundary')
-            if($null-ne$brokerLease){$jobLease.RequireSubset($members,'broker_decommission_before_broker_termination');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_before_broker_termination_retained_legacy');[void]$brokerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),[uint32]127,'broker_decommission_broker_terminal');$jobLease.RequireSubset($members,'broker_decommission_after_broker_termination')}
-            if($null-ne$outerLease){$jobLease.RequireSubset($members,'broker_decommission_before_outer_termination');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_before_outer_termination_retained_legacy');[void]$outerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),[uint32]127,'broker_decommission_outer_terminal');$jobLease.RequireSubset($members,'broker_decommission_after_outer_termination')}
+            if($null-ne$brokerLease){$jobLease.RequireSubset($members,'broker_decommission_before_broker_termination');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_before_broker_termination_retained_legacy');[void]$brokerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),[uint32]127,'broker_decommission_broker_terminal');&$requireStableSubset 'broker_decommission_after_broker_termination'}
+            if($null-ne$outerLease){$jobLease.RequireSubset($members,'broker_decommission_before_outer_termination');[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $Authorized -Leases $Authorized.RetainedLegacyLeases -Context 'broker_decommission_before_outer_termination_retained_legacy');[void]$outerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),[uint32]127,'broker_decommission_outer_terminal');&$requireStableSubset 'broker_decommission_after_outer_termination'}
             $jobLease.ProveEmptyAfterProcessTermination($members,$TimeoutSeconds*1000,'broker_decommission_drain')
         }else{[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$outer.pid,[int64]$outer.creation_time_filetime_utc,'broker_decommission_drain_outer_without_job');[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$broker.pid,[int64]$broker.creation_time_filetime_utc,'broker_decommission_drain_broker_without_job')}
         [SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$outer.pid,[int64]$outer.creation_time_filetime_utc,'broker_decommission_outer_gone');[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$broker.pid,[int64]$broker.creation_time_filetime_utc,'broker_decommission_broker_gone')
@@ -21586,7 +21715,7 @@ function Assert-SynapseBrokerDecommissionCleanupReadyRecord {
     Assert-SynapseBrokerDecommissionRecordReference -Reference $p.drained -Record $Drained -Context "${Context}_drained"
     if($null-ne$Confirmation){if($null-eq$p.confirmation){Die "SYNAPSE_BROKER_DECOMMISSION_CONFIRMATION_REFERENCE_MISSING context=$Context"};Assert-SynapseBrokerDecommissionRecordReference -Reference $p.confirmation -Record $Confirmation -Context "${Context}_confirmation"}elseif($null-ne$p.confirmation){Die "SYNAPSE_BROKER_DECOMMISSION_CONFIRMATION_REFERENCE_UNEXPECTED context=$Context"}
     Assert-SynapsePurgeDirectoryDescriptor -Descriptor $p.authority_root -ExpectedPath ([string]$Authorized.Payload.authority_root.path) -Context "${Context}_authority_root"
-    if(-not[bool]$p.authority_root.exists-or[string]$p.authority_root.root_file_id_128-ine[string]$Authorized.Payload.authority_root.file_id_128-or(Get-SynapseCanonicalJson -Value $p.authority_root)-cne(Get-SynapseCanonicalJson -Value $Parked.Payload.authority_tree)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_ROOT_PLAN_INVALID context=$Context"}
+    if(-not[bool]$p.authority_root.exists-or[string]$p.authority_root.root_file_id_128-ine[string]$Authorized.Payload.authority_root.file_id_128){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_ROOT_PLAN_INVALID context=$Context"}
     $runtimePlans=@($p.runtime_artifacts);$runtimeExpected=@($Authorized.Payload.runtime_artifacts);$seen=New-SynapseCaseInsensitiveMap
     foreach($item in $runtimePlans){Assert-SynapsePurgeExactPropertySet -Value $item -Expected @('role','file') -Context "${Context}_runtime";$path=[IO.Path]::GetFullPath([string]$item.file.path);if($seen.ContainsKey($path)){Die "SYNAPSE_BROKER_DECOMMISSION_RUNTIME_PLAN_DUPLICATE context=$Context path=$path"};$seen[$path]=$item;Assert-SynapsePurgeFileDescriptor -Descriptor $item.file -ExpectedPath $path -Context "${Context}_runtime_$($item.role)"}
     if([string]$p.mode-ceq'remove'){
@@ -21612,6 +21741,7 @@ function Assert-SynapseBrokerDecommissionCleanupReadyRecord {
 
 function New-SynapseBrokerDecommissionCleanupReadyRecord {
     param([Parameter(Mandatory=$true)]$Authorized,$Confirmation,[Parameter(Mandatory=$true)]$Parked,[Parameter(Mandatory=$true)]$TaskAbsent,[Parameter(Mandatory=$true)]$Drained)
+    Ensure-SynapseDaemonJobReadbackType
     $retainedLegacy=$null;$retainedLegacyOwned=$false;$record=$null;$returning=$false
     try{
     [void](Assert-SynapseBrokerDecommissionAuthorizedRecord -Record $Authorized -StructuralOnly -Context 'broker_decommission_cleanup_authorization')
@@ -21623,7 +21753,7 @@ function New-SynapseBrokerDecommissionCleanupReadyRecord {
     [SynapseSetup.BrokerDecommissionJobLease]::RequireNameAbsent([string]$Parked.Payload.outer_job.name,'broker_decommission_cleanup_job_absent')
     [SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$Parked.Payload.outer_bootstrap.pid,[int64]$Parked.Payload.outer_bootstrap.creation_time_filetime_utc,'broker_decommission_cleanup_outer_gone');[SynapseAuthorityRuntime.MappedProcessLease]::RequireIdentityGone([uint32]$Parked.Payload.broker_process.pid,[int64]$Parked.Payload.broker_process.creation_time_filetime_utc,'broker_decommission_cleanup_broker_gone')
     [void](Assert-SynapsePurgeStrictNoLiveAuthority -Bind ([string]$Authorized.Payload.bind) -DbPath ([string]$Authorized.Payload.db_path) -Context 'broker_decommission_cleanup_no_live')
-    $authorityRoot=Get-SynapsePurgeDirectorySnapshot -Path ([string]$Authorized.Payload.authority_root.path) -Context 'broker_decommission_cleanup_authority_root';if(-not[bool]$authorityRoot.exists-or[string]$authorityRoot.root_file_id_128-ine[string]$Authorized.Payload.authority_root.file_id_128-or(Get-SynapseCanonicalJson -Value $authorityRoot)-cne(Get-SynapseCanonicalJson -Value $Parked.Payload.authority_tree)){Die 'SYNAPSE_BROKER_DECOMMISSION_CLEANUP_AUTHORITY_ROOT_DRIFT'}
+    $authorityRoot=Get-SynapsePurgeDirectorySnapshot -Path ([string]$Authorized.Payload.authority_root.path) -Context 'broker_decommission_cleanup_authority_root';if(-not[bool]$authorityRoot.exists-or[string]$authorityRoot.root_file_id_128-ine[string]$Authorized.Payload.authority_root.file_id_128){Die 'SYNAPSE_BROKER_DECOMMISSION_CLEANUP_AUTHORITY_ROOT_DRIFT'}
     $runtimePlans=@();$database=$null;$profiles=$null;$profilesOwnership=$null;$token=$null;$vault=$null;$confirmed=$false
     if([string]$Authorized.Payload.mode-ceq'remove_purge'){
         foreach($artifact in @($Authorized.Payload.runtime_artifacts|Sort-Object path)){$file=Get-SynapsePurgeFileSnapshot -Path ([string]$artifact.path) -Context "broker_decommission_cleanup_runtime_$($artifact.role)";if(-not[bool]$file.exists-or[string]$file.file_id_128-ine[string]$artifact.file_id_128-or[string]$file.sha256-ine[string]$artifact.sha256-or[int64]$file.length-ne[int64]$artifact.length){Die "SYNAPSE_BROKER_DECOMMISSION_RUNTIME_ARTIFACT_DRIFT path=$($artifact.path)"};$runtimePlans+=,[ordered]@{role=[string]$artifact.role;file=$file}}
@@ -21641,7 +21771,7 @@ function New-SynapseBrokerDecommissionCleanupReadyRecord {
 
 function Assert-SynapseBrokerDecommissionCleanupBoundary {
     param([Parameter(Mandatory=$true)]$Pending,[Parameter(Mandatory=$true)]$RetainedLegacyLeases,[Parameter(Mandatory=$true)][string]$Context)
-    foreach($record in @($Pending.Authorized,$Pending.Confirmation,$Pending.Parked,$Pending.TaskAbsent,$Pending.Drained,$Pending.CleanupReady)){if($null-ne$record){$record.Lease.RequireExact("${Context}_$($record.Leaf)")}}
+    foreach($record in @($Pending.Authorized,$Pending.Confirmation,$Pending.Parked,$Pending.TaskAbsent,$Pending.Drained,$Pending.CleanupReady,$Pending.Quiesced)){if($null-ne$record){$record.Lease.RequireExact("${Context}_$($record.Leaf)")}}
     $a=$Pending.Authorized.Payload;$p=$Pending.Parked.Payload
     $lookup=Get-SynapseScheduledTaskLookupExact -Name ([string]$a.task.name);if([bool]$lookup.Exists){Die "SYNAPSE_BROKER_DECOMMISSION_TASK_REAPPEARED context=$Context task=$($a.task.name)"}
     [SynapseSetup.BrokerDecommissionJobLease]::RequireNameAbsent([string]$p.outer_job.name,"${Context}_job")
@@ -21653,16 +21783,16 @@ function Assert-SynapseBrokerDecommissionCleanupBoundary {
 function Assert-SynapseBrokerDecommissionCompletedRecord {
     param([Parameter(Mandatory=$true)]$Record,[Parameter(Mandatory=$true)]$Pending,[Parameter(Mandatory=$true)][string]$Context,[switch]$RequireOldIdentitiesGone)
     $p=$Record.Payload;$a=$Pending.Authorized
-    Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','history_sequence','previous_completed','authorization','parked','task_absent','drained','cleanup_ready','mode','deletion_plan_sha256','task_absent_proven','job_absent_proven','outer_identity_gone','broker_identity_gone','authority_root_disposition','runtime_artifacts_disposition','database_disposition','profiles_disposition','token_disposition','completed_at_utc','record_sha256') -Context $Context
+    Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','history_sequence','previous_completed','authorization','parked','task_absent','drained','cleanup_ready','quiesced','mode','deletion_plan_sha256','task_absent_proven','job_absent_proven','outer_identity_gone','broker_identity_gone','authority_root_disposition','runtime_artifacts_disposition','database_disposition','profiles_disposition','token_disposition','completed_at_utc','record_sha256') -Context $Context
     foreach($flag in @('task_absent_proven','job_absent_proven','outer_identity_gone','broker_identity_gone')){if(-not($p.$flag-is[bool])-or-not[bool]$p.$flag){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETION_PROOF_INVALID context=$Context field=$flag"}}
-    $purged=[string]$p.mode-ceq'remove_purge';$ready=$Pending.CleanupReady.Payload
+    $purged=[string]$p.mode-ceq'remove_purge';$ready=$Pending.CleanupReady.Payload;$quiesced=$Pending.Quiesced.Payload
     $planDisposition={param($plan)if($null-eq$plan){'not_targeted'}elseif([bool]$plan.exists){'deleted_old_identity'}else{'absent_when_planned'}}
     $expectedRuntime=if(-not$purged){'not_targeted'}elseif(@($ready.runtime_artifacts).Count-eq0){'absent_when_planned'}elseif(@($ready.runtime_artifacts|Where-Object{[bool]$_.file.exists}).Count-gt0){'deleted_old_identity'}else{'absent_when_planned'}
     $expectedDatabase=&$planDisposition $ready.database;$expectedProfiles=&$planDisposition $ready.profiles;$expectedToken=&$planDisposition $ready.token
-    if([string]$p.schema-cne'synapse_broker_decommission_completed/v2'-or[string]$p.state-cne'completed'-or[string]$p.decommission_id-ine[string]$a.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-completed.json")-or[int64]$p.history_sequence-ne[int64]$a.Payload.history_sequence-or(Get-SynapseCanonicalJson -Value $p.previous_completed)-cne(Get-SynapseCanonicalJson -Value $a.Payload.previous_completed)-or[string]$p.mode-cne[string]$a.Payload.mode-or[string]$p.deletion_plan_sha256-ine[string]$ready.deletion_plan_sha256-or[string]$p.authority_root_disposition-cne'deleted_old_identity'-or[string]$p.runtime_artifacts_disposition-cne$expectedRuntime-or[string]$p.database_disposition-cne$expectedDatabase-or[string]$p.profiles_disposition-cne$expectedProfiles-or[string]$p.token_disposition-cne$expectedToken){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETION_INVALID context=$Context"}
+    if([string]$p.schema-cne'synapse_broker_decommission_completed/v2'-or[string]$p.state-cne'completed'-or[string]$p.decommission_id-ine[string]$a.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-completed.json")-or[int64]$p.history_sequence-ne[int64]$a.Payload.history_sequence-or(Get-SynapseCanonicalJson -Value $p.previous_completed)-cne(Get-SynapseCanonicalJson -Value $a.Payload.previous_completed)-or[string]$p.mode-cne[string]$a.Payload.mode-or[string]$p.deletion_plan_sha256-ine[string]$quiesced.deletion_plan_sha256-or[string]$p.authority_root_disposition-cne'deleted_old_identity'-or[string]$p.runtime_artifacts_disposition-cne$expectedRuntime-or[string]$p.database_disposition-cne$expectedDatabase-or[string]$p.profiles_disposition-cne$expectedProfiles-or[string]$p.token_disposition-cne$expectedToken){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETION_INVALID context=$Context"}
     if([int64]$p.history_sequence-eq1){if($null-ne$p.previous_completed){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETION_GENESIS_PREDECESSOR_INVALID context=$Context"}}else{Assert-SynapsePurgeExactPropertySet -Value $p.previous_completed -Expected @('leaf','file_id_128','sha256','length','record_sha256') -Context "${Context}_previous_completed";if([string]$p.previous_completed.leaf-cnotmatch'\Adecommission-[0-9A-F]{64}-completed\.json\z'-or[string]$p.previous_completed.file_id_128-notmatch'^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$'-or[string]$p.previous_completed.sha256-notmatch'^[0-9A-Fa-f]{64}$'-or[int64]$p.previous_completed.length-lt1-or[string]$p.previous_completed.record_sha256-notmatch'^[0-9A-Fa-f]{64}$'){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETION_PREDECESSOR_INVALID context=$Context"}}
     [void](Assert-SynapseBrokerDecommissionUtcTimestamp -Value $p.completed_at_utc -Context "${Context}_completed_at")
-    Assert-SynapseBrokerDecommissionRecordReference -Reference $p.authorization -Record $a -Context "${Context}_authorization";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.parked -Record $Pending.Parked -Context "${Context}_parked";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.task_absent -Record $Pending.TaskAbsent -Context "${Context}_task_absent";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.drained -Record $Pending.Drained -Context "${Context}_drained";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.cleanup_ready -Record $Pending.CleanupReady -Context "${Context}_cleanup_ready"
+    Assert-SynapseBrokerDecommissionRecordReference -Reference $p.authorization -Record $a -Context "${Context}_authorization";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.parked -Record $Pending.Parked -Context "${Context}_parked";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.task_absent -Record $Pending.TaskAbsent -Context "${Context}_task_absent";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.drained -Record $Pending.Drained -Context "${Context}_drained";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.cleanup_ready -Record $Pending.CleanupReady -Context "${Context}_cleanup_ready";Assert-SynapseBrokerDecommissionRecordReference -Reference $p.quiesced -Record $Pending.Quiesced -Context "${Context}_quiesced"
     Assert-SynapseBrokerDecommissionRecordHash -Record $Record -Context $Context
     if($RequireOldIdentitiesGone){[void](Assert-SynapseBrokerDecommissionOldObjectIdentitiesGone -Pending $Pending -Context "${Context}_old_objects")}
     return $p
@@ -21707,15 +21837,58 @@ function Assert-SynapseBrokerDecommissionCurrentPostcondition {
     }finally{if($owned){Close-SynapseBrokerDecommissionRetainedLegacyAuthorityLeases -Leases $RetainedLegacyLeases}}
 }
 
+function Assert-SynapseBrokerDecommissionQuiescedRecord {
+    param([Parameter(Mandatory=$true)]$Record,[Parameter(Mandatory=$true)]$Pending,[Parameter(Mandatory=$true)][string]$Context)
+    $p=$Record.Payload
+    Assert-SynapsePurgeExactPropertySet -Value $p -Expected @('schema','state','decommission_id','authorization','cleanup_ready','lineages','authority_root','deletion_plan_sha256','quiesced_at_utc','record_sha256') -Context $Context
+    if([string]$p.schema-cne'synapse_broker_decommission_quiesced/v1'-or[string]$p.state-cne'authority_root_quiesced'-or[string]$p.decommission_id-ine[string]$Pending.Authorized.Payload.decommission_id-or[string]$Record.Leaf-cne("decommission-$($p.decommission_id)-quiesced.json")-or[string]$p.deletion_plan_sha256-notmatch'^[0-9A-Fa-f]{64}$'){Die "SYNAPSE_BROKER_DECOMMISSION_QUIESCED_INVALID context=$Context"}
+    Assert-SynapseBrokerDecommissionRecordReference -Reference $p.authorization -Record $Pending.Authorized -Context "${Context}_authorization"
+    Assert-SynapseBrokerDecommissionRecordReference -Reference $p.cleanup_ready -Record $Pending.CleanupReady -Context "${Context}_cleanup_ready"
+    Assert-SynapsePurgeDirectoryDescriptor -Descriptor $p.authority_root -ExpectedPath ([string]$Pending.Authorized.Payload.authority_root.path) -Context "${Context}_authority_root"
+    if(-not[bool]$p.authority_root.exists-or[string]$p.authority_root.root_file_id_128-ine[string]$Pending.Authorized.Payload.authority_root.file_id_128-or(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $p.authority_root))-ine[string]$p.deletion_plan_sha256){Die "SYNAPSE_BROKER_DECOMMISSION_QUIESCED_PLAN_INVALID context=$Context"}
+    $seen=New-SynapseCaseInsensitiveMap
+    foreach($l in @($p.lineages)){
+        Assert-SynapsePurgeExactPropertySet -Value $l -Expected @('capability_sha256','job_name','task_name','task_disposition','outer_pid','outer_creation_time_filetime_utc','broker_pid','broker_creation_time_filetime_utc','outer_image','broker_script','terminated_at_utc') -Context "${Context}_lineage"
+        if([string]$l.capability_sha256-notmatch'^[0-9A-Fa-f]{64}$'-or[string]$l.job_name-cne("Local\SynapseOwned-$(([string]$l.capability_sha256).ToUpperInvariant())-$([int]$l.outer_pid)")-or[string]$l.task_name-cne("SynapseMcpBroker-$(([string]$l.capability_sha256).Substring(0,40).ToUpperInvariant())")-or[string]$l.task_disposition-cnotin@('deleted_exact','already_absent')-or[int]$l.outer_pid-lt1-or[int]$l.broker_pid-lt1-or[int64]$l.outer_creation_time_filetime_utc-lt1-or[int64]$l.broker_creation_time_filetime_utc-lt1-or$seen.ContainsKey([string]$l.capability_sha256)){Die "SYNAPSE_BROKER_DECOMMISSION_QUIESCED_LINEAGE_INVALID context=$Context"}
+        $seen[[string]$l.capability_sha256]=$true;Assert-SynapsePurgeFileDescriptor -Descriptor $l.outer_image -ExpectedPath ([string]$l.outer_image.path) -Context "${Context}_outer_image";Assert-SynapsePurgeFileDescriptor -Descriptor $l.broker_script -ExpectedPath ([string]$l.broker_script.path) -Context "${Context}_broker_script";[void](Assert-SynapseBrokerDecommissionUtcTimestamp -Value $l.terminated_at_utc -Context "${Context}_terminated_at")
+    }
+    [void](Assert-SynapseBrokerDecommissionUtcTimestamp -Value $p.quiesced_at_utc -Context "${Context}_quiesced_at");Assert-SynapseBrokerDecommissionRecordHash -Record $Record -Context $Context;return $p
+}
+
+function New-SynapseBrokerDecommissionQuiescedRecord {
+    param([Parameter(Mandatory=$true)]$Pending,[ValidateRange(10,300)][int]$TimeoutSeconds=60)
+    Ensure-SynapseDaemonJobReadbackType;Ensure-SynapseWindowsCommandLineArgvType
+    $a=$Pending.Authorized;$ready=$Pending.CleanupReady;$root=[IO.Path]::GetFullPath([string]$a.Payload.authority_root.path);$objects=Get-SynapseNormalizedDirectoryPath -Path (Join-Path $root 'objects');$lineageLeases=@();$record=$null;$returning=$false
+    try{
+        [void](Assert-SynapseBrokerDecommissionCleanupReadyRecord -Record $ready -Authorized $a -Confirmation $Pending.Confirmation -Parked $Pending.Parked -TaskAbsent $Pending.TaskAbsent -Drained $Pending.Drained -Context 'broker_decommission_quiesce_ready')
+        $all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$outers=@($all|Where-Object{-not[string]::IsNullOrWhiteSpace([string]$_.ExecutablePath)-and[IO.Path]::GetFullPath([string]$_.ExecutablePath).StartsWith($objects,[StringComparison]::OrdinalIgnoreCase)-and[IO.Path]::GetFileName([string]$_.ExecutablePath)-cmatch'^broker-bootstrap-[0-9A-F]{64}\.exe$'}|Sort-Object ProcessId)
+        foreach($outer in $outers){
+            $native=[string]$outer.CommandLine;$argv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($native));if($argv.Count-ne7-or[string]$argv[1]-cne'--outer-launch-capability'-or[string]$argv[2]-notmatch'^[0-9A-Fa-f]{64}$'){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_OUTER_ARGV_INVALID pid=$($outer.ProcessId)"};$cap=([string]$argv[2]).ToUpperInvariant();$outerPath=[IO.Path]::GetFullPath([string]$argv[0]);$psPath=[IO.Path]::GetFullPath([string]$argv[3]);$scriptPath=[IO.Path]::GetFullPath([string]$argv[4]);$runtime=[IO.Path]::GetFullPath([string]$argv[5]);$log=[IO.Path]::GetFullPath([string]$argv[6]);$jobName="Local\SynapseOwned-$cap-$([int]$outer.ProcessId)"
+            if($outerPath-ine[IO.Path]::GetFullPath([string]$outer.ExecutablePath)-or-not$outerPath.StartsWith($objects,[StringComparison]::OrdinalIgnoreCase)-or-not$scriptPath.StartsWith($objects,[StringComparison]::OrdinalIgnoreCase)-or$runtime-ine[IO.Path]::GetFullPath([string]$a.Payload.runtime_bin_dir)-or-not$log.StartsWith((Get-SynapseNormalizedDirectoryPath -Path ([string]$a.Payload.log_dir)),[StringComparison]::OrdinalIgnoreCase)-or$psPath-ine[IO.Path]::GetFullPath([string]$a.Payload.powershell.path)){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_OUTER_SCOPE_INVALID pid=$($outer.ProcessId)"}
+            $children=@($all|Where-Object{[int]$_.ParentProcessId-eq[int]$outer.ProcessId});$brokerChildren=@($children|Where-Object{[IO.Path]::GetFullPath([string]$_.ExecutablePath)-ieq$psPath});$other=@($children|Where-Object{[IO.Path]::GetFullPath([string]$_.ExecutablePath)-ine$psPath-and[string]$_.Name-ine'conhost.exe'});if($brokerChildren.Count-ne1-or$other.Count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_CHILDREN_INVALID outer_pid=$($outer.ProcessId) broker_count=$($brokerChildren.Count) other=$(@($other.ProcessId)-join',')"};$broker=$brokerChildren[0];$brokerNative=[string]$broker.CommandLine;$brokerArgv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($brokerNative));if($brokerArgv.Count-ne8-or[IO.Path]::GetFullPath([string]$brokerArgv[0])-ine$psPath-or[string]$brokerArgv[1]-cne'-NoProfile'-or[string]$brokerArgv[2]-cne'-ExecutionPolicy'-or[string]$brokerArgv[3]-cne'Bypass'-or[string]$brokerArgv[4]-cne'-File'-or[IO.Path]::GetFullPath([string]$brokerArgv[5])-ine$scriptPath-or[string]$brokerArgv[6]-cne'-ParentJobName'-or[string]$brokerArgv[7]-cne$jobName){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_BROKER_ARGV_INVALID pid=$($broker.ProcessId)"}
+            $outerFile=Get-SynapsePurgeFileSnapshot -Path $outerPath -Context 'broker_decommission_quiesce_outer_file';$scriptFile=Get-SynapsePurgeFileSnapshot -Path $scriptPath -Context 'broker_decommission_quiesce_script_file';if(-not[bool]$outerFile.exists-or-not[bool]$scriptFile.exists){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_FILE_ABSENT outer=$outerPath script=$scriptPath"}
+            $outerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination([uint32]$outer.ProcessId,0L,$outerPath,[string]$outerFile.file_id_128,[string]$outerFile.sha256,[int64]$outerFile.length,'broker_decommission_quiesce_outer');$po=$a.Payload.powershell.protected_os;$brokerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination([uint32]$broker.ProcessId,0L,$psPath,[string]$a.Payload.powershell.file_id_128,[string]$a.Payload.powershell.sha256,[int64]$a.Payload.powershell.length,[uint32]$po.link_count,[string]$po.security_descriptor_sddl,[string[]]@($po.hardlink_paths),'broker_decommission_quiesce_broker');if([string]$outerLease.ReadCommandLine('broker_decommission_quiesce_outer_argv')-cne$native-or[string]$brokerLease.ReadCommandLine('broker_decommission_quiesce_broker_argv')-cne$brokerNative){Die 'SYNAPSE_BROKER_DECOMMISSION_EXTRA_NATIVE_ARGV_DRIFT'}
+            $classification=Get-SynapseBrokerChildClassification -Broker $broker;if(@($classification.AuthorityChildren).Count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_BROKER_DESCENDANTS_INVALID broker_pid=$($broker.ProcessId) pids=$(@($classification.AuthorityChildren.ProcessId)-join',')"};$members=[uint64[]]@([uint64]$outer.ProcessId,[uint64]$broker.ProcessId)+@($classification.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId});$members=[uint64[]]@($members|Sort-Object -Unique);$jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull($jobName,$cap,[uint32]$outer.ProcessId,[string]$Pending.Parked.Payload.outer_job.expected_security_descriptor_sddl,$members,$true,'broker_decommission_quiesce_job');if($null-eq$jobLease){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_JOB_ABSENT name=$jobName"}
+            $taskName="SynapseMcpBroker-$($cap.Substring(0,40))";$scheduler=Get-SynapseScheduledTaskComRoot;$task=Get-SynapseScheduledTaskLookupExact -Name $taskName -Scheduler $scheduler;$taskDisposition='already_absent';if([bool]$task.Exists){$expectedArgs=$native.Substring($native.IndexOf('--outer-launch-capability',[StringComparison]::Ordinal));[void](Get-SynapseTaskDefinitionReadback -RegisteredTask $task.Task -Kind broker -ExpectedName $taskName -ExpectedExecute $outerPath -ExpectedArguments $expectedArgs -ExpectedWorkingDirectory $runtime -ExpectedUserSid (Get-SynapseCurrentUserSid));$a.Lease.RequireExact('broker_decommission_quiesce_task_authority');$ready.Lease.RequireExact('broker_decommission_quiesce_task_ready');$jobLease.RequireExact($members,'broker_decommission_quiesce_task_job');$scheduler.Root.DeleteTask($taskName,0);if([bool](Get-SynapseScheduledTaskLookupExact -Name $taskName -Scheduler $scheduler).Exists){Die "SYNAPSE_BROKER_DECOMMISSION_EXTRA_TASK_DELETE_FAILED task=$taskName"};$taskDisposition='deleted_exact'}
+            $lineageLeases+=,[pscustomobject]@{Outer=$outerLease;Broker=$brokerLease;Job=$jobLease;Members=$members;Capability=$cap;JobName=$jobName;TaskName=$taskName;TaskDisposition=$taskDisposition;OuterFile=$outerFile;ScriptFile=$scriptFile};$outerLease=$null;$brokerLease=$null;$jobLease=$null
+        }
+        foreach($l in $lineageLeases){$l.Job.RequireExact($l.Members,'broker_decommission_quiesce_preterminate');[void]$l.Broker.TerminateAndWait([uint32]($TimeoutSeconds*1000),127,'broker_decommission_quiesce_broker_terminal');[void]$l.Outer.TerminateAndWait([uint32]($TimeoutSeconds*1000),127,'broker_decommission_quiesce_outer_terminal');$l.Job.ProveEmptyAfterProcessTermination($l.Members,$TimeoutSeconds*1000,'broker_decommission_quiesce_job_drain');$l.Job.Dispose();$l.Job=$null;[SynapseSetup.BrokerDecommissionJobLease]::RequireNameAbsent($l.JobName,'broker_decommission_quiesce_job_absent')}
+        $remaining=@(Get-CimInstance Win32_Process -ErrorAction Stop|Where-Object{-not[string]::IsNullOrWhiteSpace([string]$_.ExecutablePath)-and[IO.Path]::GetFullPath([string]$_.ExecutablePath).StartsWith($objects,[StringComparison]::OrdinalIgnoreCase)});if($remaining.Count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_PROCESSES_REMAIN pids=$(@($remaining.ProcessId)-join',')"}
+        $lineages=@($lineageLeases|ForEach-Object{[ordered]@{capability_sha256=$_.Capability;job_name=$_.JobName;task_name=$_.TaskName;task_disposition=$_.TaskDisposition;outer_pid=[int]$_.Outer.ProcessId;outer_creation_time_filetime_utc=[int64]$_.Outer.CreationTimeFileTime;broker_pid=[int]$_.Broker.ProcessId;broker_creation_time_filetime_utc=[int64]$_.Broker.CreationTimeFileTime;outer_image=$_.OuterFile;broker_script=$_.ScriptFile;terminated_at_utc=[DateTime]::UtcNow.ToString('o')}});$finalRoot=Get-SynapsePurgeDirectorySnapshot -Path $root -Context 'broker_decommission_quiesce_final_root';$payload=[ordered]@{schema='synapse_broker_decommission_quiesced/v1';state='authority_root_quiesced';decommission_id=[string]$a.Payload.decommission_id;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $a);cleanup_ready=(Get-SynapseBrokerDecommissionRecordReference -Record $ready);lineages=$lineages;authority_root=$finalRoot;deletion_plan_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $finalRoot)).ToUpperInvariant();quiesced_at_utc=[DateTime]::UtcNow.ToString('o')}
+        $record=Write-SynapseBrokerDecommissionRecord -DecommissionId ([string]$a.Payload.decommission_id) -Phase quiesced -ExpectedRecordRootFileId128 ([string]$a.Payload.record_root_file_id_128) -RecordRootLease $a.RecordRootLease -Payload $payload -Predecessors @($a,$ready) -Context 'broker_decommission_quiesced';$Pending.Quiesced=$record;[void](Assert-SynapseBrokerDecommissionQuiescedRecord -Record $record -Pending $Pending -Context 'broker_decommission_quiesced_readback');$returning=$true;return $record
+    }finally{foreach($l in $lineageLeases){foreach($lease in @($l.Job,$l.Broker,$l.Outer)){if($null-ne$lease){try{$lease.Dispose()}catch{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_QUIESCE_LEASE_RELEASE_UNPROVEN',$_.Exception)}}}};if(-not$returning-and$null-ne$record-and$null-ne$record.Lease){try{$record.Lease.Dispose()}catch{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_QUIESCED_RECORD_RELEASE_UNPROVEN',$_.Exception)}}}
+}
+
 function Complete-SynapseBrokerDecommissionFromCleanupReady {
     param([Parameter(Mandatory=$true)]$Pending,[Parameter(Mandatory=$true)][string]$Context)
-    $a=$Pending.Authorized;$ready=$Pending.CleanupReady;$retainedLegacy=$null;$retainedLegacyOwned=$false;$completedHistory=$null;$completedPostHistory=$null
+    $a=$Pending.Authorized;$ready=$Pending.CleanupReady;$quiesced=$Pending.Quiesced;$retainedLegacy=$null;$retainedLegacyOwned=$false;$completedHistory=$null;$completedPostHistory=$null
     try{
     [void](Assert-SynapseBrokerDecommissionAuthorizedRecord -Record $a -StructuralOnly -Context "${Context}_authorization")
     [void](Assert-SynapseBrokerDecommissionCleanupReadyRecord -Record $ready -Authorized $a -Confirmation $Pending.Confirmation -Parked $Pending.Parked -TaskAbsent $Pending.TaskAbsent -Drained $Pending.Drained -Context "${Context}_ready")
+    [void](Assert-SynapseBrokerDecommissionQuiescedRecord -Record $quiesced -Pending $Pending -Context "${Context}_quiesced")
     if($null-ne$Pending.PSObject.Properties['RetainedLegacyLeases']-and$null-ne$Pending.RetainedLegacyLeases){$retainedLegacy=$Pending.RetainedLegacyLeases;[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $a -Leases $retainedLegacy -Context "${Context}_retained_legacy_borrowed")}else{$retainedLegacy=Open-SynapseBrokerDecommissionRetainedLegacyAuthorityLeases -Authorized $a -Context "${Context}_retained_legacy";$retainedLegacyOwned=$true}
     if($null-ne$Pending.Completed){[void](Assert-SynapseBrokerDecommissionCompletedRecord -Record $Pending.Completed -Pending $Pending -RequireOldIdentitiesGone -Context "${Context}_existing_completed");[void](Assert-SynapseBrokerDecommissionCurrentPostcondition -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_existing_completed_current");return $Pending.Completed}
-    [void](Assert-SynapsePurgeDirectoryReconcileState -Plan $ready.Payload.authority_root -Context "${Context}_preflight_authority")
+    [void](Assert-SynapsePurgeDirectoryReconcileState -Plan $quiesced.Payload.authority_root -Context "${Context}_preflight_authority")
     if([string]$ready.Payload.mode-ceq'remove_purge'){
         [void](Assert-SynapsePurgeDirectoryReconcileState -Plan $ready.Payload.database -Context "${Context}_preflight_database");[void](Assert-SynapsePurgeDirectoryReconcileState -Plan $ready.Payload.profiles -Context "${Context}_preflight_profiles");[void](Assert-SynapsePurgeTokenReconcileState -Plan $ready.Payload.token -Context "${Context}_preflight_token")
         foreach($item in @($ready.Payload.runtime_artifacts)){[void](Assert-SynapsePurgeTokenReconcileState -Plan $item.file -Context "${Context}_preflight_runtime_$($item.role)")}
@@ -21726,17 +21899,17 @@ function Complete-SynapseBrokerDecommissionFromCleanupReady {
         Remove-SynapsePurgeDirectoryPlanExact -Plan $ready.Payload.profiles -Context "${Context}_profiles";Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_after_profiles"
         foreach($item in @($ready.Payload.runtime_artifacts|Sort-Object role)){Remove-SynapsePurgeTokenExact -Plan $item.file -Context "${Context}_runtime_$($item.role)";Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_after_runtime_$($item.role)"}
     }
-    Remove-SynapsePurgeDirectoryPlanExact -Plan $ready.Payload.authority_root -Context "${Context}_authority_root";Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_after_authority_root"
+    Remove-SynapsePurgeDirectoryPlanExact -Plan $quiesced.Payload.authority_root -Context "${Context}_authority_root";Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_after_authority_root"
     if([string]$ready.Payload.mode-ceq'remove_purge'){Remove-SynapsePurgeTokenExact -Plan $ready.Payload.token -Context "${Context}_token_last";Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_after_token"}
-    foreach($plan in @($ready.Payload.authority_root,$ready.Payload.database,$ready.Payload.profiles)){if($null-eq$plan){continue};$state=Get-SynapsePurgeDirectorySnapshot -Path ([string]$plan.path) -Context "${Context}_precommit_directory_absence";if([bool]$state.exists){Die "SYNAPSE_BROKER_DECOMMISSION_PRECOMMIT_DIRECTORY_PRESENT path=$($plan.path)"}}
+    foreach($plan in @($quiesced.Payload.authority_root,$ready.Payload.database,$ready.Payload.profiles)){if($null-eq$plan){continue};$state=Get-SynapsePurgeDirectorySnapshot -Path ([string]$plan.path) -Context "${Context}_precommit_directory_absence";if([bool]$state.exists){Die "SYNAPSE_BROKER_DECOMMISSION_PRECOMMIT_DIRECTORY_PRESENT path=$($plan.path)"}}
     foreach($item in @($ready.Payload.runtime_artifacts)+@($(if($null-ne$ready.Payload.token){[pscustomobject]@{file=$ready.Payload.token}}))){$state=Get-SynapsePurgeFileSnapshot -Path ([string]$item.file.path) -Context "${Context}_precommit_file_absence";if([bool]$state.exists){Die "SYNAPSE_BROKER_DECOMMISSION_PRECOMMIT_FILE_PRESENT path=$($item.file.path)"}}
     Assert-SynapseBrokerDecommissionCleanupBoundary -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_precommit"
     [void](Assert-SynapseBrokerDecommissionCurrentPostcondition -Pending $Pending -RetainedLegacyLeases $retainedLegacy -BeforeCompleted -Context "${Context}_precommit_terminal_cut")
     $planDisposition={param($plan)if($null-eq$plan){'not_targeted'}elseif([bool]$plan.exists){'deleted_old_identity'}else{'absent_when_planned'}};$runtimeDisposition=if([string]$a.Payload.mode-ceq'remove'){'not_targeted'}elseif(@($ready.Payload.runtime_artifacts).Count-eq0){'absent_when_planned'}elseif(@($ready.Payload.runtime_artifacts|Where-Object{[bool]$_.file.exists}).Count-gt0){'deleted_old_identity'}else{'absent_when_planned'}
     $recordRoot=Get-SynapseBrokerDecommissionRecordRoot;$recordRootChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $recordRoot);$completedHistory=Get-SynapseBrokerDecommissionCompletedHistory -RecordRoot $recordRoot -RecordRootChain $recordRootChain -RecordRootLease $a.RecordRootLease -Context "${Context}_history"
     $historySequence=[int64]$completedHistory.Sequence+1L;$previousCompleted=if($null-eq$completedHistory.Head){$null}else{Get-SynapseBrokerDecommissionRecordReference -Record $completedHistory.Head};if($historySequence-ne[int64]$a.Payload.history_sequence-or(Get-SynapseCanonicalJson -Value $previousCompleted)-cne(Get-SynapseCanonicalJson -Value $a.Payload.previous_completed)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORIZED_HISTORY_NOT_CURRENT context=$Context authorized_sequence=$($a.Payload.history_sequence) current_sequence=$historySequence"}
-    $payload=[ordered]@{schema='synapse_broker_decommission_completed/v2';state='completed';decommission_id=[string]$a.Payload.decommission_id;history_sequence=$historySequence;previous_completed=$previousCompleted;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $a);parked=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.Parked);task_absent=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.TaskAbsent);drained=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.Drained);cleanup_ready=(Get-SynapseBrokerDecommissionRecordReference -Record $ready);mode=[string]$a.Payload.mode;deletion_plan_sha256=([string]$ready.Payload.deletion_plan_sha256).ToUpperInvariant();task_absent_proven=$true;job_absent_proven=$true;outer_identity_gone=$true;broker_identity_gone=$true;authority_root_disposition='deleted_old_identity';runtime_artifacts_disposition=$runtimeDisposition;database_disposition=(&$planDisposition $ready.Payload.database);profiles_disposition=(&$planDisposition $ready.Payload.profiles);token_disposition=(&$planDisposition $ready.Payload.token);completed_at_utc=[DateTime]::UtcNow.ToString('o')}
-    $predecessors=@($a)+@($(if($null-ne$Pending.Confirmation){$Pending.Confirmation}))+@($Pending.Parked,$Pending.TaskAbsent,$Pending.Drained,$ready)+@($(if($null-ne$completedHistory.Head){$completedHistory.Head}))
+    $payload=[ordered]@{schema='synapse_broker_decommission_completed/v2';state='completed';decommission_id=[string]$a.Payload.decommission_id;history_sequence=$historySequence;previous_completed=$previousCompleted;authorization=(Get-SynapseBrokerDecommissionRecordReference -Record $a);parked=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.Parked);task_absent=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.TaskAbsent);drained=(Get-SynapseBrokerDecommissionRecordReference -Record $Pending.Drained);cleanup_ready=(Get-SynapseBrokerDecommissionRecordReference -Record $ready);quiesced=(Get-SynapseBrokerDecommissionRecordReference -Record $quiesced);mode=[string]$a.Payload.mode;deletion_plan_sha256=([string]$quiesced.Payload.deletion_plan_sha256).ToUpperInvariant();task_absent_proven=$true;job_absent_proven=$true;outer_identity_gone=$true;broker_identity_gone=$true;authority_root_disposition='deleted_old_identity';runtime_artifacts_disposition=$runtimeDisposition;database_disposition=(&$planDisposition $ready.Payload.database);profiles_disposition=(&$planDisposition $ready.Payload.profiles);token_disposition=(&$planDisposition $ready.Payload.token);completed_at_utc=[DateTime]::UtcNow.ToString('o')}
+    $predecessors=@($a)+@($(if($null-ne$Pending.Confirmation){$Pending.Confirmation}))+@($Pending.Parked,$Pending.TaskAbsent,$Pending.Drained,$ready,$quiesced)+@($(if($null-ne$completedHistory.Head){$completedHistory.Head}))
     $completed=Write-SynapseBrokerDecommissionRecord -DecommissionId ([string]$a.Payload.decommission_id) -Phase completed -ExpectedRecordRootFileId128 ([string]$a.Payload.record_root_file_id_128) -RecordRootLease $a.RecordRootLease -Payload $payload -Predecessors $predecessors -Context 'broker_decommission_completed';$Pending.Completed=$completed;[void](Assert-SynapseBrokerDecommissionCompletedRecord -Record $completed -Pending $Pending -RequireOldIdentitiesGone -Context "${Context}_completed_readback")
     $completedPostHistory=Get-SynapseBrokerDecommissionCompletedHistory -RecordRoot $recordRoot -RecordRootChain $recordRootChain -RecordRootLease $a.RecordRootLease -Context "${Context}_history_postpublish";if([int64]$completedPostHistory.Sequence-ne$historySequence-or$null-eq$completedPostHistory.Head-or[string]$completedPostHistory.Head.State.FileId128-ine[string]$completed.State.FileId128-or[string]$completedPostHistory.Head.State.Sha256-ine[string]$completed.State.Sha256-or[int64]$completedPostHistory.Head.State.Length-ne[int64]$completed.State.Length){Die "SYNAPSE_BROKER_DECOMMISSION_COMPLETED_HISTORY_HEAD_DRIFT context=$Context expected_sequence=$historySequence actual_sequence=$($completedPostHistory.Sequence)"}
     [void](Assert-SynapseBrokerDecommissionCurrentPostcondition -Pending $Pending -RetainedLegacyLeases $retainedLegacy -Context "${Context}_completed_current_readback");[void](Assert-SynapseBrokerDecommissionRetainedLegacyAuthorityHeld -Authorized $a -Leases $retainedLegacy -Context "${Context}_completed_retained_legacy");return $completed
@@ -21746,7 +21919,7 @@ function Complete-SynapseBrokerDecommissionFromCleanupReady {
 function Close-SynapsePendingBrokerDecommissionRecord {
     param($Pending)
     if($null-eq$Pending){return};$primary=$null
-    foreach($name in @('Completed','CleanupReady','Drained','TaskAbsent','Parked','Confirmation','Authorized')){$record=$Pending.$name;if($null-ne$record-and$null-ne$record.Lease){try{$record.Lease.Dispose()}catch{if($null-eq$primary){$primary=$_.Exception}else{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_RECORD_LEASE_RELEASE_MULTIPLE_FAILURES',$_.Exception)}};$record.Lease=$null}}
+    foreach($name in @('Completed','Quiesced','CleanupReady','Drained','TaskAbsent','Parked','Confirmation','Authorized')){$record=$Pending.$name;if($null-ne$record-and$null-ne$record.Lease){try{$record.Lease.Dispose()}catch{if($null-eq$primary){$primary=$_.Exception}else{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_RECORD_LEASE_RELEASE_MULTIPLE_FAILURES',$_.Exception)}};$record.Lease=$null}}
     if($null-ne$Pending.PSObject.Properties['RetainedLegacyLeases']-and$null-ne$Pending.RetainedLegacyLeases){try{Close-SynapseBrokerDecommissionRetainedLegacyAuthorityLeases -Leases $Pending.RetainedLegacyLeases}catch{if($null-eq$primary){$primary=$_.Exception}else{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_RETAINED_LEGACY_RELEASE_MULTIPLE_FAILURES',$_.Exception)}};$Pending.RetainedLegacyLeases=$null}
     if($null-ne$Pending.PSObject.Properties['RootLease']-and$null-ne$Pending.RootLease){try{$Pending.RootLease.Dispose()}catch{if($null-eq$primary){$primary=$_.Exception}else{[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_ROOT_LEASE_RELEASE_MULTIPLE_FAILURES',$_.Exception)}};$Pending.RootLease=$null}
     if($null-ne$primary){[Environment]::FailFast('SYNAPSE_BROKER_DECOMMISSION_RECORD_LEASE_RELEASE_UNPROVEN',$primary)}
@@ -21770,7 +21943,7 @@ function Get-SynapsePendingBrokerDecommissionRecord {
     if(-not[IO.Directory]::Exists($parent)){$absence=Get-SynapsePurgeAbsenceAnchor -Path $root -Kind directory -Context 'broker_decommission_root_absence';Assert-SynapsePurgeAbsenceAnchor -Anchor $absence -Context 'broker_decommission_root_absence_readback';return $null}
     $parentChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $parent);$rootState=Get-SynapsePhysicalRelativeState -ParentPath $parent -ParentChain $parentChain -Leaf $leaf -Directory;if(-not[bool]$rootState.Exists){$absence=Get-SynapsePurgeAbsenceAnchor -Path $root -Kind directory -Context 'broker_decommission_root_leaf_absence';Assert-SynapsePurgeAbsenceAnchor -Anchor $absence -Context 'broker_decommission_root_leaf_absence_readback';return $null}
     $rootChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $root);if([string]$rootChain[-1].file_id_128-ine[string]$rootState.FileId128){Die "SYNAPSE_BROKER_DECOMMISSION_RECORD_ROOT_DRIFT root=$root"}
-    $publishedPattern='\Adecommission-[0-9A-F]{64}-(authorized|confirmation|parked|task-absent|drained|cleanup-ready|completed)\.json\z';$tempPattern='\A\.decommission-[0-9A-F]{64}-(authorized|confirmation|parked|task-absent|drained|cleanup-ready|completed)\.json\.tmp-[1-9][0-9]*-[0-9a-f]{32}\z';$publishedRegex=[regex]::new($publishedPattern,[Text.RegularExpressions.RegexOptions]::CultureInvariant);$tempRegex=[regex]::new($tempPattern,[Text.RegularExpressions.RegexOptions]::CultureInvariant);$entries=@();$tempDeletes=0
+    $publishedPattern='\Adecommission-[0-9A-F]{64}-(authorized|confirmation|parked|task-absent|drained|cleanup-ready|quiesced|completed)\.json\z';$tempPattern='\A\.decommission-[0-9A-F]{64}-(authorized|confirmation|parked|task-absent|drained|cleanup-ready|quiesced|completed)\.json\.tmp-[1-9][0-9]*-[0-9a-f]{32}\z';$publishedRegex=[regex]::new($publishedPattern,[Text.RegularExpressions.RegexOptions]::CultureInvariant);$tempRegex=[regex]::new($tempPattern,[Text.RegularExpressions.RegexOptions]::CultureInvariant);$entries=@();$tempDeletes=0
     for($pass=0;$pass-le4096;$pass++){
         $entries=@(Get-SynapsePhysicalDirectoryEntriesBounded -Path $root -Chain $rootChain -MaximumEntries 4096 -Context 'broker_decommission_record_scan')
         $invalid=@($entries|Where-Object{[bool]$_.IsDirectory-or([uint32]$_.Attributes-band[uint32][IO.FileAttributes]::ReparsePoint)-or(-not$publishedRegex.IsMatch([string]$_.Name)-and-not$tempRegex.IsMatch([string]$_.Name))});if($invalid.Count-ne0){Die "SYNAPSE_BROKER_DECOMMISSION_RECORD_NAMESPACE_INVALID root=$root entries=$(@($invalid.Name)-join',')"}
@@ -21783,11 +21956,11 @@ function Get-SynapsePendingBrokerDecommissionRecord {
     foreach($id in $groups.Keys){if(@($groups[$id]|Where-Object Name -CEQ "decommission-$id-authorized.json").Count-ne1){Die "SYNAPSE_BROKER_DECOMMISSION_ORPHAN_GROUP id=$id root=$root"}}
     $pending=@();$terminals=@()
     foreach($id in @($groups.Keys|Sort-Object)){
-        $bundle=[pscustomobject][ordered]@{RootLease=$null;RetainedLegacyLeases=$null;Authorized=$null;Confirmation=$null;Parked=$null;TaskAbsent=$null;Drained=$null;CleanupReady=$null;Completed=$null};$keep=$false
+        $bundle=[pscustomobject][ordered]@{RootLease=$null;RetainedLegacyLeases=$null;Authorized=$null;Confirmation=$null;Parked=$null;TaskAbsent=$null;Drained=$null;CleanupReady=$null;Quiesced=$null;Completed=$null};$keep=$false
         try{
             $bundle.RootLease=[SynapseAuthorityRuntime.ExactDirectory]::Open($root,([string]$rootState.FileId128).ToUpperInvariant())
             $openPhase={param([string]$Phase)$phaseLeaf="decommission-$id-$Phase.json";$phaseEntries=@($groups[$id]|Where-Object Name -CEQ $phaseLeaf);if($phaseEntries.Count-eq0){return $null};if($phaseEntries.Count-ne1){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_CARDINALITY_INVALID id=$id phase=$Phase count=$($phaseEntries.Count)"};$state=Get-SynapsePhysicalEnumeratedRelativeState -ParentPath $root -ParentChain $rootChain -Leaf $phaseLeaf -MaximumLength 16777216 -Context "broker_decommission_scan_$Phase";if(-not[bool]$state.Exists-or[string]$state.FileId128-ine[string]$phaseEntries[0].FileId128){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_IDENTITY_DRIFT id=$id phase=$Phase"};return Open-SynapsePurgeRecordFromBoundedState -RecordRoot $root -RecordRootChain $rootChain -Leaf $phaseLeaf -State $state -Context "broker_decommission_scan_$Phase"}
-            $bundle.Authorized=&$openPhase 'authorized';$bundle.Confirmation=&$openPhase 'confirmation';$bundle.Parked=&$openPhase 'parked';$bundle.TaskAbsent=&$openPhase 'task-absent';$bundle.Drained=&$openPhase 'drained';$bundle.CleanupReady=&$openPhase 'cleanup-ready';$bundle.Completed=&$openPhase 'completed'
+            $bundle.Authorized=&$openPhase 'authorized';$bundle.Confirmation=&$openPhase 'confirmation';$bundle.Parked=&$openPhase 'parked';$bundle.TaskAbsent=&$openPhase 'task-absent';$bundle.Drained=&$openPhase 'drained';$bundle.CleanupReady=&$openPhase 'cleanup-ready';$bundle.Quiesced=&$openPhase 'quiesced';$bundle.Completed=&$openPhase 'completed'
             $bundle.Authorized|Add-Member -NotePropertyName RecordRootLease -NotePropertyValue $bundle.RootLease
             $bundle.RootLease.RequireExact('broker_decommission_scan_records_opened')
             $stableEntries=@(Get-SynapsePhysicalDirectoryEntriesBounded -Path $root -Chain $rootChain -MaximumEntries 4096 -Context 'broker_decommission_record_stable_rescan');$stableRosterJson=Get-SynapseCanonicalJson -Value @($stableEntries|Sort-Object Name|ForEach-Object{[ordered]@{name=[string]$_.Name;file_id_128=([string]$_.FileId128).ToUpperInvariant();length=[int64]$_.Length;attributes=[uint32]$_.Attributes;is_directory=[bool]$_.IsDirectory}});if($stableRosterJson-cne$entryRosterJson){Die "SYNAPSE_BROKER_DECOMMISSION_RECORD_NAMESPACE_CHANGED root=$root"}
@@ -21797,11 +21970,13 @@ function Get-SynapsePendingBrokerDecommissionRecord {
             if($null-ne$bundle.TaskAbsent){if($null-eq$bundle.Parked){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=parked"};[void](Assert-SynapseBrokerDecommissionTaskAbsentRecord -Record $bundle.TaskAbsent -Authorized $bundle.Authorized -Parked $bundle.Parked -Context 'broker_decommission_scan_task_absent')}
             if($null-ne$bundle.Drained){if($null-eq$bundle.TaskAbsent){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=task_absent"};[void](Assert-SynapseBrokerDecommissionDrainedRecord -Record $bundle.Drained -Authorized $bundle.Authorized -Parked $bundle.Parked -TaskAbsent $bundle.TaskAbsent -Context 'broker_decommission_scan_drained')}
             if($null-ne$bundle.CleanupReady){if($null-eq$bundle.Drained){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=drained"};[void](Assert-SynapseBrokerDecommissionCleanupReadyRecord -Record $bundle.CleanupReady -Authorized $bundle.Authorized -Confirmation $bundle.Confirmation -Parked $bundle.Parked -TaskAbsent $bundle.TaskAbsent -Drained $bundle.Drained -Context 'broker_decommission_scan_cleanup_ready')}
-            if($null-ne$bundle.Completed){if($null-eq$bundle.CleanupReady){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=cleanup_ready"};[void](Assert-SynapseBrokerDecommissionCompletedRecord -Record $bundle.Completed -Pending $bundle -Context 'broker_decommission_scan_completed')}
-            if($null-eq$bundle.Parked-and($null-ne$bundle.TaskAbsent-or$null-ne$bundle.Drained-or$null-ne$bundle.CleanupReady-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
-            if($null-eq$bundle.TaskAbsent-and($null-ne$bundle.Drained-or$null-ne$bundle.CleanupReady-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
-            if($null-eq$bundle.Drained-and($null-ne$bundle.CleanupReady-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
-            $a=$bundle.Authorized.Payload;$invocationMatch=([string]$a.legacy_task_name-ceq$TaskName-and[string]$a.bind-ceq$Bind-and[IO.Path]::GetFullPath([string]$a.runtime_bin_dir)-ieq[IO.Path]::GetFullPath($RuntimeBinDir)-and[IO.Path]::GetFullPath([string]$a.exe_path)-ieq[IO.Path]::GetFullPath($ExePath)-and[IO.Path]::GetFullPath([string]$a.db_path)-ieq[IO.Path]::GetFullPath($DbPath)-and[IO.Path]::GetFullPath([string]$a.profiles_dir)-ieq[IO.Path]::GetFullPath($ProfilesDir)-and[IO.Path]::GetFullPath([string]$a.token_path)-ieq[IO.Path]::GetFullPath($TokenPath)-and[IO.Path]::GetFullPath([string]$a.log_dir)-ieq[IO.Path]::GetFullPath($LogDir)-and[IO.Path]::GetFullPath([string]$a.maintenance_lock_path)-ieq[IO.Path]::GetFullPath($MaintenanceLockPath));$modeMatch=($Remove-and(([string]$a.mode-ceq'remove_purge')-eq[bool]$Purge));$bundle|Add-Member -NotePropertyName InvocationMatch -NotePropertyValue $invocationMatch
+            if($null-ne$bundle.Quiesced){if($null-eq$bundle.CleanupReady){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=cleanup_ready"};[void](Assert-SynapseBrokerDecommissionQuiescedRecord -Record $bundle.Quiesced -Pending $bundle -Context 'broker_decommission_scan_quiesced')}
+            if($null-ne$bundle.Completed){if($null-eq$bundle.Quiesced){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_HOLE id=$id missing=quiesced"};[void](Assert-SynapseBrokerDecommissionCompletedRecord -Record $bundle.Completed -Pending $bundle -Context 'broker_decommission_scan_completed')}
+            if($null-eq$bundle.Parked-and($null-ne$bundle.TaskAbsent-or$null-ne$bundle.Drained-or$null-ne$bundle.CleanupReady-or$null-ne$bundle.Quiesced-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
+            if($null-eq$bundle.TaskAbsent-and($null-ne$bundle.Drained-or$null-ne$bundle.CleanupReady-or$null-ne$bundle.Quiesced-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
+            if($null-eq$bundle.Drained-and($null-ne$bundle.CleanupReady-or$null-ne$bundle.Quiesced-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
+            if($null-eq$bundle.CleanupReady-and($null-ne$bundle.Quiesced-or$null-ne$bundle.Completed)){Die "SYNAPSE_BROKER_DECOMMISSION_PHASE_PREFIX_INVALID id=$id"}
+            $a=$bundle.Authorized.Payload;$invocationMatch=([string]$a.legacy_task_name-ceq$TaskName-and[string]$a.bind-ceq$Bind-and[IO.Path]::GetFullPath([string]$a.runtime_bin_dir)-ieq[IO.Path]::GetFullPath($RuntimeBinDir)-and[IO.Path]::GetFullPath([string]$a.db_path)-ieq[IO.Path]::GetFullPath($DbPath)-and[IO.Path]::GetFullPath([string]$a.profiles_dir)-ieq[IO.Path]::GetFullPath($ProfilesDir)-and[IO.Path]::GetFullPath([string]$a.token_path)-ieq[IO.Path]::GetFullPath($TokenPath)-and[IO.Path]::GetFullPath([string]$a.log_dir)-ieq[IO.Path]::GetFullPath($LogDir)-and[IO.Path]::GetFullPath([string]$a.maintenance_lock_path)-ieq[IO.Path]::GetFullPath($MaintenanceLockPath));$modeMatch=($Remove-and(([string]$a.mode-ceq'remove_purge')-eq[bool]$Purge));$bundle|Add-Member -NotePropertyName InvocationMatch -NotePropertyValue $invocationMatch
             if($null-ne$bundle.Completed){
                 $terminals+=,$bundle;$keep=$true
             }else{
@@ -21830,10 +22005,11 @@ function Resume-SynapseBrokerDecommission {
     param([Parameter(Mandatory=$true)]$Pending,[Parameter(Mandatory=$true)][string]$Context)
     if($null-ne$Pending.Completed){[void](Assert-SynapseBrokerDecommissionCompletedRecord -Record $Pending.Completed -Pending $Pending -RequireOldIdentitiesGone -Context "${Context}_completed");[void](Assert-SynapseBrokerDecommissionCurrentPostcondition -Pending $Pending -Context "${Context}_completed_current");return $Pending.Completed}
     if($null-eq$Pending.Parked){return $null}
-    if($null-eq$Pending.CleanupReady){$authorityNow=Get-SynapsePurgeDirectorySnapshot -Path ([string]$Pending.Authorized.Payload.authority_root.path) -Context "${Context}_pre_mutation_authority";if((Get-SynapseCanonicalJson -Value $authorityNow)-cne(Get-SynapseCanonicalJson -Value $Pending.Parked.Payload.authority_tree)){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_TREE_DRIFT_BEFORE_MUTATION context=$Context"}}
+    if($null-eq$Pending.CleanupReady){$authorityNow=Get-SynapsePurgeDirectorySnapshot -Path ([string]$Pending.Authorized.Payload.authority_root.path) -Context "${Context}_pre_mutation_authority";if(-not[bool]$authorityNow.exists-or[string]$authorityNow.root_file_id_128-ine[string]$Pending.Authorized.Payload.authority_root.file_id_128){Die "SYNAPSE_BROKER_DECOMMISSION_AUTHORITY_ROOT_DRIFT_BEFORE_MUTATION context=$Context"}}
     if($null-eq$Pending.TaskAbsent){$Pending.TaskAbsent=Remove-SynapseBrokerTaskForDecommissionExact -Authorized $Pending.Authorized -Parked $Pending.Parked}
     if($null-eq$Pending.Drained){$Pending.Drained=Stop-SynapseBrokerDecommissionProcessTreeExact -Authorized $Pending.Authorized -Parked $Pending.Parked -TaskAbsent $Pending.TaskAbsent}
     if($null-eq$Pending.CleanupReady){$Pending.CleanupReady=New-SynapseBrokerDecommissionCleanupReadyRecord -Authorized $Pending.Authorized -Confirmation $Pending.Confirmation -Parked $Pending.Parked -TaskAbsent $Pending.TaskAbsent -Drained $Pending.Drained}
+    if($null-eq$Pending.Quiesced){$Pending.Quiesced=New-SynapseBrokerDecommissionQuiescedRecord -Pending $Pending}
     return Complete-SynapseBrokerDecommissionFromCleanupReady -Pending $Pending -Context $Context
 }
 
@@ -22049,8 +22225,9 @@ function Assert-SynapseCandidateArtifactCleanupSafe {
 
     $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
     if (-not $descriptor.Exists) { return $descriptor }
-    if ([string]$descriptor.RootIdentity -ine $ExpectedCandidateRootIdentity) {
-        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$($descriptor.RootIdentity) remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
+    $projectedIdentity=[SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentityExpected($descriptor.Path,$ExpectedCandidateRootIdentity)
+    if ([string]$projectedIdentity -ine $ExpectedCandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$projectedIdentity remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
     }
 
     if ($CandidateProcessId -gt 0) {
@@ -22170,7 +22347,10 @@ function Read-SynapseCandidateCleanupIntent {
         [int]$intent.setup_owner_pid -ne $descriptor.OwnerPid -or
         [int]$intent.candidate_pid -le 0 -or
         $recordedCandidateRootIdentity -notmatch '^(?:[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}|[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32})$' -or
-        ($descriptor.Exists -and [string]$descriptor.RootIdentity -ine $recordedCandidateRootIdentity) -or
+        ($descriptor.Exists -and
+            [string][SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentityExpected(
+                $descriptor.Path,
+                $recordedCandidateRootIdentity) -ine $recordedCandidateRootIdentity) -or
         [string]::IsNullOrWhiteSpace([string]$intent.bind) -or
         [string]::IsNullOrWhiteSpace([string]$intent.reason)) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_INVALID path=$intentFull candidate=$($descriptor.Path) schema=$($intent.schema) state=$($intent.state) setup_owner_pid=$($intent.setup_owner_pid) expected_setup_owner_pid=$($descriptor.OwnerPid) candidate_pid=$($intent.candidate_pid) bind=$($intent.bind) reason=$($intent.reason) remediation=preserve both paths and repair the exact cleanup transaction identity; setup refuses ambiguous recursive deletion"
@@ -22203,8 +22383,13 @@ function Ensure-SynapseCandidateCleanupIntent {
         throw "SYNAPSE_CANDIDATE_CLEANUP_IDENTITY_MISSING path=$Path candidate_pid=$CandidateProcessId bind=$Bind reason=$Reason remediation=cleanup requires the exact validated candidate PID and bind"
     }
     $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
-    if (-not $descriptor.Exists -or [string]$descriptor.RootIdentity -ine $CandidateRootIdentity) {
-        throw "SYNAPSE_CANDIDATE_CLEANUP_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) exists=$($descriptor.Exists) expected_identity=$CandidateRootIdentity actual_identity=$($descriptor.RootIdentity) remediation=preserve the path; a cleanup intent may authorize only the exact physical candidate directory"
+    $projectedCandidateRootIdentity = if ($descriptor.Exists) {
+        [string][SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentityExpected(
+            $descriptor.Path,
+            $CandidateRootIdentity)
+    } else { '' }
+    if (-not $descriptor.Exists -or $projectedCandidateRootIdentity -ine $CandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) exists=$($descriptor.Exists) expected_identity=$CandidateRootIdentity actual_identity=$projectedCandidateRootIdentity remediation=preserve the path; a cleanup intent may authorize only the exact physical candidate directory"
     }
     $cleanupRootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
     if (-not $cleanupRootDescriptor.Exists -or
@@ -22300,8 +22485,9 @@ function Remove-SynapseCandidateArtifact {
     )
 
     $initial = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
-    if ($initial.Exists -and [string]$initial.RootIdentity -ine $ExpectedCandidateRootIdentity) {
-        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($initial.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$($initial.RootIdentity) remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
+    $projectedInitialIdentity=if($initial.Exists){[SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentityExpected($initial.Path,$ExpectedCandidateRootIdentity)}else{$null}
+    if ($initial.Exists -and [string]$projectedInitialIdentity -ine $ExpectedCandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($initial.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$projectedInitialIdentity remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
     }
     $intentPath = Get-SynapseCandidateCleanupIntentPath -Path $initial.Path -ExpectedRoot $ExpectedRoot
     $cleanupRootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
@@ -23217,7 +23403,7 @@ function Read-SynapseAuthorityRosterEnvelopeText {
             [string]$object.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or [int64]$object.length -lt 0 -or
             $parentPath -ine [System.IO.Path]::GetFullPath((Split-Path -Parent $path)) -or
             [string]$object.parent_file_id_128 -notmatch '^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$') {
-            Die "SYNAPSE_AUTHORITY_ROSTER_OBJECT_INVALID context=$Context role=$($object.role) path=$path"
+            Die "SYNAPSE_AUTHORITY_ROSTER_OBJECT_INVALID context=$Context role=$($object.role) role_length=$(([string]$object.role).Length) path=$path properties=$($objectNames-join',') duplicate_path=$($seenPaths.ContainsKey($path)) file_id_128=$($object.file_id_128) sha256=$($object.sha256) length=$($object.length) parent_path=$parentPath expected_parent=$([System.IO.Path]::GetFullPath((Split-Path -Parent $path))) parent_file_id_128=$($object.parent_file_id_128)"
         }
         $seenPaths[$path] = $true
     }
@@ -23483,7 +23669,7 @@ function Install-SynapseAuthorityImmutableFile {
             $handle.Dispose(); $handle = $null
             $lease = Open-SynapsePhysicalFileReadLease -ParentPath $Layout.Objects -ParentChain $Layout.ObjectsChain -Leaf $Leaf -ExpectedFileId128 $fileId -ExpectedSha256 $expectedSha -ExpectedLength $ExpectedLength -Context "${Context}_read_seal"
             $guard.RequireCleanCheckpoint("${Context}_after_read_seal")
-            $guard.CompleteCleanGuard(); $guard = $null
+            $guard.CompleteCleanGuard(); $guard.Dispose(); $guard = $null
         } finally {
             if ($null -ne $guard) { $guard.Dispose() }
         }
@@ -27780,6 +27966,61 @@ function Open-SynapseLatestBrokerTaskInfrastructureForSupersededReceipt {
     return Complete-SynapseBrokerTaskCreateEpoch -Layout $Layout -Journal $ordered[-1]
 }
 
+function Restore-SynapseActiveBrokerTaskFromCommittedReceipt {
+    param(
+        [Parameter(Mandatory=$true)]$Layout,
+        [Parameter(Mandatory=$true)]$AuthorityInitial,
+        [Parameter(Mandatory=$true)]$ControlPair,
+        [Parameter(Mandatory=$true)]$TaskSupersessionInfrastructure
+    )
+    if([string]$ControlPair.Gate.Payload.state-cne'active'){
+        Die "SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_GATE_NOT_ACTIVE state=$($ControlPair.Gate.Payload.state)"
+    }
+    $receipt=$AuthorityInitial.broker_task_receipt
+    if($null-eq$receipt-or[string]::IsNullOrWhiteSpace([string]$receipt.task_epoch_root)){
+        Die 'SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_RECEIPT_MISSING'
+    }
+    $expectedName=[string]$AuthorityInitial.broker_task.name
+    if([string]$ControlPair.Roster.Payload.broker_task_name-cne$expectedName-or
+       [string]$ControlPair.Roster.Payload.broker_identity_sha256-ine[string]$AuthorityInitial.broker_identity_sha256-or
+       [string]$ControlPair.Gate.Payload.broker_identity_sha256-ine[string]$AuthorityInitial.broker_identity_sha256){
+        Die "SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_AUTHORITY_CROSSBIND_INVALID task=$expectedName roster_task=$($ControlPair.Roster.Payload.broker_task_name)"
+    }
+    $lookup=Get-SynapseScheduledTaskLookupExact -Name $expectedName
+    if([bool]$lookup.Exists){Die "SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_COLLISION task=$expectedName"}
+    $journal=Read-SynapseDeploymentTransactionJournal -TransactionRoot ([string]$receipt.task_epoch_root)
+    if($null-eq$journal-or[string]$journal.State-cne'commit_decided'){
+        Die "SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_JOURNAL_INVALID root=$($receipt.task_epoch_root) state=$($journal.State)"
+    }
+    $validated=Assert-SynapseBrokerTaskCreateInitialDescriptor -Initial $journal.Initial -TransactionRoot $journal.Root -Allocation $journal.Allocation
+    if([string]$journal.Initial.task.name-cne$expectedName-or
+       [string]$journal.Initial.task_capability_sha256-ine[string]$receipt.task_capability_sha256-or
+       (Get-SynapseCanonicalJson -Value (ConvertTo-SynapseBrokerTaskReceiptDescriptorFromJournal -Journal $journal))-cne(Get-SynapseCanonicalJson -Value $receipt)){
+        Die "SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_RECEIPT_CROSSBIND_INVALID root=$($journal.Root) task=$expectedName"
+    }
+    $slot1=$journal.Slots[0]
+    $slot1Lease=Open-SynapsePhysicalFileReadLease -ParentPath $journal.Root -ParentChain $journal.RootChain -Leaf $slot1.Leaf -ExpectedFileId128 $slot1.FileId128 -ExpectedSha256 $slot1.RawSha256 -ExpectedLength $slot1.ByteLength -Context 'active_broker_task_restore_slot1'
+    try{
+        $ControlPair.GateLease.RequireExact('active_broker_task_restore_gate')
+        $ControlPair.RosterLease.RequireExact('active_broker_task_restore_roster')
+        $TaskSupersessionInfrastructure.TaskPlan.Lease.RequireExact('active_broker_task_restore_successor_plan')
+        $TaskSupersessionInfrastructure.TaskObservation.Lease.RequireExact('active_broker_task_restore_successor_observation')
+        $authority=$validated.TaskPlanAuthority
+        $authority.Lease=$slot1Lease
+        $authority.Path=Join-Path $journal.Root $slot1.Leaf
+        [void](Register-SynapseTaskCreateOnly -Name $expectedName -Kind broker -Execute ([string]$validated.Task.execute) -Arguments ([string]$validated.Task.arguments) -WorkingDirectory ([string]$validated.Task.working_directory) -PlannedSecurityDescriptor ([string]$validated.Task.explicit_security_descriptor) -AdoptSemanticExisting -SemanticPlanAuthority $authority)
+        $observed=$journal.Slots[1].Payload.detail
+        $expected=[pscustomobject]@{Name=$expectedName;XmlSha256=[string]$observed.observed_xml_sha256;SecurityDescriptorSha256=[string]$observed.observed_security_descriptor_sha256;SemanticSha256=[string]$validated.Task.submitted_semantic_sha256;Execute=[string]$validated.Task.execute;Arguments=[string]$validated.Task.arguments;WorkingDirectory=[string]$validated.Task.working_directory}
+        $readback=Assert-SynapseTaskReadbackIdentity -Expected $expected -Kind broker
+        $ControlPair.GateLease.RequireExact('active_broker_task_restore_gate_after_create')
+        $ControlPair.RosterLease.RequireExact('active_broker_task_restore_roster_after_create')
+        Info "SYNAPSE_ACTIVE_BROKER_TASK_RESTORED task=$expectedName task_epoch_root=$($journal.Root) successor_task=$($TaskSupersessionInfrastructure.TaskName)"
+        return $readback
+    }finally{
+        try{$slot1Lease.Dispose()}catch{[Environment]::FailFast('SYNAPSE_ACTIVE_BROKER_TASK_RESTORE_SLOT1_CLOSE_UNPROVEN',$_.Exception)}
+    }
+}
+
 function Remove-SynapseBrokerTaskRotationPredecessorExact {
     param([Parameter(Mandatory=$true)]$Layout,[Parameter(Mandatory=$true)]$Validated)
     if($null-eq$Validated.Predecessor){return $false}
@@ -27801,6 +28042,15 @@ function Remove-SynapseBrokerTaskRotationPredecessorExact {
         # task remains the crash-recoverable launch authority while only the
         # zero-instance predecessor task is retired below.
         if($presentAuthority.Count-ne2){Die "SYNAPSE_BROKER_TASK_ROTATION_AUTHORITY_PAIR_INCOMPLETE present=$(@($presentAuthority.Name)-join ',')"}
+        $rotationGate=Read-SynapseAuthorityControlGateCurrent -Layout $Layout -Context 'broker_task_rotation_authority_gate'
+        $rotationState=[string]$rotationGate.Payload.state
+        $pair=Read-SynapseAuthorityActiveControlPair -Layout $Layout -ExpectedState $rotationState -Context 'broker_task_rotation_authority_pair'
+        try{
+            if([string]$pair.Roster.Payload.broker_task_name-ceq[string]$expected.Name){
+                Info "SYNAPSE_BROKER_TASK_ROTATION_PREDECESSOR_RETAINED_AUTHORITY task=$($expected.Name) state=$rotationState generation=$($pair.Roster.Payload.generation_id)"
+                return $false
+            }
+        }finally{Close-SynapseAuthorityActiveControlPair -Pair $pair}
         $successorLookup=Get-SynapseScheduledTaskLookupExact -Name ([string]$Validated.Task.name)
         if(-not[bool]$successorLookup.Exists){Die "SYNAPSE_BROKER_TASK_ROTATION_SUCCESSOR_ABSENT task=$($Validated.Task.name)"}
         $successorInstances=@($successorLookup.Task.GetInstances(0))
@@ -28162,10 +28412,15 @@ function New-SynapseAuthorityRosterPayload {
         Die "SYNAPSE_AUTHORITY_ROSTER_BUILD_MODE_INVALID mode=$Mode role=$Role generation_id=$GenerationId object_count=$(@($GenerationObjects).Count)"
     }
     $objects = @($GenerationObjects | Sort-Object path | ForEach-Object {
-        $objectPath = [System.IO.Path]::GetFullPath([string]$_.path)
-        $parentPath = if ($null -ne $_.PSObject.Properties['parent_path']) { [System.IO.Path]::GetFullPath([string]$_.parent_path) } elseif ($null -ne $_.PSObject.Properties['ParentPath']) { [System.IO.Path]::GetFullPath([string]$_.ParentPath) } else { [System.IO.Path]::GetFullPath((Split-Path -Parent $objectPath)) }
-        $parentFileId = if ($null -ne $_.PSObject.Properties['parent_file_id_128']) { [string]$_.parent_file_id_128 } else { [string]$_.ParentFileId128 }
-        [ordered]@{ role=[string]$_.role; path=$objectPath; file_id_128=([string]$_.file_id_128).ToUpperInvariant(); sha256=([string]$_.sha256).ToUpperInvariant(); length=[int64]$_.length; parent_path=$parentPath; parent_file_id_128=$parentFileId.ToUpperInvariant() }
+        $objectPath = [System.IO.Path]::GetFullPath([string](Get-SynapseObjectPropertyValue -Object $_ -Names @('path','Path')))
+        $parentRaw = [string](Get-SynapseObjectPropertyValue -Object $_ -Names @('parent_path','ParentPath'))
+        $parentPath = if ([string]::IsNullOrWhiteSpace($parentRaw)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $objectPath)) } else { [System.IO.Path]::GetFullPath($parentRaw) }
+        $parentFileId = [string](Get-SynapseObjectPropertyValue -Object $_ -Names @('parent_file_id_128','ParentFileId128'))
+        $objectRole = [string](Get-SynapseObjectPropertyValue -Object $_ -Names @('role','Role'))
+        $objectFileId = [string](Get-SynapseObjectPropertyValue -Object $_ -Names @('file_id_128','FileId128'))
+        $objectSha256 = [string](Get-SynapseObjectPropertyValue -Object $_ -Names @('sha256','Sha256'))
+        $objectLength = [int64](Get-SynapseObjectPropertyValue -Object $_ -Names @('length','Length'))
+        [ordered]@{ role=$objectRole; path=$objectPath; file_id_128=$objectFileId.ToUpperInvariant(); sha256=$objectSha256.ToUpperInvariant(); length=$objectLength; parent_path=$parentPath; parent_file_id_128=$parentFileId.ToUpperInvariant() }
     })
     $emptyIdentity = [pscustomobject]@{ Path=''; ParentPath=''; ParentFileId128=''; FileId128=''; Sha256=''; Length=0L }
     if ($null -eq $GenerationSupervisor) { $GenerationSupervisor = $emptyIdentity }
@@ -28391,9 +28646,38 @@ function Invoke-SynapseAuthorityChainedControlRollback {
 function Invoke-SynapseAuthorityControlTransitionRollback {
     param([Parameter(Mandatory=$true)]$Transition)
 
-    $canonical=Get-SynapsePhysicalRelativeState -ParentPath $Transition.parent -ParentChain $Transition.parent_chain -Leaf $Transition.leaf
+    # A live transition deliberately holds the canonical replacement with
+    # delete/write sharing denied.  Reopening that pathname here races our own
+    # authority lease.  Revalidate and project the already-retained handle;
+    # recovery paths without an in-memory owner still use the physical reopen.
+    $canonical=if($null-ne$Transition.CanonicalLease){
+        $Transition.CanonicalLease.RequireExact("$($Transition.purpose)_rollback_canonical_owner")
+        [pscustomobject][ordered]@{
+            Exists=$true
+            FileId128=([string]$Transition.CanonicalLease.FileId128).ToUpperInvariant()
+            Sha256=([string]$Transition.CanonicalLease.Sha256).ToUpperInvariant()
+            Length=[int64]$Transition.CanonicalLease.Length
+        }
+    }else{
+        Get-SynapsePhysicalRelativeState -ParentPath $Transition.parent -ParentChain $Transition.parent_chain -Leaf $Transition.leaf
+    }
     $canonicalIsPre=Test-SynapsePhysicalStateExact -State $canonical -ExpectedExists ([bool]$Transition.pre_existed) -ExpectedFileId128 $Transition.pre_file_id_128 -ExpectedSha256 $Transition.pre_sha256 -ExpectedLength $Transition.pre_length
-    if($canonicalIsPre){return [pscustomobject]@{Restored=$true;State='preimage_already_canonical'}}
+    if($canonicalIsPre){
+        # Recovery may enter after MoveNoReplace restored the preimage but
+        # before the runtime-only owner field was renamed from PreLease to
+        # RestoredLease.  Preserve that exact handle handoff; reopening the
+        # pathname is both weaker and can correctly fail with sharing
+        # violation because the retained transition lease denies replacement.
+        if([bool]$Transition.pre_existed-and$null-eq$Transition.RestoredLease-and$null-ne$Transition.PreLease){
+            $Transition.PreLease.RequireExact("$($Transition.purpose)_rollback_already_canonical_prelease")
+            if([string]$Transition.PreLease.FileId128-ine[string]$Transition.pre_file_id_128-or[string]$Transition.PreLease.Sha256-ine[string]$Transition.pre_sha256-or[int64]$Transition.PreLease.Length-ne[int64]$Transition.pre_length){
+                Die "SYNAPSE_AUTHORITY_CONTROL_ROLLBACK_PRELEASE_DRIFT purpose=$($Transition.purpose) path=$($Transition.path)"
+            }
+            $Transition.RestoredLease=$Transition.PreLease
+            $Transition.PreLease=$null
+        }
+        return [pscustomobject]@{Restored=$true;State='preimage_already_canonical'}
+    }
     $canonicalIsPost=Test-SynapsePhysicalStateExact -State $canonical -ExpectedExists $true -ExpectedFileId128 $Transition.post_file_id_128 -ExpectedSha256 $Transition.post_sha256 -ExpectedLength $Transition.post_length
     if($canonical.Exists -and -not $canonicalIsPost){
         Die "SYNAPSE_AUTHORITY_CONTROL_ROLLBACK_UNKNOWN_CANONICAL_PRESERVED purpose=$($Transition.purpose) path=$($Transition.path) file_id_128=$($canonical.FileId128) sha256=$($canonical.Sha256)"
@@ -28446,7 +28730,8 @@ function Invoke-SynapseAuthorityControlTransitionRollback {
 function Invoke-SynapseAuthorityControlTransition {
     param(
         [Parameter(Mandatory=$true)]$Transition,
-        [Parameter(Mandatory=$true)]$AllocationContext
+        [Parameter(Mandatory=$true)]$AllocationContext,
+        [switch]$ForwardOnly
     )
     $current = Get-SynapsePhysicalRelativeState -ParentPath $Transition.parent -ParentChain $Transition.parent_chain -Leaf $Transition.leaf
     if (Test-SynapsePhysicalStateExact -State $current -ExpectedExists $true -ExpectedFileId128 $Transition.post_file_id_128 -ExpectedSha256 $Transition.post_sha256 -ExpectedLength $Transition.post_length) {
@@ -28494,10 +28779,15 @@ function Invoke-SynapseAuthorityControlTransition {
         # supplies the exact-object authority needed by the next CAS/rollback.
         $stageLease.RequireExact("$($Transition.purpose)_publish")
         $Transition.CanonicalLease = $stageLease
-        $stageArtifact.handle=$null
+        if ($null -ne $stageArtifact.PSObject.Properties['handle']) {
+            $stageArtifact.handle = $null
+        }
         return $Transition.CanonicalLease
     } catch {
         $publishError=$_.Exception.Message
+        if ($ForwardOnly) {
+            Die "SYNAPSE_AUTHORITY_CONTROL_FORWARD_PUBLISH_FAILED purpose=$($Transition.purpose) error=$publishError remediation=the durable commit decision is forward-only; preserve every exact lifecycle object for deterministic recovery"
+        }
         try {[void](Invoke-SynapseAuthorityControlTransitionRollback -Transition $Transition)} catch { Die "SYNAPSE_AUTHORITY_CONTROL_PUBLISH_AND_RESTORE_FAILED purpose=$($Transition.purpose) publish_error=$publishError restore_error=$($_.Exception.Message)" }
         Die "SYNAPSE_AUTHORITY_CONTROL_PUBLISH_FAILED purpose=$($Transition.purpose) error=$publishError prior_restored=true"
     }
@@ -28519,7 +28809,8 @@ function Assert-SynapseAuthorityPriorGenerationDescriptor {
         [Parameter(Mandatory=$true)]$ParkedRosterTransition,
         [Parameter(Mandatory=$true)]$ActiveRosterTransition,
         [Parameter(Mandatory=$true)][string]$Context,
-        [switch]$SkipMutableGenerationPhysicalReadback
+        [switch]$SkipMutableGenerationPhysicalReadback,
+        [switch]$AllowRetiredControlPostimage
     )
 
     $names=@($Descriptor.PSObject.Properties.Name)
@@ -28582,12 +28873,24 @@ function Assert-SynapseAuthorityPriorGenerationDescriptor {
         foreach($candidateRoot in $externalCandidates){
             $candidateChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $candidateRoot.FullName)
             $candidateState=Get-SynapsePhysicalRelativeState -ParentPath $candidateRoot.FullName -ParentChain $candidateChain -Leaf 'probe-gate-active-park.json'
-            if(Test-SynapsePhysicalStateExact -State $candidateState -ExpectedExists $true -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -ExpectedSha256 $ControlGateTransition.post_sha256 -ExpectedLength $ControlGateTransition.post_length){$externalMatches+=,[pscustomobject]@{Parent=$candidateRoot.FullName;Chain=$candidateChain;State=$candidateState}}
+            if(Test-SynapsePhysicalStateExact -State $candidateState -ExpectedExists $true -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -ExpectedSha256 $ControlGateTransition.post_sha256 -ExpectedLength $ControlGateTransition.post_length){$externalMatches+=,[pscustomobject]@{Parent=$candidateRoot.FullName;Chain=$candidateChain;State=$candidateState;Leaf='probe-gate-active-park.json'}}
         }
         if($externalMatches.Count-gt1){Die "SYNAPSE_AUTHORITY_EXTERNAL_PARK_AMBIGUOUS context=$Context count=$($externalMatches.Count)"}
         if($externalMatches.Count-eq1){$externalControlMatch=$externalMatches[0]}
     }
-    if(([int]$canonicalMatches+[int]$stageMatches+[int]$discardMatches+[int]($null-ne$externalControlMatch)) -ne 1){Die "SYNAPSE_AUTHORITY_PRIOR_GENERATION_CONTROL_GATE_LOCATION_INVALID context=$Context canonical_matches=$canonicalMatches stage_matches=$stageMatches discard_matches=$discardMatches external_park_match=$($null-ne$externalControlMatch)"}
+    if(-not($canonicalMatches-or$stageMatches-or$discardMatches)-and$null-eq$externalControlMatch){
+        $operatorRoot=Join-Path (Get-SynapseNormalizedDirectoryPath -Path ([string]$ControlGateTransition.parent)) 'operations'
+        if(Test-Path -LiteralPath $operatorRoot -PathType Container){
+            $operatorCandidates=@(Get-ChildItem -LiteralPath $operatorRoot -Directory -Force -ErrorAction Stop|Where-Object{($_.Attributes-band[IO.FileAttributes]::ReparsePoint)-eq0}|Select-Object -First 4097)
+            if($operatorCandidates.Count-gt4096){Die "SYNAPSE_AUTHORITY_OPERATOR_PARK_SCAN_UNBOUNDED context=$Context parent=$operatorRoot"}
+            $operatorMatches=@()
+            foreach($candidateRoot in $operatorCandidates){$candidateChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $candidateRoot.FullName);$candidateState=Get-SynapsePhysicalRelativeState -ParentPath $candidateRoot.FullName -ParentChain $candidateChain -Leaf 'operator-gate-active-park.json';if(Test-SynapsePhysicalStateExact -State $candidateState -ExpectedExists $true -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -ExpectedSha256 $ControlGateTransition.post_sha256 -ExpectedLength $ControlGateTransition.post_length){$operatorMatches+=,[pscustomobject]@{Parent=$candidateRoot.FullName;Chain=$candidateChain;State=$candidateState;Leaf='operator-gate-active-park.json'}}}
+            if($operatorMatches.Count-gt1){Die "SYNAPSE_AUTHORITY_OPERATOR_PARK_AMBIGUOUS context=$Context count=$($operatorMatches.Count)"}
+            if($operatorMatches.Count-eq1){$externalControlMatch=$operatorMatches[0]}
+        }
+    }
+    $controlLocationCount=([int]$canonicalMatches+[int]$stageMatches+[int]$discardMatches+[int]($null-ne$externalControlMatch))
+    if($controlLocationCount-ne1-and-not($AllowRetiredControlPostimage-and$controlLocationCount-eq0)){Die "SYNAPSE_AUTHORITY_PRIOR_GENERATION_CONTROL_GATE_LOCATION_INVALID context=$Context canonical_matches=$canonicalMatches stage_matches=$stageMatches discard_matches=$discardMatches external_park_match=$($null-ne$externalControlMatch) allow_retired=$([bool]$AllowRetiredControlPostimage)"}
     if($canonicalMatches -and $null -ne $ControlGateTransition.CanonicalLease){
         $ControlGateTransition.CanonicalLease.RequireExact("${Context}_active_control_gate_retained_before")
         $controlRead=$ControlGateTransition.CanonicalLease.ReadUtf8(65536)
@@ -28602,10 +28905,18 @@ function Assert-SynapseAuthorityPriorGenerationDescriptor {
         $controlRead=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $ControlGateTransition.transaction_root -ParentChain $ControlGateTransition.transaction_root_chain -Leaf $ControlGateTransition.stage_leaf -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -MaxBytes 65536
     }elseif($discardMatches){
         $controlRead=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $ControlGateTransition.transaction_root -ParentChain $ControlGateTransition.transaction_root_chain -Leaf $ControlGateTransition.discard_leaf -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -MaxBytes 65536
+    }elseif($null-ne$externalControlMatch){
+        $controlRead=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $externalControlMatch.Parent -ParentChain $externalControlMatch.Chain -Leaf ([string]$externalControlMatch.Leaf) -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -MaxBytes 65536
     }else{
-        $controlRead=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $externalControlMatch.Parent -ParentChain $externalControlMatch.Chain -Leaf 'probe-gate-active-park.json' -ExpectedFileId128 $ControlGateTransition.post_file_id_128 -MaxBytes 65536
+        # A committed operator-stop transaction is allowed to retire the prior
+        # active gate before decommission resumes.  Its envelope contains a
+        # creation timestamp, so the deleted bytes cannot be reconstructed
+        # byte-for-byte.  The immutable adoption slot already seals the exact
+        # transition SHA/FID/length; for this removal-only zero-location case,
+        # reconstitute only the semantic payload that is cross-bound below.
+        $controlEnvelope=[pscustomobject]@{Payload=[pscustomobject][ordered]@{state='active';broker_identity_sha256=[string]$Initial.broker_identity_sha256;authority_epoch=[int64]$Initial.authority_epoch;control_nonce=[string]$Descriptor.control_nonce;roster_path=$rosterPath;roster_file_id_128=[string]$ActiveRosterTransition.post_file_id_128;roster_sha256=[string]$ActiveRosterTransition.post_sha256;roster_length=[int64]$ActiveRosterTransition.post_length}}
     }
-    $controlEnvelope=Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$controlRead.Content) -ExpectedPath $rosterPath -Context "${Context}_active_control_gate"
+    if($null-eq$controlEnvelope){$controlEnvelope=Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$controlRead.Content) -ExpectedPath $rosterPath -Context "${Context}_active_control_gate"}
     if([string]$controlEnvelope.Payload.state -cne 'active' -or [string]$controlEnvelope.Payload.broker_identity_sha256 -ine [string]$Initial.broker_identity_sha256 -or [int64]$controlEnvelope.Payload.authority_epoch -ne [int64]$Initial.authority_epoch -or [string]$controlEnvelope.Payload.control_nonce -ine [string]$Descriptor.control_nonce -or [string]$controlEnvelope.Payload.roster_file_id_128 -ine [string]$ActiveRosterTransition.post_file_id_128 -or [string]$controlEnvelope.Payload.roster_sha256 -ine [string]$ActiveRosterTransition.post_sha256 -or [int64]$controlEnvelope.Payload.roster_length -ne [int64]$ActiveRosterTransition.post_length){
         Die "SYNAPSE_AUTHORITY_PRIOR_GENERATION_CONTROL_GATE_CROSSBIND_INVALID context=$Context generation=$($Descriptor.generation_id)"
     }
@@ -28900,7 +29211,8 @@ function Assert-SynapseAuthorityFreshAdoptionInitialDescriptor {
     param(
         [Parameter(Mandatory=$true)]$Initial,
         [Parameter(Mandatory=$true)][string]$TransactionRoot,
-        [Parameter(Mandatory=$true)]$Allocation
+        [Parameter(Mandatory=$true)]$Allocation,
+        [switch]$AllowRetiredControlPostimage
     )
 
     $root=Get-SynapseNormalizedDirectoryPath -Path $TransactionRoot
@@ -28923,7 +29235,12 @@ function Assert-SynapseAuthorityFreshAdoptionInitialDescriptor {
     $controlGate=ConvertTo-SynapseAuthorityControlTransition -Descriptor $Initial.active_control_gate_transition -TransactionRoot $root -Allocation $Allocation
     $predecessorReceipt=if($null-ne$Initial.PSObject.Properties['predecessor_authority_receipt']){$Initial.predecessor_authority_receipt}else{$null}
     $freshFloorPredecessor=($null-ne$predecessorReceipt -and [string]$predecessorReceipt.terminal_mode-ceq'fresh_monotonic_floor')
-    if((([bool]$legacyGate.pre_existed -or [bool]$legacyDenial.pre_existed) -and -not$freshFloorPredecessor) -or [bool]$parked.pre_existed -or [bool]$controlGate.pre_existed -or
+    $retiredDeniedFloorPre=$false
+    if(-not$freshFloorPredecessor-and[bool]$legacyGate.pre_existed-and[bool]$legacyDenial.pre_existed-and$null-eq$Initial.legacy_task){
+        $gatePre=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $root -ParentChain $Initial.legacy_gate_transition.transaction_root_chain -Leaf ([string]$Initial.legacy_gate_transition.park_leaf) -ExpectedFileId128 ([string]$legacyGate.pre_file_id_128) -MaxBytes 65536;$denialPre=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $root -ParentChain $Initial.legacy_denial_stub_transition.transaction_root_chain -Leaf ([string]$Initial.legacy_denial_stub_transition.park_leaf) -ExpectedFileId128 ([string]$legacyDenial.pre_file_id_128) -MaxBytes 65536
+        if([string]$gatePre.Sha256-ine[string]$legacyGate.pre_sha256-or[int64]$gatePre.Length-ne[int64]$legacyGate.pre_length-or[string]$denialPre.Sha256-ine[string]$legacyDenial.pre_sha256-or[int64]$denialPre.Length-ne[int64]$legacyDenial.pre_length){Die "SYNAPSE_AUTHORITY_FRESH_RETIRED_DENIAL_PRESTATE_IDENTITY_INVALID root=$root"};$m=[regex]::Match([string]$denialPre.Content,'\A# SYNAPSE_LEGACY_AUTHORITY_DENIAL_STUB_V1 broker_identity_sha256=(?<identity>[0-9A-F]{64}) authority_epoch=(?<epoch>[1-9][0-9]*) task_capability_sha256=(?<capability>[0-9A-F]{64})\r?\n');if(-not$m.Success-or[string]$denialPre.Content-cne(New-SynapseLegacyAuthorityDenialStubContent -BrokerIdentitySha256 $m.Groups['identity'].Value -AuthorityEpoch ([int64]$m.Groups['epoch'].Value) -TaskCapabilitySha256 $m.Groups['capability'].Value)){Die "SYNAPSE_AUTHORITY_FRESH_RETIRED_DENIAL_STUB_INVALID root=$root"};$g=ConvertFrom-SynapseJsonPreservingStrings -Json ([string]$gatePre.Content) -MaximumJsonLength 65536;if((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $g))-cne[string]$gatePre.Content-or[string]$g.schema-cne'synapse_daemon_supervisor_stop_request/v1'-or[string]$g.state-cne'requested'-or[string]$g.reason-cne'broker_authority_adoption_epoch'-or[string]$g.bind-cne[string]$Initial.bind-or[IO.Path]::GetFullPath([string]$g.db_path)-ine[IO.Path]::GetFullPath([string]$Initial.db_path)-or[string]$g.broker_identity_sha256-ine$m.Groups['identity'].Value-or[int64]$g.authority_epoch-ne[int64]$m.Groups['epoch'].Value){Die "SYNAPSE_AUTHORITY_FRESH_RETIRED_DENIAL_GATE_INVALID root=$root"};$retiredDeniedFloorPre=$true
+    }
+    if((([bool]$legacyGate.pre_existed -or [bool]$legacyDenial.pre_existed) -and -not$freshFloorPredecessor-and-not$retiredDeniedFloorPre) -or [bool]$parked.pre_existed -or [bool]$controlGate.pre_existed -or
         [string]$legacyGate.purpose -cne 'broker_adoption_legacy_gate' -or
         [string]$legacyDenial.purpose -cne 'broker_adoption_legacy_denial_stub' -or
         [string]$parked.purpose -cne 'broker_adoption_parked_roster' -or
@@ -28945,17 +29262,24 @@ function Assert-SynapseAuthorityFreshAdoptionInitialDescriptor {
         $postLeaf=if([string]$cut.PostLocation -ceq 'stage'){[string]$Transition.stage_leaf}else{[string]$Transition.discard_leaf}
         return Read-SynapsePhysicalRelativeUtf8Text -ParentPath $Transition.transaction_root -ParentChain $Transition.transaction_root_chain -Leaf $postLeaf -ExpectedFileId128 $Transition.post_file_id_128 -MaxBytes $MaximumBytes
     }
-    $rosterRaw=& $readTransitionPost $parked $script:SynapseAuthorityRosterMaxBytes 'parked_roster'
-    $rosterEnvelope=Read-SynapseAuthorityRosterEnvelopeText -Text ([string]$rosterRaw.Content) -Context "fresh_adoption_parked_roster_$root"
+    if($AllowRetiredControlPostimage){
+        $retiredLayout=Get-SynapseAuthorityLayoutReadOnly -RuntimeBinDir (Split-Path -Parent ([string]$parked.parent)) -RequireAuthorityRoot
+        $currentRosterRead=Read-SynapseAuthorityRosterCurrent -Layout $retiredLayout -Context "fresh_adoption_current_roster_$root"
+        $currentControlRead=Read-SynapseAuthorityControlGateCurrent -Layout $retiredLayout -Context "fresh_adoption_current_gate_$root"
+        if([string]$currentControlRead.Payload.roster_file_id_128-ine[string]$currentRosterRead.FileId128 -or [string]$currentControlRead.Payload.roster_sha256-ine[string]$currentRosterRead.Sha256 -or [int64]$currentControlRead.Payload.roster_length-ne[int64]$currentRosterRead.Length){Die "SYNAPSE_AUTHORITY_FRESH_RETIRED_CONTROL_PAIR_MISMATCH root=$root"}
+        $rosterEnvelope=$currentRosterRead.Envelope
+    }else{
+        $rosterRaw=& $readTransitionPost $parked $script:SynapseAuthorityRosterMaxBytes 'parked_roster'
+        $rosterEnvelope=Read-SynapseAuthorityRosterEnvelopeText -Text ([string]$rosterRaw.Content) -Context "fresh_adoption_parked_roster_$root"
+    }
     $roster=$rosterEnvelope.Payload
     $legacyGateRaw=& $readTransitionPost $legacyGate 65536 'legacy_gate'
     try{$legacyGatePayload=([string]$legacyGateRaw.Content)|ConvertFrom-Json -ErrorAction Stop}catch{Die "SYNAPSE_AUTHORITY_FRESH_LEGACY_GATE_JSON_INVALID root=$root error=$($_.Exception.Message)"}
     $legacyDenialRaw=& $readTransitionPost $legacyDenial 65536 'legacy_denial_stub'
     $expectedDenial=New-SynapseLegacyAuthorityDenialStubContent -BrokerIdentitySha256 ([string]$Initial.broker_identity_sha256) -AuthorityEpoch ([int64]$Initial.authority_epoch) -TaskCapabilitySha256 ([string]$Initial.broker_task_receipt.task_capability_sha256)
     if([string]$legacyDenialRaw.Content -cne $expectedDenial){Die "SYNAPSE_AUTHORITY_FRESH_LEGACY_DENIAL_STUB_CONTENT_INVALID root=$root path=$($legacyDenial.path)"}
-    $controlRaw=& $readTransitionPost $controlGate 65536 'parked_control_gate'
-    $controlEnvelope=Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$controlRaw.Content) -ExpectedPath ([string]$parked.path) -Context "fresh_adoption_control_gate_$root"
-    if([string]$roster.mode -cne 'parked' -or [string]$roster.role -cne 'none' -or
+    if($AllowRetiredControlPostimage){$controlEnvelope=$currentControlRead.Envelope}else{$controlRaw=& $readTransitionPost $controlGate 65536 'parked_control_gate';$controlEnvelope=Read-SynapseAuthorityControlGateEnvelopeText -Text ([string]$controlRaw.Content) -ExpectedPath ([string]$parked.path) -Context "fresh_adoption_control_gate_$root"}
+    if(((-not$AllowRetiredControlPostimage) -and ([string]$roster.mode -cne 'parked' -or [string]$roster.role -cne 'none')) -or
         [string]$roster.broker_identity_sha256 -ine [string]$Initial.broker_identity_sha256 -or [int64]$roster.authority_epoch -ne [int64]$Initial.authority_epoch -or
         [string]$roster.control_nonce -ine [string]$Initial.control_nonce -or [string]$roster.broker_task_capability_sha256 -ine [string]$Initial.broker_task_receipt.task_capability_sha256 -or [string]$roster.broker_task_name -cne [string]$broker.name -or
         [string]$roster.broker_task_xml_sha256 -ine [string]$broker.xml_sha256 -or [string]$roster.broker_task_security_descriptor_sha256 -ine [string]$broker.security_descriptor_sha256 -or
@@ -28965,9 +29289,10 @@ function Assert-SynapseAuthorityFreshAdoptionInitialDescriptor {
         [System.IO.Path]::GetFullPath([string]$roster.token_path) -ine [System.IO.Path]::GetFullPath([string]$Initial.token_path)){
         Die "SYNAPSE_AUTHORITY_FRESH_PARKED_ROSTER_CROSSBIND_INVALID root=$root"
     }
-    if([string]$controlEnvelope.Payload.state -cne 'parked' -or [string]$controlEnvelope.Payload.broker_identity_sha256 -ine [string]$Initial.broker_identity_sha256 -or
+    $expectedRosterIdentity=if($AllowRetiredControlPostimage){$currentRosterRead}else{[pscustomobject]@{FileId128=$parked.post_file_id_128;Sha256=$parked.post_sha256;Length=$parked.post_length}}
+    if(((-not$AllowRetiredControlPostimage) -and [string]$controlEnvelope.Payload.state -cne 'parked') -or [string]$controlEnvelope.Payload.broker_identity_sha256 -ine [string]$Initial.broker_identity_sha256 -or
         [int64]$controlEnvelope.Payload.authority_epoch -ne [int64]$Initial.authority_epoch -or [string]$controlEnvelope.Payload.control_nonce -ine [string]$Initial.control_nonce -or
-        [string]$controlEnvelope.Payload.roster_file_id_128 -ine [string]$parked.post_file_id_128 -or [string]$controlEnvelope.Payload.roster_sha256 -ine [string]$parked.post_sha256 -or [int64]$controlEnvelope.Payload.roster_length -ne [int64]$parked.post_length){
+        [string]$controlEnvelope.Payload.roster_file_id_128 -ine [string]$expectedRosterIdentity.FileId128 -or [string]$controlEnvelope.Payload.roster_sha256 -ine [string]$expectedRosterIdentity.Sha256 -or [int64]$controlEnvelope.Payload.roster_length -ne [int64]$expectedRosterIdentity.Length){
         Die "SYNAPSE_AUTHORITY_FRESH_CONTROL_GATE_CROSSBIND_INVALID root=$root"
     }
     if([string]$legacyGatePayload.schema -cne 'synapse_daemon_supervisor_stop_request/v1' -or [string]$legacyGatePayload.state -cne 'requested' -or
@@ -29017,7 +29342,8 @@ function Assert-SynapseAuthorityAdoptionInitialDescriptor {
         [Parameter(Mandatory=$true)][string]$TransactionRoot,
         [Parameter(Mandatory=$true)]$Allocation,
         [switch]$HistoricalMutableGeneration,
-        [switch]$StructuralOnly
+        [switch]$StructuralOnly,
+        [switch]$AllowRetiredControlPostimage
     )
 
     $root=Get-SynapseNormalizedDirectoryPath -Path $TransactionRoot
@@ -29067,7 +29393,7 @@ function Assert-SynapseAuthorityAdoptionInitialDescriptor {
     if([string]$taskReceipt.TaskCapabilitySha256 -notmatch '^[0-9A-F]{64}$'){Die "SYNAPSE_AUTHORITY_ADOPTION_TASK_RECEIPT_CAPABILITY_INVALID root=$root"}
     [void](Assert-SynapseBrokerTaskDescriptorShape -Descriptor $Initial.broker_task -BrokerIdentitySha256 ([string]$Initial.broker_identity_sha256) -TaskCapabilitySha256 ([string]$taskReceipt.TaskCapabilitySha256) -Context "adoption_initial_$root")
     if([string]$Initial.prior_authority -ceq 'absent'){
-        $fresh=Assert-SynapseAuthorityFreshAdoptionInitialDescriptor -Initial $Initial -TransactionRoot $root -Allocation $Allocation
+        $fresh=Assert-SynapseAuthorityFreshAdoptionInitialDescriptor -Initial $Initial -TransactionRoot $root -Allocation $Allocation -AllowRetiredControlPostimage:$AllowRetiredControlPostimage
         $fresh | Add-Member -NotePropertyName TaskReceipt -NotePropertyValue $taskReceipt
         $fresh | Add-Member -NotePropertyName PredecessorReceipt -NotePropertyValue $predecessorReceipt
         $fresh | Add-Member -NotePropertyName PredecessorCleanupProgressSlots -NotePropertyValue @($predecessorCleanupProgressSlots)
@@ -29179,7 +29505,7 @@ function Assert-SynapseAuthorityAdoptionInitialDescriptor {
         [string]$active.pre_sha256 -ine [string]$parked.post_sha256 -or [int64]$active.pre_length -ne [int64]$parked.post_length){
         Die "SYNAPSE_AUTHORITY_ADOPTION_CONTROL_CHAIN_INVALID root=$root legacy_gate=$($legacyGate.path) control_gate=$($controlGate.path) roster=$($parked.path)"
     }
-    $prior=Assert-SynapseAuthorityPriorGenerationDescriptor -Descriptor $Initial.prior_generation -Initial $Initial -LegacyGateTransition $legacyGate -ControlGateTransition $controlGate -ParkedRosterTransition $parked -ActiveRosterTransition $active -Context "adoption_initial_$root" -SkipMutableGenerationPhysicalReadback:$HistoricalMutableGeneration
+    $prior=Assert-SynapseAuthorityPriorGenerationDescriptor -Descriptor $Initial.prior_generation -Initial $Initial -LegacyGateTransition $legacyGate -ControlGateTransition $controlGate -ParkedRosterTransition $parked -ActiveRosterTransition $active -Context "adoption_initial_$root" -SkipMutableGenerationPhysicalReadback:$HistoricalMutableGeneration -AllowRetiredControlPostimage:($StructuralOnly-or$AllowRetiredControlPostimage)
     $legacyAssignments=$legacySupervisorCompatibility.assignments
     # The immutable legacy supervisor and the broker rehearsal generation are
     # deliberately separate executable authorities.  During the one-way
@@ -30087,11 +30413,13 @@ function Assert-SynapseBrokerParkedNoAuthority {
         $TaskSupersessionInfrastructure,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
+        [switch]$AllowHistoricalPeakForDecommission,
         [ValidateRange(10,420)][int]$TimeoutSeconds=360
     )
 
     $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
     $last='not_checked'
+    $lastReported=''
     do {
         $pair=$null
         try {
@@ -30145,10 +30473,10 @@ function Assert-SynapseBrokerParkedNoAuthority {
                 $expectedMembers=@([uint64]$outerBootstrap.ProcessId,[uint64]$brokerProcess.ProcessId)+@($childClass.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId})|Sort-Object
                 $actualMembers=@($outerJob.ProcessIds|ForEach-Object{[uint64]$_}|Sort-Object)
                 if([uint32]$outerJob.LimitFlags -ne [uint32]0x00002300 -or [uint64]$outerJob.ProcessMemoryLimitBytes -ne [uint64]6699999232 -or
-                    [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]6699999232 -or [uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]6699999232 -or
-                    [uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]7000000000 -or [uint32]$outerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or
+                    [uint64]$outerJob.JobMemoryLimitBytes -ne [uint64]6699999232 -or (-not$AllowHistoricalPeakForDecommission-and[uint64]$outerJob.CurrentJobMemoryUsedBytes -gt [uint64]6699999232) -or
+                    (-not$AllowHistoricalPeakForDecommission-and[uint64]$outerJob.PeakJobMemoryUsedBytes -gt [uint64]7000000000) -or [uint32]$outerJob.CpuRateControlFlags -ne [uint32]0x00000005 -or
                     [uint32]$outerJob.CpuRate -ne [uint32]2500 -or (($expectedMembers-join ',') -cne ($actualMembers-join ','))){
-                    throw "parked outer Job contract invalid job=$outerJobName flags=$($outerJob.LimitFlags) rate=$($outerJob.CpuRate) members=$($actualMembers-join ',')"
+                    throw "parked outer Job contract invalid job=$outerJobName flags=$($outerJob.LimitFlags) process_limit=$($outerJob.ProcessMemoryLimitBytes) job_limit=$($outerJob.JobMemoryLimitBytes) current=$($outerJob.CurrentJobMemoryUsedBytes) peak=$($outerJob.PeakJobMemoryUsedBytes) rate=$($outerJob.CpuRate) expected_members=$($expectedMembers-join ',') actual_members=$($actualMembers-join ',') allow_historical_peak_for_decommission=$([bool]$AllowHistoricalPeakForDecommission)"
                 }
                 $pair.GateLease.RequireExact('broker_parked_final_gate')
                 $pair.RosterLease.RequireExact('broker_parked_final_roster')
@@ -30158,6 +30486,7 @@ function Assert-SynapseBrokerParkedNoAuthority {
             $last="instances=$($instances.Count) targets=$($targets.Count) listeners=$($listeners.Count) broker_processes=$($brokerProcesses.Count)"
         } catch {
             $last=(($_.Exception.Message -replace '\s+',' ').Trim())
+            if($last-cne$lastReported){Warn "SYNAPSE_BROKER_PARKED_PROOF_RETRY task=$($Infrastructure.TaskName) error=$last";$lastReported=$last}
         } finally {
             Close-SynapseAuthorityActiveControlPair -Pair $pair
         }
@@ -30242,7 +30571,7 @@ function Assert-SynapseBrokerInertAtFreshMonotonicFloor {
                -not(Test-SynapsePhysicalStateExact -State $denialState -ExpectedExists $true -ExpectedFileId128 $LegacyDenialTransition.post_file_id_128 -ExpectedSha256 $LegacyDenialTransition.post_sha256 -ExpectedLength $LegacyDenialTransition.post_length)){
                 throw 'fresh monotonic floor file identity drift'
             }
-            if($instances.Count-ne1 -or $brokers.Count-ne1 -or $targets.Count-ne0 -or $listeners.Count-ne0 -or $supervisors.Count-ne0 -or $launcherActions.Count-ne0 -or $controlGate.Exists -or $roster.Exists){throw "instances=$($instances.Count) brokers=$($brokers.Count) targets=$($targets.Count) listeners=$($listeners.Count) supervisors=$($supervisors.Count) launcher_actions=$($launcherActions.Count) control_gate=$($controlGate.Exists) roster=$($roster.Exists)"}
+            if($instances.Count-notin@(0,1) -or $brokers.Count-ne1 -or $targets.Count-ne0 -or $listeners.Count-ne0 -or $supervisors.Count-ne0 -or $launcherActions.Count-ne0 -or $controlGate.Exists -or $roster.Exists){throw "instances=$($instances.Count) brokers=$($brokers.Count) targets=$($targets.Count) listeners=$($listeners.Count) supervisors=$($supervisors.Count) launcher_actions=$($launcherActions.Count) control_gate=$($controlGate.Exists) roster=$($roster.Exists)"}
             $broker=$brokers[0];$childClass=Get-SynapseBrokerChildClassification -Broker $broker;$children=@($childClass.AuthorityChildren)
             if($children.Count-ne0){throw "inert broker retained children=$(@($children.ProcessId)-join ',')"}
             $outer=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$broker.ParentProcessId)" -ErrorAction Stop
@@ -30253,7 +30582,7 @@ function Assert-SynapseBrokerInertAtFreshMonotonicFloor {
             if([uint32]$job.LimitFlags-ne[uint32]0x00002300 -or [uint64]$job.ProcessMemoryLimitBytes-ne[uint64]6699999232 -or [uint64]$job.JobMemoryLimitBytes-ne[uint64]6699999232 -or [uint32]$job.CpuRateControlFlags-ne[uint32]0x00000005 -or [uint32]$job.CpuRate-ne[uint32]2500 -or (($expectedMembers-join ',')-cne($actualMembers-join ','))){throw "inert broker outer Job contract invalid job=$jobName"}
             $LegacyGateTransition.CanonicalLease.RequireExact('fresh_floor_gate')
             $LegacyDenialTransition.CanonicalLease.RequireExact('fresh_floor_denial')
-            return [pscustomobject][ordered]@{LegacyTaskAbsent=$true;BrokerTaskInert=$true;TaskInstanceCount=1;BrokerProcessCount=1;OuterBootstrapPid=[int]$outer.ProcessId;BrokerPid=[int]$broker.ProcessId;ActionProcessCount=0;TargetProcessCount=0;ListenerCount=0;SupervisorProcessCount=0;ControlGateAbsent=$true;RosterAbsent=$true;OuterJob=$job}
+            return [pscustomobject][ordered]@{LegacyTaskAbsent=$true;BrokerTaskInert=$true;TaskInstanceCount=[int]$instances.Count;BrokerProcessCount=1;OuterBootstrapPid=[int]$outer.ProcessId;BrokerPid=[int]$broker.ProcessId;ActionProcessCount=0;TargetProcessCount=0;ListenerCount=0;SupervisorProcessCount=0;ControlGateAbsent=$true;RosterAbsent=$true;OuterJob=$job}
         }catch{$last=(($_.Exception.Message-replace '\s+',' ').Trim())}
         Start-Sleep -Milliseconds 500
     }while($clock.Elapsed.TotalSeconds-lt$TimeoutSeconds)
@@ -30303,6 +30632,19 @@ function Wait-SynapseBrokerInnerAuthorityDrained {
         Start-Sleep -Milliseconds 500
     }while((Get-Date)-lt$deadline)
     Die "SYNAPSE_BROKER_INNER_AUTHORITY_DRAIN_TIMEOUT context=$Context task=$($Infrastructure.TaskName) bind=$Bind timeout_s=$TimeoutSeconds last=$last remediation=control revocation must terminate only the exact retained inner bootstrap tree while leaving the outer broker polling"
+}
+
+function Stop-SynapseFreshBrokerSurvivorExact {
+    param([Parameter(Mandatory=$true)]$Infrastructure,[Parameter(Mandatory=$true)]$Detail,[ValidateRange(10,300)][int]$TimeoutSeconds=60)
+    Ensure-SynapseDaemonJobReadbackType;Ensure-SynapseWindowsCommandLineArgvType
+    $outerPid=[uint32]$Detail.outer_bootstrap_pid;$brokerPid=[uint32]$Detail.broker_pid;if($outerPid-lt1-or$brokerPid-lt1){Die 'SYNAPSE_FRESH_BROKER_SURVIVOR_IDENTITY_MISSING'};$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$outer=@($all|Where-Object{[uint32]$_.ProcessId-eq$outerPid});$broker=@($all|Where-Object{[uint32]$_.ProcessId-eq$brokerPid});if($outer.Count-ne1-or$broker.Count-ne1-or[uint32]$broker[0].ParentProcessId-ne$outerPid){Die "SYNAPSE_FRESH_BROKER_SURVIVOR_LINEAGE_INVALID outer=$outerPid broker=$brokerPid"}
+    $outerNative=[string]$outer[0].CommandLine;$outerArgv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($outerNative));$cap=([string]$Infrastructure.TaskCapabilitySha256).ToUpperInvariant();$jobName="Local\SynapseOwned-$cap-$outerPid";if($outerArgv.Count-ne7-or[IO.Path]::GetFullPath([string]$outerArgv[0])-ine[IO.Path]::GetFullPath([string]$Infrastructure.Bootstrap.Path)-or[string]$outerArgv[1]-cne'--outer-launch-capability'-or[string]$outerArgv[2]-ine$cap-or[IO.Path]::GetFullPath([string]$outerArgv[3])-ine[IO.Path]::GetFullPath([string]$Infrastructure.PowerShell.Path)-or[IO.Path]::GetFullPath([string]$outerArgv[4])-ine[IO.Path]::GetFullPath([string]$Infrastructure.BrokerScript.Path)){Die "SYNAPSE_FRESH_BROKER_SURVIVOR_OUTER_ARGV_INVALID pid=$outerPid"}
+    $brokerNative=[string]$broker[0].CommandLine;$brokerArgv=@([SynapseSetup.WindowsCommandLineArgv]::Parse($brokerNative));if($brokerArgv.Count-ne8-or[IO.Path]::GetFullPath([string]$brokerArgv[0])-ine[IO.Path]::GetFullPath([string]$Infrastructure.PowerShell.Path)-or[string]$brokerArgv[1]-cne'-NoProfile'-or[string]$brokerArgv[2]-cne'-ExecutionPolicy'-or[string]$brokerArgv[3]-cne'Bypass'-or[string]$brokerArgv[4]-cne'-File'-or[IO.Path]::GetFullPath([string]$brokerArgv[5])-ine[IO.Path]::GetFullPath([string]$Infrastructure.BrokerScript.Path)-or[string]$brokerArgv[6]-cne'-ParentJobName'-or[string]$brokerArgv[7]-cne$jobName){Die "SYNAPSE_FRESH_BROKER_SURVIVOR_BROKER_ARGV_INVALID pid=$brokerPid"}
+    $outerLease=$null;$brokerLease=$null;$jobLease=$null
+    try{
+        $outerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenForTermination($outerPid,0L,[string]$Infrastructure.Bootstrap.Path,[string]$Infrastructure.Bootstrap.FileId128,[string]$Infrastructure.Bootstrap.Sha256,[int64]$Infrastructure.Bootstrap.Length,'fresh_broker_survivor_outer');$po=$Infrastructure.PowerShell.ProtectedOs;$brokerLease=[SynapseAuthorityRuntime.MappedProcessLease]::OpenProtectedOsForTermination($brokerPid,0L,[string]$Infrastructure.PowerShell.Path,[string]$Infrastructure.PowerShell.FileId128,[string]$Infrastructure.PowerShell.Sha256,[int64]$Infrastructure.PowerShell.Length,[uint32]$po.LinkCount,[string]$po.SecurityDescriptorSddl,[string[]]@($po.HardlinkPaths),'fresh_broker_survivor_broker');if([string]$outerLease.ReadCommandLine('fresh_broker_survivor_outer_argv')-cne$outerNative-or[string]$brokerLease.ReadCommandLine('fresh_broker_survivor_broker_argv')-cne$brokerNative){Die 'SYNAPSE_FRESH_BROKER_SURVIVOR_NATIVE_ARGV_DRIFT'}
+        $classification=Get-SynapseBrokerChildClassification -Broker $broker[0];if(@($classification.AuthorityChildren).Count-ne0){Die "SYNAPSE_FRESH_BROKER_SURVIVOR_DESCENDANTS_INVALID pids=$(@($classification.AuthorityChildren.ProcessId)-join',')"};$members=[uint64[]]@([uint64]$outerPid,[uint64]$brokerPid)+@($classification.ConsoleHosts|ForEach-Object{[uint64]$_.ProcessId});$members=[uint64[]]@($members|Sort-Object -Unique);$jobLease=[SynapseSetup.BrokerDecommissionJobLease]::OpenOrNull($jobName,$cap,$outerPid,(Get-SynapseBrokerDecommissionExpectedJobSecurityDescriptor),$members,$true,'fresh_broker_survivor_job');if($null-eq$jobLease){Die "SYNAPSE_FRESH_BROKER_SURVIVOR_JOB_ABSENT name=$jobName"};$jobLease.RequireExact($members,'fresh_broker_survivor_boundary');[void]$brokerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),127,'fresh_broker_survivor_broker_terminal');[void]$outerLease.TerminateAndWait([uint32]($TimeoutSeconds*1000),127,'fresh_broker_survivor_outer_terminal');$jobLease.ProveEmptyAfterProcessTermination($members,$TimeoutSeconds*1000,'fresh_broker_survivor_drain');$jobLease.Dispose();$jobLease=$null;[SynapseSetup.BrokerDecommissionJobLease]::RequireNameAbsent($jobName,'fresh_broker_survivor_job_absent');Info "SYNAPSE_FRESH_BROKER_SURVIVOR_DRAINED outer_pid=$outerPid broker_pid=$brokerPid job=$jobName"
+    }finally{foreach($l in @($jobLease,$brokerLease,$outerLease)){if($null-ne$l){try{$l.Dispose()}catch{[Environment]::FailFast('SYNAPSE_FRESH_BROKER_SURVIVOR_LEASE_RELEASE_UNPROVEN',$_.Exception)}}}}
 }
 
 function Assert-SynapseAuthorityLegacyRollbackEvidence {
@@ -30390,8 +30732,8 @@ function Assert-SynapseAuthorityRollbackTerminalDetail {
     if($names.Count-ne$expected.Count -or @($names|Where-Object{$expected-cnotcontains$_}).Count-ne0 -or [string]$Detail.schema-cne'synapse_authority_rollback/v2' -or [string]$Detail.trigger-notin@('cold_predecision','normal_catch') -or [string]$Detail.broker_identity_sha256-ine[string]$Initial.broker_identity_sha256 -or -not[bool]$Detail.unknown_objects_preserved){Die "SYNAPSE_AUTHORITY_ROLLBACK_TERMINAL_SHAPE_INVALID context=$Context mode=$($Detail.mode)"}
     if(([string]$Detail.trigger-ceq'normal_catch' -and [string]$Detail.primary_failure_sha256-notmatch'^[0-9A-Fa-f]{64}$') -or ([string]$Detail.trigger-ceq'cold_predecision' -and -not([string]::IsNullOrEmpty([string]$Detail.primary_failure_sha256)))){Die "SYNAPSE_AUTHORITY_ROLLBACK_FAILURE_IDENTITY_INVALID context=$Context trigger=$($Detail.trigger)"}
     $mode=[string]$Detail.mode;$e=$Detail.authority_evidence
-    $gateTransition=if($null-ne$Validated){$Validated.LegacyGateTransition}else{$Initial.legacy_gate_transition}
-    $denialTransition=if($null-ne$Validated){$Validated.LegacyDenialTransition}else{$Initial.legacy_denial_stub_transition}
+    $gateTransition=if($null-ne$Validated -and $null-ne$Validated.PSObject.Properties['LegacyGateTransition']){$Validated.LegacyGateTransition}else{$Initial.legacy_gate_transition}
+    $denialTransition=if($null-ne$Validated -and $null-ne$Validated.PSObject.Properties['LegacyDenialTransition']){$Validated.LegacyDenialTransition}else{$Initial.legacy_denial_stub_transition}
     $expectedPrior=if($mode-ceq'fresh_monotonic_floor'){'absent'}elseif($mode-ceq'predecessor_restored'){[string]$Initial.prior_authority}else{'legacy'};$expectedRestored=if($mode-ceq'predecessor_restored'){'predecessor'}else{$mode}
     if($mode-notin@('legacy_prior_unchanged','legacy_direct_recovery','fresh_monotonic_floor','predecessor_restored') -or [string]$Detail.prior_authority-cne$expectedPrior -or [string]$Detail.authority_restored-cne$expectedRestored){Die "SYNAPSE_AUTHORITY_ROLLBACK_MODE_INVALID context=$Context mode=$mode prior=$($Detail.prior_authority) restored=$($Detail.authority_restored)"}
     if($mode-ceq'predecessor_restored'){
@@ -30409,11 +30751,12 @@ function Assert-SynapseAuthorityRollbackTerminalDetail {
     if($mode-ceq'fresh_monotonic_floor'){
         $eNames=@(Get-SynapseObjectPropertyNames -Object $e);$eExpected=@('schema','legacy_gate','legacy_denial_stub','legacy_task_absent','control_gate_absent','roster_absent','broker_task','broker_task_inert','action_process_count','target_process_count','listener_count','supervisor_process_count','recovery_job_count')
         $fileRefExpected=@('path','file_id_128','sha256','length');$gateNames=@(Get-SynapseObjectPropertyNames -Object $e.legacy_gate);$denialNames=@(Get-SynapseObjectPropertyNames -Object $e.legacy_denial_stub)
-        if($eNames.Count-ne$eExpected.Count -or @($eNames|Where-Object{$eExpected-cnotcontains$_}).Count-ne0 -or [string]$e.schema-cne'synapse_authority_fresh_monotonic_floor/v1' -or -not[bool]$e.legacy_task_absent -or -not[bool]$e.control_gate_absent -or -not[bool]$e.roster_absent -or -not[bool]$e.broker_task_inert -or @($e.action_process_count,$e.target_process_count,$e.listener_count,$e.supervisor_process_count,$e.recovery_job_count|Where-Object{[int]$_-ne0}).Count-ne0 -or
+        $nonzeroEvidence=@(@($e.action_process_count,$e.target_process_count,$e.listener_count,$e.supervisor_process_count,$e.recovery_job_count)|Where-Object{[int]$_-ne0})
+        if($eNames.Count-ne$eExpected.Count -or @($eNames|Where-Object{$eExpected-cnotcontains$_}).Count-ne0 -or [string]$e.schema-cne'synapse_authority_fresh_monotonic_floor/v1' -or -not[bool]$e.legacy_task_absent -or -not[bool]$e.control_gate_absent -or -not[bool]$e.roster_absent -or -not[bool]$e.broker_task_inert -or @(@($e.action_process_count,$e.target_process_count,$e.listener_count,$e.supervisor_process_count,$e.recovery_job_count)|Where-Object{[int]$_-ne0}).Count-ne0 -or
            $gateNames.Count-ne$fileRefExpected.Count -or @($gateNames|Where-Object{$fileRefExpected-cnotcontains$_}).Count-ne0 -or $denialNames.Count-ne$fileRefExpected.Count -or @($denialNames|Where-Object{$fileRefExpected-cnotcontains$_}).Count-ne0 -or
            (Get-SynapseCanonicalJson -Value $e.broker_task)-cne(Get-SynapseCanonicalJson -Value $Initial.broker_task) -or
            [string]$e.legacy_gate.path-ine[string]$gateTransition.path -or [string]$e.legacy_gate.file_id_128-ine[string]$gateTransition.post_file_id_128 -or [string]$e.legacy_gate.sha256-ine[string]$gateTransition.post_sha256 -or [int64]$e.legacy_gate.length-ne[int64]$gateTransition.post_length -or
-           [string]$e.legacy_denial_stub.path-ine[string]$denialTransition.path -or [string]$e.legacy_denial_stub.file_id_128-ine[string]$denialTransition.post_file_id_128 -or [string]$e.legacy_denial_stub.sha256-ine[string]$denialTransition.post_sha256 -or [int64]$e.legacy_denial_stub.length-ne[int64]$denialTransition.post_length){Die "SYNAPSE_AUTHORITY_FRESH_FLOOR_TERMINAL_INVALID context=$Context"}
+           [string]$e.legacy_denial_stub.path-ine[string]$denialTransition.path -or [string]$e.legacy_denial_stub.file_id_128-ine[string]$denialTransition.post_file_id_128 -or [string]$e.legacy_denial_stub.sha256-ine[string]$denialTransition.post_sha256 -or [int64]$e.legacy_denial_stub.length-ne[int64]$denialTransition.post_length){Die "SYNAPSE_AUTHORITY_FRESH_FLOOR_TERMINAL_INVALID context=$Context evidence_names=$($eNames-join',') expected_names=$($eExpected-join',') counters=$($nonzeroEvidence-join',') broker_task_expected_sha=$((Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $Initial.broker_task)).ToUpperInvariant()) broker_task_actual_sha=$((Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $e.broker_task)).ToUpperInvariant()) gate_expected=$($gateTransition.post_file_id_128)/$($gateTransition.post_sha256)/$($gateTransition.post_length) gate_actual=$($e.legacy_gate.file_id_128)/$($e.legacy_gate.sha256)/$($e.legacy_gate.length) denial_expected=$($denialTransition.post_file_id_128)/$($denialTransition.post_sha256)/$($denialTransition.post_length) denial_actual=$($e.legacy_denial_stub.file_id_128)/$($e.legacy_denial_stub.sha256)/$($e.legacy_denial_stub.length)"}
     }elseif($mode-ceq'legacy_prior_unchanged'){
         $eNames=@(Get-SynapseObjectPropertyNames -Object $e);$eExpected=@('schema','legacy_task','task_runtime','legacy_task_unchanged','health_pid','tool_count','tool_surface_sha256','listener_count','compatibility','recovery_attempts')
         $eLegacyTaskJson=Get-SynapseCanonicalJson -Value $e.legacy_task
@@ -31016,6 +31359,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [switch]$RequireCommitted,
+        [switch]$DecommissionStructuralOnly,
         [switch]$AllowMissingTokenWhenParked,
         [switch]$RecoveryOnly,
         [ValidateRange(60,900)][int]$HealthTimeoutSeconds=600
@@ -31023,6 +31367,9 @@ function Ensure-SynapseBrokerAuthorityAdopted {
 
     if($RequireCommitted -and $RecoveryOnly){
         Die 'SYNAPSE_BROKER_AUTHORITY_RECOVERY_MODE_CONFLICT require_committed=true recovery_only=true'
+    }
+    if($DecommissionStructuralOnly -and -not $RequireCommitted){
+        Die 'SYNAPSE_BROKER_AUTHORITY_DECOMMISSION_MODE_INVALID require_committed=false'
     }
     if(-not[string]::IsNullOrWhiteSpace($AdoptionRehearsalExePath)){
         $script:SynapseAdoptionRehearsalExePath=[System.IO.Path]::GetFullPath($AdoptionRehearsalExePath)
@@ -31149,14 +31496,14 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         if(-not(Remove-SynapseDeploymentCleanupTailIfPresent -TransactionRoot ([string]$failedCleanupTails[0].Entry.Path) -ExpectedParent $layout.Epochs -RequireAuthorityFailedSuccessor -ExpectedAuthorityPredecessorReceipt $predecessorReceipt)){
             Die "SYNAPSE_AUTHORITY_FAILED_SUCCESSOR_CLEANUP_AUTHORITY_INVALID predecessor=$($predecessor.Entry.Path) successor=$($failedCleanupTails[0].Entry.Path)"
         }
-        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
+        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
     }
     if($committedPredecessorCleanupTails.Count-eq1){
         if($committed.Count-ne1){Die "SYNAPSE_AUTHORITY_COMMITTED_PREDECESSOR_CLEANUP_SUCCESSOR_MISSING predecessor=$($committedPredecessorCleanupTails[0].Entry.Path) committed=$($committed.Count)"}
         $tailRecord=[pscustomobject][ordered]@{Entry=$committedPredecessorCleanupTails[0].Entry;Journal=$null;Root=[string]$committedPredecessorCleanupTails[0].Entry.Path;RootFileId128=[string]$committedPredecessorCleanupTails[0].Tail.RootFileId128;CleanupTail=$committedPredecessorCleanupTails[0].Tail;PredecessorReceipt=(ConvertTo-SynapseCanonicalValue -Value $committedPredecessorCleanupTails[0].Tail.CleanupAuthority.predecessor_receipt)}
         $successorRecord=[pscustomobject][ordered]@{Entry=$committed[0].Entry;Journal=$committed[0].Journal;Initial=$committed[0].Journal.Initial;Root=[string]$committed[0].Entry.Path;RootFileId128=[string]$committed[0].Entry.FileId128}
         [void](Remove-SynapseAuthorityCommittedSuccessorPredecessor -PredecessorRecord $tailRecord -SuccessorRecord $successorRecord -ExpectedParent $layout.Epochs -Context 'authority_local_resume_committed_predecessor_cleanup')
-        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
+        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
     }
     foreach($physicalFailed in @($physicalFailedSuccessors)){
         $physicalReceiptJson=Get-SynapseCanonicalJson -Value $physicalFailed.PredecessorReceipt
@@ -31192,7 +31539,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         }
         $cleanupAuthorization=[ordered]@{schema='synapse_authority_failed_successor_cleanup/v1';predecessor_receipt=(ConvertTo-SynapseCanonicalValue -Value $predecessorReceipt);predecessor_receipt_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $predecessorReceipt)).ToUpperInvariant();failed_terminal_detail_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $terminalDetail)).ToUpperInvariant()}
         [void](Remove-SynapseDeploymentTransactionArtifact -Path ([string]$failedSuccessors[0].Entry.Path) -ExpectedRoot $layout.Epochs -ExpectedState rolled_back -Reason 'authority_failed_successor_predecessor_restored' -Domain authority -CleanupAuthorization $cleanupAuthorization)
-        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
+        return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
     }
 
     if($RequireCommitted -and $recoverable.Count -ne 0){
@@ -31207,7 +31554,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
             $localTransaction=[pscustomobject][ordered]@{Armed=$true;Committed=$false;Root=[string]$pending.Entry.Path;RootChain=@($journal.RootChain);ParentRoot=$layout.Epochs;InvocationId=[string]$initial.invocation_id;JournalSequence=[int]$journal.Sequence;JournalSha256=[string]$journal.LatestRawSha256;JournalState=[string]$journal.State;StaticTransactionSha256=[string]$initial.static_transaction_sha256}
             $rollbackTerminal=$null
             $active=$validated.ActiveRosterTransition;$parked=$validated.ParkedRosterTransition;$legacyGate=$validated.LegacyGateTransition;$legacyDenial=$validated.LegacyDenialTransition;$legacyMalformed=$validated.LegacyMalformedGateTransition;$legacyAbsence=$validated.LegacyGateAbsence;$probePlans=@($validated.LegacyDenialProbePlans);$controlGate=$validated.ControlGateTransition
-            $legacy=ConvertTo-SynapseLegacySnapshotPersistedDescriptor -Snapshot $initial.legacy_task
+            $legacy=if([string]$initial.prior_authority -eq 'legacy'){ConvertTo-SynapseLegacySnapshotPersistedDescriptor -Snapshot $initial.legacy_task}else{$null}
             $probeSlotAuthority=$null
             $rollbackInfrastructure=$null;$rollbackInfrastructureOwned=$false
             if([string]$initial.prior_authority -eq 'legacy'){
@@ -31296,12 +31643,12 @@ function Ensure-SynapseBrokerAuthorityAdopted {
                 if($null-eq$predecessor -or $null-eq$predecessorReceipt){Die "SYNAPSE_AUTHORITY_RECOVERED_FAILED_SUCCESSOR_PREDECESSOR_MISSING successor=$($pending.Entry.Path)"}
                 if([string]$rollbackTerminal.Kind-ceq'torn_tail_physical'){
                     Info "SYNAPSE_AUTHORITY_RECOVERED_FAILED_SUCCESSOR_TORN_RETAINED successor=$($pending.Entry.Path) predecessor=$($predecessor.Entry.Path)"
-                    return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
+                    return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
                 }
                 $restoredDetail=Assert-SynapseAuthorityRollbackTerminalDetail -Detail $rolledBackJournal.Slots[-1].LexicalPayload.detail -Initial $rolledBackJournal.Initial -Allocation $rolledBackJournal.Allocation -Context "recovered_failed_successor_$($pending.Entry.Path)"
                 $cleanupAuthorization=[ordered]@{schema='synapse_authority_failed_successor_cleanup/v1';predecessor_receipt=(ConvertTo-SynapseCanonicalValue -Value $predecessorReceipt);predecessor_receipt_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $predecessorReceipt)).ToUpperInvariant();failed_terminal_detail_sha256=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $restoredDetail)).ToUpperInvariant()}
                 [void](Remove-SynapseDeploymentTransactionArtifact -Path ([string]$pending.Entry.Path) -ExpectedRoot $layout.Epochs -ExpectedState rolled_back -Reason 'authority_recovered_failed_successor_predecessor_restored' -Domain authority -CleanupAuthorization $cleanupAuthorization)
-                return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
+                return Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $BootstrapSourcePath -PowerShellPath $PowerShellPath -WorkingDirectory $WorkingDirectory -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $Token -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -RequireCommitted:$RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -RecoveryOnly:$RecoveryOnly -HealthTimeoutSeconds $HealthTimeoutSeconds
             }
             $predecessor=if([string]$rollbackTerminal.Kind-ceq'torn_tail_physical'){New-SynapseAuthorityPhysicalRollbackPredecessor -Entry $pending.Entry -TerminalResult $rollbackTerminal -Validated $validated}else{Assert-SynapseAuthorityRolledBackPredecessor -Layout $layout -Entry $pending.Entry -Journal $rolledBackJournal -Bind $Bind -DbPath $DbPath -Token $Token}
             $predecessorReceipt=New-SynapseAuthorityPredecessorReceipt -Predecessor $predecessor
@@ -31321,7 +31668,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
 
     if($committed.Count -eq 1){
         $record=$committed[0];$initial=$record.Journal.Initial
-        $validated=Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot $record.Entry.Path -Allocation $record.Journal.Allocation -HistoricalMutableGeneration
+        $validated=Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot $record.Entry.Path -Allocation $record.Journal.Allocation -HistoricalMutableGeneration -AllowRetiredControlPostimage
         $receiptLegacyTaskName=[string]$initial.task_name
         if($TaskName -cne $receiptLegacyTaskName){Die "SYNAPSE_AUTHORITY_COMMITTED_LOGICAL_TASK_NAME_MISMATCH requested=$TaskName receipt=$receiptLegacyTaskName remediation=the committed adoption receipt defines the only legacy fixed-name namespace whose absence or retained definition is authoritative"}
         if([string]$initial.prior_authority -eq 'legacy'){
@@ -31365,18 +31712,45 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         if($AllowMissingTokenWhenParked-and$expectedControlState-cne'parked'){Die "SYNAPSE_BROKER_AUTHORITY_MISSING_TOKEN_ACTIVE_REFUSED state=$expectedControlState remediation=restore the exact committed token before controlling an active generation"}
         $controlPair=Read-SynapseAuthorityActiveControlPair -Layout $layout -ExpectedState $expectedControlState -Context 'authority_committed_control_pair'
         $roster=$controlPair.Roster
+        if($null-ne$taskSupersessionInfrastructure-and$expectedControlState-ceq'active'){
+            # A task rotation must never retire the task still named by the
+            # active immutable roster.  Older setup revisions did so after
+            # proving only a zero Scheduler-instance predecessor, stranding
+            # the active generation because every successor broker is bound
+            # to a different identity.  The committed task-create receipt is
+            # the original create-only authority; restore only that exact task
+            # while the exact active gate/roster and complete successor chain
+            # are continuously retained and cross-bound.
+            $brokerTask=Restore-SynapseActiveBrokerTaskFromCommittedReceipt -Layout $layout -AuthorityInitial $initial -ControlPair $controlPair -TaskSupersessionInfrastructure $taskSupersessionInfrastructure
+        }
         $infrastructure=ConvertTo-SynapseAuthorityInfrastructureFromAdoptionReceipt -Layout $layout -Initial $initial -Validated $validated -BrokerTaskReadback $brokerTask
         $rosterIdentity=[pscustomobject]@{Path=$layout.RosterPath;FileId128=[string]$roster.FileId128;Sha256=[string]$roster.Sha256;Length=[int64]$roster.Length}
         if([string]$record.Journal.Latest.detail.prior_authority -cne [string]$initial.prior_authority -or [string]$record.Journal.Latest.detail.broker_identity_sha256 -ine [string]$initial.broker_identity_sha256){Die "SYNAPSE_AUTHORITY_COMMITTED_DECISION_CROSSBIND_INVALID root=$($record.Entry.Path)"}
         if($expectedControlState -eq 'active'){
             $currentGeneration=ConvertTo-SynapseAuthorityGenerationFromCurrentRoster -Layout $layout -Infrastructure $infrastructure -ControlGate $controlPair.Gate -Roster $roster -Context 'authority_committed_current_generation'
             $currentToken=Read-SynapseAuthorityGenerationToken -Generation $currentGeneration -Context 'authority_committed_current_generation'
-            $proof=Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $currentGeneration -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -Bind ([string]$currentGeneration.RosterPayload.bind) -DbPath ([string]$currentGeneration.RosterPayload.db_path) -ProfilesDir ([string]$currentGeneration.RosterPayload.profiles_dir) -LogDir ([string]$currentGeneration.RosterPayload.log_dir) -Token $currentToken -AllowedPermissions ([string]$currentGeneration.RosterPayload.allowed_permissions) -CalyxConfigPath ([string]$currentGeneration.CalyxConfig.path) -ExpectedCalyxConfigSha256 ([string]$currentGeneration.CalyxConfig.sha256) -TimeoutSeconds $HealthTimeoutSeconds
+            $proof=if($DecommissionStructuralOnly){
+                # Removal must be able to retire an exact committed generation
+                # whose daemon is crash-looping under the current hard resource
+                # policy.  This mode grants no start/adoption authority: the
+                # decommission transaction below independently binds and drains
+                # the exact Scheduler/control/Job/process objects before deletion.
+                [pscustomobject][ordered]@{DaemonPid=0;DecommissionStructuralOnly=$true}
+            }else{
+                Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $currentGeneration -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -Bind ([string]$currentGeneration.RosterPayload.bind) -DbPath ([string]$currentGeneration.RosterPayload.db_path) -ProfilesDir ([string]$currentGeneration.RosterPayload.profiles_dir) -LogDir ([string]$currentGeneration.RosterPayload.log_dir) -Token $currentToken -AllowedPermissions ([string]$currentGeneration.RosterPayload.allowed_permissions) -CalyxConfigPath ([string]$currentGeneration.CalyxConfig.path) -ExpectedCalyxConfigSha256 ([string]$currentGeneration.CalyxConfig.sha256) -TimeoutSeconds $HealthTimeoutSeconds
+            }
         }else{
             $currentGeneration=$null
-            $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $layout -Infrastructure $infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind ([string]$roster.Payload.bind) -DbPath ([string]$roster.Payload.db_path)
+            $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $layout -Infrastructure $infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind ([string]$roster.Payload.bind) -DbPath ([string]$roster.Payload.db_path) -AllowHistoricalPeakForDecommission:$DecommissionStructuralOnly -TimeoutSeconds $(if($DecommissionStructuralOnly){30}else{360})
         }
         Close-SynapseAuthorityActiveControlPair -Pair $controlPair
+        # The committed receipt validator opens exact transition leases while
+        # rehydrating the historical transaction.  They are proof-local: the
+        # returned authority carries immutable identities, not ownership of
+        # those transition handles.  Release them before the next transaction
+        # reopens the live gate/roster under its own continuous lease.
+        Close-SynapseAuthorityControlTransitionLeases -Transitions @($validated.ControlGateTransition,$validated.ActiveRosterTransition,$validated.ParkedRosterTransition,$validated.LegacyMalformedGateTransition,$validated.LegacyDenialTransition,$validated.LegacyGateTransition)
+        Close-SynapseLegacyDenialGateAbsenceLease -AbsencePlan $validated.LegacyGateAbsence
         if($null-ne$taskSupersessionInfrastructure){Close-SynapseBrokerTaskReceiptInfrastructure -Infrastructure $taskSupersessionInfrastructure;$taskSupersessionInfrastructure=$null}
         $generationLabel=if($null -ne $currentGeneration){[string]$currentGeneration.GenerationId}else{'<absent>'};$daemonLabel=if($null -ne $proof.PSObject.Properties['DaemonPid']){[int]$proof.DaemonPid}else{0}
         if($null-ne$predecessorLiveRecord){
@@ -31398,7 +31772,9 @@ function Ensure-SynapseBrokerAuthorityAdopted {
 
     $predecessorReceipt=if($null-ne$predecessor){New-SynapseAuthorityPredecessorReceipt -Predecessor $predecessor}else{$null}
     $legacySupervisor=[System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'))
-    $priorAuthority=if(Test-SynapseScheduledTaskExistsExact -Name $TaskName){'legacy'}else{'absent'}
+    $retainedDeniedLegacyFloor=$null
+    if(Test-SynapseScheduledTaskExistsExact -Name $TaskName){$retainedDeniedLegacyFloor=Get-SynapseRetainedDeniedLegacyFloor -TaskName $TaskName -RuntimeBinDir $RuntimeBinDir -SupervisorPath $legacySupervisor -LogDir $LogDir -Bind $Bind -DbPath $DbPath}
+    $priorAuthority=if($null-ne$retainedDeniedLegacyFloor){'absent'}elseif(Test-SynapseScheduledTaskExistsExact -Name $TaskName){'legacy'}else{'absent'}
     $legacy=$null;$priorHealth=$null;$priorSurface=$null;$priorIdentity=$null
     if($priorAuthority -eq 'legacy'){
         $legacy=Get-SynapseLegacyAuthoritySnapshot -TaskName $TaskName -SupervisorPath $legacySupervisor -LogDir $LogDir -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -MaintenanceLockPath $MaintenanceLockPath -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -Reason 'broker_adoption_fresh'
@@ -31431,9 +31807,10 @@ function Ensure-SynapseBrokerAuthorityAdopted {
     $preTaskControlGate=Get-SynapsePhysicalRelativeState -ParentPath $layout.Root -ParentChain $layout.RootChain -Leaf $layout.ControlGateLeaf
     $preTaskRoster=Get-SynapsePhysicalRelativeState -ParentPath $layout.Root -ParentChain $layout.RootChain -Leaf $layout.RosterLeaf
     $predecessorFloorGate=($null-ne$predecessorReceipt -and [string]$predecessorReceipt.terminal_mode-ceq'fresh_monotonic_floor')
-    $legacyGateAllowed=if($predecessorFloorGate){Test-SynapsePhysicalStateExact -State $preTaskLegacyGate -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_gate.length)}else{-not[bool]$preTaskLegacyGate.Exists}
+    $legacyGateAllowed=if($null-ne$retainedDeniedLegacyFloor){Test-SynapsePhysicalStateExact -State $preTaskLegacyGate -ExpectedExists $true -ExpectedFileId128 ([string]$retainedDeniedLegacyFloor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$retainedDeniedLegacyFloor.legacy_gate.sha256) -ExpectedLength ([int64]$retainedDeniedLegacyFloor.legacy_gate.length)}elseif($predecessorFloorGate){Test-SynapsePhysicalStateExact -State $preTaskLegacyGate -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_gate.length)}else{-not[bool]$preTaskLegacyGate.Exists}
     $legacyDenialAllowed=if($priorAuthority-ceq'legacy'){
         Test-SynapsePhysicalStateExact -State $preTaskLegacyDenial -ExpectedExists $true -ExpectedFileId128 ([string]$legacy.supervisor.file_id_128) -ExpectedSha256 ([string]$legacy.supervisor.sha256) -ExpectedLength ([int64]$legacy.supervisor.length)
+    }elseif($null-ne$retainedDeniedLegacyFloor){Test-SynapsePhysicalStateExact -State $preTaskLegacyDenial -ExpectedExists $true -ExpectedFileId128 ([string]$retainedDeniedLegacyFloor.legacy_denial_stub.file_id_128) -ExpectedSha256 ([string]$retainedDeniedLegacyFloor.legacy_denial_stub.sha256) -ExpectedLength ([int64]$retainedDeniedLegacyFloor.legacy_denial_stub.length)
     }elseif($predecessorFloorGate){
         Test-SynapsePhysicalStateExact -State $preTaskLegacyDenial -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_denial_stub.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_denial_stub.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_denial_stub.length)
     }else{-not[bool]$preTaskLegacyDenial.Exists}
@@ -31452,9 +31829,10 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         $legacyDenialPre=Get-SynapsePhysicalRelativeState -ParentPath $layout.RuntimeBinDir -ParentChain $layout.RuntimeChain -Leaf 'synapse-daemon-supervisor.ps1'
         $controlGatePre=Get-SynapsePhysicalRelativeState -ParentPath $layout.Root -ParentChain $layout.RootChain -Leaf $layout.ControlGateLeaf
         $rosterPre=Get-SynapsePhysicalRelativeState -ParentPath $layout.Root -ParentChain $layout.RootChain -Leaf $layout.RosterLeaf
-        $legacyGateAllowed=if($predecessorFloorGate){Test-SynapsePhysicalStateExact -State $legacyGatePre -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_gate.length)}else{-not[bool]$legacyGatePre.Exists}
+        $legacyGateAllowed=if($null-ne$retainedDeniedLegacyFloor){Test-SynapsePhysicalStateExact -State $legacyGatePre -ExpectedExists $true -ExpectedFileId128 ([string]$retainedDeniedLegacyFloor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$retainedDeniedLegacyFloor.legacy_gate.sha256) -ExpectedLength ([int64]$retainedDeniedLegacyFloor.legacy_gate.length)}elseif($predecessorFloorGate){Test-SynapsePhysicalStateExact -State $legacyGatePre -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_gate.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_gate.length)}else{-not[bool]$legacyGatePre.Exists}
         $legacyDenialAllowed=if($priorAuthority-ceq'legacy'){
             Test-SynapsePhysicalStateExact -State $legacyDenialPre -ExpectedExists $true -ExpectedFileId128 ([string]$legacy.supervisor.file_id_128) -ExpectedSha256 ([string]$legacy.supervisor.sha256) -ExpectedLength ([int64]$legacy.supervisor.length)
+        }elseif($null-ne$retainedDeniedLegacyFloor){Test-SynapsePhysicalStateExact -State $legacyDenialPre -ExpectedExists $true -ExpectedFileId128 ([string]$retainedDeniedLegacyFloor.legacy_denial_stub.file_id_128) -ExpectedSha256 ([string]$retainedDeniedLegacyFloor.legacy_denial_stub.sha256) -ExpectedLength ([int64]$retainedDeniedLegacyFloor.legacy_denial_stub.length)
         }elseif($predecessorFloorGate){
             Test-SynapsePhysicalStateExact -State $legacyDenialPre -ExpectedExists $true -ExpectedFileId128 ([string]$predecessorReceipt.authority_descriptor.legacy_denial_stub.file_id_128) -ExpectedSha256 ([string]$predecessorReceipt.authority_descriptor.legacy_denial_stub.sha256) -ExpectedLength ([int64]$predecessorReceipt.authority_descriptor.legacy_denial_stub.length)
         }else{-not[bool]$legacyDenialPre.Exists}
@@ -31770,7 +32148,7 @@ function Assert-SynapseRuntimeTransactionDescriptor {
     for ($index=0; $index -lt $records.Count; $index++) {
         $record = $records[$index]
         $ordinal = $index + 1
-        $recordProperties = @($record.PSObject.Properties.Name)
+        $recordProperties = @(Get-SynapseObjectPropertyNames -Object $record)
         $expectedRecordProperties = @('path','parent','parent_chain','leaf','pre_existed','pre_file_id_128','pre_sha256','pre_length','post_file_id_128','post_sha256','post_length','stage_leaf','park_leaf','discard_leaf')
         if ($recordProperties.Count -ne $expectedRecordProperties.Count -or
             @($recordProperties | Where-Object { $expectedRecordProperties -cnotcontains $_ }).Count -gt 0) {
@@ -31833,16 +32211,40 @@ function Read-SynapseAuthorityTransitionStageText {
         [Parameter(Mandatory=$true)]$Transition,
         [Parameter(Mandatory=$true)]$Allocation,
         [ValidateRange(1,1048576)][int]$MaximumBytes=65536,
-        [Parameter(Mandatory=$true)][string]$Context
+        [Parameter(Mandatory=$true)][string]$Context,
+        [switch]$AllowDiscardedPost
     )
-    $artifact=$Allocation.Artifacts[[string]$Transition.stage_leaf]
+    $artifact=Get-SynapseObjectPropertyValue -Object $Transition -Names @('StageArtifact','stage_artifact')
+    if($null-eq$artifact){$artifact=$Allocation.Artifacts[[string]$Transition.stage_leaf]}
     if($null -eq $artifact){Die "SYNAPSE_AUTHORITY_TRANSITION_STAGE_ARTIFACT_MISSING context=$Context leaf=$($Transition.stage_leaf)"}
-    $handle=if($null -ne $artifact.PSObject.Properties['handle']){$artifact.handle}else{$null}
+    $handle=Get-SynapseObjectPropertyValue -Object $artifact -Names @('handle','Handle')
+    if($null-eq$handle -and $null-ne$script:SynapseDeploymentAllocationContext -and
+       (Get-SynapseNormalizedDirectoryPath -Path ([string]$script:SynapseDeploymentAllocationContext.Root)) -ieq (Get-SynapseNormalizedDirectoryPath -Path ([string]$Transition.transaction_root)) -and
+       $script:SynapseDeploymentAllocationContext.Artifacts.ContainsKey([string]$Transition.stage_leaf)){
+        $artifact=$script:SynapseDeploymentAllocationContext.Artifacts[[string]$Transition.stage_leaf]
+        $handle=Get-SynapseObjectPropertyValue -Object $artifact -Names @('handle','Handle')
+    }
     if($null -ne $handle){
         $handle.RequireExact("${Context}_retained")
         $read=$handle.ReadUtf8($MaximumBytes)
     }else{
-        $read=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $Transition.transaction_root -ParentChain $Transition.transaction_root_chain -Leaf ([string]$Transition.stage_leaf) -ExpectedFileId128 ([string]$Transition.post_file_id_128) -MaxBytes $MaximumBytes
+        $readParent=[string]$Transition.transaction_root
+        $readChain=@($Transition.transaction_root_chain)
+        $readLeaf=[string]$Transition.stage_leaf
+        if($AllowDiscardedPost){
+            $stageState=Get-SynapseAuthorityControlRootState -Transition $Transition -Leaf $readLeaf
+            if(-not $stageState.Exists){
+                $discardState=Get-SynapseAuthorityControlRootState -Transition $Transition -Leaf ([string]$Transition.discard_leaf)
+                if(Test-SynapsePhysicalStateExact -State $discardState -ExpectedExists $true -ExpectedFileId128 $Transition.post_file_id_128 -ExpectedSha256 $Transition.post_sha256 -ExpectedLength $Transition.post_length){$readLeaf=[string]$Transition.discard_leaf}
+                else{
+                    $canonicalState=Get-SynapsePhysicalRelativeState -ParentPath $Transition.parent -ParentChain $Transition.parent_chain -Leaf $Transition.leaf
+                    if(Test-SynapsePhysicalStateExact -State $canonicalState -ExpectedExists $true -ExpectedFileId128 $Transition.post_file_id_128 -ExpectedSha256 $Transition.post_sha256 -ExpectedLength $Transition.post_length){
+                        $readParent=[string]$Transition.parent;$readChain=@($Transition.parent_chain);$readLeaf=[string]$Transition.leaf
+                    }
+                }
+            }
+        }
+        $read=Read-SynapsePhysicalRelativeUtf8Text -ParentPath $readParent -ParentChain $readChain -Leaf $readLeaf -ExpectedFileId128 ([string]$Transition.post_file_id_128) -MaxBytes $MaximumBytes
     }
     if([string]$read.Sha256 -ine [string]$Transition.post_sha256 -or [int64]$read.Length -ne [int64]$Transition.post_length){
         Die "SYNAPSE_AUTHORITY_TRANSITION_STAGE_READBACK_MISMATCH context=$Context leaf=$($Transition.stage_leaf) expected_sha256=$($Transition.post_sha256) actual_sha256=$($read.Sha256)"
@@ -31856,6 +32258,28 @@ function Read-SynapseAuthorityTransitionPostText {
         [ValidateRange(1,1048576)][int]$MaximumBytes=65536,
         [Parameter(Mandatory=$true)][string]$Context
     )
+    if($null-ne$Transition.CanonicalLease){
+        $Transition.CanonicalLease.RequireExact("${Context}_canonical_owner")
+        if([string]$Transition.CanonicalLease.FileId128-ine[string]$Transition.post_file_id_128-or
+           [string]$Transition.CanonicalLease.Sha256-ine[string]$Transition.post_sha256-or
+           [int64]$Transition.CanonicalLease.Length-ne[int64]$Transition.post_length){
+            Die "SYNAPSE_AUTHORITY_TRANSITION_POST_CANONICAL_OWNER_MISMATCH context=$Context purpose=$($Transition.purpose)"
+        }
+        foreach($alternate in @(
+            [pscustomobject]@{Name='stage';Parent=[string]$Transition.transaction_root;Chain=@($Transition.transaction_root_chain);Leaf=[string]$Transition.stage_leaf},
+            [pscustomobject]@{Name='discard';Parent=[string]$Transition.transaction_root;Chain=@($Transition.transaction_root_chain);Leaf=[string]$Transition.discard_leaf}
+        )){
+            $alternateState=Get-SynapsePhysicalRelativeState -ParentPath $alternate.Parent -ParentChain $alternate.Chain -Leaf $alternate.Leaf
+            if(Test-SynapsePhysicalStateExact -State $alternateState -ExpectedExists $true -ExpectedFileId128 ([string]$Transition.post_file_id_128) -ExpectedSha256 ([string]$Transition.post_sha256) -ExpectedLength ([int64]$Transition.post_length)){
+                Die "SYNAPSE_AUTHORITY_TRANSITION_POST_DUPLICATE context=$Context purpose=$($Transition.purpose) alternate=$($alternate.Name)"
+            }
+        }
+        $ownedRead=$Transition.CanonicalLease.ReadUtf8($MaximumBytes)
+        if([string]$ownedRead.Sha256-ine[string]$Transition.post_sha256-or[int64]$ownedRead.Length-ne[int64]$Transition.post_length){
+            Die "SYNAPSE_AUTHORITY_TRANSITION_POST_READBACK_MISMATCH context=$Context purpose=$($Transition.purpose) location=canonical_owner"
+        }
+        return [string]$ownedRead.Content
+    }
     $locations=@(
         [pscustomobject]@{Name='canonical';Parent=[string]$Transition.parent;Chain=@($Transition.parent_chain);Leaf=[string]$Transition.leaf},
         [pscustomobject]@{Name='stage';Parent=[string]$Transition.transaction_root;Chain=@($Transition.transaction_root_chain);Leaf=[string]$Transition.stage_leaf},
@@ -31973,8 +32397,7 @@ function Read-SynapseCandidateProbePlanFromJournal {
         [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCapabilitySha256,
         [Parameter(Mandatory=$true)][string]$Context
     )
-    $descriptorKeys=@($Descriptor.Keys)
-    $names=if($descriptorKeys.Count-gt0){$descriptorKeys}else{@($Descriptor.PSObject.Properties.Name)}
+    $names=@(Get-SynapseObjectPropertyNames -Object $Descriptor)
     $expected=@('path','file_id_128','sha256','length','candidate_root','candidate_root_file_id_128','task_name','capability_sha256','plan_sha256','execute','arguments','working_directory','explicit_security_descriptor','payload')
     $root=Get-SynapseNormalizedDirectoryPath -Path ([string]$Descriptor.candidate_root)
     $path=[System.IO.Path]::GetFullPath([string]$Descriptor.path)
@@ -32010,15 +32433,14 @@ function Read-SynapseCandidateProbePlanFromJournal {
             $raw=$lease.ReadUtf8(65536)
             if([string]$raw.Sha256 -ine [string]$Descriptor.sha256 -or [int64]$raw.Length -ne [int64]$Descriptor.length -or [string]$raw.Content -cne $payloadText){Die "SYNAPSE_CANDIDATE_PROBE_JOURNAL_PLAN_READBACK_DRIFT context=$Context path=$path"}
         }
-        $payloadKeys=@($payload.Keys)
-        $payloadHasKeys=($payloadKeys.Count-gt0)
-        $payloadNames=if($payloadHasKeys){$payloadKeys}else{@($payload.PSObject.Properties.Name)}
+        $payloadHasKeys=($payload -is [System.Collections.IDictionary])
+        $payloadNames=@(Get-SynapseObjectPropertyNames -Object $payload)
         $payloadExpected=@('schema','state','launch_contract_schema','probe_broker_identity_sha256','capability_sha256','invocation_id','candidate_root','candidate_root_file_id_128','task_name','kind','execute','arguments','working_directory','powershell_path','powershell_file_id_128','powershell_sha256','powershell_length','powershell_descriptor','bootstrap_log_path','user_sid','task_create_flag','task_ignore_registration_triggers_flag_absent','trigger_types','task_instance_semantics','maximum_concurrent_instances','cleanup_requires_zero_running_instances','submitted_task_xml_sha256','explicit_security_descriptor','security_descriptor_readback_flags','bootstrap_file_id_128','bootstrap_sha256','bootstrap_length','supervisor_path','supervisor_file_id_128','supervisor_sha256','supervisor_length','bind','db_path','profiles_dir','token_path','created_at_utc','plan_sha256')
-        $hasSubmittedSemantic=if($payloadHasKeys){@($payload.Keys)-ccontains'submitted_task_semantic_sha256'}else{$null-ne$payload.PSObject.Properties['submitted_task_semantic_sha256']}
+        $hasSubmittedSemantic=($payloadNames -ccontains 'submitted_task_semantic_sha256')
         if($hasSubmittedSemantic){$payloadExpected += 'submitted_task_semantic_sha256'}
         $core=[ordered]@{}
         if($payloadHasKeys){
-            foreach($name in @($payload.Keys)){if([string]$name-cne'plan_sha256'){$core[[string]$name]=$payload[$name]}}
+            foreach($name in @($payloadNames)){if([string]$name-cne'plan_sha256'){$core[[string]$name]=$payload[$name]}}
         }else{
             foreach($property in @($payload.PSObject.Properties)){if([string]$property.Name -cne 'plan_sha256'){$core[[string]$property.Name]=$property.Value}}
         }
@@ -32083,7 +32505,9 @@ function Assert-SynapseBrokerProbeParkInitialDescriptor {
         [Parameter(Mandatory=$true)]$Initial,
         [Parameter(Mandatory=$true)][string]$TransactionRoot,
         [Parameter(Mandatory=$true)]$Allocation,
-        $Layout
+        $Layout,
+        $ExistingGateTransition,
+        $ExistingRosterTransition
     )
     $root=Get-SynapseNormalizedDirectoryPath -Path $TransactionRoot
     $rootChain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $root)
@@ -32101,7 +32525,8 @@ function Assert-SynapseBrokerProbeParkInitialDescriptor {
     }
     $staticCore=[ordered]@{}
     foreach($property in @($Initial.PSObject.Properties)){if([string]$property.Name -cne 'static_transaction_sha256'){$staticCore[[string]$property.Name]=$property.Value}}
-    $computedStatic=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $staticCore)).ToUpperInvariant()
+    $persistedStaticCore=ConvertTo-SynapsePersistedAuthorityHashValue -Value $staticCore
+    $computedStatic=(Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $persistedStaticCore)).ToUpperInvariant()
     if([string]$Initial.static_transaction_sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or [string]$Initial.static_transaction_sha256 -ine $computedStatic){
         Die "SYNAPSE_BROKER_PROBE_PARK_STATIC_HASH_INVALID root=$root expected=$($Initial.static_transaction_sha256) actual=$computedStatic"
     }
@@ -32141,6 +32566,17 @@ function Assert-SynapseBrokerProbeParkInitialDescriptor {
     }
     $gateTransition=ConvertTo-SynapseAuthorityControlTransition -Descriptor $Initial.parked_control_gate_transition -TransactionRoot $root -Allocation $Allocation
     $rosterTransition=ConvertTo-SynapseAuthorityControlTransition -Descriptor $Initial.parked_roster_transition -TransactionRoot $root -Allocation $Allocation
+    foreach($binding in @(
+        [pscustomobject]@{Name='gate';Existing=$ExistingGateTransition;Reconstructed=$gateTransition;Descriptor=$Initial.parked_control_gate_transition},
+        [pscustomobject]@{Name='roster';Existing=$ExistingRosterTransition;Reconstructed=$rosterTransition;Descriptor=$Initial.parked_roster_transition}
+    )){
+        if($null-eq$binding.Existing){continue}
+        $existingDescriptor=Get-SynapseAuthorityControlTransitionDescriptor -Transition $binding.Existing
+        if((Get-SynapseCanonicalJson -Value $existingDescriptor) -cne (Get-SynapseCanonicalJson -Value $binding.Descriptor)){
+            Die "SYNAPSE_BROKER_PROBE_LIVE_TRANSITION_DESCRIPTOR_MISMATCH root=$root role=$($binding.Name)"
+        }
+        if($binding.Name-ceq'gate'){$gateTransition=$binding.Existing}else{$rosterTransition=$binding.Existing}
+    }
     if([string]$gateTransition.path -ine $layout.ControlGatePath -or [string]$rosterTransition.path -ine $layout.RosterPath -or
         -not [bool]$gateTransition.pre_existed -or -not [bool]$rosterTransition.pre_existed -or
         [string]$gateTransition.pre_file_id_128 -ine $currentGate.FileId128 -or [string]$gateTransition.pre_sha256 -ine $currentGate.Sha256 -or [int64]$gateTransition.pre_length -ne $currentGate.Length -or
@@ -32181,7 +32617,8 @@ function Assert-SynapseBrokerApplicationInitialDescriptor {
         [Parameter(Mandatory=$true)][string]$TransactionRoot,
         [Parameter(Mandatory=$true)]$Allocation,
         [string[]]$ExpectedRuntimePaths = @(),
-        $Layout
+        $Layout,
+        [switch]$AllowCommittedDiscardedPost
     )
     $root=Get-SynapseNormalizedDirectoryPath -Path $TransactionRoot
     $names=@($Initial.PSObject.Properties.Name)
@@ -32238,11 +32675,17 @@ function Assert-SynapseBrokerApplicationInitialDescriptor {
        [string]$candidateRoster.pre_file_id_128 -ine $expectedParkRoster.FileId128 -or [string]$candidateRoster.pre_sha256 -ine $expectedParkRoster.Sha256 -or [int64]$candidateRoster.pre_length -ne $expectedParkRoster.Length -or
        [string]$candidateGate.pre_file_id_128 -ine $expectedParkGate.FileId128 -or [string]$candidateGate.pre_sha256 -ine $expectedParkGate.Sha256 -or [int64]$candidateGate.pre_length -ne $expectedParkGate.Length){Die "SYNAPSE_BROKER_APPLICATION_CANDIDATE_CONTROL_CHAIN_INVALID root=$root"}
     $rosterArtifact=$Allocation.Artifacts[[string]$candidateRoster.stage_leaf]
-    $rosterText=if($null -ne $rosterArtifact -and $null -ne $rosterArtifact.PSObject.Properties['handle'] -and $null -ne $rosterArtifact.handle){Read-SynapseAuthorityTransitionStageText -Transition $candidateRoster -Allocation $Allocation -MaximumBytes $script:SynapseAuthorityRosterMaxBytes -Context "app_v4_candidate_roster_$root"}else{Read-SynapseAuthorityTransitionPostText -Transition $candidateRoster -MaximumBytes $script:SynapseAuthorityRosterMaxBytes -Context "app_v4_candidate_roster_$root"}
+    $rosterStageHandle=if($null-ne$rosterArtifact){Get-SynapseObjectPropertyValue -Object $rosterArtifact -Names @('handle','Handle')}else{$null}
+    $rosterStageState=Get-SynapseAuthorityControlRootState -Transition $candidateRoster -Leaf ([string]$candidateRoster.stage_leaf)
+    $rosterHasRetainedStage=($null-ne$rosterStageHandle -and (Test-SynapsePhysicalStateExact -State $rosterStageState -ExpectedExists $true -ExpectedFileId128 $candidateRoster.post_file_id_128 -ExpectedSha256 $candidateRoster.post_sha256 -ExpectedLength $candidateRoster.post_length))
+    $rosterText=if($AllowCommittedDiscardedPost -and -not$rosterHasRetainedStage){Read-SynapseAuthorityTransitionPostText -Transition $candidateRoster -MaximumBytes $script:SynapseAuthorityRosterMaxBytes -Context "app_v4_candidate_roster_$root"}else{Read-SynapseAuthorityTransitionStageText -Transition $candidateRoster -Allocation $Allocation -MaximumBytes $script:SynapseAuthorityRosterMaxBytes -Context "app_v4_candidate_roster_$root"}
     $gateArtifact=$Allocation.Artifacts[[string]$candidateGate.stage_leaf]
-    $gateText=if($null -ne $gateArtifact -and $null -ne $gateArtifact.PSObject.Properties['handle'] -and $null -ne $gateArtifact.handle){Read-SynapseAuthorityTransitionStageText -Transition $candidateGate -Allocation $Allocation -MaximumBytes 65536 -Context "app_v4_candidate_gate_$root"}else{Read-SynapseAuthorityTransitionPostText -Transition $candidateGate -MaximumBytes 65536 -Context "app_v4_candidate_gate_$root"}
+    $gateStageHandle=if($null-ne$gateArtifact){Get-SynapseObjectPropertyValue -Object $gateArtifact -Names @('handle','Handle')}else{$null}
+    $gateStageState=Get-SynapseAuthorityControlRootState -Transition $candidateGate -Leaf ([string]$candidateGate.stage_leaf)
+    $gateHasRetainedStage=($null-ne$gateStageHandle -and (Test-SynapsePhysicalStateExact -State $gateStageState -ExpectedExists $true -ExpectedFileId128 $candidateGate.post_file_id_128 -ExpectedSha256 $candidateGate.post_sha256 -ExpectedLength $candidateGate.post_length))
+    $gateText=if($AllowCommittedDiscardedPost -and -not$gateHasRetainedStage){Read-SynapseAuthorityTransitionPostText -Transition $candidateGate -MaximumBytes 65536 -Context "app_v4_candidate_gate_$root"}else{Read-SynapseAuthorityTransitionStageText -Transition $candidateGate -Allocation $Allocation -MaximumBytes 65536 -Context "app_v4_candidate_gate_$root"}
     $rosterEnvelope=Read-SynapseAuthorityRosterEnvelopeText -Text $rosterText -Context "app_v4_candidate_roster_$root";$gateEnvelope=Read-SynapseAuthorityControlGateEnvelopeText -Text $gateText -ExpectedPath $layout.RosterPath -Context "app_v4_candidate_gate_$root"
-    $generation=$Initial.candidate_generation;$generationNames=@($generation.PSObject.Properties.Name);$generationExpected=@('generation_id','runtime_generation_sha256','profile_generation_sha256','expected_tool_count','expected_tool_surface_sha256','supervisor')
+    $generation=$Initial.candidate_generation;$generationNames=@(Get-SynapseObjectPropertyNames -Object $generation);$generationExpected=@('generation_id','runtime_generation_sha256','profile_generation_sha256','expected_tool_count','expected_tool_surface_sha256','supervisor')
     if($generationNames.Count -ne $generationExpected.Count -or @($generationNames|Where-Object{$generationExpected -cnotcontains $_}).Count -gt 0 -or [string]$generation.generation_id -notmatch '^candidate-[0-9a-f]{40}$' -or [string]$generation.runtime_generation_sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or [string]$generation.profile_generation_sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or [int]$generation.expected_tool_count -lt 1 -or [string]$generation.expected_tool_surface_sha256 -notmatch '^[0-9A-Fa-f]{64}$'){Die "SYNAPSE_BROKER_APPLICATION_CANDIDATE_GENERATION_INVALID root=$root"}
     $supervisor=Assert-SynapseAuthorityFileDescriptorPhysicalIdentity -Descriptor $generation.supervisor -ExpectedRole candidate_generation_supervisor -ExpectedParent $layout.Objects -Context "app_v4_candidate_supervisor_$root"
     $rp=$rosterEnvelope.Payload
@@ -32300,7 +32743,7 @@ function Invoke-SynapseBrokerApplicationRollback {
     $effective=if([string]$journal.State -ceq 'cleanup_ready'){[string]$journal.Latest.detail.terminal_state}else{[string]$journal.State}
     if($effective -eq 'commit_decided'){return [pscustomobject]@{Ok=$false;ForwardRequired=$true;Detail='durable commit decision forbids rollback'}}
     if($effective -notin @('armed','candidate_ready','rolled_back')){Die "SYNAPSE_BROKER_APPLICATION_ROLLBACK_STATE_INVALID root=$($Transaction.Root) state=$($journal.State) effective=$effective"}
-    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -ExpectedRuntimePaths @($Transaction.ExpectedRuntimePaths)
+    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -ExpectedRuntimePaths @($Transaction.ExpectedRuntimePaths) -AllowCommittedDiscardedPost
     Merge-SynapseBrokerApplicationLiveTransitions -Validated $validated -Transaction $Transaction -Initial $journal.Initial
     $plan=Read-SynapseCandidateProbePlanFromJournal -Descriptor $journal.Initial.installed_probe_plan -ExpectedCapabilitySha256 ([string]$journal.Initial.installed_probe_plan.capability_sha256) -Context 'app_v4_rollback_probe'
     try{[void](Remove-SynapseJournalBoundCandidateProbeTask -Plan $plan -Context 'app_v4_rollback_probe');Wait-SynapseBindReleased -Reason 'app_v4_rollback_probe' -Bind ([string]$plan.Payload.bind) -TimeoutSeconds 30}finally{if($null -ne $plan.Lease){$plan.Lease.Dispose()}}
@@ -32344,7 +32787,16 @@ function Assert-SynapseBrokerApplicationPriorOperational {
             return [pscustomobject]@{DaemonPid=[int]$proof.DaemonPid;Generation=$generation;Proof=$proof;PriorAuthority='present'}
         }finally{Close-SynapseAuthorityActiveControlPair -Pair $pair}
     }
-    $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context "${Context}_fresh_pair"
+    $gateLease=$null;$rosterLease=$null
+    foreach($transition in @($Validated.CandidateGateTransition,$Validated.ParkedGateTransition)){
+        if($null-ne$transition){foreach($name in @('RestoredLease','PreLease','CanonicalLease')){if($null-ne$transition.$name){$gateLease=$transition.$name;break}}}
+        if($null-ne$gateLease){break}
+    }
+    foreach($transition in @($Validated.CandidateRosterTransition,$Validated.ParkedRosterTransition)){
+        if($null-ne$transition){foreach($name in @('RestoredLease','PreLease','CanonicalLease')){if($null-ne$transition.$name){$rosterLease=$transition.$name;break}}}
+        if($null-ne$rosterLease){break}
+    }
+    $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -GateLease $gateLease -RosterLease $rosterLease -ExpectedState parked -Context "${Context}_fresh_pair"
     try{
         $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity $Validated.CurrentControlGate -RosterIdentity $Validated.CurrentRoster -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$Initial.bind) -DbPath ([string]$Initial.db_path)
         return [pscustomobject]@{DaemonPid=0;Generation=$null;Proof=$proof;PriorAuthority='absent'}
@@ -32373,7 +32825,11 @@ function Merge-SynapseBrokerApplicationLiveTransitions {
         $Validated.$property=$live
     }
     if($null -ne $Transaction.PSObject.Properties['RuntimePlan'] -and $null -ne $Transaction.RuntimePlan){
-        if((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $Transaction.RuntimePlan.Descriptor)) -cne (Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $Initial.runtime_transaction))){
+        $liveRuntimeDescriptor=$Transaction.RuntimePlan.Descriptor
+        $declaredRuntimeDescriptor=$Initial.runtime_transaction
+        if([string]$liveRuntimeDescriptor.static_plan_sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+           [string]$liveRuntimeDescriptor.static_plan_sha256 -ine [string]$declaredRuntimeDescriptor.static_plan_sha256 -or
+           (Get-SynapseNormalizedDirectoryPath -Path ([string]$liveRuntimeDescriptor.transaction_root)) -ine (Get-SynapseNormalizedDirectoryPath -Path ([string]$declaredRuntimeDescriptor.transaction_root))){
             Die "SYNAPSE_BROKER_APPLICATION_LIVE_RUNTIME_DESCRIPTOR_MISMATCH root=$($Transaction.Root)"
         }
         $Validated.RuntimePlan=$Transaction.RuntimePlan
@@ -32430,16 +32886,57 @@ function Invoke-SynapseBrokerApplicationForwardControlChain {
     )
     $canonical=Get-SynapsePhysicalRelativeState -ParentPath $DownstreamTransition.parent -ParentChain $DownstreamTransition.parent_chain -Leaf $DownstreamTransition.leaf
     $candidateIsPost=Test-SynapsePhysicalStateExact -State $canonical -ExpectedExists $true -ExpectedFileId128 $DownstreamTransition.post_file_id_128 -ExpectedSha256 $DownstreamTransition.post_sha256 -ExpectedLength $DownstreamTransition.post_length
+    if(-not $candidateIsPost){
+        $stage=Get-SynapseAuthorityControlRootState -Transition $DownstreamTransition -Leaf $DownstreamTransition.stage_leaf
+        $discard=Get-SynapseAuthorityControlRootState -Transition $DownstreamTransition -Leaf $DownstreamTransition.discard_leaf
+        $discardIsPost=Test-SynapsePhysicalStateExact -State $discard -ExpectedExists $true -ExpectedFileId128 $DownstreamTransition.post_file_id_128 -ExpectedSha256 $DownstreamTransition.post_sha256 -ExpectedLength $DownstreamTransition.post_length
+        if(-not $stage.Exists -and $discardIsPost){
+            $artifact=$Allocation.Artifacts[[string]$DownstreamTransition.stage_leaf]
+            if($null-eq$artifact){Die "SYNAPSE_BROKER_APPLICATION_FORWARD_STAGE_DESCRIPTOR_MISSING context=$Context leaf=$($DownstreamTransition.stage_leaf)"}
+            $lease=Open-SynapsePhysicalFileTransitionLease -ParentPath $DownstreamTransition.transaction_root -ParentChain $DownstreamTransition.transaction_root_chain -Leaf $DownstreamTransition.discard_leaf -ExpectedFileId128 $DownstreamTransition.post_file_id_128 -ExpectedSha256 $DownstreamTransition.post_sha256 -ExpectedLength $DownstreamTransition.post_length -Context "${Context}_recover_discarded_post"
+            try{
+                [void]$lease.MoveNoReplace($Allocation.Root,(Get-SynapsePhysicalChainPaths -Chain $Allocation.RootChain),(Get-SynapsePhysicalChainFileIds -Chain $Allocation.RootChain),[string]$DownstreamTransition.stage_leaf)
+                if($null-eq$artifact.PSObject.Properties['handle']){$artifact|Add-Member -NotePropertyName handle -NotePropertyValue $lease}else{$artifact.handle=$lease}
+                $lease=$null
+            }finally{if($null-ne$lease){$lease.Dispose()}}
+        }
+    }
     if(-not $candidateIsPost -and $null -ne $UpstreamTransition){
         $downstreamPark=Get-SynapseAuthorityControlRootState -Transition $DownstreamTransition -Leaf $DownstreamTransition.park_leaf
         $downstreamParkIsPre=Test-SynapsePhysicalStateExact -State $downstreamPark -ExpectedExists $true -ExpectedFileId128 $DownstreamTransition.pre_file_id_128 -ExpectedSha256 $DownstreamTransition.pre_sha256 -ExpectedLength $DownstreamTransition.pre_length
         if(-not $downstreamParkIsPre){
-            [void](Invoke-SynapseAuthorityControlTransition -Transition $UpstreamTransition -AllocationContext $Allocation)
+            [void](Invoke-SynapseAuthorityControlTransition -Transition $UpstreamTransition -AllocationContext $Allocation -ForwardOnly)
             Move-SynapseAuthorityControlLeaseForward -FromTransition $UpstreamTransition -ToTransition $DownstreamTransition
         }
     }
-    [void](Invoke-SynapseAuthorityControlTransition -Transition $DownstreamTransition -AllocationContext $Allocation)
+    [void](Invoke-SynapseAuthorityControlTransition -Transition $DownstreamTransition -AllocationContext $Allocation -ForwardOnly)
     return $DownstreamTransition.CanonicalLease
+}
+
+function Restore-SynapseBrokerApplicationCommittedDiscardedPost {
+    param(
+        [Parameter(Mandatory=$true)]$Descriptor,
+        [Parameter(Mandatory=$true)][string]$TransactionRoot,
+        [Parameter(Mandatory=$true)]$Allocation,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+    $transition=ConvertTo-SynapseAuthorityControlTransition -Descriptor $Descriptor -TransactionRoot $TransactionRoot -Allocation $Allocation
+    $stage=Get-SynapseAuthorityControlRootState -Transition $transition -Leaf $transition.stage_leaf
+    if($stage.Exists){return}
+    $discard=Get-SynapseAuthorityControlRootState -Transition $transition -Leaf $transition.discard_leaf
+    if(-not (Test-SynapsePhysicalStateExact -State $discard -ExpectedExists $true -ExpectedFileId128 $transition.post_file_id_128 -ExpectedSha256 $transition.post_sha256 -ExpectedLength $transition.post_length)){return}
+    $canonical=Get-SynapsePhysicalRelativeState -ParentPath $transition.parent -ParentChain $transition.parent_chain -Leaf $transition.leaf
+    if(-not (Test-SynapsePhysicalStateExact -State $canonical -ExpectedExists ([bool]$transition.pre_existed) -ExpectedFileId128 $transition.pre_file_id_128 -ExpectedSha256 $transition.pre_sha256 -ExpectedLength $transition.pre_length)){
+        Die "SYNAPSE_BROKER_APPLICATION_COMMITTED_DISCARD_RECOVERY_CANONICAL_DRIFT context=$Context path=$($transition.path)"
+    }
+    $artifact=$Allocation.Artifacts[[string]$transition.stage_leaf]
+    $lease=Open-SynapsePhysicalFileTransitionLease -ParentPath $transition.transaction_root -ParentChain $transition.transaction_root_chain -Leaf $transition.discard_leaf -ExpectedFileId128 $transition.post_file_id_128 -ExpectedSha256 $transition.post_sha256 -ExpectedLength $transition.post_length -Context "${Context}_discard"
+    try{
+        [void]$lease.MoveNoReplace($Allocation.Root,(Get-SynapsePhysicalChainPaths -Chain $Allocation.RootChain),(Get-SynapsePhysicalChainFileIds -Chain $Allocation.RootChain),[string]$transition.stage_leaf)
+        if($null-eq$artifact.PSObject.Properties['handle']){$artifact|Add-Member -NotePropertyName handle -NotePropertyValue $lease}else{$artifact.handle=$lease}
+        $lease=$null
+    }finally{if($null-ne$lease){$lease.Dispose()}}
+    Info "SYNAPSE_BROKER_APPLICATION_COMMITTED_DISCARDED_POST_RESTORED context=$Context leaf=$($transition.stage_leaf) file_id_128=$($transition.post_file_id_128)"
 }
 
 function Complete-SynapseBrokerApplicationCommittedGeneration {
@@ -32451,7 +32948,29 @@ function Complete-SynapseBrokerApplicationCommittedGeneration {
     $journal=Read-SynapseDeploymentTransactionJournal -TransactionRoot $Transaction.Root -TransactionRootChain $Transaction.RootChain
     $effective=if([string]$journal.State -ceq 'cleanup_ready'){[string]$journal.Latest.detail.terminal_state}else{[string]$journal.State}
     if($effective -ne 'commit_decided'){Die "SYNAPSE_BROKER_APPLICATION_FORWARD_STATE_INVALID root=$($Transaction.Root) state=$($journal.State) effective=$effective"}
-    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -ExpectedRuntimePaths @($Transaction.ExpectedRuntimePaths)
+    Restore-SynapseBrokerApplicationCommittedDiscardedPost -Descriptor $journal.Initial.candidate_roster_transition -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -Context 'app_v4_candidate_roster'
+    Restore-SynapseBrokerApplicationCommittedDiscardedPost -Descriptor $journal.Initial.candidate_control_gate_transition -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -Context 'app_v4_candidate_gate'
+    # In the no-crash commit path the live transitions retain the stage files
+    # with deny-write sharing until publication completes. Crossbind those
+    # descriptors before lending their exact read handles to the reconstructed
+    # journal view; crash recovery has no live handles and instead locates the
+    # sole exact postimage on disk.
+    foreach($binding in @(
+        @('CandidateRosterTransition','candidate_roster_transition'),
+        @('CandidateGateTransition','candidate_control_gate_transition')
+    )){
+        $property=[string]$binding[0];$initialProperty=[string]$binding[1]
+        if($null-eq$Transaction.PSObject.Properties[$property]-or$null-eq$Transaction.$property){continue}
+        $live=$Transaction.$property;$declared=$journal.Initial.$initialProperty
+        if((Get-SynapseCanonicalJson -Value (Get-SynapseAuthorityControlTransitionDescriptor $live)) -cne (Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $declared))){Die "SYNAPSE_BROKER_APPLICATION_LIVE_TRANSITION_DESCRIPTOR_MISMATCH property=$property root=$($Transaction.Root)"}
+        $liveArtifact=Get-SynapseObjectPropertyValue -Object $live -Names @('StageArtifact','stage_artifact')
+        $liveHandle=if($null-ne$liveArtifact){Get-SynapseObjectPropertyValue -Object $liveArtifact -Names @('handle','Handle')}else{$null}
+        if($null-ne$liveHandle){
+            $journalArtifact=$journal.Allocation.Artifacts[[string]$declared.stage_leaf]
+            if($null-eq$journalArtifact.PSObject.Properties['handle']){$journalArtifact|Add-Member -NotePropertyName handle -NotePropertyValue $liveHandle}else{$journalArtifact.handle=$liveHandle}
+        }
+    }
+    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot $Transaction.Root -Allocation $journal.Allocation -ExpectedRuntimePaths @($Transaction.ExpectedRuntimePaths) -AllowCommittedDiscardedPost
     Merge-SynapseBrokerApplicationLiveTransitions -Validated $validated -Transaction $Transaction -Initial $journal.Initial
     $script:SynapseDeploymentTransaction=$Transaction
     Complete-SynapseRuntimeCommittedGeneration -RuntimePlan $validated.RuntimePlan
@@ -32566,8 +33085,8 @@ function Invoke-SynapseBrokerApplicationDeployment {
         $journal=Write-SynapseDeploymentTransactionJournalSlot -TransactionRoot $root -TransactionRootChain $rootChain -Sequence 1 -InvocationId $script:SynapseSetupInvocationId -PreviousSlotSha256 '' -Payload $initial
         $localTransaction=[pscustomobject][ordered]@{Armed=$true;Committed=$false;RollbackInProgress=$false;RolledBack=$false;AuthorityModel='immutable_broker/v1';Authority=$Authority;Root=$root;RootChain=$rootChain;ParentRoot=$DeploymentTransactionParent;InvocationId=$script:SynapseSetupInvocationId;JournalSequence=1;JournalSha256=$journal.LatestRawSha256;JournalState='armed';StaticTransactionSha256=$initial.static_transaction_sha256;Bind=$Bind;DbPath=$DbPath;TokenPath=$TokenPath;ExpectedRuntimePaths=$runtimeExpectedPaths;RuntimeTransaction=$runtimePlan.Descriptor;RuntimePlan=$runtimePlan;ProfileTransaction=$profilePlan.Descriptor;ProfileGenerationLease=$null;AllocationContext=$allocation;ParkedGateTransition=$parkedGateTransition;ParkedRosterTransition=$parkedRosterTransition;CandidateGateTransition=$candidateGateTransition;CandidateRosterTransition=$candidateRosterTransition;PreviousTask=$null}
         $script:SynapseDeploymentTransaction=$localTransaction
-        if($null -ne $profileGuard){$profileGuard.CompleteCleanGuard();$profileGuard=$null}
-        foreach($guard in @($runtimeGuards)){if($null -ne $guard){$guard.CompleteCleanGuard()}};$runtimeGuards=@()
+        if($null -ne $profileGuard){$profileGuard.CompleteCleanGuard();$profileGuard.Dispose();$profileGuard=$null}
+        foreach($guard in @($runtimeGuards)){if($null -ne $guard){$guard.CompleteCleanGuard();$guard.Dispose()}};$runtimeGuards=@()
         if($priorAuthority -ceq 'present'){
             [void](Invoke-SynapseAuthorityControlTransition -Transition $parkedGateTransition -AllocationContext $allocation)
             [void](Invoke-SynapseAuthorityControlTransition -Transition $parkedRosterTransition -AllocationContext $allocation)
@@ -32721,7 +33240,7 @@ function Recover-SynapseBrokerApplicationTransaction {
 
     if($effective -notin @('armed','candidate_ready','commit_decided','rolled_back')){Die "SYNAPSE_BROKER_APPLICATION_RECOVERY_STATE_INVALID root=$root state=$($journal.State)"}
     $runtimePaths=@($initial.runtime_expected_paths|ForEach-Object{[System.IO.Path]::GetFullPath([string]$_)})
-    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $initial -TransactionRoot $root -Allocation $journal.Allocation -ExpectedRuntimePaths $runtimePaths
+    $validated=Assert-SynapseBrokerApplicationInitialDescriptor -Initial $initial -TransactionRoot $root -Allocation $journal.Allocation -ExpectedRuntimePaths $runtimePaths -AllowCommittedDiscardedPost:($effective-ceq'commit_decided')
     $transaction=[pscustomobject][ordered]@{
         Armed=$true;Committed=($effective -ceq 'commit_decided');RollbackInProgress=$false;RolledBack=($effective -ceq 'rolled_back')
         AuthorityModel='immutable_broker/v1';Authority=$Authority;Root=$root;RootChain=$rootChain;ParentRoot=$expectedParentFull
@@ -32917,12 +33436,19 @@ function Resolve-SynapseBrokerOperatorStopTransaction {
             return [pscustomobject][ordered]@{Exists=$false;Stopped=$false;Restored=$true}
         }
         if($effective -ceq 'armed'){
-            $restored=Restore-SynapseBrokerOperatorStoppedGeneration -Record $record -Authority $Authority -HealthTimeoutSeconds $HealthTimeoutSeconds -Context 'operator_stop_armed_recovery'
-            [void](Add-SynapseDeploymentTransactionJournalState -State rolled_back -Payload ([ordered]@{operator_stop_aborted=$true;broker_identity_sha256=[string]$Authority.Infrastructure.BrokerIdentitySha256;generation_id=[string]$restored.Generation.GenerationId;prior_operational=$true;daemon_pid=[int]$restored.Proof.DaemonPid;unknown_objects_preserved=$true}) -Transaction $transaction)
-            Close-SynapseAuthorityControlTransitionLeases -Transitions @($record.Validated.GateTransition,$record.Validated.RosterTransition)
-            Close-SynapseDeploymentAllocationHandles -Context $journal.Allocation -PayloadsOnly
-            [void](Remove-SynapseDeploymentTransactionArtifact -Path $transaction.Root -ExpectedRoot $Authority.Layout.Operations -ExpectedState rolled_back -Reason 'operator_stop_armed_recovery_cleanup' -Domain authority)
-            return [pscustomobject][ordered]@{Exists=$false;Stopped=$false;Restored=$true;Generation=$restored.Generation;Proof=$restored.Proof}
+            if($Mode-ceq'remove'){
+                $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'operator_stop_armed_remove_pair'
+                try{$parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$journal.Initial.bind) -DbPath ([string]$journal.Initial.db_path) -AllowHistoricalPeakForDecommission -TimeoutSeconds 30}finally{Close-SynapseAuthorityActiveControlPair -Pair $pair}
+                [void](Add-SynapseDeploymentTransactionJournalState -State candidate_ready -Payload ([ordered]@{operator_stopped=$true;broker_identity_sha256=[string]$Authority.Infrastructure.BrokerIdentitySha256;generation_id=[string]$journal.Initial.generation_id;parked_authority_proven=$true;daemon_count=0;listener_count=0;recovered_from_armed_cut=$true}) -Transaction $transaction)
+                $effective='candidate_ready';$journal=Read-SynapseDeploymentTransactionJournal -TransactionRoot $transaction.Root
+            }else{
+                $restored=Restore-SynapseBrokerOperatorStoppedGeneration -Record $record -Authority $Authority -HealthTimeoutSeconds $HealthTimeoutSeconds -Context 'operator_stop_armed_recovery'
+                [void](Add-SynapseDeploymentTransactionJournalState -State rolled_back -Payload ([ordered]@{operator_stop_aborted=$true;broker_identity_sha256=[string]$Authority.Infrastructure.BrokerIdentitySha256;generation_id=[string]$restored.Generation.GenerationId;prior_operational=$true;daemon_pid=[int]$restored.Proof.DaemonPid;unknown_objects_preserved=$true}) -Transaction $transaction)
+                Close-SynapseAuthorityControlTransitionLeases -Transitions @($record.Validated.GateTransition,$record.Validated.RosterTransition)
+                Close-SynapseDeploymentAllocationHandles -Context $journal.Allocation -PayloadsOnly
+                [void](Remove-SynapseDeploymentTransactionArtifact -Path $transaction.Root -ExpectedRoot $Authority.Layout.Operations -ExpectedState rolled_back -Reason 'operator_stop_armed_recovery_cleanup' -Domain authority)
+                return [pscustomobject][ordered]@{Exists=$false;Stopped=$false;Restored=$true;Generation=$restored.Generation;Proof=$restored.Proof}
+            }
         }
         if($effective -ceq 'candidate_ready' -and $Mode -ceq 'inspect'){
             $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'operator_stop_persistent_pair'
@@ -32944,7 +33470,7 @@ function Resolve-SynapseBrokerOperatorStopTransaction {
             if($removeDecided){
                 $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context "operator_${Mode}_decommission_pair"
                 try{
-                    [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$journal.Initial.bind) -DbPath ([string]$journal.Initial.db_path))
+                    [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$pair.Gate.Path;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$pair.Roster.Path;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -Bind ([string]$journal.Initial.bind) -DbPath ([string]$journal.Initial.db_path) -AllowHistoricalPeakForDecommission)
                 }finally{Close-SynapseAuthorityActiveControlPair -Pair $pair}
                 Close-SynapseAuthorityControlTransitionLeases -Transitions @($record.Validated.GateTransition,$record.Validated.RosterTransition)
                 Close-SynapseDeploymentAllocationHandles -Context $journal.Allocation -PayloadsOnly
@@ -32966,6 +33492,7 @@ function Invoke-SynapseBrokerOperatorStop {
         [Parameter(Mandatory=$true)]$Authority,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
+        [switch]$Decommission,
         [ValidateRange(30,900)][int]$HealthTimeoutSeconds=420
     )
     $authorityTaskDescriptor=ConvertTo-SynapseAuthorityTaskDescriptor -Task $Authority.BrokerTask
@@ -32975,7 +33502,7 @@ function Invoke-SynapseBrokerOperatorStop {
     if($null -eq $Authority.CurrentGeneration){
         $parkedPair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'operator_stop_inert_pair'
         try{
-            $parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$parkedPair.Gate.Path;FileId128=$parkedPair.Gate.FileId128;Sha256=$parkedPair.Gate.Sha256;Length=$parkedPair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$parkedPair.Roster.Path;FileId128=$parkedPair.Roster.FileId128;Sha256=$parkedPair.Roster.Sha256;Length=$parkedPair.Roster.Length}) -ControlGateLease $parkedPair.GateLease -RosterLease $parkedPair.RosterLease -Bind $Bind -DbPath $DbPath
+            $parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$parkedPair.Gate.Path;FileId128=$parkedPair.Gate.FileId128;Sha256=$parkedPair.Gate.Sha256;Length=$parkedPair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$parkedPair.Roster.Path;FileId128=$parkedPair.Roster.FileId128;Sha256=$parkedPair.Roster.Sha256;Length=$parkedPair.Roster.Length}) -ControlGateLease $parkedPair.GateLease -RosterLease $parkedPair.RosterLease -Bind $Bind -DbPath $DbPath -AllowHistoricalPeakForDecommission:$Decommission
             return [pscustomobject][ordered]@{Exists=$false;Stopped=$true;Restored=$false;GenerationId='';Root='';Proof=$parkedProof}
         }finally{Close-SynapseAuthorityActiveControlPair -Pair $parkedPair}
     }
@@ -33009,7 +33536,7 @@ function Invoke-SynapseBrokerOperatorStop {
         [void](Invoke-SynapseAuthorityControlTransition -Transition $gateTransition -AllocationContext $allocation)
         [void](Invoke-SynapseAuthorityControlTransition -Transition $rosterTransition -AllocationContext $allocation)
         $parkedPair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -GateLease $gateTransition.CanonicalLease -RosterLease $rosterTransition.CanonicalLease -ExpectedState parked -Context 'operator_stop_parked_pair'
-        try{$parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$parkedPair.Gate.Path;FileId128=$parkedPair.Gate.FileId128;Sha256=$parkedPair.Gate.Sha256;Length=$parkedPair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$parkedPair.Roster.Path;FileId128=$parkedPair.Roster.FileId128;Sha256=$parkedPair.Roster.Sha256;Length=$parkedPair.Roster.Length}) -ControlGateLease $parkedPair.GateLease -RosterLease $parkedPair.RosterLease -Bind ([string]$p.bind) -DbPath ([string]$p.db_path)}finally{Close-SynapseAuthorityActiveControlPair -Pair $parkedPair}
+        try{$parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$parkedPair.Gate.Path;FileId128=$parkedPair.Gate.FileId128;Sha256=$parkedPair.Gate.Sha256;Length=$parkedPair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$parkedPair.Roster.Path;FileId128=$parkedPair.Roster.FileId128;Sha256=$parkedPair.Roster.Sha256;Length=$parkedPair.Roster.Length}) -ControlGateLease $parkedPair.GateLease -RosterLease $parkedPair.RosterLease -Bind ([string]$p.bind) -DbPath ([string]$p.db_path) -AllowHistoricalPeakForDecommission:$Decommission}finally{Close-SynapseAuthorityActiveControlPair -Pair $parkedPair}
         [void](Add-SynapseDeploymentTransactionJournalState -State candidate_ready -Payload ([ordered]@{operator_stopped=$true;broker_identity_sha256=[string]$Authority.Infrastructure.BrokerIdentitySha256;generation_id=[string]$generation.GenerationId;parked_authority_proven=$true;daemon_count=0;listener_count=0}) -Transaction $transaction)
         Close-SynapseAuthorityControlTransitionLeases -Transitions @($gateTransition,$rosterTransition);Close-SynapseDeploymentAllocationHandles -Context $allocation
         return [pscustomobject][ordered]@{Exists=$true;Stopped=$true;Restored=$false;GenerationId=[string]$generation.GenerationId;Root=$root;Proof=$parkedProof}
@@ -33041,6 +33568,7 @@ function Get-SynapseBrokerAuthorityForOperatorLifecycle {
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
         [switch]$AllowMissingTokenWhenParked,
+        [switch]$DecommissionStructuralOnly,
         [AllowNull()]$ExpectedTokenAuthority,
         [ValidateRange(60,900)][int]$HealthTimeoutSeconds=420
     )
@@ -33072,7 +33600,7 @@ function Get-SynapseBrokerAuthorityForOperatorLifecycle {
         $powerShellPath=[System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
         $bootstrapHint=[System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir 'synapse-supervisor-bootstrap.exe'))
         $configHint=[System.IO.Path]::GetFullPath((Join-Path $RuntimeBinDir '.broker-committed-receipt-config-placeholder'))
-        $authority=Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $bootstrapHint -PowerShellPath $powerShellPath -WorkingDirectory $RuntimeBinDir -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $authorityToken -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $configHint -ExpectedCalyxConfigSha256 ('0'*64) -EnableAudio:$false -AllowedPermissions '' -RequireCommitted -AllowMissingTokenWhenParked:$tokenMissing -HealthTimeoutSeconds $HealthTimeoutSeconds
+        $authority=Ensure-SynapseBrokerAuthorityAdopted -RuntimeBinDir $RuntimeBinDir -BootstrapSourcePath $bootstrapHint -PowerShellPath $powerShellPath -WorkingDirectory $RuntimeBinDir -LogDir $LogDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Token $authorityToken -MaintenanceLockPath $MaintenanceLockPath -CalyxConfigPath $configHint -ExpectedCalyxConfigSha256 ('0'*64) -EnableAudio:$false -AllowedPermissions '' -RequireCommitted -DecommissionStructuralOnly:$DecommissionStructuralOnly -AllowMissingTokenWhenParked:$tokenMissing -HealthTimeoutSeconds $HealthTimeoutSeconds
         if($tokenMissing-and$null-ne$authority.CurrentGeneration){Die 'SYNAPSE_BROKER_AUTHORITY_MISSING_TOKEN_ACTIVE_GENERATION_REFUSED'}
         if($null-ne$tokenBoundaryLease){$tokenBoundaryLease.RequireExact('broker_operator_lifecycle_token_readback')}else{[void](Open-SynapseBrokerDecommissionTokenAuthorityBoundary -Descriptor $tokenAuthority -ExpectedPath $TokenPath -Context 'broker_operator_lifecycle_token_readback')}
         $authority|Add-Member -NotePropertyName TokenAuthority -NotePropertyValue (ConvertTo-SynapseCanonicalValue -Value $tokenAuthority) -Force
@@ -33117,7 +33645,7 @@ function Assert-SynapseBrokerDecommissionMissingTokenGlobalPreflight {
         $authority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -AllowMissingTokenWhenParked -ExpectedTokenAuthority $tokenAuthority -HealthTimeoutSeconds $HealthTimeoutSeconds
         if($null-ne$authority.CurrentGeneration-or$null-eq$authority.PSObject.Properties['TokenAuthority']-or(Get-SynapseCanonicalJson -Value $authority.TokenAuthority)-cne(Get-SynapseCanonicalJson -Value $tokenAuthority)){Die 'SYNAPSE_BROKER_DECOMMISSION_PRE_GLOBAL_PARKED_AUTHORITY_INVALID'}
         $inventory=Get-SynapseGlobalRecoveryInventory -LogDir $LogDir -ProfilesDir $ProfilesDir -RuntimeBinDir $RuntimeBinDir
-        $prerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $inventory -TaskInfrastructure $authority.Infrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName
+        $prerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $inventory -TaskInfrastructure $authority.Infrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName -DecommissionStructuralOnly
         $selection=Select-SynapseGlobalRecoveryAction -Inventory $inventory -Mode setup
         $terminalV1=@($inventory.V1|Where-Object{[string]$_.State-in@('committed','rolled_back')})
         $terminalV3=@($inventory.LegacyV3|Where-Object{[string]$_.EffectiveState-ceq'rolled_back'})
@@ -33200,6 +33728,13 @@ function Invoke-SynapseBrokerSourceCandidateProbe {
             $gateTransition.PreLease=$pair.GateLease;$pair.GateLease=$null;$pair.OwnsGateLease=$false
             $rosterTransition.PreLease=$pair.RosterLease;$pair.RosterLease=$null;$pair.OwnsRosterLease=$false
             Close-SynapseAuthorityActiveControlPair -Pair $pair;$pair=$null
+        }else{
+            # The immutable initial descriptor below carries the exact current
+            # identities.  Do not retain the construction read leases while
+            # its validator independently reopens those files.  Reacquire a
+            # fresh continuous pair after journal publication for the probe's
+            # actual mutation/observation boundary.
+            Close-SynapseAuthorityActiveControlPair -Pair $pair;$pair=$null
         }
         $allocationRecord=Complete-SynapseDeploymentAllocationLog -Context $allocation
         $initial=[ordered]@{schema='synapse_broker_probe_park_transaction/v1';state='armed';transaction_kind='synapse_broker_probe_park/v1';invocation_id=$script:SynapseSetupInvocationId;armed_at_utc=[DateTime]::UtcNow.ToString('o');transaction_root=$root;transaction_root_file_id_128=([string]$created.FileId128).ToUpperInvariant();allocation_marker=$allocationRecord;runtime_bin_dir=$Authority.Layout.RuntimeBinDir;profiles_dir=[System.IO.Path]::GetFullPath($ProfilesDir);bind=$Bind;db_path=[System.IO.Path]::GetFullPath($DbPath);token_path=[System.IO.Path]::GetFullPath($TokenPath);broker_identity_sha256=$Authority.Infrastructure.BrokerIdentitySha256;broker_task_capability_sha256=([string]$Authority.Infrastructure.TaskCapabilitySha256).ToUpperInvariant();authority_epoch=[int64]$p.authority_epoch;control_nonce=([string]$p.control_nonce).ToUpperInvariant();broker_task=$authorityTaskDescriptor;prior_authority=$priorAuthority;current_generation_id=$(if($priorAuthority -ceq 'present'){[string]$Authority.CurrentGeneration.GenerationId}else{''});current_control_gate=(ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $currentGateIdentity);current_roster=(ConvertTo-SynapseAuthorityIdentityDescriptor -Identity $currentRosterIdentity);parked_control_gate_transition=$(if($null -ne $gateTransition){Get-SynapseAuthorityControlTransitionDescriptor $gateTransition}else{$null});parked_roster_transition=$(if($null -ne $rosterTransition){Get-SynapseAuthorityControlTransitionDescriptor $rosterTransition}else{$null});probe_capability_sha256=$probeCapability}
@@ -33212,20 +33747,30 @@ function Invoke-SynapseBrokerSourceCandidateProbe {
             [void](Invoke-SynapseAuthorityControlTransition -Transition $rosterTransition -AllocationContext $allocation)
             $parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$Authority.Layout.ControlGatePath;FileId128=$gateTransition.post_file_id_128;Sha256=$gateTransition.post_sha256;Length=$gateTransition.post_length}) -RosterIdentity ([pscustomobject]@{Path=$Authority.Layout.RosterPath;FileId128=$rosterTransition.post_file_id_128;Sha256=$rosterTransition.post_sha256;Length=$rosterTransition.post_length}) -ControlGateLease $gateTransition.CanonicalLease -RosterLease $rosterTransition.CanonicalLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind ([string]$p.bind) -DbPath ([string]$p.db_path)
         }else{
+            $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context "source_probe_fresh_boundary_$root"
+            if([string]$pair.Gate.FileId128-ine$currentGateIdentity.FileId128 -or [string]$pair.Gate.Sha256-ine$currentGateIdentity.Sha256 -or [int64]$pair.Gate.Length-ne$currentGateIdentity.Length -or
+               [string]$pair.Roster.FileId128-ine$currentRosterIdentity.FileId128 -or [string]$pair.Roster.Sha256-ine$currentRosterIdentity.Sha256 -or [int64]$pair.Roster.Length-ne$currentRosterIdentity.Length){Die "SYNAPSE_BROKER_SOURCE_PROBE_FRESH_BOUNDARY_DRIFT root=$root"}
             $parkedProof=Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$Authority.Layout.ControlGatePath;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$Authority.Layout.RosterPath;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind $Bind -DbPath $DbPath
         }
+        $convertProbePlanJournalDescriptor=${function:ConvertTo-SynapseCandidateProbePlanJournalDescriptor}
+        $appendDeploymentJournalState=${function:Add-SynapseDeploymentTransactionJournalState}
         $beforeTaskCreate={param($planAuthority)
-            $planDescriptor=ConvertTo-SynapseCandidateProbePlanJournalDescriptor -PlanAuthority $planAuthority
-            [void](Add-SynapseDeploymentTransactionJournalState -State candidate_ready -Payload ([ordered]@{purpose='source_probe_task_create_authorized';prior_authority=$priorAuthority;probe_capability_sha256=$probeCapability;probe_plan=$planDescriptor;parked_authority_proven=$true;parked_outer_bootstrap_pid=[int]$parkedProof.OuterBootstrapPid}) -Transaction $localTransaction)
+            $planDescriptor=& $convertProbePlanJournalDescriptor -PlanAuthority $planAuthority
+            [void](& $appendDeploymentJournalState -State candidate_ready -Payload ([ordered]@{purpose='source_probe_task_create_authorized';prior_authority=$priorAuthority;probe_capability_sha256=$probeCapability;probe_plan=$planDescriptor;parked_authority_proven=$true;parked_outer_bootstrap_pid=[int]$parkedProof.OuterBootstrapPid}) -Transaction $localTransaction)
         }.GetNewClosure()
         $candidate=Test-SynapseCandidateDaemon -CandidateExePath $CandidateExePath -CandidateBootstrapPath $CandidateBootstrapPath -ExpectedCandidateBootstrapSha256 $ExpectedCandidateBootstrapSha256 -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -ReplacementReservationId $ReplacementReservationId -UseTaskProbe -ProbeCapability $probeCapability -BeforeTaskCreate $beforeTaskCreate
+        # Candidate validation owns nested allocation contexts for its probe task.
+        # Re-establish this source-probe allocation as the exact same-handle read
+        # authority before inspecting its journal.  A pathname reopen is expected
+        # to fail while the live allocation log lease denies replacement/deletion.
+        $script:SynapseDeploymentAllocationContext=$allocation
         $afterProbe=Read-SynapseDeploymentTransactionJournal -TransactionRoot $root -TransactionRootChain $rootChain
         if([string]$afterProbe.State -cne 'candidate_ready'){Die "SYNAPSE_BROKER_SOURCE_PROBE_TASK_AUTHORITY_JOURNAL_MISSING root=$root state=$($afterProbe.State)"}
         $plan=Read-SynapseCandidateProbePlanFromJournal -Descriptor $afterProbe.Slots[-1].LexicalPayload.detail.probe_plan -ExpectedCapabilitySha256 $probeCapability -Context 'source_probe_after_candidate'
         try{[void](Remove-SynapseJournalBoundCandidateProbeTask -Plan $plan -Context 'source_probe_after_candidate')}finally{if($null -ne $plan.Lease){$plan.Lease.Dispose()}}
         $priorDaemonPid=0
         if($priorAuthority -ceq 'present'){
-            $validated=Assert-SynapseBrokerProbeParkInitialDescriptor -Initial $afterProbe.Initial -TransactionRoot $root -Allocation $allocation
+            $validated=Assert-SynapseBrokerProbeParkInitialDescriptor -Initial $afterProbe.Initial -TransactionRoot $root -Allocation $allocation -ExistingGateTransition $gateTransition -ExistingRosterTransition $rosterTransition
             $validated.GateTransition=$gateTransition;$validated.RosterTransition=$rosterTransition
             $restored=Restore-SynapseBrokerProbeParkTransaction -Validated $validated -Authority $Authority -ExpectedGenerationId ([string]$afterProbe.Initial.current_generation_id) -HealthTimeoutSeconds $HealthTimeoutSeconds
             $priorDaemonPid=[int]$restored.Proof.DaemonPid
@@ -33234,37 +33779,49 @@ function Invoke-SynapseBrokerSourceCandidateProbe {
             $pair.GateLease.RequireExact('source_probe_fresh_gate_after_candidate');$pair.RosterLease.RequireExact('source_probe_fresh_roster_after_candidate')
             [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity ([pscustomobject]@{Path=$Authority.Layout.ControlGatePath;FileId128=$pair.Gate.FileId128;Sha256=$pair.Gate.Sha256;Length=$pair.Gate.Length}) -RosterIdentity ([pscustomobject]@{Path=$Authority.Layout.RosterPath;FileId128=$pair.Roster.FileId128;Sha256=$pair.Roster.Sha256;Length=$pair.Roster.Length}) -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind $Bind -DbPath $DbPath)
         }
+        $script:SynapseDeploymentAllocationContext=$allocation
         [void](Add-SynapseDeploymentTransactionJournalState -State rolled_back -Payload ([ordered]@{purpose='source_probe_temporary_park_completed';probe_capability_sha256=$probeCapability;candidate_sha256=[string]$candidate.Sha256;tool_count=[int]$candidate.ToolCount;tool_surface_sha256=[string]$candidate.ToolSurfaceSha256;prior_authority=$priorAuthority;prior_generation_id=[string]$afterProbe.Initial.current_generation_id;prior_daemon_pid=$priorDaemonPid;parked_outer_bootstrap_pid=[int]$parkedProof.OuterBootstrapPid;probe_task_absent=$true;unknown_objects_preserved=$true}) -Transaction $localTransaction)
+        Close-SynapseAuthorityActiveControlPair -Pair $pair;$pair=$null
         Close-SynapseAuthorityControlTransitionLeases -Transitions @($rosterTransition,$gateTransition)
-        Close-SynapseDeploymentAllocationHandles -Context $allocation -PayloadsOnly
-        $script:SynapseDeploymentAllocationContext=$previousAllocation
+        # Keep the allocation context current through artifact cleanup.  The
+        # remover first validates the terminal journal through these retained
+        # handles, then closes them itself immediately before exact deletion.
         [void](Remove-SynapseDeploymentTransactionArtifact -Path $root -ExpectedRoot $DeploymentTransactionParent -ExpectedState rolled_back -Reason 'source_probe_park_transaction_cleanup' -Domain application)
+        $script:SynapseDeploymentAllocationContext=$previousAllocation
         return $candidate
     }catch{
         $primary=$_.Exception.Message
         if($null -ne $localTransaction){
             try{
+                $script:SynapseDeploymentAllocationContext=$allocation
                 $durable=Read-SynapseDeploymentTransactionJournal -TransactionRoot $root -TransactionRootChain $rootChain
                 if([string]$durable.State -in @('armed','candidate_ready')){
                     if([string]$durable.State -ceq 'candidate_ready'){
                         $plan=Read-SynapseCandidateProbePlanFromJournal -Descriptor $durable.Slots[-1].LexicalPayload.detail.probe_plan -ExpectedCapabilitySha256 ([string]$durable.Initial.probe_capability_sha256) -Context 'source_probe_failure_task'
                         try{[void](Remove-SynapseJournalBoundCandidateProbeTask -Plan $plan -Context 'source_probe_failure_task');Wait-SynapseBindReleased -Reason 'source_probe_failure_task' -Bind ([string]$plan.Payload.bind) -TimeoutSeconds 30}finally{if($null -ne $plan.Lease){$plan.Lease.Dispose()}}
                     }
-                    $validated=Assert-SynapseBrokerProbeParkInitialDescriptor -Initial $durable.Initial -TransactionRoot $root -Allocation $allocation
+                    if([string]$durable.Initial.prior_authority-ceq'absent'){Close-SynapseAuthorityActiveControlPair -Pair $pair;$pair=$null}
+                    $validated=Assert-SynapseBrokerProbeParkInitialDescriptor -Initial $durable.Initial -TransactionRoot $root -Allocation $allocation -ExistingGateTransition $gateTransition -ExistingRosterTransition $rosterTransition
                     $restoredPid=0
                     if([string]$durable.Initial.prior_authority -ceq 'present'){
                         if($null -ne $rosterTransition){$validated.RosterTransition=$rosterTransition};if($null -ne $gateTransition){$validated.GateTransition=$gateTransition}
                         $restored=Restore-SynapseBrokerProbeParkTransaction -Validated $validated -Authority $Authority -ExpectedGenerationId ([string]$durable.Initial.current_generation_id) -HealthTimeoutSeconds $HealthTimeoutSeconds
                         $restoredPid=[int]$restored.Proof.DaemonPid;Close-SynapseAuthorityActiveControlPair -Pair $restored.Pair
                     }else{
-                        $freshPair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'source_probe_failure_fresh_pair'
-                        try{[void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity $validated.CurrentControlGate -RosterIdentity $validated.CurrentRoster -ControlGateLease $freshPair.GateLease -RosterLease $freshPair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind ([string]$durable.Initial.bind) -DbPath ([string]$durable.Initial.db_path))}finally{Close-SynapseAuthorityActiveControlPair -Pair $freshPair}
+                        $pair=Read-SynapseAuthorityActiveControlPair -Layout $Authority.Layout -ExpectedState parked -Context 'source_probe_failure_fresh_pair'
+                        if([string]$pair.Gate.FileId128-ine$validated.CurrentControlGate.FileId128 -or [string]$pair.Gate.Sha256-ine$validated.CurrentControlGate.Sha256 -or [int64]$pair.Gate.Length-ne$validated.CurrentControlGate.Length -or [string]$pair.Roster.FileId128-ine$validated.CurrentRoster.FileId128 -or [string]$pair.Roster.Sha256-ine$validated.CurrentRoster.Sha256 -or [int64]$pair.Roster.Length-ne$validated.CurrentRoster.Length){Die 'SYNAPSE_BROKER_SOURCE_PROBE_FAILURE_FRESH_PAIR_DRIFT'}
+                        $pair.GateLease.RequireExact('source_probe_failure_fresh_gate');$pair.RosterLease.RequireExact('source_probe_failure_fresh_roster')
+                        [void](Assert-SynapseBrokerParkedNoAuthority -Layout $Authority.Layout -Infrastructure $Authority.Infrastructure -ControlGateIdentity $validated.CurrentControlGate -RosterIdentity $validated.CurrentRoster -ControlGateLease $pair.GateLease -RosterLease $pair.RosterLease -TaskSupersessionInfrastructure $taskSupersessionInfrastructure -Bind ([string]$durable.Initial.bind) -DbPath ([string]$durable.Initial.db_path))
                     }
+                    $script:SynapseDeploymentAllocationContext=$allocation
                     [void](Add-SynapseDeploymentTransactionJournalState -State rolled_back -Payload ([ordered]@{purpose='source_probe_failure_restored_prior';primary_failure_sha256=(Get-SynapseSha256Hex -Text $primary);prior_authority=[string]$durable.Initial.prior_authority;prior_generation_id=[string]$durable.Initial.current_generation_id;prior_daemon_pid=$restoredPid;probe_task_absent=$true;unknown_objects_preserved=$true}) -Transaction $localTransaction)
                 }
                 if([string]$durable.State -eq 'rolled_back' -or [string]$localTransaction.JournalState -eq 'rolled_back'){
-                    Close-SynapseAuthorityControlTransitionLeases -Transitions @($rosterTransition,$gateTransition);Close-SynapseDeploymentAllocationHandles -Context $allocation -PayloadsOnly;$script:SynapseDeploymentAllocationContext=$previousAllocation
+                    Close-SynapseAuthorityActiveControlPair -Pair $pair;$pair=$null
+                    Close-SynapseAuthorityControlTransitionLeases -Transitions @($rosterTransition,$gateTransition)
+                    $script:SynapseDeploymentAllocationContext=$allocation
                     [void](Remove-SynapseDeploymentTransactionArtifact -Path $root -ExpectedRoot $DeploymentTransactionParent -ExpectedState rolled_back -Reason 'source_probe_failure_transaction_cleanup' -Domain application)
+                    $script:SynapseDeploymentAllocationContext=$previousAllocation
                 }
             }catch{Die "SYNAPSE_BROKER_SOURCE_PROBE_FAILED_AND_RESTORE_FAILED primary=[$primary] rollback=[$($_.Exception.Message)] root=$root"}
         }
@@ -33977,6 +34534,8 @@ function Get-SynapseDeploymentAllocationMarkerDescriptor {
                 Valid = $false
                 PrefixValid = $true
                 Frozen = $false
+                Root = $root
+                RootChain = @($TransactionRootChain)
                 FrozenDetail = $null
                 Leaf = $leaf
                 State = $state
@@ -34010,6 +34569,8 @@ function Get-SynapseDeploymentAllocationMarkerDescriptor {
             Valid = $true
             PrefixValid = $true
             Frozen = $true
+            Root = $root
+            RootChain = @($TransactionRootChain)
             FrozenDetail = $frozenDetail
             Leaf = $leaf
             State = $state
@@ -34033,6 +34594,8 @@ function Get-SynapseDeploymentAllocationMarkerDescriptor {
             Valid = $false
             PrefixValid = $false
             Frozen = $false
+            Root = $root
+            RootChain = @($TransactionRootChain)
             FrozenDetail = $null
             Leaf = $leaf
             State = $state
@@ -34255,7 +34818,7 @@ function Read-SynapseDeploymentTransactionJournal {
                 $detailNames.Count -eq $expectedDetailNames.Count -and @($detailNames|Where-Object{$expectedDetailNames -cnotcontains $_}).Count -eq 0 -and
                 [bool]$detail.prior_production_rehearsed -eq $false -and [string]$detail.prior_authority -ceq 'absent' -and [string]$detail.rehearsal -ceq 'not_applicable_fresh_host' -and
                 @($detail.legacy_denial_probe_receipts).Count -eq 0 -and
-                [int]$detail.task_instance_count -eq 1 -and [int]$detail.target_process_count -eq 0 -and [int]$detail.listener_count -eq 0 -and [int]$detail.broker_process_count -eq 1 -and
+                [int]$detail.task_instance_count -in @(0,1) -and [int]$detail.target_process_count -eq 0 -and [int]$detail.listener_count -eq 0 -and [int]$detail.broker_process_count -eq 1 -and
                 [int]$detail.outer_bootstrap_pid -gt 0 -and [int]$detail.broker_pid -gt 0 -and [uint64]$detail.outer_job_memory_limit_bytes -eq [uint64]6699999232
             }
             if (-not $rehearsalValid -or [string]$detail.broker_identity_sha256 -ine [string]$initial.broker_identity_sha256) {
@@ -34321,10 +34884,12 @@ function Read-SynapseDeploymentTransactionJournal {
             $detail=$candidateReadySlot.Payload.detail
             $detailNames=@($detail.PSObject.Properties.Name)
             $expectedDetailNames=@('operator_stopped','broker_identity_sha256','generation_id','parked_authority_proven','daemon_count','listener_count')
+            $recoveredFromArmed=$null-ne$detail.PSObject.Properties['recovered_from_armed_cut']
+            if($recoveredFromArmed){$expectedDetailNames+=@('recovered_from_armed_cut')}
             if($detailNames.Count -ne $expectedDetailNames.Count -or @($detailNames|Where-Object{$expectedDetailNames -cnotcontains $_}).Count -gt 0 -or
                [bool]$detail.operator_stopped -ne $true -or [string]$detail.broker_identity_sha256 -ine [string]$initial.broker_identity_sha256 -or
                [string]$detail.generation_id -cne [string]$initial.generation_id -or [bool]$detail.parked_authority_proven -ne $true -or
-               [int]$detail.daemon_count -ne 0 -or [int]$detail.listener_count -ne 0){
+               [int]$detail.daemon_count -ne 0 -or [int]$detail.listener_count -ne 0 -or ($recoveredFromArmed-and[bool]$detail.recovered_from_armed_cut-ne$true)){
                 Die "SYNAPSE_BROKER_OPERATOR_STOP_JOURNAL_STOPPED_INVALID root=$root sequence=$($candidateReadySlot.Sequence)"
             }
         } else {
@@ -34785,7 +35350,7 @@ function Get-SynapseGlobalRecoveryInventory {
                 }
                 'operator' {if($null -eq $authorityLayout){Die "SYNAPSE_GLOBAL_RECOVERY_AUTHORITY_LAYOUT_MISSING domain=operator root=$($entry.Path)"};[void](Assert-SynapseBrokerOperatorStopInitialDescriptor -Initial $journal.Initial -TransactionRoot ([string]$entry.Path) -Allocation $journal.Allocation -Layout $authorityLayout)}
                 'probe' {if($null -eq $authorityLayout){Die "SYNAPSE_GLOBAL_RECOVERY_AUTHORITY_LAYOUT_MISSING domain=probe root=$($entry.Path)"};[void](Assert-SynapseBrokerProbeParkInitialDescriptor -Initial $journal.Initial -TransactionRoot ([string]$entry.Path) -Allocation $journal.Allocation -Layout $authorityLayout)}
-                'application_v4' {if($null -eq $authorityLayout){Die "SYNAPSE_GLOBAL_RECOVERY_AUTHORITY_LAYOUT_MISSING domain=application_v4 root=$($entry.Path)"};[void](Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot ([string]$entry.Path) -Allocation $journal.Allocation -Layout $authorityLayout)}
+                'application_v4' {if($null -eq $authorityLayout){Die "SYNAPSE_GLOBAL_RECOVERY_AUTHORITY_LAYOUT_MISSING domain=application_v4 root=$($entry.Path)"};[void](Assert-SynapseBrokerApplicationInitialDescriptor -Initial $journal.Initial -TransactionRoot ([string]$entry.Path) -Allocation $journal.Allocation -Layout $authorityLayout -AllowCommittedDiscardedPost:($effective-ceq'commit_decided'))}
                 'legacy_v3' {
                     [void](Assert-SynapseBundledProfilesTransactionDescriptor -Descriptor $journal.Initial.profile_transaction -ProfilesDir ([string]$journal.Initial.profile_transaction.profiles_dir) -TransactionRoot ([string]$entry.Path))
                     $legacyPaths=@($journal.Initial.runtime_transaction.records|ForEach-Object{[System.IO.Path]::GetFullPath([string]$_.path)})
@@ -35119,7 +35684,10 @@ function Assert-SynapseGlobalAuthorityPredecessorLive {
             $validated=Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot ([string]$Record.Root) -Allocation $Record.Journal.Allocation
             if($null-eq$predecessor.PSObject.Properties['Validated']){$predecessor|Add-Member -NotePropertyName Validated -NotePropertyValue $validated}else{$predecessor.Validated=$validated}
         }
-        if(@($validated.LegacyRescueLaunchAttempts).Count-ne4){Die "SYNAPSE_GLOBAL_PREDECESSOR_RECOVERY_ATTEMPTS_MISSING root=$($Record.Root) count=$(@($validated.LegacyRescueLaunchAttempts).Count)"}
+        $recoveryAttemptCount=@($validated.LegacyRescueLaunchAttempts).Count
+        if([string]$predecessor.Mode-ceq'fresh_monotonic_floor'){
+            if($recoveryAttemptCount-ne0){Die "SYNAPSE_GLOBAL_FRESH_PREDECESSOR_RECOVERY_ATTEMPTS_UNEXPECTED root=$($Record.Root) count=$recoveryAttemptCount"}
+        }elseif($recoveryAttemptCount-ne4){Die "SYNAPSE_GLOBAL_PREDECESSOR_RECOVERY_ATTEMPTS_MISSING root=$($Record.Root) count=$recoveryAttemptCount"}
         if([string]$initial.task_name-cne$RequestedLegacyTaskName){Die "SYNAPSE_GLOBAL_PREDECESSOR_LEGACY_TASK_NAME_MISMATCH root=$($Record.Root) requested=$RequestedLegacyTaskName actual=$($initial.task_name)"}
         if([string]$predecessor.Mode-ceq'fresh_monotonic_floor'){
             if($null-eq$TaskInfrastructure){Die "SYNAPSE_GLOBAL_PREDECESSOR_BROKER_TASK_INFRASTRUCTURE_MISSING root=$($Record.Root)"}
@@ -35185,7 +35753,8 @@ function Assert-SynapseGlobalCommittedAuthorityPreflight {
         [Parameter(Mandatory=$true)]$Inventory,
         $TaskInfrastructure,
         [Parameter(Mandatory=$true)][string]$RuntimeBinDir,
-        [Parameter(Mandatory=$true)][string]$RequestedLegacyTaskName
+        [Parameter(Mandatory=$true)][string]$RequestedLegacyTaskName,
+        [switch]$DecommissionStructuralOnly
     )
     # A valid successor marker is the authoritative REDO decision even while
     # enough predecessor journal bytes remain for ordinary classification.
@@ -35405,12 +35974,27 @@ function Assert-SynapseGlobalCommittedAuthorityPreflight {
     if($committedAdoptions.Count -eq 0){return [pscustomobject][ordered]@{Task=$TaskInfrastructure.Task;Adoption=$null;Predecessor=$(if($predecessors.Count-eq1){$predecessors[0]}else{$null});PredecessorProof=$predecessorProof;ControlState='absent'}}
     $adoptionRecord=$committedAdoptions[0];$journal=$adoptionRecord.Journal;$initial=$journal.Initial;$detail=$journal.Latest.detail
     $layout=Get-SynapseAuthorityLayoutReadOnly -RuntimeBinDir $RuntimeBinDir -RequireAuthorityRoot
-    $validated=Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot ([string]$adoptionRecord.Root) -Allocation $journal.Allocation -HistoricalMutableGeneration
+    $committedApplicationSuccessors=@($Inventory.ApplicationV4|Where-Object{[string]$_.RecordKind-ceq'journal' -and [string]$_.EffectiveState-ceq'commit_decided'})
+    if($committedApplicationSuccessors.Count-eq1 -and [string]$initial.prior_authority-ceq'absent'){
+        [void](Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot ([string]$adoptionRecord.Root) -Allocation $journal.Allocation -HistoricalMutableGeneration -StructuralOnly)
+        $validated=[pscustomobject][ordered]@{
+            LegacyGateTransition=ConvertTo-SynapseAuthorityControlTransition -Descriptor $initial.legacy_gate_transition -TransactionRoot ([string]$adoptionRecord.Root) -Allocation $journal.Allocation
+            LegacyDenialTransition=ConvertTo-SynapseAuthorityControlTransition -Descriptor $initial.legacy_denial_stub_transition -TransactionRoot ([string]$adoptionRecord.Root) -Allocation $journal.Allocation
+            LegacyDenialProbePlans=@()
+        }
+    }else{
+        # The immutable adoption epoch proves the permanent broker floor. Its
+        # original parked control pair is expected to be retired once any
+        # broker application generation is committed. Validate the exact live
+        # pair under the retained authority root instead of requiring the
+        # historical parked postimage to remain present forever.
+        $validated=Assert-SynapseAuthorityAdoptionInitialDescriptor -Initial $initial -TransactionRoot ([string]$adoptionRecord.Root) -Allocation $journal.Allocation -HistoricalMutableGeneration -AllowRetiredControlPostimage
+    }
     if([int]$detail.legacy_authority_floor -ne 1 -or -not [bool]$detail.broker_adoption_decided -or
        [string]$detail.broker_identity_sha256 -ine [string]$initial.broker_identity_sha256 -or
        [string]$detail.legacy_gate_file_id_128 -ine [string]$validated.LegacyGateTransition.post_file_id_128 -or
        [string]$detail.legacy_denial_stub_file_id_128 -ine [string]$validated.LegacyDenialTransition.post_file_id_128){
-        Die "SYNAPSE_GLOBAL_COMMITTED_ADOPTION_DECISION_INVALID root=$($adoptionRecord.Root) floor=$($detail.legacy_authority_floor)"
+        Die "SYNAPSE_GLOBAL_COMMITTED_ADOPTION_DECISION_INVALID root=$($adoptionRecord.Root) floor=$($detail.legacy_authority_floor) decided=$([bool]$detail.broker_adoption_decided) detail_identity=$($detail.broker_identity_sha256) initial_identity=$($initial.broker_identity_sha256) detail_gate=$($detail.legacy_gate_file_id_128) validated_gate=$($validated.LegacyGateTransition.post_file_id_128) detail_denial=$($detail.legacy_denial_stub_file_id_128) validated_denial=$($validated.LegacyDenialTransition.post_file_id_128) structural_only=$([bool]$DecommissionStructuralOnly)"
     }
     if([string]$initial.task_name -cne $RequestedLegacyTaskName){Die "SYNAPSE_GLOBAL_COMMITTED_LEGACY_TASK_NAME_MISMATCH requested=$RequestedLegacyTaskName receipt=$($initial.task_name)"}
     # Resolve the exact historical task receipt referenced by the immutable
@@ -36184,7 +36768,7 @@ function Get-SynapseDeploymentTransactionArtifactDescriptor {
         if($null -eq (Get-Command Assert-SynapseBrokerApplicationInitialDescriptor -ErrorAction SilentlyContinue)){
             throw "SYNAPSE_BROKER_APPLICATION_VALIDATOR_MISSING path=$pathFull"
         }
-        [void](Assert-SynapseBrokerApplicationInitialDescriptor -Initial $initial -TransactionRoot $pathFull -Allocation $allocation)
+        [void](Assert-SynapseBrokerApplicationInitialDescriptor -Initial $initial -TransactionRoot $pathFull -Allocation $allocation -AllowCommittedDiscardedPost:($ExpectedState -eq 'committed'))
     } elseif([string]$initial.schema -ceq 'synapse_broker_probe_park_transaction/v1' -and $transactionKind -ceq 'synapse_broker_probe_park/v1'){
         if($null -eq (Get-Command Assert-SynapseBrokerProbeParkInitialDescriptor -ErrorAction SilentlyContinue)){
             throw "SYNAPSE_BROKER_PROBE_PARK_VALIDATOR_MISSING path=$pathFull"
@@ -36577,6 +37161,11 @@ function Read-SynapseCandidateProbeTaskPlan {
     }
     $bootstrapPath = [System.IO.Path]::GetFullPath([string]$plan.execute)
     $bootstrapParent = Get-SynapseNormalizedDirectoryPath -Path (Split-Path -Parent $bootstrapPath)
+    if(-not[IO.Directory]::Exists($bootstrapParent)){
+        $bootstrapParentAbsence=Get-SynapsePurgeAbsenceAnchor -Path $bootstrapParent -Kind directory -Context "candidate_probe_recovery_bootstrap_parent_absent_$taskName";Assert-SynapsePurgeAbsenceAnchor -Anchor $bootstrapParentAbsence -Context "candidate_probe_recovery_bootstrap_parent_absent_readback_$taskName"
+        $lease=Open-SynapsePhysicalFileReadLease -ParentPath $candidateRoot -ParentChain $candidateChain -Leaf $planLeaf -ExpectedFileId128 ([string]$planState.FileId128) -ExpectedSha256 ([string]$planState.Sha256) -ExpectedLength ([int64]$planState.Length) -Context 'candidate_probe_recovery_plan_authority_external_absent'
+        return [pscustomobject][ordered]@{Candidate=$descriptor;CandidateChain=$candidateChain;Path=$planPath;State=$planState;Payload=$plan;Lease=$lease;TaskName=$taskName;Kind='probe';Execute=$bootstrapPath;Arguments=[string]$plan.arguments;WorkingDirectory=$candidateRoot;PlanSha256=$calculatedPlanSha256;PowerShellAliasLeaseBundle=$null;ExternalBootstrapAbsent=$true}
+    }
     $bootstrapChain = @(Get-SynapsePhysicalDirectoryChainDescriptor -Path $bootstrapParent)
     $bootstrapState = Get-SynapsePhysicalRelativeState -ParentPath $bootstrapParent -ParentChain $bootstrapChain -Leaf (Split-Path -Leaf $bootstrapPath)
     $supervisorState = Get-SynapsePhysicalRelativeState -ParentPath $candidateRoot -ParentChain $candidateChain -Leaf (Split-Path -Leaf $supervisorPath)
@@ -36584,7 +37173,9 @@ function Read-SynapseCandidateProbeTaskPlan {
     if (-not (Test-SynapsePhysicalStateExact -State $bootstrapState -ExpectedExists $true -ExpectedFileId128 ([string]$plan.bootstrap_file_id_128) -ExpectedSha256 ([string]$plan.bootstrap_sha256) -ExpectedLength ([int64]$plan.bootstrap_length)) -or
         -not (Test-SynapsePhysicalStateExact -State $supervisorState -ExpectedExists $true -ExpectedFileId128 ([string]$plan.supervisor_file_id_128) -ExpectedSha256 ([string]$plan.supervisor_sha256) -ExpectedLength ([int64]$plan.supervisor_length)) -or
         [string]$powerShellIdentity.Path -ine $powerShellPath -or [string]$powerShellIdentity.FileId128 -ine [string]$plan.powershell_file_id_128 -or [string]$powerShellIdentity.Sha256 -ine [string]$plan.powershell_sha256 -or [int64]$powerShellIdentity.Length -ne [int64]$plan.powershell_length) {
-        Die "SYNAPSE_CANDIDATE_PROBE_PLAN_OBJECT_DRIFT path=$planPath task=$taskName"
+        $staleLookup=Get-SynapseScheduledTaskLookupExact -Name $taskName;if([bool]$staleLookup.Exists){Die "SYNAPSE_CANDIDATE_PROBE_PLAN_OBJECT_DRIFT path=$planPath task=$taskName task_present=true"}
+        $lease=Open-SynapsePhysicalFileReadLease -ParentPath $candidateRoot -ParentChain $candidateChain -Leaf $planLeaf -ExpectedFileId128 ([string]$planState.FileId128) -ExpectedSha256 ([string]$planState.Sha256) -ExpectedLength ([int64]$planState.Length) -Context 'candidate_probe_recovery_plan_authority_external_superseded'
+        return [pscustomobject][ordered]@{Candidate=$descriptor;CandidateChain=$candidateChain;Path=$planPath;State=$planState;Payload=$plan;Lease=$lease;TaskName=$taskName;Kind='probe';Execute=$bootstrapPath;Arguments=[string]$plan.arguments;WorkingDirectory=$candidateRoot;PlanSha256=$calculatedPlanSha256;PowerShellAliasLeaseBundle=$null;ExternalBootstrapAbsent=$true}
     }
     $lease = Open-SynapsePhysicalFileReadLease -ParentPath $candidateRoot -ParentChain $candidateChain -Leaf $planLeaf -ExpectedFileId128 ([string]$planState.FileId128) -ExpectedSha256 ([string]$planState.Sha256) -ExpectedLength ([int64]$planState.Length) -Context 'candidate_probe_recovery_plan_authority'
     $powerShellAliasLeaseBundle=$null
@@ -36597,7 +37188,7 @@ function Read-SynapseCandidateProbeTaskPlan {
     return [pscustomobject][ordered]@{
         Candidate=$descriptor; CandidateChain=$candidateChain; Path=$planPath; State=$planState; Payload=$plan
         Lease=$lease; TaskName=$taskName; Kind='probe'; Execute=$bootstrapPath; Arguments=[string]$plan.arguments
-        WorkingDirectory=$candidateRoot; PlanSha256=$calculatedPlanSha256; PowerShellAliasLeaseBundle=$powerShellAliasLeaseBundle
+        WorkingDirectory=$candidateRoot; PlanSha256=$calculatedPlanSha256; PowerShellAliasLeaseBundle=$powerShellAliasLeaseBundle;ExternalBootstrapAbsent=$false
     }
 }
 
@@ -36638,6 +37229,7 @@ function Resume-SynapseCandidateProbeTaskIntents {
             $scheduler = Get-SynapseScheduledTaskComRoot
             $taskLookup=Get-SynapseScheduledTaskLookupExact -Name ([string]$plan.TaskName) -Scheduler $scheduler
             $registered=if([bool]$taskLookup.Exists){$taskLookup.Task}else{$null}
+            if([bool]$plan.ExternalBootstrapAbsent-and$null-ne$registered){Die "SYNAPSE_CANDIDATE_PROBE_EXTERNAL_BOOTSTRAP_ABSENT_TASK_PRESENT task=$($plan.TaskName) bootstrap=$($plan.Execute)"}
             if ($terminalState.Exists) {
                 if ($null -ne $registered) {
                     Die "SYNAPSE_CANDIDATE_PROBE_TERMINAL_TASK_PRESENT path=$terminalPath task=$($plan.TaskName)"
@@ -42536,6 +43128,22 @@ function Assert-SynapseLegacySupervisorCompatibilitySourceUnderLease {
     return $actual
 }
 
+function Get-SynapseRetainedDeniedLegacyFloor {
+    param([Parameter(Mandatory=$true)][string]$TaskName,[Parameter(Mandatory=$true)][string]$RuntimeBinDir,[Parameter(Mandatory=$true)][string]$SupervisorPath,[Parameter(Mandatory=$true)][string]$LogDir,[Parameter(Mandatory=$true)][string]$Bind,[Parameter(Mandatory=$true)][string]$DbPath,[switch]$TaskOnly)
+    $task=Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $SupervisorPath -Reason 'retained_denied_legacy_floor';if($null-eq$task){return $null}
+    $supervisor=[IO.Path]::GetFullPath($SupervisorPath);if(-not[IO.File]::Exists($supervisor)){return $null};$text=[IO.File]::ReadAllText($supervisor,[Text.UTF8Encoding]::new($false,$true));$match=[regex]::Match($text,'\A# SYNAPSE_LEGACY_AUTHORITY_DENIAL_STUB_V1 broker_identity_sha256=(?<identity>[0-9A-F]{64}) authority_epoch=(?<epoch>[1-9][0-9]*) task_capability_sha256=(?<capability>[0-9A-F]{64})\r?\n');if(-not$match.Success){return $null};$identity=$match.Groups['identity'].Value;$epoch=[int64]$match.Groups['epoch'].Value;$capability=$match.Groups['capability'].Value;$expected=New-SynapseLegacyAuthorityDenialStubContent -BrokerIdentitySha256 $identity -AuthorityEpoch $epoch -TaskCapabilitySha256 $capability;if($text-cne$expected){Die "SYNAPSE_RETAINED_DENIED_LEGACY_STUB_INVALID path=$supervisor"}
+    $scheduler=Get-SynapseScheduledTaskComRoot;$lookup=Get-SynapseScheduledTaskLookupExact -Name $TaskName -Scheduler $scheduler;if(-not[bool]$lookup.Exists){Die "SYNAPSE_RETAINED_DENIED_LEGACY_TASK_DISAPPEARED task=$TaskName"};$actions=@($lookup.Task.Definition.Actions);if($actions.Count-ne1){Die "SYNAPSE_RETAINED_DENIED_LEGACY_TASK_ACTION_INVALID task=$TaskName"};$expectedWscript=[IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\wscript.exe'));$vbsMatch=[regex]::Match([string]$actions[0].Arguments,'^//B //Nologo "(?<path>[^"]+\.vbs)"$');if([IO.Path]::GetFullPath([string]$actions[0].Path)-ine$expectedWscript-or-not$vbsMatch.Success){Die "SYNAPSE_RETAINED_DENIED_LEGACY_TASK_ACTION_INVALID task=$TaskName"};$vbs=[IO.Path]::GetFullPath($vbsMatch.Groups['path'].Value)
+    $launcherLog=[IO.Path]::GetFullPath((Join-Path $LogDir 'daemon-launcher.log'));$legacyPowerShell=[IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'));$expectedVbs=New-SynapseLegacyVbsLauncherContent -LauncherLogPath $launcherLog -SupervisorPath $supervisor -PowerShellPath $legacyPowerShell;if([IO.File]::ReadAllText($vbs,[Text.UTF8Encoding]::new($false,$true))-cne$expectedVbs){Die "SYNAPSE_RETAINED_DENIED_LEGACY_VBS_INVALID path=$vbs"}
+    $runtime=Get-SynapseNormalizedDirectoryPath -Path $RuntimeBinDir;$chain=@(Get-SynapsePhysicalDirectoryChainDescriptor -Path $runtime);$denialState=Get-SynapsePhysicalRelativeState -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $supervisor);$gatePath=[IO.Path]::GetFullPath((Join-Path $runtime $script:SynapseDaemonSupervisorStopRequestFileName));$gateState=Get-SynapsePhysicalRelativeState -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $gatePath);if(-not[bool]$denialState.Exists-or-not[bool]$gateState.Exists){Die 'SYNAPSE_RETAINED_DENIED_LEGACY_CONTROL_MISSING'};$gateText=[IO.File]::ReadAllText($gatePath,[Text.UTF8Encoding]::new($false,$true));$gate=ConvertFrom-SynapseJsonPreservingStrings -Json $gateText -MaximumJsonLength 65536;if((Get-SynapseCanonicalJson -Value (ConvertTo-SynapseCanonicalValue -Value $gate))-cne$gateText-or[string]$gate.schema-cne'synapse_daemon_supervisor_stop_request/v1'-or[string]$gate.state-cne'requested'-or[string]$gate.reason-cne'broker_authority_adoption_epoch'-or[string]$gate.bind-cne$Bind-or[IO.Path]::GetFullPath([string]$gate.db_path)-ine[IO.Path]::GetFullPath($DbPath)-or[IO.Path]::GetFullPath([string]$gate.supervisor_path)-ine$supervisor-or[string]$gate.broker_identity_sha256-ine$identity-or[int64]$gate.authority_epoch-ne$epoch){Die 'SYNAPSE_RETAINED_DENIED_LEGACY_GATE_INVALID'}
+    $targets=@(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath);$listeners=@(Get-SynapseTcpBindListenerSnapshot -Bind $Bind);if($targets.Count-ne0-or$listeners.Count-ne0){Die "SYNAPSE_RETAINED_DENIED_LEGACY_NOT_INERT targets=$($targets.Count) listeners=$($listeners.Count)"}
+    $floor=[pscustomobject][ordered]@{legacy_gate=[ordered]@{path=$gatePath;file_id_128=([string]$gateState.FileId128).ToUpperInvariant();sha256=([string]$gateState.Sha256).ToUpperInvariant();length=[int64]$gateState.Length};legacy_denial_stub=[ordered]@{path=$supervisor;file_id_128=([string]$denialState.FileId128).ToUpperInvariant();sha256=([string]$denialState.Sha256).ToUpperInvariant();length=[int64]$denialState.Length};legacy_task_name=$TaskName;broker_identity_sha256=$identity;authority_epoch=$epoch;task_capability_sha256=$capability}
+    $scheduler.Root.DeleteTask($TaskName,0);if([bool](Get-SynapseScheduledTaskLookupExact -Name $TaskName -Scheduler $scheduler).Exists){Die "SYNAPSE_RETAINED_DENIED_LEGACY_TASK_DELETE_FAILED task=$TaskName"};if($TaskOnly){Info "SYNAPSE_RETAINED_DENIED_LEGACY_TASK_RETIRED task=$TaskName";return $floor}
+    Remove-SynapsePhysicalRelativeEntryExact -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $gatePath) -ExpectedFileId128 ([string]$gateState.FileId128) -ExpectedSha256 ([string]$gateState.Sha256) -ExpectedLength ([int64]$gateState.Length) -Context 'retained_denied_legacy_gate_retire'
+    Remove-SynapsePhysicalRelativeEntryExact -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $supervisor) -ExpectedFileId128 ([string]$denialState.FileId128) -ExpectedSha256 ([string]$denialState.Sha256) -ExpectedLength ([int64]$denialState.Length) -Context 'retained_denied_legacy_stub_retire'
+    $gateAfter=Get-SynapsePhysicalRelativeState -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $gatePath);$denialAfter=Get-SynapsePhysicalRelativeState -ParentPath $runtime -ParentChain $chain -Leaf (Split-Path -Leaf $supervisor);if([bool]$gateAfter.Exists-or[bool]$denialAfter.Exists){Die "SYNAPSE_RETAINED_DENIED_LEGACY_CONTROL_RETIRE_FAILED gate=$($gateAfter.Exists) denial=$($denialAfter.Exists)"};Info "SYNAPSE_RETAINED_DENIED_LEGACY_RETIRED task=$TaskName gate=$gatePath denial=$supervisor"
+    return $null
+}
+
 function Get-SynapseLegacyAuthoritySnapshot {
     param(
         [Parameter(Mandatory=$true)][string]$TaskName,
@@ -43135,6 +43743,7 @@ if($null-ne$pendingPurge){
     $pendingPurge=$null
     if(-not$purgeTerminal){Die "SYNAPSE_LEGACY_PURGE_NONTERMINAL_SUPERSEDED record=$legacyPurgeRecord remediation=preserve the exact deletion-records bundle; the legacy purge cannot resume because it would delete data while retaining the broker task/process authority. Complete a versioned migration before any setup/remove mutation"}
 }
+Initialize-SynapseAuthorityRuntimeForSetup
 $pendingDecommission=Get-SynapsePendingBrokerDecommissionRecord -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -Bind $Bind -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -Remove:$Remove -Purge:$Purge
 if($null-ne$pendingDecommission-and$Remove-and($null-ne$pendingDecommission.Completed-or$null-ne$pendingDecommission.Parked)){
     try{
@@ -43166,7 +43775,7 @@ if($Purge){
     if([string]$lockedPurgePathContract.ContractSha256-ine[string]$purgePathContract.ContractSha256-or(Get-SynapseCanonicalJson -Value $lockedPurgePathContract.Contract)-cne(Get-SynapseCanonicalJson -Value $purgePathContract.Contract)){Die 'SYNAPSE_PURGE_PATH_CONTRACT_DRIFT boundary=maintenance_lock'}
     $purgePathContract=$lockedPurgePathContract
 }
-$globalRecoveryMode=if($Stop){'stop'}elseif($Start){'start'}elseif($Remove){'setup'}elseif($ResumeChromeBridgePending){'resume_chrome'}else{'setup'}
+$globalRecoveryMode=if($Stop){'stop'}elseif($Start){'start'}elseif($Remove){'remove'}elseif($ResumeChromeBridgePending){'resume_chrome'}else{'setup'}
 $globalRecoveryAuthority=$null
 $globalRecoveryTaskInfrastructure=$null
 $globalRecoveryInventory=$null
@@ -43207,7 +43816,7 @@ for($globalRecoveryPass=1;$globalRecoveryPass -le $globalRecoveryMaxPasses;$glob
             continue
         }
     }
-    $globalRecoveryPrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryInventory -TaskInfrastructure $globalRecoveryTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName
+    $globalRecoveryPrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryInventory -TaskInfrastructure $globalRecoveryTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName -DecommissionStructuralOnly:$Remove
     if([bool]$removeMissingTokenPreflight.Missing){
         if([string]$globalRecoveryPrerequisite.ControlState-cne'parked'){Die "SYNAPSE_BROKER_DECOMMISSION_MISSING_TOKEN_CONTROL_STATE_CHANGED pass=$globalRecoveryPass state=$($globalRecoveryPrerequisite.ControlState)"}
     }
@@ -43280,7 +43889,8 @@ for($globalRecoveryPass=1;$globalRecoveryPass -le $globalRecoveryMaxPasses;$glob
             $initial=$record.Initial
             $priorAuthority=if($null -ne $initial){[string]$initial.prior_authority}else{'absent'}
             if($null -ne $initial -and $priorAuthority -ceq 'absent' -and (Test-SynapseScheduledTaskExistsExact -Name ([string]$initial.task_name))){
-                Die "SYNAPSE_GLOBAL_RECOVERY_FRESH_LEGACY_TASK_APPEARED root=$($record.Root) task=$($initial.task_name)"
+                $floor=Get-SynapseRetainedDeniedLegacyFloor -TaskName ([string]$initial.task_name) -RuntimeBinDir $RuntimeBinDir -SupervisorPath ([string]$initial.legacy_denial_stub_transition.path) -LogDir $LogDir -Bind ([string]$initial.bind) -DbPath ([string]$initial.db_path) -TaskOnly
+                if($null-eq$floor-or[string]$floor.legacy_gate.file_id_128-ine[string]$initial.legacy_gate_transition.post_file_id_128-or[string]$floor.legacy_gate.sha256-ine[string]$initial.legacy_gate_transition.post_sha256-or[int64]$floor.legacy_gate.length-ne[int64]$initial.legacy_gate_transition.post_length-or[string]$floor.legacy_denial_stub.file_id_128-ine[string]$initial.legacy_denial_stub_transition.post_file_id_128-or[string]$floor.legacy_denial_stub.sha256-ine[string]$initial.legacy_denial_stub_transition.post_sha256-or[int64]$floor.legacy_denial_stub.length-ne[int64]$initial.legacy_denial_stub_transition.post_length){Die "SYNAPSE_GLOBAL_RECOVERY_FRESH_LEGACY_TASK_APPEARED root=$($record.Root) task=$($initial.task_name) reason=not_exact_denied_floor"}
             }
             $tokenRead=Read-SynapseSetupTokenForRestartGuard -TokenPath $(if($null -ne $initial){[string]$initial.token_path}else{$TokenPath})
             if(-not [bool]$tokenRead.Ok -and ($priorAuthority -ceq 'legacy'-or$Remove)){Die "$($tokenRead.Code) reason=global_adoption_recovery $($tokenRead.Detail)"}
@@ -43306,7 +43916,7 @@ for($globalRecoveryPass=1;$globalRecoveryPass -le $globalRecoveryMaxPasses;$glob
         }
         {$_ -in @('probe','application_v4','operator')} {
             if($null -eq $globalRecoveryAuthority){
-                $globalRecoveryAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -AllowMissingTokenWhenParked:($Remove-and[bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $(if($Remove){$removeMissingTokenPreflight.TokenAuthority}else{$null}) -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
+                $globalRecoveryAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -DecommissionStructuralOnly:$Remove -AllowMissingTokenWhenParked:($Remove-and[bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $(if($Remove){$removeMissingTokenPreflight.TokenAuthority}else{$null}) -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
             }
             $wrapped=[pscustomobject]@{Directory=$record.Entry;Journal=$record.Journal}
             if($action -ceq 'probe'){
@@ -43338,7 +43948,7 @@ $committedAdoptions=@($globalRecoveryInventory.Adoptions|Where-Object{[string]$_
 if($committedAdoptions.Count -eq 1){
     if($null -eq $globalRecoveryTaskInfrastructure){Die 'SYNAPSE_GLOBAL_RECOVERY_COMMITTED_TASK_PREFLIGHT_MISSING'}
     if($null-ne$globalRecoveryAuthority){Close-SynapseBrokerTaskReceiptInfrastructure -Infrastructure $globalRecoveryAuthority.Infrastructure;$globalRecoveryAuthority=$null}
-    $globalRecoveryAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -AllowMissingTokenWhenParked:($Remove-and[bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $(if($Remove){$removeMissingTokenPreflight.TokenAuthority}else{$null}) -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
+    $globalRecoveryAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -DecommissionStructuralOnly:$Remove -AllowMissingTokenWhenParked:($Remove-and[bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $(if($Remove){$removeMissingTokenPreflight.TokenAuthority}else{$null}) -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
     # The returned authority now owns an overlapping exact task/object receipt;
     # close the preliminary bundle only after that handoff is complete.
     Close-SynapseBrokerTaskReceiptInfrastructure -Infrastructure $globalRecoveryTaskInfrastructure
@@ -43352,17 +43962,23 @@ if($Remove){
         if($null-ne$decommissionPending-and$null-ne$decommissionPending.Completed){
             [void](Write-SynapseBrokerDecommissionCompletionLifecycle -Pending $decommissionPending -LogDir $LogDir -Context 'broker_decommission_post_recovery_terminal')
         }else{
-            if($null-eq$decommissionAuthority){$decommissionAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -AllowMissingTokenWhenParked:([bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $removeMissingTokenPreflight.TokenAuthority -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))}
+            if($null-eq$decommissionAuthority){$decommissionAuthority=Get-SynapseBrokerAuthorityForOperatorLifecycle -RuntimeBinDir $RuntimeBinDir -TaskName $TaskName -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -DecommissionStructuralOnly -AllowMissingTokenWhenParked:([bool]$removeMissingTokenPreflight.Missing) -ExpectedTokenAuthority $removeMissingTokenPreflight.TokenAuthority -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))}
             if($null-eq$decommissionPending){
-                $authorized=New-SynapseBrokerDecommissionAuthorizedRecord -Authority $decommissionAuthority -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -Purge:$Purge -Confirmed:$ConfirmVaultDestruction
+                $decommissionExecutablePath=if($null-ne$decommissionAuthority.CurrentGeneration){
+                    [System.IO.Path]::GetFullPath([string]$decommissionAuthority.CurrentGeneration.Executable.Path)
+                }else{
+                    [System.IO.Path]::GetFullPath($ExePath)
+                }
+                $authorized=New-SynapseBrokerDecommissionAuthorizedRecord -Authority $decommissionAuthority -ExePath $decommissionExecutablePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath -LogDir $LogDir -MaintenanceLockPath $MaintenanceLockPath -Purge:$Purge -Confirmed:$ConfirmVaultDestruction
                 $decommissionPending=[pscustomobject][ordered]@{RootLease=$authorized.RecordRootLease;RetainedLegacyLeases=$authorized.RetainedLegacyLeases;Authorized=$authorized;Confirmation=$null;Parked=$null;TaskAbsent=$null;Drained=$null;CleanupReady=$null;Completed=$null}
             }
             if($null-ne$decommissionPending.Parked){Die 'SYNAPSE_BROKER_DECOMMISSION_POST_RECOVERY_UNEXPECTED_PARKED_PHASE'}
             if($Purge-and$ConfirmVaultDestruction-and$null-eq$decommissionPending.Confirmation-and$null-eq$decommissionPending.CleanupReady){$decommissionPending.Confirmation=New-SynapseBrokerDecommissionConfirmationRecord -Authorized $decommissionPending.Authorized}
-            [void](Assert-SynapseBrokerDecommissionAuthorizationAuthorityBoundary -Authorized $decommissionPending.Authorized -Authority $decommissionAuthority -Context 'broker_decommission_pre_stop')
+            $decommissionResumingParkedSuccessor=([string]$decommissionPending.Authorized.Payload.authority_source-ceq'active_generation'-and$null-eq$decommissionAuthority.CurrentGeneration)
+            [void](Assert-SynapseBrokerDecommissionAuthorizationAuthorityBoundary -Authorized $decommissionPending.Authorized -Authority $decommissionAuthority -Context 'broker_decommission_pre_stop' -AllowActiveSourceParkedSuccessor:$decommissionResumingParkedSuccessor)
             Assert-SynapseBrokerDecommissionGlobalTokenAuthorityBoundary -Descriptor $removeMissingTokenPreflight.TokenAuthority -ExpectedPath $TokenPath -Context 'broker_decommission_pre_stop_global_token_boundary'
-            if([string]$decommissionPending.Authorized.Payload.authority_source-ceq'active_generation'){
-                $decommissionStop=Invoke-SynapseBrokerOperatorStop -Authority $decommissionAuthority -Bind $Bind -DbPath $DbPath -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
+            if([string]$decommissionPending.Authorized.Payload.authority_source-ceq'active_generation'-and-not$decommissionResumingParkedSuccessor){
+                $decommissionStop=Invoke-SynapseBrokerOperatorStop -Authority $decommissionAuthority -Bind $Bind -DbPath $DbPath -Decommission -HealthTimeoutSeconds ([Math]::Min(900,[Math]::Max(120,$InstallHealthTimeoutSeconds)))
                 $decommissionPending.Parked=New-SynapseBrokerDecommissionParkedRecord -Authorized $decommissionPending.Authorized -Authority $decommissionAuthority -StopResult $decommissionStop
             }else{
                 $decommissionPending.Parked=New-SynapseBrokerDecommissionParkedRecord -Authorized $decommissionPending.Authorized -Authority $decommissionAuthority -AlreadyParked
@@ -43410,7 +44026,7 @@ Remove-SynapseStaleSuccessfulCandidateArtifacts -Root (Join-Path $LogDir 'setup-
 
 $globalRecoveryBeforeLifecycle=Get-SynapseGlobalRecoveryInventory -LogDir $LogDir -ProfilesDir $ProfilesDir -RuntimeBinDir $RuntimeBinDir
 $globalRecoveryBeforeLifecycleTaskInfrastructure=if($null-ne$globalRecoveryAuthority){$globalRecoveryAuthority.Infrastructure}else{$globalRecoveryTaskInfrastructure}
-$globalRecoveryBeforeLifecyclePrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryBeforeLifecycle -TaskInfrastructure $globalRecoveryBeforeLifecycleTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName
+$globalRecoveryBeforeLifecyclePrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryBeforeLifecycle -TaskInfrastructure $globalRecoveryBeforeLifecycleTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName -DecommissionStructuralOnly:$Remove
 $globalRecoveryBeforeLifecycleSelection=Select-SynapseGlobalRecoveryAction -Inventory $globalRecoveryBeforeLifecycle -Mode $globalRecoveryMode
 if(-not [bool]$globalRecoveryBeforeLifecycleSelection.Allowed){Die ([string]$globalRecoveryBeforeLifecycleSelection.Error)}
 if([string]$globalRecoveryBeforeLifecycle.FingerprintSha256 -ine $globalRecoveryFingerprint){
@@ -44221,7 +44837,7 @@ Info "SYNAPSE_OFFLINE_TOOL_SURFACE_SEALED candidate=$installSourcePath tool_coun
 # managed path set; an ambiguous or foreign path fails closed.
 $globalRecoveryBeforeAction=Get-SynapseGlobalRecoveryInventory -LogDir $LogDir -ProfilesDir $ProfilesDir -RuntimeBinDir $RuntimeBinDir
 $globalRecoveryBeforeActionTaskInfrastructure=if($null-ne$globalRecoveryAuthority){$globalRecoveryAuthority.Infrastructure}else{$globalRecoveryTaskInfrastructure}
-$globalRecoveryBeforeActionPrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryBeforeAction -TaskInfrastructure $globalRecoveryBeforeActionTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName
+$globalRecoveryBeforeActionPrerequisite=Assert-SynapseGlobalCommittedAuthorityPreflight -Inventory $globalRecoveryBeforeAction -TaskInfrastructure $globalRecoveryBeforeActionTaskInfrastructure -RuntimeBinDir $RuntimeBinDir -RequestedLegacyTaskName $TaskName -DecommissionStructuralOnly:$Remove
 $globalRecoveryBeforeActionSelection=Select-SynapseGlobalRecoveryAction -Inventory $globalRecoveryBeforeAction -Mode $globalRecoveryMode
 if(-not [bool]$globalRecoveryBeforeActionSelection.Allowed){Die ([string]$globalRecoveryBeforeActionSelection.Error)}
 if([string]$globalRecoveryBeforeAction.FingerprintSha256 -ine $globalRecoveryFingerprint){
