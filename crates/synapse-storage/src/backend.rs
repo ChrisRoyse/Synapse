@@ -4735,11 +4735,10 @@ impl StorageBackend for CalyxBackend {
                         // the four panels the catalog declares. Checked before
                         // the lineage lookup because being the live version is
                         // the stronger fact.
-                        let live_finite_only = constellations::panel_catalog_entry_for_version(
-                            panel_version,
-                        )
-                        .filter(|entry| entry.panel_version == panel_version)
-                        .map(|entry| entry.panel_name);
+                        let live_finite_only =
+                            constellations::panel_catalog_entry_for_version(panel_version)
+                                .filter(|entry| entry.panel_version == panel_version)
+                                .map(|entry| entry.panel_name);
                         let disposition = if let Some(panel_name) = live_finite_only {
                             tracing::debug!(
                                 code = "STORAGE_SEARCH_GENERATION_FINITE_ONLY_LIVE_PANEL",
@@ -4751,9 +4750,7 @@ impl StorageBackend for CalyxBackend {
                                  fused search; this is a declared terminal state, not damage"
                             );
                             GenerationDisposition::FiniteOnlyLivePanel { panel_name }
-                        } else if let Some(lineage) =
-                            superseded_panel_lineage(panel_version)
-                        {
+                        } else if let Some(lineage) = superseded_panel_lineage(panel_version) {
                             let retain_for_rollback = newest_closed_predecessor
                                 .get(lineage.panel_name)
                                 .is_some_and(|newest| *newest == panel_version);

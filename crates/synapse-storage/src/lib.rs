@@ -1101,8 +1101,11 @@ impl Db {
         expected_failure_sha256: &str,
         reason: &str,
     ) -> StorageResult<synapse_calyx::SynapseCalyxSealAdjudicationReceipt> {
-        self.backend
-            .adjudicate_calyx_raw_commitment_seal(ledger_seq, expected_failure_sha256, reason)
+        self.backend.adjudicate_calyx_raw_commitment_seal(
+            ledger_seq,
+            expected_failure_sha256,
+            reason,
+        )
     }
 
     /// Reads and decodes one physical provenance-ledger entry by sequence for

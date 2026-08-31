@@ -30,8 +30,8 @@ use super::{
     types::{
         AuditLedgerEntryReadback, AuditLegacyProbeRepairResponse, AuditOperation, AuditParams,
         AuditRepairRowReadback, AuditReproduceResponse, AuditResponse,
-        AuditSealAdjudicationResponse, AuditVerifyChainResponse,
-        ReplayArtifactInspectParams, ReplayOperation, ReplayParams, ReplayResponse,
+        AuditSealAdjudicationResponse, AuditVerifyChainResponse, ReplayArtifactInspectParams,
+        ReplayOperation, ReplayParams, ReplayResponse,
     },
     validation::{validate_audit_params, validate_replay_params},
 };
@@ -784,13 +784,9 @@ fn verify_chain_response(
         raw_commitment_failure: verify.raw_commitment_failure.clone(),
         raw_commitment_failure_sha256: verify.raw_commitment_failure_sha256.clone(),
         raw_commitment_adjudicated_count: verify.raw_commitment_adjudicated_count,
-        raw_commitment_adjudicated_exceptions: verify
-            .raw_commitment_adjudicated_exceptions
-            .clone(),
+        raw_commitment_adjudicated_exceptions: verify.raw_commitment_adjudicated_exceptions.clone(),
         raw_commitment_failed_seal_count: verify.raw_commitment_failed_seal_count,
-        raw_commitment_failed_seal_examples: verify
-            .raw_commitment_failed_seal_examples
-            .clone(),
+        raw_commitment_failed_seal_examples: verify.raw_commitment_failed_seal_examples.clone(),
         raw_commitment_uncovered_count: verify.raw_commitment_uncovered_count,
         reader_lease_duration_ms: verify.reader_lease_duration_ms,
         reader_lease_renewal_count: verify.reader_lease_renewal_count,

@@ -52,8 +52,7 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-30-terminal-discard-v27";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-30-terminal-discard-v27";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "7fe3e0ca82e0ba6083f25221b29cbfab5d03af63ad25253b6c37e1c92c6fe1cf";
 
