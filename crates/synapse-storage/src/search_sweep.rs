@@ -114,7 +114,7 @@ pub enum GenerationDisposition {
         live_panel_version: u32,
     },
     /// A generation is published for the **live** version of a panel the code
-    /// deliberately does not admit to fused search (#2262).
+    /// deliberately does not admit to fused search (#2263).
     ///
     /// [`crate::constellations::syn_panel_is_queryable`] admits five panels.
     /// The rest — agent-event, reflex, process, observation — are *finite-only*:
@@ -174,7 +174,7 @@ impl GenerationDisposition {
     }
 
     /// Whether this generation belongs to a live, deliberately finite-only
-    /// panel (#2262) — a declared terminal state that is neither damage nor
+    /// panel (#2263) — a declared terminal state that is neither damage nor
     /// debt, and must never be counted as unmaintainable.
     #[must_use]
     pub const fn is_finite_only_live_panel(&self) -> bool {

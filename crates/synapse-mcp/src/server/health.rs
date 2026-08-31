@@ -843,7 +843,7 @@ impl SynapseService {
                 .filter(|entry| entry.disposition.is_retirable())
                 .count() as u64
         });
-        // #2262: the live versions of the finite-only panels are a *declared*
+        // #2263: the live versions of the finite-only panels are a *declared*
         // terminal state, not unknown debt. Counting them as unmaintainable put
         // exactly the permanent floor under this subsystem that #1972 removed
         // for superseded generations — the live vault carried `unmaintainable=4`

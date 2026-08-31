@@ -721,7 +721,7 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generations_retirable_panel_versions: Option<Vec<u32>>,
     /// Generations published for the **live version of a deliberately
-    /// finite-only panel** (#2262) — agent-event, reflex, process, observation.
+    /// finite-only panel** (#2263) — agent-event, reflex, process, observation.
     /// `syn_panel_is_queryable` excludes them because #1965 retired their
     /// graded dense lens, so no fused query can name them and there is no dense
     /// generation to rebuild; the published directory is the exact-filter

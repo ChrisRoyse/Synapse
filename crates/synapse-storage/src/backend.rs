@@ -4721,7 +4721,7 @@ impl StorageBackend for CalyxBackend {
                         // a version nothing declares must be investigated before
                         // anything is deleted. The catalog already knows which
                         // is which, so this is a lookup rather than a judgement.
-                        // #2262 ask 1: "no contract" collapsed a *third*
+                        // #2263 ask 1: "no contract" collapsed a *third*
                         // situation. The live versions of the finite-only
                         // panels — agent-event, reflex, process, observation —
                         // have no query contract because
