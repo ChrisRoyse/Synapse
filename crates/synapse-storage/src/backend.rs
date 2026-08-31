@@ -4721,7 +4721,37 @@ impl StorageBackend for CalyxBackend {
                         // a version nothing declares must be investigated before
                         // anything is deleted. The catalog already knows which
                         // is which, so this is a lookup rather than a judgement.
-                        let disposition = if let Some(lineage) =
+                        // #2262 ask 1: "no contract" collapsed a *third*
+                        // situation. The live versions of the finite-only
+                        // panels — agent-event, reflex, process, observation —
+                        // have no query contract because
+                        // `syn_panel_is_queryable` deliberately excludes them
+                        // (#1965 retired their graded dense lens), and they are
+                        // live, so `superseded_panel_lineage` does not know
+                        // them either. They fell to UnmaintainableNoContract,
+                        // whose text asserts the version has no place in any
+                        // live panel's lineage and tells an operator to
+                        // investigate what wrote it — two false claims about
+                        // the four panels the catalog declares. Checked before
+                        // the lineage lookup because being the live version is
+                        // the stronger fact.
+                        let live_finite_only = constellations::panel_catalog_entry_for_version(
+                            panel_version,
+                        )
+                        .filter(|entry| entry.panel_version == panel_version)
+                        .map(|entry| entry.panel_name);
+                        let disposition = if let Some(panel_name) = live_finite_only {
+                            tracing::debug!(
+                                code = "STORAGE_SEARCH_GENERATION_FINITE_ONLY_LIVE_PANEL",
+                                panel_version,
+                                panel_name,
+                                index_root = %published.index_root.display(),
+                                "a search generation is published for the live version of a \
+                                 finite-only panel that the code deliberately does not admit to \
+                                 fused search; this is a declared terminal state, not damage"
+                            );
+                            GenerationDisposition::FiniteOnlyLivePanel { panel_name }
+                        } else if let Some(lineage) =
                             superseded_panel_lineage(panel_version)
                         {
                             let retain_for_rollback = newest_closed_predecessor

@@ -113,6 +113,30 @@ pub enum GenerationDisposition {
         /// The generation that superseded it and is maintained today.
         live_panel_version: u32,
     },
+    /// A generation is published for the **live** version of a panel the code
+    /// deliberately does not admit to fused search (#2262).
+    ///
+    /// [`crate::constellations::syn_panel_is_queryable`] admits five panels.
+    /// The rest — agent-event, reflex, process, observation — are *finite-only*:
+    /// #1965 retired their magnitude-weighted record vectors, so what remains
+    /// cannot honestly rank a neighbourhood, and admitting them would mean
+    /// giving a panel empty ANN lanes purely to obtain membership. Their
+    /// published directory is the exact-filter sidecar and nothing else.
+    ///
+    /// Split out for exactly the reason [`Self::RetirableSupersededGeneration`]
+    /// was (#1972): these four are *live catalog versions*, so
+    /// [`crate::constellations::superseded_panel_lineage`] does not know them,
+    /// and they fell through to [`Self::UnmaintainableNoContract`] — whose text
+    /// asserts the version has "no place in any live panel's declared lineage"
+    /// and tells an operator to "investigate what wrote" it. Both claims are
+    /// false: it *is* the live panel, and the code declares exactly why it has
+    /// no query contract. The live vault carried `unmaintainable=4`
+    /// continuously, which is a permanent floor under `calyx_search_generation`
+    /// — the same defect #1972 removed, re-entering through a different door.
+    FiniteOnlyLivePanel {
+        /// The live panel this version *is* — not one it descends from.
+        panel_name: &'static str,
+    },
     /// A closed superseded generation was physically retired after the sweep
     /// retained the newest closed predecessor for rollback diagnostics.
     RetiredSupersededGeneration {
@@ -132,6 +156,7 @@ impl GenerationDisposition {
             Self::Maintained(_) => "maintained",
             Self::UnmaintainableNoContract => "unmaintainable_no_contract",
             Self::RetirableSupersededGeneration { .. } => "retirable_superseded_generation",
+            Self::FiniteOnlyLivePanel { .. } => "finite_only_live_panel",
             Self::RetiredSupersededGeneration { .. } => "retired_superseded_generation",
             Self::Failed { .. } => "failed",
         }
@@ -146,6 +171,14 @@ impl GenerationDisposition {
     #[must_use]
     pub const fn is_retirable(&self) -> bool {
         matches!(self, Self::RetirableSupersededGeneration { .. })
+    }
+
+    /// Whether this generation belongs to a live, deliberately finite-only
+    /// panel (#2262) — a declared terminal state that is neither damage nor
+    /// debt, and must never be counted as unmaintainable.
+    #[must_use]
+    pub const fn is_finite_only_live_panel(&self) -> bool {
+        matches!(self, Self::FiniteOnlyLivePanel { .. })
     }
 }
 
@@ -235,6 +268,7 @@ impl PanelGenerationMaintenance {
                 }),
             GenerationDisposition::UnmaintainableNoContract
             | GenerationDisposition::RetirableSupersededGeneration { .. }
+            | GenerationDisposition::FiniteOnlyLivePanel { .. }
             | GenerationDisposition::RetiredSupersededGeneration { .. }
             | GenerationDisposition::Failed { .. } => self.manifest_present_at_start,
         }
@@ -315,6 +349,18 @@ impl PanelGenerationMaintenance {
                  idx/search/panel_{:010} and declare the panel's contract before deleting \
                  anything",
                 self.panel_version, self.panel_version,
+            ),
+            GenerationDisposition::FiniteOnlyLivePanel { panel_name } => format!(
+                "panel {}{active}{queryable} {disposition}: this IS the live version of \
+                 {panel_name}, and the code deliberately does not admit it to fused search - \
+                 #1965 retired its magnitude-weighted record vector, so the remaining \
+                 finite-direction lanes cannot honestly rank a neighbourhood and \
+                 syn_panel_is_queryable excludes it. The published directory is the \
+                 exact-filter sidecar only: no fused query can name this version and there is \
+                 no dense generation to rebuild. A declared terminal state, not damage and not \
+                 debt; action=none, unless this panel is meant to be searchable, in which case \
+                 declare a graded dense lens for it and add it to syn_panel_is_queryable",
+                self.panel_version,
             ),
             GenerationDisposition::RetirableSupersededGeneration {
                 panel_name,

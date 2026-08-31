@@ -843,6 +843,20 @@ impl SynapseService {
                 .filter(|entry| entry.disposition.is_retirable())
                 .count() as u64
         });
+        // #2262: the live versions of the finite-only panels are a *declared*
+        // terminal state, not unknown debt. Counting them as unmaintainable put
+        // exactly the permanent floor under this subsystem that #1972 removed
+        // for superseded generations — the live vault carried `unmaintainable=4`
+        // continuously, so `degraded` again taught an operator nothing and a
+        // genuinely-unknown generation would have been invisible against that
+        // background. Still reported, in its own field.
+        let sweep_finite_only_live = sweep.map_or(0, |sweep| {
+            sweep
+                .generations
+                .iter()
+                .filter(|entry| entry.disposition.is_finite_only_live_panel())
+                .count() as u64
+        });
         let sweep_failed = sweep.map_or(0, |sweep| {
             sweep
                 .generations
@@ -969,6 +983,15 @@ impl SynapseService {
                     .generations
                     .iter()
                     .filter(|entry| entry.disposition.is_retirable())
+                    .map(|entry| entry.panel_version)
+                    .collect()
+            }),
+            calyx_search_generations_finite_only_live: sweep.map(|_| sweep_finite_only_live),
+            calyx_search_generations_finite_only_live_panel_versions: sweep.map(|sweep| {
+                sweep
+                    .generations
+                    .iter()
+                    .filter(|entry| entry.disposition.is_finite_only_live_panel())
                     .map(|entry| entry.panel_version)
                     .collect()
             }),
