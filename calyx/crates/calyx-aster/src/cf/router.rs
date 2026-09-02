@@ -938,14 +938,34 @@ impl CfRouter {
         cf: ColumnFamily,
     ) -> Result<()> {
         let current_files = shard.levels.get(&cf).map_or(0, SstLevel::file_count);
-        if current_files < crate::vault::LIVE_COMPACTION_TRIGGER_FILES {
+        // Stall at the hard range-page source limit, NOT at the proactive
+        // compaction trigger.
+        //
+        // `LIVE_COMPACTION_TRIGGER_FILES` is 3/4 of the hard limit and its own
+        // doc comment says it "intentionally leaves 25% of the range-page
+        // source budget as headroom for concurrent memtable flushes". Refusing
+        // writes at the trigger spent that headroom instead of preserving it,
+        // and made the stall self-blocking: the readiness pass that exists to
+        // clear the debt has to *write* (staged-batch checkpoint, then each
+        // compacted output) and its own writes were refused by the condition it
+        // was running to fix. A vault that crossed the trigger between two opens
+        // could therefore never open again — `compact_catalog_cf_batch` returned
+        // `CALYX_ASTER_SST_FANOUT_WRITE_STALL` before it could compact anything,
+        // observed on a live vault at 386 `time_index` sources against a 384
+        // trigger and a 512 limit.
+        //
+        // The trigger's job is to *schedule* compaction (it still does, via
+        // `debt_for_cf` admission in the maintenance lanes). The hard limit is
+        // the real correctness bound, because that is what range paging cannot
+        // exceed, so that is what write admission enforces.
+        if current_files < crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES {
             return Ok(());
         }
         self.resource_counters.record_memtable_rejected();
         Err(CalyxError {
             code: "CALYX_ASTER_SST_FANOUT_WRITE_STALL",
             message: format!(
-                "stopped {} writes because its live router has {} immutable SST sources; proactive_compaction_trigger={} hard_page_source_limit={}",
+                "stopped {} writes because its live router has {} immutable SST sources at the hard range-page source limit; proactive_compaction_trigger={} hard_page_source_limit={}",
                 cf.name(),
                 current_files,
                 crate::vault::LIVE_COMPACTION_TRIGGER_FILES,
