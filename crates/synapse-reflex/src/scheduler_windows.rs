@@ -1,94 +1,100 @@
+//! Windows wake source for the reflex scheduler tick.
+//!
+//! # Why this is a plain blocking wait
+//!
+//! This module used to do three things at once: raise the scheduler thread to
+//! `THREAD_PRIORITY_TIME_CRITICAL`, register it with MMCSS as `Pro Audio` at
+//! `AVRT_PRIORITY_CRITICAL`, and then busy-spin `std::hint::spin_loop()` for the
+//! final millisecond before every deadline. With `target_interval` at 1 ms
+//! (`SchedulerConfig::default`) the spin window equalled the whole interval, so
+//! `timer_wait` was *always* zero: the high-resolution waitable timer below was
+//! constructed, armed once, and then never waited on. Every microsecond between
+//! ticks was burned by the spin instead.
+//!
+//! MMCSS `Pro Audio` at `AVRT_PRIORITY_CRITICAL` promotes a thread into the
+//! realtime scheduling range, above the threads that carry mouse and keyboard
+//! input and above DWM. A thread that spins there does not merely consume a
+//! core — it consumes a core at a priority the input stack cannot preempt, for
+//! as long as any reflex is scheduled. The operator-visible result is the
+//! machine feeling seized and the pointer stuttering whenever a reflex runs,
+//! which is exactly what the scheduler was reported doing.
+//!
+//! `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (Windows 10 1803 and later) is the
+//! supported mechanism for sub-millisecond wakes and needs neither a priority
+//! escalation nor a spin: it resolves to roughly 0.5 ms without either. It was
+//! already being created here; it is now actually used, for the full remaining
+//! interval, from an ordinary-priority thread.
+//!
+//! The tradeoff is deliberate and stated: wake jitter is now whatever the
+//! kernel timer delivers rather than whatever a realtime spin can pin down, so
+//! p99 tick jitter may sit above the `REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`
+//! reference figure on some hosts. Jitter is measured and published
+//! (`reflex_tick_jitter_us`, and `p99_tick_jitter_us` in health), lateness is
+//! already classified by `scheduler_tick`, and no gate fails on it. Trading
+//! bounded, observable jitter for an operator who can move their mouse is the
+//! correct direction, and a tighter wake must never again be bought with a
+//! realtime spin.
+
 use std::time::{Duration, Instant};
 
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         System::Threading::{
-            AVRT_PRIORITY_CRITICAL, AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
-            AvSetMmThreadPriority, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW,
-            GetCurrentThread, INFINITE, SetThreadPriority, SetWaitableTimerEx,
-            THREAD_PRIORITY_TIME_CRITICAL, TIMER_ALL_ACCESS, WaitForSingleObject,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE,
+            SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForSingleObject,
         },
     },
-    core::{PCWSTR, w},
+    core::PCWSTR,
 };
 
 pub struct WindowsHighResolutionTimer {
     timer: HANDLE,
-    mmcss: HANDLE,
 }
-
-// The configured Win11 host shows >200us p99 wake jitter if the final
-// millisecond is left entirely to the kernel timer. Longer intervals still
-// park on the high-resolution timer until this precision window.
-const SPIN_WINDOW: Duration = Duration::from_millis(1);
 
 impl WindowsHighResolutionTimer {
     pub fn start(target_interval: Duration) -> Result<Self, String> {
-        // SAFETY: GetCurrentThread returns a pseudo-handle for the current thread,
-        // and SetThreadPriority only mutates that thread's scheduler priority.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) }
-            .map_err(|error| format!("SetThreadPriority TIME_CRITICAL failed: {error}"))?;
-
-        let mut task_index = 0_u32;
-        // SAFETY: The task name is a static null-terminated UTF-16 literal and
-        // task_index is initialized to 0 as required for the first MMCSS call.
-        let mmcss = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task_index) }
-            .map_err(|error| format!("MMCSS Pro Audio registration failed: {error}"))?;
-        // SAFETY: mmcss is the task handle returned by AvSetMmThreadCharacteristicsW.
-        if let Err(error) = unsafe { AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL) } {
-            // SAFETY: mmcss was returned by AvSetMmThreadCharacteristicsW above.
-            let _ = unsafe { AvRevertMmThreadCharacteristics(mmcss) };
-            return Err(format!("MMCSS critical priority failed: {error}"));
-        }
-
         // SAFETY: Null security attributes/name create a private unnamed timer.
         // The returned handle is owned by this guard and closed in Drop.
-        let timer = match unsafe {
+        let timer = unsafe {
             CreateWaitableTimerExW(
                 None,
                 PCWSTR::null(),
                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                 TIMER_ALL_ACCESS.0,
             )
-        } {
-            Ok(timer) => timer,
-            Err(error) => {
-                // SAFETY: mmcss was returned by AvSetMmThreadCharacteristicsW above.
-                let _ = unsafe { AvRevertMmThreadCharacteristics(mmcss) };
-                return Err(format!(
-                    "CreateWaitableTimerExW high-resolution failed: {error}"
-                ));
-            }
-        };
+        }
+        .map_err(|error| format!("CreateWaitableTimerExW high-resolution failed: {error}"))?;
 
+        // Arm once at startup so a host that cannot honour the requested
+        // interval fails here, on the constructor, rather than on the first
+        // tick. `wait_until` re-arms per wait.
         if let Err(error) = arm_timer(timer, target_interval) {
-            // SAFETY: handles are valid and owned by this function on this path.
+            // SAFETY: `timer` is the handle created above and is owned here on
+            // this path; nothing else can observe it.
             let _ = unsafe { CloseHandle(timer) };
-            let _ = unsafe { AvRevertMmThreadCharacteristics(mmcss) };
             return Err(error);
         }
 
-        Ok(Self { timer, mmcss })
+        Ok(Self { timer })
     }
 
     pub fn wait_until(&self, deadline: Instant) -> Result<(), String> {
         let wait = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::ZERO);
-        let timer_wait = wait.saturating_sub(SPIN_WINDOW);
-        if !timer_wait.is_zero() {
-            arm_timer(self.timer, timer_wait)?;
-            // SAFETY: self.timer is a live waitable timer handle owned by this guard.
-            let result = unsafe { WaitForSingleObject(self.timer, INFINITE) };
-            if result != WAIT_OBJECT_0 {
-                return Err(format!(
-                    "WaitForSingleObject on scheduler timer returned {result:?}"
-                ));
-            }
+        // Already at or past the deadline: the tick is late and runs now. This
+        // is the same immediate return the old spin gave on a missed deadline.
+        if wait.is_zero() {
+            return Ok(());
         }
-        while Instant::now() < deadline {
-            std::hint::spin_loop();
+        arm_timer(self.timer, wait)?;
+        // SAFETY: self.timer is a live waitable timer handle owned by this guard.
+        let result = unsafe { WaitForSingleObject(self.timer, INFINITE) };
+        if result != WAIT_OBJECT_0 {
+            return Err(format!(
+                "WaitForSingleObject on scheduler timer returned {result:?}"
+            ));
         }
         Ok(())
     }
@@ -96,9 +102,8 @@ impl WindowsHighResolutionTimer {
 
 impl Drop for WindowsHighResolutionTimer {
     fn drop(&mut self) {
-        // SAFETY: both handles were acquired by this guard and are dropped once.
+        // SAFETY: the handle was acquired by this guard and is dropped once.
         let _ = unsafe { CloseHandle(self.timer) };
-        let _ = unsafe { AvRevertMmThreadCharacteristics(self.mmcss) };
     }
 }
 

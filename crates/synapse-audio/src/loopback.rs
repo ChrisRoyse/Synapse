@@ -451,6 +451,13 @@ impl MmcssGuard {
         };
 
         let mut task_index = 0_u32;
+        // This thread is driven by the WASAPI loopback device clock, not by an
+        // internal deadline: it wakes on the endpoint's own buffer-ready event
+        // and a missed wake drops captured audio outright. That is the one
+        // condition MMCSS exists for, and the thread blocks on the device event
+        // rather than spinning, so it yields its core between buffers instead
+        // of holding one above the input stack.
+        #[allow(clippy::disallowed_methods)]
         // SAFETY: The task name is a static null-terminated UTF-16 literal and
         // task_index is initialized as required for the first MMCSS call.
         let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task_index) }

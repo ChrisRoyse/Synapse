@@ -43,5 +43,32 @@ allow-expect-in-tests = true
 # naming itself, and any new use has to justify itself the same way.
 disallowed-methods = [
     { path = "calyx_forge::cpu::simd::dot_and_pair_norms", reason = "use calyx_forge::cpu::distance::cosine, the single cosine entry point (#1922); it owns shape validation, dispatched reduction, per-side finiteness attribution, the zero-norm threshold and the [-1,1] range contract, and returns a typed CosineFailure you map to your own error codes" },
+
+    # Never buy scheduler precision with the operator's input responsiveness.
+    #
+    # The reflex scheduler ran its 1 ms tick on a thread registered with MMCSS
+    # as `Pro Audio` at `AVRT_PRIORITY_CRITICAL` and then busy-spun the whole
+    # interval, because its 1 ms spin window equalled its 1 ms tick and the
+    # high-resolution waitable timer it had already created was consequently
+    # never waited on. MMCSS `Pro Audio` promotes a thread into the realtime
+    # range, above the threads carrying mouse and keyboard input and above DWM,
+    # so the spin held a core at a priority the input stack could not preempt
+    # for as long as any reflex was scheduled: the machine felt seized and the
+    # pointer stuttered.
+    #
+    # Both halves are banned rather than just the pairing, because each is only
+    # ever safe under a condition a reviewer has to check by hand. MMCSS is for
+    # threads feeding a real device clock, where missing a deadline drops audio
+    # — not for anything whose deadline is internal. A spin is for a wait
+    # bounded by a handful of iterations of another core's progress — not for
+    # one bounded by a wall-clock deadline, which is what a waitable timer is
+    # for. `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` gives ~0.5 ms wakes from an
+    # ordinary-priority blocked thread and is the correct tool for that case.
+    #
+    # A genuinely legitimate use carries an explicit `#[allow]` naming which of
+    # those two conditions it meets and why.
+    { path = "windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW", reason = "MMCSS promotes the thread into the realtime range, above mouse/keyboard input and DWM; reserve it for threads driven by a real device clock (WASAPI render/capture) and block for wall-clock deadlines on CREATE_WAITABLE_TIMER_HIGH_RESOLUTION instead, which reaches ~0.5 ms at ordinary priority" },
+    { path = "std::hint::spin_loop", reason = "spin only for a wait bounded by a few iterations of another core's progress (a bounded atomic readback retry); for a wall-clock deadline block on a high-resolution waitable timer, and never spin on a thread whose priority outranks the input stack" },
+    { path = "core::hint::spin_loop", reason = "spin only for a wait bounded by a few iterations of another core's progress (a bounded atomic readback retry); for a wall-clock deadline block on a high-resolution waitable timer, and never spin on a thread whose priority outranks the input stack" },
 ]
 # <<< SHARED-LINT-CONTRACT <<<

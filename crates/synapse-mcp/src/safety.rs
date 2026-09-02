@@ -1395,6 +1395,10 @@ fn operator_panic_finalization_postcondition_readback(
         if ok || attempt == 1 {
             return (lease, safety, ok);
         }
+        // Bounded by the enclosing `0..2`, not by a wall-clock deadline: this
+        // is the one-iteration pause before re-reading a concurrent finalizer's
+        // atomic decrement, on an ordinary-priority thread.
+        #[allow(clippy::disallowed_methods)]
         std::hint::spin_loop();
     }
     unreachable!("bounded operator-panic finalization readback loop always returns")

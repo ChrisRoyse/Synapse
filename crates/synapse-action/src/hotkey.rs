@@ -356,6 +356,11 @@ pub fn operator_panic_safety_readback() -> OperatorPanicSafetyReadback {
                     || accounting_incident,
             };
         }
+        // Bounded by another core's progress, not by a wall-clock deadline:
+        // the loop re-reads the publication epoch until three consecutive
+        // reads agree, which a concurrent publisher settles in a handful of
+        // iterations, on an ordinary-priority thread.
+        #[allow(clippy::disallowed_methods)]
         std::hint::spin_loop();
     }
 }
