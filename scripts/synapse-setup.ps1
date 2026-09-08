@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Windows-side Synapse setup: build/install the daemon binary, deploy bundled
   profiles, generate the bearer token, register the auto-start HTTP daemon, and
@@ -23110,6 +23110,16 @@ function Close-SynapseDeploymentAllocationHandles {
         [switch]$PayloadsOnly
     )
 
+    # Tolerate an absent context. This runs from `finally` blocks that fire
+    # whether or not the allocation was ever opened, and a null $Context made
+    # `@($Context.ArtifactOrder)` a one-element array holding $null, so the
+    # first `$Context.Artifacts[$leaf]` threw "Cannot index into a null array"
+    # -- from a cleanup path, which then REPLACED the primary error that was
+    # already unwinding. A decommission that failed for one reason therefore
+    # reported an unrelated indexing bug and left the operator with no way to
+    # see what actually went wrong.
+    if ($null -eq $Context -or $null -eq $Context.Artifacts) { return }
+
     foreach ($leaf in @($Context.ArtifactOrder)) {
         $artifact = $Context.Artifacts[$leaf]
         if ($PayloadsOnly -and [string]$artifact.kind -eq 'journal_slot') { continue }
@@ -23117,7 +23127,7 @@ function Close-SynapseDeploymentAllocationHandles {
             try { $artifact.handle.Dispose() } finally { $artifact.handle = $null }
         }
     }
-    if (-not $PayloadsOnly) {
+    if (-not $PayloadsOnly -and $null -ne $Context.JournalSlotHandles) {
         foreach ($sequence in @($Context.JournalSlotHandles.Keys)) {
             $handle = $Context.JournalSlotHandles[$sequence]
             if ($null -ne $handle) { try { $handle.Dispose() } catch {} }
@@ -30195,7 +30205,30 @@ function Wait-SynapseBrokerGenerationOperational {
         [Parameter(Mandatory=$true)][string]$CalyxConfigPath,
         [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$ExpectedCalyxConfigSha256,
         [ValidateRange(30,900)][int]$TimeoutSeconds=420,
-        [switch]$RequireCpuPolicy
+        [switch]$RequireCpuPolicy,
+        # Adopt a generation that is running and identity-proven even when the
+        # APPLICATION reports itself unhealthy.
+        #
+        # Every other proof in this function -- roster/gate cross-binding,
+        # broker state, the five-process lineage, the three Job contracts, the
+        # executable SHA-256 readback -- answers "is THIS the exact committed
+        # generation?", which is what adoption actually needs. `health.ok` does
+        # not: it is an application-level rollup that goes false whenever any
+        # subsystem is degraded.
+        #
+        # Gating adoption on it made the supported update path unable to
+        # replace a broken daemon, because being broken is precisely what makes
+        # `ok` false. On 2026-09-08 a Calyx storage stall set storage,
+        # calyx_derived_state and vault_verify to `error`; setup then refused
+        # to adopt authority, so it never reached its build step, and the fix
+        # for that stall could not be shipped by the tool that exists to ship
+        # fixes. The daemon you most need to update is the unhealthy one.
+        #
+        # This relaxes ONLY the application rollup, and only for callers that
+        # are adopting or rolling back an EXISTING generation. Verification of a
+        # newly installed daemon still demands `ok -eq $true`, because there the
+        # question genuinely is "did the thing I just installed come up well?".
+        [switch]$AllowUnhealthyApplication
     )
     # The immutable generation supervisor is the authority for the resource
     # contract that created its already-running daemon Job.  Recovery must
@@ -30213,6 +30246,7 @@ function Wait-SynapseBrokerGenerationOperational {
     $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
     $lastError='not_started'
     $lastReportedError=''
+    $unhealthyReported=''
     do {
         $currentPair=$null
         try {
@@ -30230,7 +30264,17 @@ function Wait-SynapseBrokerGenerationOperational {
                 throw "canonical roster identity mismatch"
             }
             $health=Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{Authorization="Bearer $Token"} -TimeoutSec 10
-            if($health.ok -ne $true){throw "health ok was $($health.ok)"}
+            if($health.ok -ne $true){
+                if(-not$AllowUnhealthyApplication){throw "health ok was $($health.ok)"}
+                $unhealthySubsystems=@()
+                if($null -ne $health.subsystems){
+                    $unhealthySubsystems=@($health.subsystems.PSObject.Properties|Where-Object{[string]$_.Value.status -cne 'ok'}|ForEach-Object{"$($_.Name)=$([string]$_.Value.status)"})
+                }
+                if($unhealthyReported -cne [string]$Generation.GenerationId){
+                    Write-Warning "[synapse-setup] SYNAPSE_BROKER_GENERATION_ADOPTED_WHILE_UNHEALTHY generation=$($Generation.GenerationId) health_ok=$($health.ok) daemon_pid=$($health.pid) unhealthy_subsystems=$($unhealthySubsystems -join ',') basis=identity_and_lineage_proofs_still_enforced remediation=this generation is being adopted so it can be replaced or rolled back; the named subsystems stay broken until a repaired generation is installed"
+                    $unhealthyReported=[string]$Generation.GenerationId
+                }
+            }
             $pidValue=[int]$health.pid
             $identity=Get-SynapseInstalledDaemonIdentityReadback -HealthPid $pidValue -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -ExpectedExePath $Generation.Executable.path -ExpectedSha256 $Generation.Executable.sha256 -LogDir $LogDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -ExpectedSupervisorCpuRate 10000 -ExpectedSupervisorBootstrapPath ([string]$Generation.RosterPayload.bootstrap_path) -ExpectedSupervisorLaunchCapabilitySha256 ([string]$Generation.LaunchCapabilitySha256)
             if(-not [bool]$identity.Ok){throw "installed identity: $($identity.Detail)"}
@@ -31737,7 +31781,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
                 # the exact Scheduler/control/Job/process objects before deletion.
                 [pscustomobject][ordered]@{DaemonPid=0;DecommissionStructuralOnly=$true}
             }else{
-                Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $currentGeneration -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -Bind ([string]$currentGeneration.RosterPayload.bind) -DbPath ([string]$currentGeneration.RosterPayload.db_path) -ProfilesDir ([string]$currentGeneration.RosterPayload.profiles_dir) -LogDir ([string]$currentGeneration.RosterPayload.log_dir) -Token $currentToken -AllowedPermissions ([string]$currentGeneration.RosterPayload.allowed_permissions) -CalyxConfigPath ([string]$currentGeneration.CalyxConfig.path) -ExpectedCalyxConfigSha256 ([string]$currentGeneration.CalyxConfig.sha256) -TimeoutSeconds $HealthTimeoutSeconds
+                Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $currentGeneration -ControlGateIdentity ([pscustomobject]@{Path=$controlPair.Gate.Path;FileId128=$controlPair.Gate.FileId128;Sha256=$controlPair.Gate.Sha256;Length=$controlPair.Gate.Length}) -RosterIdentity $rosterIdentity -ControlGateLease $controlPair.GateLease -RosterLease $controlPair.RosterLease -Bind ([string]$currentGeneration.RosterPayload.bind) -DbPath ([string]$currentGeneration.RosterPayload.db_path) -ProfilesDir ([string]$currentGeneration.RosterPayload.profiles_dir) -LogDir ([string]$currentGeneration.RosterPayload.log_dir) -Token $currentToken -AllowedPermissions ([string]$currentGeneration.RosterPayload.allowed_permissions) -CalyxConfigPath ([string]$currentGeneration.CalyxConfig.path) -ExpectedCalyxConfigSha256 ([string]$currentGeneration.CalyxConfig.sha256) -TimeoutSeconds $HealthTimeoutSeconds -AllowUnhealthyApplication
             }
         }else{
             $currentGeneration=$null
@@ -31992,7 +32036,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
             }
             $activeIdentity=[pscustomobject]@{Path=$layout.RosterPath;FileId128=$activeTransition.post_file_id_128;Sha256=$activeTransition.post_sha256;Length=$activeTransition.post_length}
             $activeControlIdentity=[pscustomobject]@{Path=$layout.ControlGatePath;FileId128=$controlGateTransition.post_file_id_128;Sha256=$controlGateTransition.post_sha256;Length=$controlGateTransition.post_length}
-            $proof=Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $priorGeneration -ControlGateIdentity $activeControlIdentity -RosterIdentity $activeIdentity -ControlGateLease $controlGateTransition.CanonicalLease -RosterLease $activeTransition.CanonicalLease -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -Token $Token -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -TimeoutSeconds $HealthTimeoutSeconds
+            $proof=Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $priorGeneration -ControlGateIdentity $activeControlIdentity -RosterIdentity $activeIdentity -ControlGateLease $controlGateTransition.CanonicalLease -RosterLease $activeTransition.CanonicalLease -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -Token $Token -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -TimeoutSeconds $HealthTimeoutSeconds -AllowUnhealthyApplication
             $rehearsalJournal=Add-SynapseDeploymentTransactionJournalState -State candidate_ready -Payload ([ordered]@{prior_authority='legacy';prior_production_rehearsed=$true;legacy_denial_probe_receipts=@($legacyDenialProbeReceipts);broker_identity_sha256=$infrastructure.BrokerIdentitySha256;generation_id=$priorGeneration.GenerationId;daemon_pid=$proof.DaemonPid;outer_bootstrap_pid=$proof.OuterBootstrapPid;broker_pid=$proof.BrokerPid;inner_bootstrap_pid=$proof.InnerBootstrapPid;supervisor_pid=$proof.SupervisorPid;tool_count=[int]$proof.ToolSurface.tool_count;tool_surface_sha256=[string]$proof.ToolSurface.tool_surface_sha256;outer_job_memory_limit_bytes=[uint64]$proof.OuterJob.JobMemoryLimitBytes}) -Transaction $localTransaction
             $rehearsalSlot=$rehearsalJournal.Slots[-1]
             [void](Assert-SynapseLegacyAuthoritySnapshotUnchanged -Snapshot $legacy -LegacyDenialTransition $legacyDenialTransition)
@@ -32010,7 +32054,7 @@ function Ensure-SynapseBrokerAuthorityAdopted {
         }
         $localTransaction.Committed=$true
         if($priorAuthority-ceq'legacy'){
-            $proof=Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $priorGeneration -ControlGateIdentity $activeControlIdentity -RosterIdentity $activeIdentity -ControlGateLease $controlGateTransition.CanonicalLease -RosterLease $activeTransition.CanonicalLease -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -Token $Token -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -TimeoutSeconds $HealthTimeoutSeconds
+            $proof=Wait-SynapseBrokerGenerationOperational -Layout $layout -Infrastructure $infrastructure -Generation $priorGeneration -ControlGateIdentity $activeControlIdentity -RosterIdentity $activeIdentity -ControlGateLease $controlGateTransition.CanonicalLease -RosterLease $activeTransition.CanonicalLease -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -Token $Token -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ExpectedCalyxConfigSha256 $ExpectedCalyxConfigSha256 -TimeoutSeconds $HealthTimeoutSeconds -AllowUnhealthyApplication
         }else{
             $proof=Assert-SynapseBrokerParkedNoAuthority -Layout $layout -Infrastructure $infrastructure -ControlGateIdentity $activeControlIdentity -RosterIdentity $activeIdentity -ControlGateLease $controlGateTransition.CanonicalLease -RosterLease $parkedTransition.CanonicalLease -Bind $Bind -DbPath $DbPath
         }

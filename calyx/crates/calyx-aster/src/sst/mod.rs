@@ -20,6 +20,28 @@ pub use reader_cache::{
 /// cannot drift from the read-side bound it must protect.
 pub const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
 
+/// Immutable SST files one *admitted* router put can still add to a CF before
+/// the next admission check runs.
+///
+/// A single put seals at most twice: once to relieve memtable backpressure,
+/// and once more when the retried write reports `flush_triggered`. Each seal
+/// writes one immutable SST.
+pub const MAX_SST_FILES_PER_ADMITTED_PUT: usize = 2;
+
+/// Highest live source count at which ordinary ingest is still admitted.
+///
+/// Admission has to stop [`MAX_SST_FILES_PER_ADMITTED_PUT`] short of the hard
+/// limit, or the write admitted *because* the CF was under the bound is itself
+/// what carries it over: a CF at 511 admits, seals twice, and lands at 513 --
+/// above [`MAX_INTERSECTING_SST_PAGE_SOURCES`], which is what range paging
+/// cannot exceed. This vault reached exactly 513 sources on `base` and `ledger`
+/// that way, and every range scan over them then failed closed with
+/// `CALYX_ASTER_SST_SEQUENTIAL_SOURCE_LIMIT_EXCEEDED` -- including the GC
+/// reachability census, which is what schedules the compaction that would have
+/// reduced them.
+pub const INGEST_ADMISSION_CEILING_SST_PAGE_SOURCES: usize =
+    MAX_INTERSECTING_SST_PAGE_SOURCES - MAX_SST_FILES_PER_ADMITTED_PUT;
+
 /// Upper bound on decoded key+value bytes a single [`SstReader`] range scan will
 /// materialize into memory before failing closed.
 ///

@@ -15,5 +15,8 @@ pub use key::{
     scalar_prefix_range, slot_key, temporal_xterm_key, temporal_xterm_prefix_range,
     verify_cx_hash_prefix, xterm_key, xterm_prefix_range,
 };
-pub use router::{CfRouter, NO_COMMIT_DOMAIN, RetiredCfPhysical, RouterPutCost, SealedFlush};
+pub use router::{
+    CfRouter, FanoutMaintenanceScope, NO_COMMIT_DOMAIN, RetiredCfPhysical, RouterPutCost,
+    SealedFlush,
+};
 pub(crate) use router_scan::CfImmutableRowStream;

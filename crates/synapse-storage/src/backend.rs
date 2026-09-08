@@ -17170,6 +17170,44 @@ fn run_calyx_gc_budgets_owned(
     budgets: &[CalyxGcBudget],
     source_census_cache: &Mutex<Option<CalyxGcSourceCensusCache>>,
 ) -> StorageResult<gc::GcReport> {
+    // Fan-out maintenance runs FIRST, before anything that can fail on the
+    // fan-out it exists to reduce.
+    //
+    // This is the only scheduled caller of `compact_native_fanout_once`, and it
+    // used to sit at the end of this function, behind the exact-reachability
+    // census below. That census streams the whole `base` CF, so once `base`
+    // crossed `MAX_INTERSECTING_SST_PAGE_SOURCES` the census failed closed with
+    // `CALYX_ASTER_SST_SEQUENTIAL_SOURCE_LIMIT_EXCEEDED`, the `?` returned, and
+    // compaction — the one thing that would have brought `base` back under the
+    // limit — was never reached. Every six-hourly tick from 2026-09-04 onward
+    // died there, fan-out grew unattended across every CF, and on 2026-09-05
+    // `time_index` hit the write-stall ceiling and the store went read-only:
+    // `thread/start` could no longer write CF_SESSIONS, so no new session could
+    // open. Compaction is the remediation; it must never be sequenced behind a
+    // consumer of the condition it remediates.
+    //
+    // Ordering only. Each pass is still file/byte bounded per CF and still runs
+    // off the durable commit lock; a failure here still fails the tick.
+    let native_fanout = vault.compact_native_fanout_once().map_err(|source| {
+        calyx_write_failed(
+            CALYX_GC_CF,
+            "run bounded native Calyx CF fan-out maintenance",
+            &source,
+        )
+    })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_NATIVE_FANOUT_MAINTENANCE_COMPLETED",
+        attempted_cfs = native_fanout.attempted_cfs,
+        compacted_cfs = native_fanout.compacted_cfs,
+        skipped_cfs = native_fanout.skipped_cfs,
+        reclaimed_input_files = native_fanout.reclaimed_input_files,
+        input_bytes = native_fanout.input_bytes,
+        output_bytes = native_fanout.output_bytes,
+        compacted_cf_names = ?native_fanout.compacted_cf_names,
+        "Calyx storage GC completed bounded native-CF file-count maintenance before its \
+         reachability census"
+    );
+
     let now_ms = calyx_clock_now_for_write(vault, CALYX_GC_CF)?;
     let mut source_census_cache = source_census_cache.lock().map_err(|poisoned| {
         calyx_write_failed_detail(
@@ -17280,15 +17318,15 @@ fn run_calyx_gc_budgets_owned(
     }
 
     // Every per-CF retention vector and committed tombstone payload is now
-    // dead. Return those allocator pages before compaction; the exact packed
-    // source baseline remains live by design. The executable allocator hook is
-    // mandatory and this operation fails closed if the OS readback or release
-    // itself fails.
+    // dead. Return those allocator pages before durable WAL recycling; the
+    // exact packed source baseline remains live by design. The executable
+    // allocator hook is mandatory and this operation fails closed if the OS
+    // readback or release itself fails.
     let retention_release = synapse_calyx::release_process_memory("storage_gc_retention_complete")
         .map_err(|source| {
             calyx_write_failed(
                 CALYX_GC_CF,
-                "release dead retention-census memory before native fan-out compaction",
+                "release dead retention-census memory before durable WAL recycling",
                 &source,
             )
         })?;
@@ -17298,26 +17336,7 @@ fn run_calyx_gc_budgets_owned(
         private_bytes_after = retention_release.private_bytes_after,
         private_bytes_reclaimed = retention_release.private_bytes_reclaimed,
         release_elapsed_us = retention_release.elapsed_us,
-        "released the completed retention phase before native fan-out compaction acquired its working set"
-    );
-
-    let native_fanout = vault.compact_native_fanout_once().map_err(|source| {
-        calyx_write_failed(
-            CALYX_GC_CF,
-            "run bounded native Calyx CF fan-out maintenance",
-            &source,
-        )
-    })?;
-    tracing::info!(
-        code = "STORAGE_CALYX_NATIVE_FANOUT_MAINTENANCE_COMPLETED",
-        attempted_cfs = native_fanout.attempted_cfs,
-        compacted_cfs = native_fanout.compacted_cfs,
-        skipped_cfs = native_fanout.skipped_cfs,
-        reclaimed_input_files = native_fanout.reclaimed_input_files,
-        input_bytes = native_fanout.input_bytes,
-        output_bytes = native_fanout.output_bytes,
-        compacted_cf_names = ?native_fanout.compacted_cf_names,
-        "Calyx storage GC completed bounded native-CF file-count maintenance"
+        "released the completed retention phase before durable WAL recycling acquired its working set"
     );
 
     let wal_recycle = vault

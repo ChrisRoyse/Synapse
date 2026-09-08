@@ -24,6 +24,48 @@ mod queries;
 /// several-hundred-MiB process commitment.
 const DEFAULT_MEMTABLE_BYTES: usize = 1024 * 1024;
 
+thread_local! {
+    /// Nesting depth of [`FanoutMaintenanceScope`] on the current thread.
+    static FANOUT_MAINTENANCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the calling thread as running the native fan-out maintenance pass,
+/// whose own writes are exempt from fan-out write admission.
+///
+/// The stall exists to stop *ingest* from growing a CF past the point where
+/// range paging works. The maintenance pass is the remediation for that exact
+/// condition, and it cannot run without writing: its preflight drains staged
+/// checkpoints, and that drain commits a `ledger` batch-commitment row. Gating
+/// those writes on the condition the pass was started to clear makes the stall
+/// self-blocking — observed on this vault with `ledger` at 513 sources, where
+/// every fan-out pass died in its own preflight and no CF was compacted again.
+///
+/// The exemption is bounded and self-correcting. What it admits is the pass's
+/// own bookkeeping, not ingest, and the pass compacts the CF back down to
+/// `DEFAULT_COMPACTION_TARGET_FILES` immediately afterwards. Refusing it
+/// instead trades a few files of overshoot for a permanently read-only vault.
+pub struct FanoutMaintenanceScope(());
+
+impl FanoutMaintenanceScope {
+    /// Enters the scope for the current thread until the guard is dropped.
+    #[must_use]
+    pub fn enter() -> Self {
+        FANOUT_MAINTENANCE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self(())
+    }
+
+    /// Whether the current thread is inside a fan-out maintenance pass.
+    fn is_active() -> bool {
+        FANOUT_MAINTENANCE_DEPTH.with(|depth| depth.get() > 0)
+    }
+}
+
+impl Drop for FanoutMaintenanceScope {
+    fn drop(&mut self) {
+        FANOUT_MAINTENANCE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// A poisoned shard names the column family that reached it, because "the
 /// router lock is poisoned" used to be true of one lock and is now true of one
 /// of [`ColumnFamily::SHARDS`].
@@ -957,17 +999,36 @@ impl CfRouter {
         // The trigger's job is to *schedule* compaction (it still does, via
         // `debt_for_cf` admission in the maintenance lanes). The hard limit is
         // the real correctness bound, because that is what range paging cannot
-        // exceed, so that is what write admission enforces.
-        if current_files < crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES {
+        // exceed, so that is what write admission enforces — minus the flush
+        // headroom one admitted put can still consume before the next check,
+        // so an admitted write can never be what breaches the bound.
+        let admission_ceiling = crate::sst::INGEST_ADMISSION_CEILING_SST_PAGE_SOURCES;
+        if current_files <= admission_ceiling {
+            return Ok(());
+        }
+        // The fan-out maintenance pass writes to clear this very debt. Refusing
+        // its writes here is what made the stall unrecoverable; see
+        // `FanoutMaintenanceScope`.
+        if FanoutMaintenanceScope::is_active() {
+            tracing::warn!(
+                code = "CALYX_ASTER_SST_FANOUT_MAINTENANCE_WRITE_ADMITTED",
+                cf = cf.name(),
+                current_files,
+                admission_ceiling,
+                hard_page_source_limit = crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
+                "admitted a fan-out maintenance write above the ingest admission ceiling; this \
+                 pass is the remediation for the fan-out it is writing through"
+            );
             return Ok(());
         }
         self.resource_counters.record_memtable_rejected();
         Err(CalyxError {
             code: "CALYX_ASTER_SST_FANOUT_WRITE_STALL",
             message: format!(
-                "stopped {} writes because its live router has {} immutable SST sources at the hard range-page source limit; proactive_compaction_trigger={} hard_page_source_limit={}",
+                "stopped {} writes because its live router has {} immutable SST sources at the hard range-page source limit; ingest_admission_ceiling={} proactive_compaction_trigger={} hard_page_source_limit={}",
                 cf.name(),
                 current_files,
+                admission_ceiling,
                 crate::vault::LIVE_COMPACTION_TRIGGER_FILES,
                 crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
             ),

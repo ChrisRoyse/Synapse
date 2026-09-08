@@ -310,6 +310,13 @@ where
                 CLOSE_COMPACTION_WAIT,
             )?,
         };
+        // Everything this pass writes from here down — the preflight
+        // checkpoint drain's `ledger` batch-commitment row included — is the
+        // remediation for fan-out debt, so it is exempt from the fan-out write
+        // stall that debt raises. Without this the pass is refused by the
+        // condition it was started to clear and the vault can never recover
+        // (see `FanoutMaintenanceScope`).
+        let _fanout_write_scope = crate::cf::FanoutMaintenanceScope::enter();
         // Issue #1806: this pass already performed its physical rewrites off
         // the durable commit lock, but its *preflight* checkpoint drained the
         // entire staged backlog inside one acquisition — the actual 469 s /
@@ -451,14 +458,46 @@ where
                     }
                     continue;
                 }
+                // A stalled CF that is already safe is not a reason to fail.
+                //
+                // `DEFAULT_COMPACTION_TARGET_FILES` is a maintenance *target*,
+                // not a correctness bound. The bounds are the ingest admission
+                // ceiling (below it, writes are accepted) and the hard
+                // range-page source limit (at or below it, range scans work).
+                // A CF made mostly of files at or above the rolled output
+                // target legitimately plateaus above 256 — no bounded window
+                // over them reduces the file count — and failing the pass for
+                // that took down whatever ran it: at open, the daemon could not
+                // start; on the periodic tick, fan-out maintenance stopped for
+                // the whole vault. Both outcomes are strictly worse than a CF
+                // sitting at a safe-but-unideal file count, so the plateau is
+                // reported and the pass moves on to the next CF. A plateau that
+                // is *not* safe still fails closed below.
+                if after.pending_files <= crate::sst::INGEST_ADMISSION_CEILING_SST_PAGE_SOURCES {
+                    tracing::warn!(
+                        code = "CALYX_ASTER_NATIVE_FANOUT_READINESS_PLATEAU",
+                        cf = cf.name(),
+                        before_files = before.pending_files,
+                        after_files = after.pending_files,
+                        target_files = DEFAULT_COMPACTION_TARGET_FILES,
+                        ingest_admission_ceiling =
+                            crate::sst::INGEST_ADMISSION_CEILING_SST_PAGE_SOURCES,
+                        hard_page_source_limit = crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
+                        "native-CF maintenance stopped reducing this CF above its file-count \
+                         target while still below every safety bound; leaving it at this count \
+                         and continuing with the remaining CFs"
+                    );
+                    break;
+                }
                 return Err(CalyxError {
                     code: "CALYX_ASTER_NATIVE_FANOUT_READINESS_NO_PROGRESS",
                     message: format!(
-                        "native-CF readiness compaction for {} made no file-count progress: before_files={} after_files={} target_files={} proactive_trigger_files={} hard_page_source_limit={}",
+                        "native-CF readiness compaction for {} made no file-count progress and is still at or above the ingest admission ceiling: before_files={} after_files={} target_files={} ingest_admission_ceiling={} proactive_trigger_files={} hard_page_source_limit={}",
                         cf.name(),
                         before.pending_files,
                         after.pending_files,
                         DEFAULT_COMPACTION_TARGET_FILES,
+                        crate::sst::INGEST_ADMISSION_CEILING_SST_PAGE_SOURCES,
                         LIVE_COMPACTION_TRIGGER_FILES,
                         crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
                     ),
