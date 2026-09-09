@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Windows-side Synapse setup: build/install the daemon binary, deploy bundled
   profiles, generate the bearer token, register the auto-start HTTP daemon, and
