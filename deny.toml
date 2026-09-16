@@ -1,23 +1,4 @@
-# cargo-deny — the dependency/advisory/license gate for the Synapse workspace.
-#
-# #1930: this file declared a policy from initial scaffolding onward and nothing
-# ever ran it. `cargo-deny` was not installed on the build host and no script
-# invoked it, while two docs described it as an active gate. The first run after
-# installing it (2026-07-31, cargo-deny 0.20.2) failed all three checks. The
-# standalone Calyx graph now has its colocated policy at `calyx/deny.toml`:
-#
-#   advisories : 3 errors  (anyhow unsoundness, crossbeam-epoch UB, paste unmaintained)
-#   licenses   : 29 errors (15 calyx crates unlicensed, 14 synapse crates rejected)
-#   bans       : 13 errors (85 wildcard first-party path deps across both workspaces)
-#
-# All of those were real and are fixed at the source (manifest + lock), not by
-# loosening this file. `scripts/lint.ps1` gate 5 now runs it over both workspaces
-# and FAILS CLOSED when the binary is missing.
-
 [graph]
-# cargo-deny only walks the targets named here. Anything reachable ONLY on a
-# third platform is invisible to this gate, so this list must stay in step with
-# what is actually built.
 targets = [
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "x86_64-pc-windows-msvc" },
@@ -25,68 +6,24 @@ targets = [
 
 [advisories]
 version = 2
-
-# BOTH default to "workspace", which means "only report when the affected crate
-# is a direct dependency of a workspace MEMBER". The root workspace `exclude`s
-# calyx (see Cargo.toml), so every calyx crate is a path dependency rather than
-# a member — and under the default, an advisory reached only through calyx is
-# filtered out of the root run entirely. Not downgraded to a warning: absent.
-#
-# Measured 2026-07-31, RUSTSEC-2026-0186 (unchecked pointer offset in memmap2):
-#   root, unsound = "workspace" (default) -> silent, though `cargo tree -i memmap2`
-#                                            shows it reachable via calyx-aster,
-#                                            calyx-registry and calyx-sextant
-#   root, unsound = "all"                 -> reported
-#   calyx workspace                       -> reported either way (there they ARE members)
-#
-# This is #1928/#1929's blind spot in the advisory gate: the workspace boundary
-# decides what the security check can see. "all" removes the boundary.
-unsound = "all"
-unmaintained = "all"
-
-# A yanked crate in a committed lock file is a supply-chain fact, not a style
-# nit: the version was withdrawn by its author and will not be there on a clean
-# fetch. Default is "warn", which this repository treats as "nobody will read
-# it".
-yanked = "deny"
-
-# Every entry here is an ACCEPTED risk with a written reason and a named owner
-# of the eventual removal. Never add one to make a run go green.
 ignore = []
-
-# The half of the ignore-list discipline that keeps it honest. An accepted risk
-# that no longer applies is a lie about what the gate is checking, so a stale
-# `ignore` entry is an error, not a warning.
-unused-ignored-advisory = "deny"
 
 [licenses]
 version = 2
 confidence-threshold = 0.93
-
-# THIRD-PARTY licenses only. First-party crates are `publish = false` in both
-# workspaces (see `[workspace.package]` in Cargo.toml and calyx/Cargo.toml), and
-# their licenses are a policy decision by the copyright holder rather than a
-# compliance finding this gate can rule on:
-#
-#   synapse crates -> LICENSE.md    = PolyForm-Noncommercial-1.0.0
-#   calyx crates   -> calyx/LICENSE = BUSL-1.1
-#
-# Neither is in `allow` below, and neither should be: allowing them here would
-# also silently admit a *third-party* dependency under a noncommercial or
-# source-available license, which is exactly the thing this check exists to
-# catch. `private.ignore` scopes the exemption to crates that can never be
-# published, which is the only set it is safe for. (#1930)
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "MPL-2.0",
     "ISC",
     "Zlib",
     "Unicode-3.0",
     "BSL-1.0",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
 ]
 
 [[licenses.clarify]]
@@ -95,16 +32,10 @@ expression = "MIT"
 license-files = [{ path = "LICENSE-MIT", hash = 0xeb164a42 }]
 
 [licenses.private]
-ignore = true
+ignore = false
 
 [bans]
 multiple-versions = "allow"
-
-# A `{ path = "..." }` dependency with no version requirement resolves to `*`.
-# Both workspaces now declare their first-party crates once in
-# `[workspace.dependencies]` with an explicit `version = "0.1.0"`, so this ban
-# is enforceable rather than aspirational, and `allow-wildcard-paths` is
-# deliberately NOT set — the wildcards were removed instead of exempted.
 wildcards = "deny"
 highlight = "all"
 
@@ -112,10 +43,3 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Exact revisions remain mandatory in Cargo.toml. Remove the vigem-client fork
-# once CasualX/vigem-client#6 is merged and published to crates.io; crates.io
-# 0.1.4's type-only winapi/xinput feature injects an unused xinput.lib link.
-allow-git = [
-    "https://github.com/enigo-rs/enigo",
-    "https://github.com/rofferom/vigem-client",
-]

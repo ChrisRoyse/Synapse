@@ -3,8 +3,6 @@ mod click;
 mod clipboard;
 mod config;
 mod focus_window;
-pub(crate) mod foreground_fence;
-pub(crate) mod hidden_desktop;
 mod pad;
 pub(crate) mod postcondition;
 pub(crate) mod press;
@@ -41,11 +39,13 @@ pub(crate) use click::ForegroundClickPolicy;
 pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget};
 pub(crate) use click::{
     ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, CLICK_TIER_FOREGROUND,
-    CLICK_TIER_POSTMESSAGE, act_click_hidden_desktop_worker, act_click_postmessage_with_params,
-    act_click_with_handle_and_lease, attach_click_tier_attempts,
-    click_params_can_route_background_first, click_target_foreground_guard_hwnds,
-    click_target_root_hwnd, click_tier_delivered, click_tier_failed, window_root_at_screen_point,
+    CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params, act_click_with_handle_and_lease,
+    attach_click_tier_attempts, click_params_can_route_background_first,
+    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
+    click_tier_failed,
 };
+#[cfg(test)]
+pub use clipboard::{ActClipboardFormat, ActClipboardVerb};
 pub use clipboard::{ActClipboardParams, ActClipboardResponse};
 pub(crate) use clipboard::{
     SharedSessionClipboardBuffers, act_clipboard_session_buffer, new_session_clipboards,
@@ -55,10 +55,6 @@ pub(crate) use focus_window::act_focus_window_with_boundary;
 pub use focus_window::{
     ActFocusWindowParams, ActFocusWindowResponse, act_focus_window_request_details,
     act_focus_window_target_hwnd,
-};
-pub(crate) use hidden_desktop::{
-    HiddenDesktopValueRoute, HiddenDesktopWindowRoute, desktop_label_for_hwnd,
-    resolve_hidden_desktop_value_route, resolve_hidden_desktop_window_route,
 };
 pub(crate) use pad::act_pad_with_handle_and_boundary;
 pub use pad::{ActPadParams, ActPadResponse};
@@ -71,12 +67,11 @@ pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
     act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
-    normalized_press_keys, post_key_sequence_blocking, resolve_keymap_press,
-    select_all_chord_action,
+    resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub(crate) use scroll::act_scroll_with_handle_and_boundary;
-pub use scroll::{ActScrollElementTarget, ActScrollParams, ActScrollResponse};
+pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
 pub use set_field_text::{
@@ -85,14 +80,12 @@ pub use set_field_text::{
 };
 pub(crate) use set_field_text::{
     METHOD_FOREGROUND_CLEAR, METHOD_FOREGROUND_REPLACE, SOURCE_UIA_PASSWORD_LENGTH,
-    SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_hidden_desktop,
-    act_set_field_text_native, finish_replace_response, params_with_resolved_element,
-    required_element_id, set_field_text_route_with_hidden_desktops, validate_set_field_text_params,
+    SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_native,
+    finish_replace_response, params_with_resolved_element, required_element_id,
+    set_field_text_route, validate_set_field_text_params,
 };
+pub(crate) use set_value::act_set_value_with_boundary;
 pub use set_value::{ActSetValueParams, ActSetValueResponse, act_set_value_request_details};
-pub(crate) use set_value::{
-    act_set_value_hidden_desktop_with_boundary, act_set_value_with_boundary,
-};
 pub use stroke::{
     ActStrokeParams, ActStrokeResponse, act_stroke_error_details, act_stroke_request_details,
     act_stroke_validation_failure_details, validate_act_stroke_params,
@@ -159,9 +152,6 @@ impl Drop for ForegroundInputLeaseGuard {
         }
         match lease::release(&self.session_id) {
             Ok(status) => {
-                // The foreground claim ends with the lease, so the delivery
-                // fence armed under it must not outlive it (#1830).
-                foreground_fence::disarm("foreground_input_lease_auto_released");
                 tracing::info!(
                     code = "INPUT_LEASE_AUTO_RELEASED",
                     tool = self.tool,
@@ -617,9 +607,30 @@ fn record_foreground_restore_context_event(
     foreground_read_error: Option<Value>,
     detail: Value,
 ) {
-    // The daemon lifecycle ledger is a process-global singleton. This production
-    // path records every foreground-restore decision into that ledger so the
-    // daemon has durable context when an input lease refuses or skips action.
+    // The daemon lifecycle ledger is a process-global singleton. In this crate's
+    // own unit-test binary, tests run in parallel and this production side-effect
+    // would write into whichever ledger the `daemon_lifecycle` tests momentarily
+    // have configured — corrupting their assertions and poisoning `last_error`
+    // (which flips `health_payload().ok` false for any concurrent health-reading
+    // test). The recording itself is covered directly by
+    // `daemon_lifecycle::tests::records_context_event_to_physical_files`, and the
+    // real daemon (integration tests, production) is built without `cfg(test)` and
+    // records normally. So suppress only this unasserted side-effect under test.
+    #[cfg(test)]
+    {
+        let _ = (
+            tool,
+            session_id,
+            status,
+            code,
+            reason_code,
+            foreground,
+            foreground_read_error,
+            detail,
+        );
+        return;
+    }
+    #[cfg(not(test))]
     {
         let detail = json!({
             "code": code,
@@ -976,7 +987,6 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     }
     match lease::try_acquire(session_id, lease::ttl_from_ms(ttl_ms)) {
         LeaseOutcome::Acquired(status) => {
-            foreground_fence::disarm("foreground_input_lease_action_acquired_by_new_owner");
             let boundary_result = ensure_operator_panic_action_admission(
                 tool,
                 "immediately_after_lease_acquire",
@@ -1178,11 +1188,28 @@ impl OperatorPanicActionBoundary {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn arm(tool: &'static str, stage: &'static str) -> Result<Self, ErrorData> {
+        arm_operator_panic_action_admission(tool, stage).map(|epoch_at_arm| Self {
+            tool,
+            epoch_at_arm,
+            // Production callers, including forgotten direct-helper seams,
+            // inherit the task-local epoch captured by handler::call_tool.
+            // Truly unscoped module/unit calls have no outer MCP request.
+            require_mcp_boundary: crate::server::operator_panic_boundary::is_mcp_request_guarded(),
+        })
+    }
+
     pub(crate) fn ensure(self, stage: &'static str) -> Result<(), ErrorData> {
         if self.require_mcp_boundary {
             crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
         }
         ensure_operator_panic_action_admission(self.tool, stage, self.epoch_at_arm)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn epoch_at_arm(self) -> u64 {
+        self.epoch_at_arm
     }
 }
 
@@ -1242,23 +1269,6 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
                 "retry_after_ms": retry_after_ms,
             })),
         ),
-        // The emission fence refuses strictly *before* the OS call, so there is
-        // provably nothing delivered to verify. Carrying the structured drift
-        // through keeps `refused_before_delivery` on the payload — the facade
-        // uses that marker to avoid reporting `delivered_unverified` for a call
-        // that emitted nothing (#1830/#2057).
-        ActionError::ForegroundEmissionRefused { detail, drift } => {
-            let mut data = drift.to_json();
-            if let Value::Object(map) = &mut data {
-                map.insert("code".to_owned(), Value::String(error.code().to_owned()));
-                map.insert("detail".to_owned(), Value::String(detail.clone()));
-                map.insert(
-                    "resolution".to_owned(),
-                    Value::String(drift.reason.remediation().to_owned()),
-                );
-            }
-            ErrorData::new(ErrorCode(-32099), detail.clone(), Some(data))
-        }
         _ => crate::m1::mcp_error(error.code(), error.to_string()),
     }
 }
@@ -1603,3 +1613,6 @@ pub fn shared_m2_state_from_config_with_shutdown_reason(
 pub fn recording_backend_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
+
+#[cfg(test)]
+mod tests;

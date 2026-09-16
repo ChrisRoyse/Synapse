@@ -1,8 +1,7 @@
 use windows::Win32::{
     Foundation::E_ACCESSDENIED,
     System::Threading::{
-        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-        THREAD_PRIORITY_TIME_CRITICAL,
+        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     },
     UI::HiDpi::{
         AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -42,7 +41,7 @@ pub fn current_thread_priority() -> CaptureThreadPriority {
 }
 
 pub fn set_capture_thread_priority() -> Result<(), CaptureError> {
-    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) }.map_err(|err| {
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) }.map_err(|err| {
         CaptureError::ThreadFailed {
             detail: err.to_string(),
         }

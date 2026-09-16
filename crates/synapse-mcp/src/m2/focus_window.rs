@@ -115,17 +115,6 @@ pub(crate) async fn act_focus_window_with_boundary(
     let changed = before.hwnd != verification.after.hwnd;
     let matched_hwnd = matched.hwnd;
 
-    // Arm the delivery fence from the *verified* foreground, not the requested
-    // target: every later foreground-tier dispatch now refuses unless this
-    // exact window still holds the foreground (#1830).
-    super::foreground_fence::arm(super::foreground_fence::ArmedForeground {
-        hwnd: verification.after.hwnd,
-        pid: verification.after.pid,
-        process_name: verification.after.process_name.clone(),
-        window_title: verification.after.window_title.clone(),
-        armed_by: TOOL,
-    });
-
     tracing::info!(
         code = "M2_ACT_FOCUS_WINDOW_READBACK",
         hwnd = matched.hwnd,
@@ -639,4 +628,67 @@ fn window_summaries(contexts: &[ForegroundContext]) -> Vec<WindowSummary> {
             window_title: context.window_title.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActFocusWindowParams, METHOD_ALREADY_FOREGROUND, METHOD_SET_FOREGROUND,
+        RequestedFocusTarget, focus_activation_plan, requested_target,
+    };
+
+    fn hwnd_params(hwnd: i64) -> ActFocusWindowParams {
+        ActFocusWindowParams {
+            hwnd: Some(hwnd),
+            title_regex: None,
+            pid: None,
+            verify_timeout_ms: 100,
+            stable_ms: 0,
+        }
+    }
+
+    #[test]
+    fn focus_hwnd_schema_and_runtime_enforce_canonical_user_handle_range() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(ActFocusWindowParams))
+            .expect("focus params schema should serialize");
+        assert_eq!(
+            schema["properties"]["hwnd"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            schema["properties"]["hwnd"]["maximum"],
+            serde_json::json!(u32::MAX)
+        );
+
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = requested_target(&hwnd_params(hwnd))
+                .expect_err("noncanonical HWND must fail before Win32 lookup");
+            let data = error.data.expect("HWND shape error must be structured");
+            assert_eq!(data["field"], "hwnd");
+            assert_eq!(data["actual_value"], hwnd);
+        }
+        assert!(matches!(
+            requested_target(&hwnd_params(i64::from(u32::MAX))),
+            Ok(RequestedFocusTarget::Hwnd(hwnd)) if hwnd == i64::from(u32::MAX)
+        ));
+    }
+
+    #[test]
+    fn focus_activation_plan_is_zero_or_one_activation() {
+        let already = focus_activation_plan(0x1001, 0x1001);
+        println!(
+            "readback=focus_activation_plan edge=already before_hwnd=0x1001 matched_hwnd=0x1001 after_attempts={} method={}",
+            already.attempts, already.method
+        );
+        assert_eq!(already.attempts, 0);
+        assert_eq!(already.method, METHOD_ALREADY_FOREGROUND);
+
+        let different = focus_activation_plan(0x1001, 0x2002);
+        println!(
+            "readback=focus_activation_plan edge=different before_hwnd=0x1001 matched_hwnd=0x2002 after_attempts={} method={}",
+            different.attempts, different.method
+        );
+        assert_eq!(different.attempts, 1);
+        assert_eq!(different.method, METHOD_SET_FOREGROUND);
+    }
 }

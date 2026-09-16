@@ -1,4 +1,4 @@
-import { fileURLToPath } from "node:url";
+import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import type { StorybookConfig } from "@storybook/react-vite";
 import { mergeConfig } from "vite";
@@ -15,7 +15,7 @@ const config: StorybookConfig = {
       plugins: [tailwindcss()],
       resolve: {
         alias: {
-          "@": fileURLToPath(new URL("../src", import.meta.url))
+          "@": path.resolve(__dirname, "../src")
         }
       },
       server: {

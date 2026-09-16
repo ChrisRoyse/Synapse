@@ -7,17 +7,15 @@ use std::{
 
 use regex::Regex;
 use synapse_core::{
-    Backend, CompiledHudParser, HudRegion, OcrBackend, PerceptionMode, Profile,
-    ProfileCaptureTarget, ProfileMatch, ProfileUseScope,
+    Backend, HudRegion, OcrBackend, PerceptionMode, Profile, ProfileCaptureTarget, ProfileMatch,
+    ProfileUseScope,
 };
 use tracing::instrument;
 
 use crate::error::ProfileError;
 use crate::toml_format::RawProfile;
 
-const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 250;
-pub(crate) const MIN_CAPTURE_INTERVAL_MS: u32 = 250;
-pub(crate) const MAX_CAPTURE_INTERVAL_MS: u32 = 60_000;
+const DEFAULT_CAPTURE_INTERVAL_MS: u32 = 50;
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_MAX_DETECTIONS: u32 = 32;
 const DEFAULT_SCREEN_WIDTH: i32 = 3840;
@@ -29,25 +27,13 @@ pub struct ProfileDefaults {
     pub keyboard_dynamics_default: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoadedProfile {
     pub profile: Profile,
-    pub compiled_title_regexes: Vec<Option<Regex>>,
-    pub compiled_hud_parsers: Vec<CompiledHudParser>,
     pub schema_version: u32,
     pub defaults: ProfileDefaults,
     pub source_path: PathBuf,
     pub modified: SystemTime,
-}
-
-impl PartialEq for LoadedProfile {
-    fn eq(&self, other: &Self) -> bool {
-        self.profile == other.profile
-            && self.schema_version == other.schema_version
-            && self.defaults == other.defaults
-            && self.source_path == other.source_path
-            && self.modified == other.modified
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

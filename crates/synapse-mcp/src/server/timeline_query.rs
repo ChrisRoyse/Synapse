@@ -182,8 +182,8 @@ impl SynapseService {
         params: StorageGcOnceParams,
     ) -> Result<StorageGcOnceResponse, ErrorData> {
         self.require_m3_permissions("storage_gc_once", &required_permissions_gc(&params))?;
-        let db = self.m3_storage()?;
-        run_storage_gc_once(&db, &params)
+        let runtime = self.reflex_runtime()?;
+        run_storage_gc_once(&runtime, &params)
     }
 
     #[tool(

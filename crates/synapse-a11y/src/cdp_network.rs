@@ -58,7 +58,6 @@ pub struct CdpDurableBrowserMutationOwnersReadback {
     pub fetch_interception_active_count: usize,
     pub network_override_active_count: usize,
     pub dialog_auto_policy_active_count: usize,
-    pub file_chooser_active_count: usize,
     pub clock_active_count: usize,
     pub init_script_active_count: usize,
     pub persisted_cdp_mutation_owner_count: usize,
@@ -86,10 +85,6 @@ pub struct CdpDurableBrowserMutationOwnersDrainReadback {
     pub dialog_auto_policies_found: usize,
     pub dialog_listener_tasks_drained: usize,
     pub dialog_handler_tasks_drained: usize,
-    pub file_choosers_found: usize,
-    pub file_chooser_intercepts_disabled: usize,
-    pub file_chooser_listener_tasks_drained: usize,
-    pub file_chooser_handler_tasks_drained: usize,
     pub clocks_found: usize,
     pub clocks_uninstalled: usize,
     pub init_scripts_found: usize,
@@ -472,18 +467,6 @@ pub struct CdpFetchRouteRule {
     pub action: CdpFetchRouteAction,
 }
 
-#[derive(Clone, Debug)]
-struct CompiledCdpFetchRouteRule {
-    rule: CdpFetchRouteRule,
-    url_matcher: CdpFetchRouteUrlMatcher,
-}
-
-#[derive(Clone, Debug)]
-enum CdpFetchRouteUrlMatcher {
-    Glob,
-    Regex(Regex),
-}
-
 struct RingBuffer {
     entries: VecDeque<CdpNetworkEntry>,
     capacity: usize,
@@ -792,7 +775,7 @@ struct FetchInterceptionSlot {
     target_id: String,
     armed_at_unix_ms: u64,
     patterns: Vec<CdpFetchInterceptionPattern>,
-    rules: Arc<Mutex<Vec<CompiledCdpFetchRouteRule>>>,
+    rules: Arc<Mutex<Vec<CdpFetchRouteRule>>>,
     counters: Arc<Mutex<FetchInterceptionCounters>>,
     page: Page,
     _browser: Browser,
@@ -1654,10 +1637,7 @@ pub fn fetch_interception_status(target_id: &str) -> Option<CdpFetchInterception
 #[must_use]
 pub fn fetch_route_rules(target_id: &str) -> Option<Vec<CdpFetchRouteRule>> {
     let slot = lookup_fetch_live(target_id.trim())?;
-    slot.rules
-        .lock()
-        .ok()
-        .map(|rules| rules.iter().map(|rule| rule.rule.clone()).collect())
+    slot.rules.lock().ok().map(|rules| rules.clone())
 }
 
 /// Adds or replaces a Fetch route rule for an active interception target.
@@ -1667,7 +1647,7 @@ pub fn fetch_route_add(
 ) -> A11yResult<CdpFetchInterceptionStatus> {
     require_durable_browser_mutation_owners_enabled("Fetch route install")?;
     let target_id = target_id.trim();
-    let rule = compile_fetch_route_rule(rule)?;
+    validate_fetch_route_rule(&rule)?;
     let slot = lookup_fetch_live(target_id).ok_or_else(|| A11yError::CdpAttachFailed {
         detail: format!("Fetch interception for target {target_id} is not armed"),
     })?;
@@ -1676,10 +1656,7 @@ pub fn fetch_route_add(
             detail: "Fetch route registry lock is poisoned".to_owned(),
         })?;
         require_durable_browser_mutation_owners_enabled("Fetch route registration")?;
-        if let Some(existing) = rules
-            .iter_mut()
-            .find(|existing| existing.rule.id == rule.rule.id)
-        {
+        if let Some(existing) = rules.iter_mut().find(|existing| existing.id == rule.id) {
             *existing = rule;
         } else {
             rules.push(rule);
@@ -1699,7 +1676,7 @@ pub fn fetch_route_remove(target_id: &str, route_id: &str) -> A11yResult<bool> {
         detail: "Fetch route registry lock is poisoned".to_owned(),
     })?;
     let before = rules.len();
-    rules.retain(|rule| rule.rule.id != route_id);
+    rules.retain(|rule| rule.id != route_id);
     Ok(rules.len() != before)
 }
 
@@ -1896,14 +1873,6 @@ pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOw
                 usize::MAX
             }
         };
-    let file_chooser_active_count = match crate::cdp_files::cdp_file_chooser_active_count_readback()
-    {
-        Ok(count) => count,
-        Err(error) => {
-            registry_readback_failures.push(error);
-            usize::MAX
-        }
-    };
     let init_script_active_count =
         match crate::cdp_action::durable_init_script_active_count_readback() {
             Ok(count) => count,
@@ -1928,7 +1897,6 @@ pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOw
         fetch_interception_active_count,
         network_override_active_count,
         dialog_auto_policy_active_count,
-        file_chooser_active_count,
         clock_active_count,
         init_script_active_count,
         persisted_cdp_mutation_owner_count: persisted.total_count,
@@ -2012,14 +1980,6 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
     let dialog_active_after = dialog.active_after;
     failures.extend(dialog.failures);
 
-    let file_choosers = crate::cdp_files::cdp_file_chooser_disable_and_drain_all().await;
-    let file_choosers_found = file_choosers.found;
-    let file_chooser_intercepts_disabled = file_choosers.intercepts_disabled;
-    let file_chooser_listener_tasks_drained = file_choosers.listener_tasks_drained;
-    let file_chooser_handler_tasks_drained = file_choosers.handler_tasks_drained;
-    let file_chooser_active_after = file_choosers.active_after;
-    failures.extend(file_choosers.failures);
-
     let clocks = crate::cdp_clock::durable_clocks_disable_and_drain_all().await;
     let clocks_found = clocks.found;
     let clocks_uninstalled = clocks.uninstalled;
@@ -2068,10 +2028,6 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         && dialog_listener_tasks_drained == dialog_auto_policies_found
         && dialog_handler_tasks_drained == dialog_auto_policies_found
         && dialog_active_after == 0
-        && file_chooser_intercepts_disabled == file_choosers_found
-        && file_chooser_listener_tasks_drained == file_choosers_found
-        && file_chooser_handler_tasks_drained == file_choosers_found
-        && file_chooser_active_after == 0
         && clocks_uninstalled == clocks_found
         && clocks_active_after == 0
         && init_scripts_removed == init_scripts_found
@@ -2086,7 +2042,6 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         && readback.fetch_interception_active_count == 0
         && readback.network_override_active_count == 0
         && readback.dialog_auto_policy_active_count == 0
-        && readback.file_chooser_active_count == 0
         && readback.clock_active_count == 0
         && readback.init_script_active_count == 0
         && readback.persisted_cdp_mutation_owner_count == 0
@@ -2106,10 +2061,6 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         dialog_auto_policies_found,
         dialog_listener_tasks_drained,
         dialog_handler_tasks_drained,
-        file_choosers_found,
-        file_chooser_intercepts_disabled,
-        file_chooser_listener_tasks_drained,
-        file_chooser_handler_tasks_drained,
         clocks_found,
         clocks_uninstalled,
         init_scripts_found,
@@ -2457,20 +2408,16 @@ fn validate_user_agent(value: &str) -> A11yResult<()> {
 
 fn fetch_route_match(
     event: &FetchEventRequestPaused,
-    rules: &[CompiledCdpFetchRouteRule],
+    rules: &[CdpFetchRouteRule],
 ) -> Option<CdpFetchRouteRule> {
     rules
         .iter()
         .find(|rule| fetch_route_rule_matches(event, rule))
-        .map(|rule| rule.rule.clone())
+        .cloned()
 }
 
-fn fetch_route_rule_matches(
-    event: &FetchEventRequestPaused,
-    compiled: &CompiledCdpFetchRouteRule,
-) -> bool {
-    let rule = &compiled.rule;
-    if !fetch_route_url_matches(&event.request.url, compiled) {
+fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRouteRule) -> bool {
+    if !fetch_route_url_matches(&event.request.url, rule) {
         return false;
     }
     if let Some(method) = rule.method.as_deref()
@@ -2486,11 +2433,12 @@ fn fetch_route_rule_matches(
     true
 }
 
-fn fetch_route_url_matches(url: &str, compiled: &CompiledCdpFetchRouteRule) -> bool {
-    let rule = &compiled.rule;
-    match &compiled.url_matcher {
-        CdpFetchRouteUrlMatcher::Glob => glob_matches(&rule.url, url),
-        CdpFetchRouteUrlMatcher::Regex(regex) => regex.is_match(url),
+fn fetch_route_url_matches(url: &str, rule: &CdpFetchRouteRule) -> bool {
+    match rule.match_kind {
+        CdpFetchRouteMatchKind::Glob => glob_matches(&rule.url, url),
+        CdpFetchRouteMatchKind::Regex => {
+            Regex::new(&rule.url).is_ok_and(|regex| regex.is_match(url))
+        }
     }
 }
 
@@ -2620,6 +2568,11 @@ fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
             detail: "Fetch route url must not contain NUL".to_owned(),
         });
     }
+    if matches!(rule.match_kind, CdpFetchRouteMatchKind::Regex) {
+        Regex::new(&rule.url).map_err(|error| A11yError::CdpAttachFailed {
+            detail: format!("Fetch route regex url is invalid: {error}"),
+        })?;
+    }
     if let Some(method) = rule.method.as_deref() {
         validate_http_method(method)?;
     }
@@ -2634,21 +2587,6 @@ fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
         }
     }
     Ok(())
-}
-
-fn compile_fetch_route_rule(rule: CdpFetchRouteRule) -> A11yResult<CompiledCdpFetchRouteRule> {
-    validate_fetch_route_rule(&rule)?;
-    let url_matcher = match rule.match_kind {
-        CdpFetchRouteMatchKind::Glob => CdpFetchRouteUrlMatcher::Glob,
-        CdpFetchRouteMatchKind::Regex => {
-            CdpFetchRouteUrlMatcher::Regex(Regex::new(&rule.url).map_err(|error| {
-                A11yError::CdpAttachFailed {
-                    detail: format!("Fetch route regex url is invalid: {error}"),
-                }
-            })?)
-        }
-    };
-    Ok(CompiledCdpFetchRouteRule { rule, url_matcher })
 }
 
 fn validate_fetch_route_fulfill(fulfill: &CdpFetchRouteFulfill) -> A11yResult<()> {
@@ -3074,4 +3012,557 @@ fn now_unix_ms_u64() -> u64 {
 fn finite_f64_eq(left: f64, right: f64) -> bool {
     left.partial_cmp(&right)
         .is_some_and(std::cmp::Ordering::is_eq)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chromiumoxide::cdp::browser_protocol::network::{MonotonicTime, ResourceType};
+    use serde_json::json;
+
+    fn request_event(request_id: &str, url: &str) -> EventRequestWillBeSent {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "loaderId": "loader-1",
+            "documentURL": "https://example.test/",
+            "request": {
+                "url": url,
+                "method": "GET",
+                "headers": {"Accept": "text/html"},
+                "initialPriority": "VeryHigh",
+                "referrerPolicy": "strict-origin-when-cross-origin"
+            },
+            "timestamp": 10.0,
+            "wallTime": 1710000000.25,
+            "initiator": {"type": "other"},
+            "redirectHasExtraInfo": false,
+            "type": "Document",
+            "frameId": "frame-1"
+        }))
+        .expect("request event")
+    }
+
+    fn response_event(request_id: &str, status: i64) -> EventResponseReceived {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "loaderId": "loader-1",
+            "timestamp": 10.5,
+            "type": "Document",
+            "response": {
+                "url": "https://example.test/",
+                "status": status,
+                "statusText": "OK",
+                "headers": {"content-type": "text/html"},
+                "mimeType": "text/html",
+                "charset": "",
+                "connectionReused": false,
+                "connectionId": 1,
+                "remoteIPAddress": "127.0.0.1",
+                "remotePort": 443,
+                "encodedDataLength": 512,
+                "protocol": "h2",
+                "securityState": "secure"
+            },
+            "hasExtraInfo": false,
+            "frameId": "frame-1"
+        }))
+        .expect("response event")
+    }
+
+    fn finished_event(request_id: &str) -> EventLoadingFinished {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 11.0,
+            "encodedDataLength": 1024
+        }))
+        .expect("loading finished event")
+    }
+
+    fn failed_event(request_id: &str) -> EventLoadingFailed {
+        EventLoadingFailed {
+            request_id: request_id.to_owned().into(),
+            timestamp: MonotonicTime::new(12.0),
+            r#type: ResourceType::Image,
+            error_text: "net::ERR_ABORTED".to_owned(),
+            canceled: Some(true),
+            blocked_reason: None,
+            cors_error_status: None,
+        }
+    }
+
+    fn websocket_created_event(request_id: &str, url: &str) -> EventWebSocketCreated {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "url": url,
+            "initiator": {"type": "script"}
+        }))
+        .expect("websocket created event")
+    }
+
+    fn websocket_handshake_request_event(
+        request_id: &str,
+    ) -> EventWebSocketWillSendHandshakeRequest {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 20.0,
+            "wallTime": 30.0,
+            "request": {
+                "headers": {
+                    "Sec-WebSocket-Key": "abc"
+                }
+            }
+        }))
+        .expect("websocket handshake request event")
+    }
+
+    fn websocket_handshake_response_event(
+        request_id: &str,
+    ) -> EventWebSocketHandshakeResponseReceived {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 21.0,
+            "response": {
+                "status": 101,
+                "statusText": "Switching Protocols",
+                "headers": {
+                    "Upgrade": "websocket"
+                }
+            }
+        }))
+        .expect("websocket handshake response event")
+    }
+
+    fn websocket_frame_sent_event(
+        request_id: &str,
+        opcode: f64,
+        payload_data: &str,
+    ) -> EventWebSocketFrameSent {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 22.0,
+            "response": {
+                "opcode": opcode,
+                "mask": true,
+                "payloadData": payload_data
+            }
+        }))
+        .expect("websocket frame sent event")
+    }
+
+    fn websocket_frame_received_event(
+        request_id: &str,
+        opcode: f64,
+        payload_data: &str,
+    ) -> EventWebSocketFrameReceived {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 23.0,
+            "response": {
+                "opcode": opcode,
+                "mask": false,
+                "payloadData": payload_data
+            }
+        }))
+        .expect("websocket frame received event")
+    }
+
+    fn websocket_closed_event(request_id: &str) -> EventWebSocketClosed {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "timestamp": 24.0
+        }))
+        .expect("websocket closed event")
+    }
+
+    fn paused_event(request_id: &str, url: &str, resource_type: &str) -> FetchEventRequestPaused {
+        serde_json::from_value(json!({
+            "requestId": request_id,
+            "request": {
+                "url": url,
+                "method": "GET",
+                "headers": {"Accept": "application/json"},
+                "initialPriority": "High",
+                "referrerPolicy": "strict-origin-when-cross-origin"
+            },
+            "frameId": "frame-1",
+            "resourceType": resource_type
+        }))
+        .expect("Fetch.requestPaused event")
+    }
+
+    fn fulfill_rule(id: &str, url: &str, match_kind: CdpFetchRouteMatchKind) -> CdpFetchRouteRule {
+        CdpFetchRouteRule {
+            id: id.to_owned(),
+            url: url.to_owned(),
+            match_kind,
+            method: None,
+            resource_type: None,
+            action: CdpFetchRouteAction::Fulfill(CdpFetchRouteFulfill {
+                status: 201,
+                response_phrase: Some("Created".to_owned()),
+                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                body_base64: Some("eyJvayI6dHJ1ZX0=".to_owned()),
+            }),
+        }
+    }
+
+    #[test]
+    fn ring_buffer_keeps_bounded_request_records_and_evicts_oldest() {
+        let mut buffer = RingBuffer::new(2);
+        buffer.apply_request_will_be_sent(&request_event("r1", "https://example.test/one"));
+        buffer.apply_request_will_be_sent(&request_event("r2", "https://example.test/two"));
+        buffer.apply_request_will_be_sent(&request_event("r3", "https://example.test/three"));
+
+        let request_ids: Vec<&str> = buffer
+            .entries
+            .iter()
+            .map(|entry| entry.request_id.as_str())
+            .collect();
+        assert_eq!(request_ids, vec!["r2", "r3"]);
+        assert_eq!(buffer.dropped, 1);
+        assert_eq!(buffer.cursor(), 3);
+    }
+
+    #[test]
+    fn response_and_finished_events_update_existing_request_cursor() {
+        let mut buffer = RingBuffer::new(10);
+        buffer.apply_request_will_be_sent(&request_event("r1", "https://example.test/"));
+        let after_request_cursor = buffer.cursor();
+        buffer.apply_response_received(&response_event("r1", 200));
+        buffer.apply_loading_finished(&finished_event("r1"));
+
+        assert_eq!(buffer.entries.len(), 1);
+        let entry = &buffer.entries[0];
+        assert_eq!(entry.first_seq, 0);
+        assert_eq!(entry.seq, 2);
+        assert!(entry.seq >= after_request_cursor);
+        assert_eq!(entry.method.as_deref(), Some("GET"));
+        assert_eq!(entry.url.as_deref(), Some("https://example.test/"));
+        assert_eq!(entry.resource_type.as_deref(), Some("Document"));
+        assert_eq!(entry.response.as_ref().map(|r| r.status), Some(200));
+        assert_eq!(entry.encoded_data_length, Some(1024.0));
+        assert!(entry.response_received);
+        assert!(entry.loading_finished);
+        assert!(!entry.loading_failed);
+    }
+
+    #[test]
+    fn websocket_buffer_tracks_frames_and_close_info() {
+        let mut buffer = WebSocketRingBuffer::new(8);
+        buffer.apply_created(&websocket_created_event(
+            "ws-1",
+            "wss://example.test/socket",
+        ));
+        buffer.apply_handshake_request(&websocket_handshake_request_event("ws-1"));
+        buffer.apply_handshake_response(&websocket_handshake_response_event("ws-1"));
+        buffer.apply_frame_sent(&websocket_frame_sent_event("ws-1", 1.0, "hello"));
+        let close_payload = BASE64_STANDARD.encode([0x03, 0xe8, b'o', b'k']);
+        buffer.apply_frame_received(&websocket_frame_received_event("ws-1", 8.0, &close_payload));
+        buffer.apply_closed(&websocket_closed_event("ws-1"));
+
+        assert_eq!(buffer.entries.len(), 1);
+        let entry = &buffer.entries[0];
+        assert_eq!(entry.request_id, "ws-1");
+        assert_eq!(entry.url.as_deref(), Some("wss://example.test/socket"));
+        assert!(entry.created);
+        assert_eq!(entry.status, Some(101));
+        assert_eq!(entry.sent_frame_count, 1);
+        assert_eq!(entry.received_frame_count, 1);
+        assert!(entry.closed);
+        assert_eq!(entry.close_code, Some(1000));
+        assert_eq!(entry.close_reason.as_deref(), Some("ok"));
+        assert_eq!(entry.frames.len(), 2);
+        assert_eq!(entry.frames[0].payload_data.as_deref(), Some("hello"));
+        assert_eq!(entry.frames[1].close_code, Some(1000));
+        println!(
+            "readback=websocket_buffer request_id={} sent={} received={} close_code={:?} close_reason={:?}",
+            entry.request_id,
+            entry.sent_frame_count,
+            entry.received_frame_count,
+            entry.close_code,
+            entry.close_reason
+        );
+    }
+
+    #[test]
+    fn loading_failed_creates_failure_entry_with_error_text() {
+        let mut buffer = RingBuffer::new(10);
+        buffer.apply_loading_failed(&failed_event("r-failed"));
+
+        let entry = &buffer.entries[0];
+        assert_eq!(entry.request_id, "r-failed");
+        assert_eq!(entry.resource_type.as_deref(), Some("Image"));
+        assert!(entry.loading_failed);
+        assert!(!entry.loading_finished);
+        assert_eq!(
+            entry.failure_error_text.as_deref(),
+            Some("net::ERR_ABORTED")
+        );
+        assert_eq!(entry.failure_canceled, Some(true));
+    }
+
+    #[test]
+    fn read_filter_sorts_by_latest_event_cursor_for_delta_reads() {
+        let mut buffer = RingBuffer::new(10);
+        buffer.apply_request_will_be_sent(&request_event("r1", "https://example.test/one"));
+        let since = buffer.cursor();
+        buffer.apply_request_will_be_sent(&request_event("r2", "https://example.test/two"));
+        buffer.apply_response_received(&response_event("r1", 201));
+
+        let mut entries: Vec<CdpNetworkEntry> = buffer
+            .entries
+            .iter()
+            .filter(|entry| entry.seq >= since)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|entry| entry.seq);
+
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.request_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["r2", "r1"]);
+        assert_eq!(entries[1].response.as_ref().map(|r| r.status), Some(201));
+    }
+
+    #[test]
+    fn fetch_pattern_conversion_preserves_url_resource_type_and_stage() {
+        let converted = fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+            url_pattern: Some("https://example.test/api/*".to_owned()),
+            resource_type: Some("XHR".to_owned()),
+            request_stage: CdpFetchInterceptionStage::Response,
+        })
+        .expect("pattern converts");
+        let value = serde_json::to_value(converted).expect("pattern json");
+        assert_eq!(value["urlPattern"], "https://example.test/api/*");
+        assert_eq!(value["resourceType"], "XHR");
+        assert_eq!(value["requestStage"], "Response");
+    }
+
+    #[test]
+    fn fetch_pattern_conversion_rejects_invalid_values() {
+        assert!(
+            fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+                url_pattern: Some(String::new()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+                resource_type: Some("NotAResource".to_owned()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fetch_request_id_string_round_trips_generated_id() {
+        let request_id = FetchRequestId::from("intercept-1".to_owned());
+        assert_eq!(fetch_request_id_string(&request_id), "intercept-1");
+    }
+
+    #[test]
+    fn network_override_headers_params_serializes_header_map() {
+        let params =
+            network_override_headers_params(&[("x-synapse-test".to_owned(), "enabled".to_owned())])
+                .expect("headers params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["headers"]["x-synapse-test"], "enabled");
+    }
+
+    #[test]
+    fn network_override_user_agent_params_serializes_ua() {
+        let params =
+            network_override_user_agent_params("SynapseTest/1.0").expect("user-agent params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["userAgent"], "SynapseTest/1.0");
+    }
+
+    #[test]
+    fn network_override_config_rejects_invalid_values() {
+        assert!(
+            validate_network_override_config(&CdpNetworkOverrideConfig {
+                headers: vec![("bad header".to_owned(), "value".to_owned())],
+                user_agent: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_network_override_config(&CdpNetworkOverrideConfig {
+                headers: Vec::new(),
+                user_agent: Some("bad\nua".to_owned()),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fetch_route_glob_matches_url_with_star_and_question_mark() {
+        assert!(glob_matches(
+            "https://example.test/api/*/user?.json",
+            "https://example.test/api/v1/user1.json"
+        ));
+        assert!(!glob_matches(
+            "https://example.test/api/*/user?.json",
+            "https://example.test/assets/user1.json"
+        ));
+    }
+
+    #[test]
+    fn fetch_route_match_supports_regex_and_first_match_order() {
+        let event = paused_event("fetch-1", "https://example.test/api/users/42", "XHR");
+        let first = fulfill_rule(
+            "first",
+            r"^https://example\.test/api/users/\d+$",
+            CdpFetchRouteMatchKind::Regex,
+        );
+        let second = fulfill_rule(
+            "second",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+
+        let matched = fetch_route_match(&event, &[first, second]).expect("matched route");
+        assert_eq!(matched.id, "first");
+    }
+
+    #[test]
+    fn fetch_route_match_respects_resource_type() {
+        let event = paused_event("fetch-1", "https://example.test/api/users", "XHR");
+        let mut document_rule = fulfill_rule(
+            "document",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        document_rule.resource_type = Some("Document".to_owned());
+        let mut xhr_rule = fulfill_rule(
+            "xhr",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        xhr_rule.resource_type = Some("XHR".to_owned());
+
+        let matched =
+            fetch_route_match(&event, &[document_rule, xhr_rule]).expect("matched xhr route");
+        assert_eq!(matched.id, "xhr");
+    }
+
+    #[test]
+    fn fetch_route_match_respects_method_when_present() {
+        let event = paused_event("fetch-1", "https://example.test/api/users", "XHR");
+        let mut post_rule = fulfill_rule(
+            "post",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        post_rule.method = Some("POST".to_owned());
+        let mut get_rule = fulfill_rule(
+            "get",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        get_rule.method = Some("GET".to_owned());
+
+        let matched = fetch_route_match(&event, &[post_rule, get_rule]).expect("matched get route");
+        assert_eq!(matched.id, "get");
+    }
+
+    #[test]
+    fn fetch_route_validation_rejects_bad_values() {
+        let mut rule = fulfill_rule(
+            "bad id",
+            "https://example.test/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.id = "ok".to_owned();
+        rule.url = "[".to_owned();
+        rule.match_kind = CdpFetchRouteMatchKind::Regex;
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.url = "https://example.test/*".to_owned();
+        rule.match_kind = CdpFetchRouteMatchKind::Glob;
+        let fulfill = match &mut rule.action {
+            CdpFetchRouteAction::Fulfill(fulfill) => fulfill,
+            CdpFetchRouteAction::Abort(_) => panic!("expected fulfill rule"),
+            CdpFetchRouteAction::Continue(_) => panic!("expected fulfill rule"),
+        };
+        fulfill.status = 99;
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.action = CdpFetchRouteAction::Abort(CdpFetchRouteAbort {
+            error_reason: "NotAReason".to_owned(),
+        });
+        assert!(validate_fetch_route_rule(&rule).is_err());
+
+        rule.action = CdpFetchRouteAction::Continue(CdpFetchRouteContinue::default());
+        assert!(validate_fetch_route_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn fetch_fulfill_params_serializes_status_headers_phrase_and_body() {
+        let fulfill = match fulfill_rule(
+            "route-1",
+            "https://example.test/*",
+            CdpFetchRouteMatchKind::Glob,
+        )
+        .action
+        {
+            CdpFetchRouteAction::Fulfill(fulfill) => fulfill,
+            CdpFetchRouteAction::Abort(_) => panic!("expected fulfill rule"),
+            CdpFetchRouteAction::Continue(_) => panic!("expected fulfill rule"),
+        };
+        let params = fetch_fulfill_params(FetchRequestId::from("intercept-1".to_owned()), &fulfill)
+            .expect("fulfill params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["requestId"], "intercept-1");
+        assert_eq!(value["responseCode"], 201);
+        assert_eq!(value["responsePhrase"], "Created");
+        assert_eq!(value["body"], "eyJvayI6dHJ1ZX0=");
+        assert_eq!(value["responseHeaders"][0]["name"], "content-type");
+        assert_eq!(value["responseHeaders"][0]["value"], "application/json");
+    }
+
+    #[test]
+    fn fetch_continue_params_serializes_overrides() {
+        let params = fetch_continue_params(
+            FetchRequestId::from("intercept-1".to_owned()),
+            &CdpFetchRouteContinue {
+                url: Some("https://example.test/rewritten".to_owned()),
+                method: Some("POST".to_owned()),
+                headers: vec![("x-test".to_owned(), "yes".to_owned())],
+                post_data_base64: Some("eyJwYXRjaGVkIjp0cnVlfQ==".to_owned()),
+            },
+        )
+        .expect("continue params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["requestId"], "intercept-1");
+        assert_eq!(value["url"], "https://example.test/rewritten");
+        assert_eq!(value["method"], "POST");
+        assert_eq!(value["postData"], "eyJwYXRjaGVkIjp0cnVlfQ==");
+        assert_eq!(value["headers"][0]["name"], "x-test");
+        assert_eq!(value["headers"][0]["value"], "yes");
+    }
+
+    #[test]
+    fn fetch_fail_params_serializes_error_reason() {
+        let params = fetch_fail_params(
+            FetchRequestId::from("intercept-1".to_owned()),
+            &CdpFetchRouteAbort {
+                error_reason: "BlockedByClient".to_owned(),
+            },
+        )
+        .expect("fail params");
+        let value = serde_json::to_value(params).expect("params json");
+
+        assert_eq!(value["requestId"], "intercept-1");
+        assert_eq!(value["errorReason"], "BlockedByClient");
+    }
 }

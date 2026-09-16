@@ -1,11 +1,4 @@
-# Clippy configuration for the ROOT (`synapse`) workspace.
-#
-# `clippy.toml` is resolved **per workspace**, and `calyx/` declares its own
-# `[workspace]`, so nothing written here reaches a single calyx crate. Rules that
-# must hold across both trees live in the shared contract block below and are
-# duplicated byte-for-byte into `calyx/clippy.toml`. `scripts/lint.ps1` extracts
-# both blocks and fails closed if they differ, so the duplication cannot drift
-# silently (issue #1928).
+# Workspace Clippy configuration.
 #
 # `clippy::unwrap_used` and `clippy::expect_used` are denied workspace-wide
 # (see [workspace.lints.clippy] in Cargo.toml) to keep PRODUCTION paths free of
@@ -13,35 +6,5 @@
 # `unwrap()`/`expect()`/`unwrap_err()`/`expect_err()` to assert invariants, so
 # allow them in `#[cfg(test)]` / `#[test]` contexts only. Production code remains
 # strict.
-#
-# NOTE: these two keys are deliberately NOT in the shared block. The calyx
-# workspace does not deny `unwrap_used`/`expect_used` at all, so an
-# `allow-*-in-tests` relaxation there would be relaxing a lint that never fires.
-# `scripts/lint.ps1` reports that policy divergence explicitly rather than
-# letting "I ran lint" imply the two trees are held to one standard.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
-
-# >>> SHARED-LINT-CONTRACT — byte-identical in ./clippy.toml and ./calyx/clippy.toml >>>
-# Edit BOTH files together; scripts/lint.ps1 fails closed on any divergence.
-#
-# #1922 ask 3: make a fifth undispatched cosine impossible to add by accident.
-#
-# Four independent cosine implementations grew in this workspace, and each one
-# started from zero on the same four decisions — shape validation, finiteness
-# classification, the zero-norm threshold, the [-1,1] range contract — because
-# nothing stopped a new call site from reaching straight for the raw reduction.
-# Three of them then had to be rediscovered and fixed one at a time (#1908,
-# #1912, #1917), and #1923 found a fifth site nobody had counted.
-#
-# `dot_and_pair_norms` is the raw fused reduction. It is the correct primitive
-# for exactly one caller — `calyx_forge::cpu::distance::cosine`, which owns all
-# four decisions on everyone's behalf — and reaching for it anywhere else means
-# re-deciding them. Disallowing it turns "did this new site remember to
-# dispatch, attribute per side, and clamp?" from a review question into a
-# compile-time one: the one legitimate use carries an explicit `#[allow]`
-# naming itself, and any new use has to justify itself the same way.
-disallowed-methods = [
-    { path = "calyx_forge::cpu::simd::dot_and_pair_norms", reason = "use calyx_forge::cpu::distance::cosine, the single cosine entry point (#1922); it owns shape validation, dispatched reduction, per-side finiteness attribution, the zero-norm threshold and the [-1,1] range contract, and returns a typed CosineFailure you map to your own error codes" },
-]
-# <<< SHARED-LINT-CONTRACT <<<

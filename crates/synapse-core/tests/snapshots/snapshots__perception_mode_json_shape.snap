@@ -1,0 +1,5 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "PerceptionMode::A11yOnly"
+---
+"a11y_only"

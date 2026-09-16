@@ -6,9 +6,10 @@ use synapse_core::{
     Action, Event, EventRef, EventSource, ReflexId, ReflexState, SCHEMA_VERSION,
     StoredAuditContext, StoredReflexAudit, StoredReflexStep, error_codes,
 };
+use synapse_storage::Db;
 use uuid::Uuid;
 
-use crate::{EventBus, ReflexAuditSink};
+use crate::{EventBus, write_audit};
 
 pub const MAX_ON_EVENT_FIRINGS_PER_TICK: usize = 4;
 pub const REFLEX_DEBOUNCED_KIND: &str = "reflex_debounced";
@@ -52,7 +53,7 @@ impl OnEventTickGuard {
     pub(crate) fn report_limit_once(
         &mut self,
         event_bus: &EventBus,
-        audit_sink: Option<&ReflexAuditSink>,
+        audit_db: Option<&Db>,
         reflex_id: &ReflexId,
         tick_index: u64,
         trigger_event: &Event,
@@ -63,34 +64,24 @@ impl OnEventTickGuard {
         }
         self.limit_reported = true;
         metrics::counter!(REFLEX_RECURSION_CLAMPS_METRIC).increment(1);
-        let occurred_at = Utc::now();
-        let audit_ts_ns = audit_sink.and_then(|_sink| {
-            crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_RECURSION_LIMIT_KIND)
-        });
-        publish_limit_event(event_bus, reflex_id, tick_index, trigger_event, occurred_at);
-        if let Some(ts_ns) = audit_ts_ns {
-            let audit =
-                recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context, ts_ns);
-            enqueue_audit_if_configured(audit_sink, audit);
-        }
+        publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
+        let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
+        write_audit_if_configured(audit_db, &audit);
     }
 }
 
 pub(crate) fn publish_fired(
     event_bus: &EventBus,
-    audit_sink: Option<&ReflexAuditSink>,
+    audit_db: Option<&Db>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
     actions: &[Action],
     audit_context: Option<&StoredAuditContext>,
 ) {
-    let occurred_at = Utc::now();
-    let audit_ts_ns = audit_sink
-        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_FIRED_KIND));
     let event = Event {
         seq: tick_index,
-        at: occurred_at,
+        at: Utc::now(),
         source: EventSource::Reflex,
         kind: REFLEX_FIRED_KIND.to_owned(),
         data: json!({
@@ -102,17 +93,8 @@ pub(crate) fn publish_fired(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
-    if let Some(ts_ns) = audit_ts_ns {
-        let audit = fired_audit(
-            reflex_id,
-            tick_index,
-            trigger_event,
-            actions,
-            audit_context,
-            ts_ns,
-        );
-        enqueue_audit_if_configured(audit_sink, audit);
-    }
+    let audit = fired_audit(reflex_id, tick_index, trigger_event, actions, audit_context);
+    write_audit_if_configured(audit_db, &audit);
     tracing::info!(
         code = "REFLEX_FIRED",
         reflex_id = %reflex_id,
@@ -127,7 +109,7 @@ pub(crate) fn publish_fired(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_debounced(
     event_bus: &EventBus,
-    audit_sink: Option<&ReflexAuditSink>,
+    audit_db: Option<&Db>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
@@ -138,12 +120,9 @@ pub(crate) fn publish_debounced(
 ) {
     let debounce_ms = u64::try_from(debounce.as_millis()).unwrap_or(u64::MAX);
     let suppressed_count = u64::try_from(suppressed_count).unwrap_or(u64::MAX);
-    let occurred_at = Utc::now();
-    let audit_ts_ns = audit_sink
-        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_DEBOUNCED_KIND));
     let event = Event {
         seq: tick_index,
-        at: occurred_at,
+        at: Utc::now(),
         source: EventSource::Reflex,
         kind: REFLEX_DEBOUNCED_KIND.to_owned(),
         data: json!({
@@ -159,18 +138,16 @@ pub(crate) fn publish_debounced(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
-    if let Some(ts_ns) = audit_ts_ns {
-        let audit = debounced_audit(
-            reflex_id,
-            tick_index,
-            trigger_event,
-            debounce_ms,
-            suppressed_count,
-            reason,
-            (audit_context, ts_ns),
-        );
-        enqueue_audit_if_configured(audit_sink, audit);
-    }
+    let audit = debounced_audit(
+        reflex_id,
+        tick_index,
+        trigger_event,
+        debounce_ms,
+        suppressed_count,
+        reason,
+        audit_context,
+    );
+    write_audit_if_configured(audit_db, &audit);
     tracing::info!(
         code = error_codes::REFLEX_DEBOUNCED,
         reflex_id = %reflex_id,
@@ -189,11 +166,10 @@ fn publish_limit_event(
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
-    occurred_at: chrono::DateTime<Utc>,
 ) {
     let event = Event {
         seq: tick_index,
-        at: occurred_at,
+        at: Utc::now(),
         source: EventSource::Reflex,
         kind: REFLEX_RECURSION_LIMIT_KIND.to_owned(),
         data: json!({
@@ -216,14 +192,13 @@ fn debounced_audit(
     debounce_ms: u64,
     suppressed_count: u64,
     reason: &str,
-    audit_clock: (Option<&StoredAuditContext>, u64),
+    audit_context: Option<&StoredAuditContext>,
 ) -> StoredReflexAudit {
-    let (audit_context, ts_ns) = audit_clock;
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -248,13 +223,12 @@ fn fired_audit(
     trigger_event: &Event,
     actions: &[Action],
     audit_context: Option<&StoredAuditContext>,
-    ts_ns: u64,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -275,13 +249,12 @@ fn recursion_limit_audit(
     tick_index: u64,
     trigger_event: &Event,
     audit_context: Option<&StoredAuditContext>,
-    ts_ns: u64,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -311,13 +284,19 @@ fn completed_steps(actions: &[Action]) -> Vec<StoredReflexStep> {
         .collect()
 }
 
-/// Hands an on-event audit row to the off-thread writer. Never performs I/O on
-/// the scheduler tick thread (#1802).
-fn enqueue_audit_if_configured(audit_sink: Option<&ReflexAuditSink>, audit: StoredReflexAudit) {
-    let Some(sink) = audit_sink else {
+fn write_audit_if_configured(audit_db: Option<&Db>, audit: &StoredReflexAudit) {
+    let Some(db) = audit_db else {
         return;
     };
-    sink.enqueue(audit);
+    if let Err(error) = write_audit(db, audit) {
+        tracing::warn!(
+            component = "reflex_on_event",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex audit write failed"
+        );
+    }
 }
 
 fn trigger_correlation(trigger_event: &Event) -> Vec<EventRef> {
@@ -325,4 +304,11 @@ fn trigger_correlation(trigger_event: &Event) -> Vec<EventRef> {
         seq: trigger_event.seq,
         relation: "trigger".to_owned(),
     }]
+}
+
+fn now_ts_ns() -> u64 {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default()
 }

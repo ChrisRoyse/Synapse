@@ -64,11 +64,12 @@ The pipeline is driven by `ObservationAssembler::assemble(include, input)`. Step
 | `ObservationAssembler::assemble(&self, include: ObserveInclude, input: ObservationInput) -> PerceptionResult<Observation>` | core fusion |
 | `assemble(include: ObserveInclude, input: ObservationInput) -> PerceptionResult<Observation>` | fresh seq counter per call |
 | `assemble_from_input(input: ObservationInput) -> PerceptionResult<Observation>` | uses `ObserveInclude::default()` |
-| `auto_mode(foreground: &ForegroundContext) -> PerceptionMode` | `A11yOnly` |
-| `auto_mode_with_a11y(foreground: &ForegroundContext, summary: &A11yTreeSummary) -> PerceptionMode` | `Hybrid` if `summary.is_sparse()`, else `A11yOnly` |
+| `auto_mode(foreground: &ForegroundContext) -> PerceptionMode` | `Hybrid` for known game process, else `A11yOnly` |
+| `auto_mode_with_a11y(foreground: &ForegroundContext, summary: &A11yTreeSummary) -> PerceptionMode` | `Hybrid` if known game OR `summary.is_sparse()`, else `A11yOnly` |
 | `parse_perception_mode(value: &str) -> PerceptionResult<PerceptionMode>` | see table below |
 | `bounded_sensor_latency(input: BTreeMap<String, f32>) -> BTreeMap<String, f32>` | keeps only finite values for keys in `SENSOR_KEYS` |
 | `is_interactable_node(node: &AccessibleNode) -> bool` | role/pattern based interactability test |
+| `is_known_game_process(process_name: &str) -> bool` | hardcoded process allowlist |
 | `A11yTreeSummary::from_nodes(nodes: &[AccessibleNode]) -> Self` | |
 | `A11yTreeSummary::is_sparse(&self) -> bool` | `node_count < 2 || max_depth < 1` |
 | `ObservationInput::new(foreground: ForegroundContext) -> Self` | all sensors default unavailable/disabled |
@@ -95,6 +96,8 @@ The pipeline is driven by `ObservationAssembler::assemble(include, input)`. Step
 | `hybrid` | `PerceptionMode::Hybrid` |
 | `auto` | `PerceptionMode::Auto` |
 | other | `Err(PerceptionModeInvalid { value })` |
+
+`is_known_game_process` allowlist (lowercased match): `eldenring.exe`, `fortniteclient-win64-shipping.exe`, `game.exe`, `minecraft.exe`, `overwatch.exe`, `starfield.exe`, `valorant.exe`.
 
 ### 2.4 `is_interactable_node` logic
 
@@ -163,8 +166,6 @@ The assembler produces a `synapse_core::Observation` (fields populated here):
 `foreground: ForegroundContext`, `is_minimized: bool`, `focused: Option<FocusedElement>`, `elements: Vec<AccessibleNode>`, `entities: Vec<DetectedEntity>`, `hud: HudReadings`, `audio: AudioContext`, `recent_events: Vec<EventSummary>`, `clipboard_summary: Option<ClipboardSummary>`, `fs_recent: Vec<FsEvent>`, `sensor_latency_ms: BTreeMap<String, f32>`, `a11y_status / capture_status / detection_status / audio_status: SensorStatus`, `mode_override: Option<PerceptionMode>`, `capture_config: Option<ObservationCaptureConfig>`, `capture_runtime: Option<CaptureRuntimeReadback>`, `input_backends: Option<InputBackendDiagnostics>`, `cdp: Option<CdpDiagnostics>`, `web_path: Option<WebPerceptionPath>`.
 
 `ObservationInput::new` defaults: `a11y_status` and `capture_status` = `Unavailable`; `detection_status` and `audio_status` = `Disabled`.
-
-`SensorStatus::NotConfigured { reason_code, detail }` (#2054): the producer stage ran but did no work because the active configuration asked for none. `detection_status` takes it whenever the perception mode admits detection (`PixelOnly`/`Hybrid`) but the active profile declares no `[detection].model_id` or `max_detections=0`, with `reason_code = DETECTION_NOT_CONFIGURED`. `Healthy` on `detection_status` therefore means exactly one thing: a model completed inference for this observation, and `sensor_latency_ms["detection"]` is present. `NotConfigured` is not an available sensor for `ensure_any_sensor_available`, and it is not `sensor_source_unavailable` for reality audits.
 
 ---
 
@@ -272,8 +273,8 @@ Slot reading `x` is `slot_x + best.x` (screen/region-relative within the cropped
 
 | Constant / default | Value |
 |---|---|
-| `DEFAULT_TEMPLATE_COUNTER_SLOTS` | `10` |
-| `DEFAULT_TEMPLATE_COUNTER_MAX_VALUE` | `20` |
+| `MINECRAFT_STATUS_SLOTS` | `10` |
+| `MINECRAFT_STATUS_MAX_VALUE` | `20` |
 | `DEFAULT_MIN_TEMPLATE_CONFIDENCE` | `0.85` |
 | `TemplateCounterConfig::default()` | `{ slots: 10, min_confidence: 0.85, max_value: 20 }` |
 

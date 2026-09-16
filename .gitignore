@@ -68,7 +68,3 @@ tracing-*.log
 # dirty git status. The script itself IS committed; its run products are not.
 /synapse-update-*.log
 /synapse-update.log
-
-# Vendored Calyx nested workspace build artifacts (docs/calyx/)
-/calyx/target/
-/logs/

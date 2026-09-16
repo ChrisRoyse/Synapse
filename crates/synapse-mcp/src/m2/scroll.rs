@@ -649,7 +649,6 @@ async fn execute_scroll_actions(
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.into_iter().enumerate() {
         boundary.ensure("immediately_before_foreground_scroll_dispatch")?;
-        super::foreground_fence::ensure("immediately_before_foreground_scroll_dispatch")?;
         handle
             .execute(action)
             .await
@@ -1095,4 +1094,56 @@ fn hwnd_from_i64(hwnd: i64) -> Result<HWND, ActionError> {
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: HWND) -> i64 {
     synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn targeted_wheel_chunks_fit_signed_message_delta() {
+        let before_ticks = 2400;
+        let after = wheel_delta_chunks(before_ticks)
+            .unwrap_or_else(|error| panic!("targeted scroll chunking should fit: {error}"));
+
+        println!(
+            "readback=act_scroll_targeted_chunks before_ticks={before_ticks} after_chunks={after:?}"
+        );
+        assert_eq!(
+            after.iter().map(|delta| i32::from(*delta)).sum::<i32>(),
+            before_ticks * 120
+        );
+        assert!(after.iter().all(|delta| delta.unsigned_abs() <= 32_760));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn targeted_wheel_chunks_preserve_negative_direction() {
+        let before_ticks = -20;
+        let after = wheel_delta_chunks(before_ticks)
+            .unwrap_or_else(|error| panic!("negative targeted scroll should fit: {error}"));
+
+        println!(
+            "readback=act_scroll_targeted_chunks edge=negative before_ticks={before_ticks} after_chunks={after:?}"
+        );
+        assert_eq!(after, [-2400]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uia_target_backend_tier_reports_uia_not_cdp() {
+        let params = ActScrollParams {
+            dy: -1,
+            target: Some(ActScrollElementTarget {
+                element_id: synapse_core::element_id(1, "aa"),
+            }),
+            ..ActScrollParams::default()
+        };
+
+        let tier = scroll_backend_tier_used(&params, true, "uia_scroll_pattern");
+        assert_eq!(tier, "uia");
+        assert!(!scroll_required_foreground(tier));
+    }
 }

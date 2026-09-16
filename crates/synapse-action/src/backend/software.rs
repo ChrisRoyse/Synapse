@@ -163,3 +163,16 @@ fn release_all(state: &mut EmitState) -> Result<(), ActionError> {
     state.release_all();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combo_step_delay_honors_absolute_offsets() {
+        assert_eq!(combo_step_delay_ms(0, 150), 150);
+        assert_eq!(combo_step_delay_ms(40, 150), 110);
+        assert_eq!(combo_step_delay_ms(150, 150), 0);
+        assert_eq!(combo_step_delay_ms(200, 150), 0);
+    }
+}

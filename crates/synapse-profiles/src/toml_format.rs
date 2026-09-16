@@ -10,12 +10,11 @@ use synapse_core::{
 use crate::{
     error::ProfileError,
     parser::{
-        LoadedProfile, MAX_CAPTURE_INTERVAL_MS, MIN_CAPTURE_INTERVAL_MS, ProfileDefaults,
-        ScreenBounds, default_backend, default_capture_interval, default_capture_target,
-        default_confidence_threshold, default_cursor_visible, default_hud_region_kind,
-        default_max_detections, default_mode, default_ocr_backend, natural_default, parse_backend,
-        parse_capture_target, parse_mode, parse_ocr_backend, parse_use_scope, validate_hud_region,
-        validate_keymap, validate_match,
+        LoadedProfile, ProfileDefaults, ScreenBounds, default_backend, default_capture_interval,
+        default_capture_target, default_confidence_threshold, default_cursor_visible,
+        default_hud_region_kind, default_max_detections, default_mode, default_ocr_backend,
+        natural_default, parse_backend, parse_capture_target, parse_mode, parse_ocr_backend,
+        parse_use_scope, validate_hud_region, validate_keymap, validate_match,
     },
 };
 
@@ -38,7 +37,7 @@ pub struct RawProfile {
     #[serde(default)]
     capture: RawCapture,
     #[serde(default)]
-    detection: Option<RawDetection>,
+    detection: RawDetection,
     #[serde(default)]
     ocr: RawOcr,
     #[serde(default)]
@@ -98,9 +97,7 @@ impl RawProfile {
             matches,
             mode: parse_mode(&self.mode, &path)?,
             capture: self.capture.into_capture(&path)?,
-            detection: self
-                .detection
-                .map_or_else(RawDetection::disabled, RawDetection::into_detection),
+            detection: self.detection.into_detection(),
             ocr: self.ocr.into_ocr(&path)?,
             hud,
             keymap: self.keymap,
@@ -108,8 +105,6 @@ impl RawProfile {
             metadata: self.metadata,
             event_extensions: self.event_extensions,
         };
-        let (compiled_title_regexes, compiled_hud_parsers) =
-            compile_profile_runtime_plans(&path, &profile)?;
         let mouse_velocity_profile_default = match (
             self.mouse_velocity_profile_default,
             self.mouse_curve_default,
@@ -134,8 +129,6 @@ impl RawProfile {
 
         Ok(LoadedProfile {
             profile,
-            compiled_title_regexes,
-            compiled_hud_parsers,
             schema_version: self.schema_version,
             defaults: ProfileDefaults {
                 mouse_velocity_profile_default,
@@ -149,51 +142,6 @@ impl RawProfile {
             modified,
         })
     }
-}
-
-fn compile_profile_runtime_plans(
-    path: &Path,
-    profile: &Profile,
-) -> Result<
-    (
-        Vec<Option<regex::Regex>>,
-        Vec<synapse_core::CompiledHudParser>,
-    ),
-    ProfileError,
-> {
-    let title_regexes = profile
-        .matches
-        .iter()
-        .map(|profile_match| {
-            profile_match
-                .title_regex
-                .as_deref()
-                .map(regex::Regex::new)
-                .transpose()
-                .map_err(|source| ProfileError::Parse {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "accepted profile title_regex could not be compiled: {source}"
-                    ),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let hud_parsers = profile
-        .hud
-        .iter()
-        .map(|field| {
-            synapse_core::CompiledHudParser::compile(&field.parser).map_err(|source| {
-                ProfileError::Parse {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "HUD field {:?} parser could not be compiled: {source}",
-                        field.name
-                    ),
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((title_regexes, hud_parsers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,17 +194,6 @@ impl Default for RawCapture {
 
 impl RawCapture {
     fn into_capture(self, path: &Path) -> Result<ProfileCapture, ProfileError> {
-        if !(MIN_CAPTURE_INTERVAL_MS..=MAX_CAPTURE_INTERVAL_MS)
-            .contains(&self.min_update_interval_ms)
-        {
-            return Err(ProfileError::Parse {
-                path: path.to_path_buf(),
-                message: format!(
-                    "capture.min_update_interval_ms={} is outside the CPU/GDI low-CPU policy range {}..={} ms",
-                    self.min_update_interval_ms, MIN_CAPTURE_INTERVAL_MS, MAX_CAPTURE_INTERVAL_MS
-                ),
-            });
-        }
         Ok(ProfileCapture {
             target: parse_capture_target(&self.target, path)?,
             min_update_interval_ms: self.min_update_interval_ms,
@@ -290,15 +227,6 @@ impl Default for RawDetection {
 }
 
 impl RawDetection {
-    const fn disabled() -> ProfileDetection {
-        ProfileDetection {
-            model_id: None,
-            classes_of_interest: Vec::new(),
-            confidence_threshold: default_confidence_threshold(),
-            max_detections: 0,
-        }
-    }
-
     fn into_detection(self) -> ProfileDetection {
         ProfileDetection {
             model_id: self.model_id,

@@ -11,9 +11,7 @@ mod frame;
 mod platform;
 mod stats;
 
-pub use backend::{
-    CaptureBackend, CaptureBackendPreference, capture_backend_preference_from_environment,
-};
+pub use backend::{CaptureBackend, CaptureBackendPreference};
 // `screen_region_to_bgra_bitmap` is cross-platform (fails loud off Windows); the
 // WinRT `SoftwareBitmap` helpers in `bitmap` stay `#[cfg(windows)]`, so off
 // Windows this glob re-exports only the BGRA entry point that `synapse-mcp` calls.
@@ -27,18 +25,13 @@ pub use coords::*;
 pub use dpi::*;
 pub use error::*;
 pub use frame::*;
-pub use stats::{CaptureStats, CaptureTerminalError, CaptureThreadPriority};
+pub use stats::{CaptureStats, CaptureThreadPriority};
 
-pub const CAPTURE_CHANNEL_CAPACITY: usize = 1;
-pub const DEFAULT_CAPTURE_INTERVAL_MS: u64 = 250;
-pub const MIN_CAPTURE_INTERVAL_MS: u64 = 250;
-pub const MAX_CAPTURE_INTERVAL_MS: u64 = 60_000;
-pub const MAX_CAPTURE_BYTES: usize = 40 * 1024 * 1024;
-pub const GPU_CAPTURE_BACKENDS_COMPILED: bool = false;
-/// Canonical backend identity for the capture policy.
-///
-/// GDI `BitBlt` avoids explicit DXGI/D3D/Windows.Graphics.Capture APIs, but the
-/// Windows compositor or display driver may still accelerate GDI internally.
-/// This identity therefore makes no unsupported claim about physical GPU RAM.
-pub const NO_EXPLICIT_GPU_API_CAPTURE_BACKEND: &str = "gdi_bitblt_no_explicit_gpu_api";
+#[cfg(test)]
+pub(crate) use backend::{backend_after_fallback, should_fallback_to_dxgi};
+
+pub const CAPTURE_CHANNEL_CAPACITY: usize = 2;
 pub const FRAMES_DROPPED_METRIC: &str = "synapse_capture_frames_dropped_total";
+
+#[cfg(test)]
+mod tests;

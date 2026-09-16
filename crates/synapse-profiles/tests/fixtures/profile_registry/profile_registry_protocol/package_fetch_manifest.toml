@@ -1,0 +1,25 @@
+schema_version = 1
+kind = "registry_package_manifest"
+source_id = "registry.synthetic.local-fixture"
+package_id = "profile.synthetic.governance"
+package_version = "0.1.0"
+profile_id = "synthetic.governance"
+profile_version = "1.0.0"
+manifest_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+package_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+fetch_url = "file://crates/synapse-profiles/tests/fixtures/profile_registry/profile_registry_governance/profile_package_manifest.toml"
+license_spdx = "MIT OR Apache-2.0"
+moderation_status = "approved"
+trust_status = "trusted_fixture_signer"
+revoked = false
+
+[signer]
+signer_id = "signer.synthetic.fixture"
+key_id = "key.synthetic.fixture.1"
+signature_algorithm = "synthetic-ed25519"
+transparency_log_ref = "rekor.synthetic/entry/0001"
+
+[compatibility]
+target = "synthetic.governance.app"
+supported_use_scope = "operator_owned_test"
+synapse_schema_version = 1

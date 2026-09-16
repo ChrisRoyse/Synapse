@@ -6,11 +6,6 @@ pub const CAPTURE_PRINTWINDOW_DISABLED: &str = "CAPTURE_PRINTWINDOW_DISABLED";
 pub const CAPTURE_PRINTWINDOW_BLACK: &str = "CAPTURE_PRINTWINDOW_BLACK";
 pub const CAPTURE_TARGET_LOST: &str = "CAPTURE_TARGET_LOST";
 pub const CAPTURE_NO_DIRTY_REGIONS: &str = "CAPTURE_NO_DIRTY_REGIONS";
-pub const CAPTURE_UNSUPPORTED_SEMANTICS: &str = "CAPTURE_UNSUPPORTED_SEMANTICS";
-/// A screenshot request's independently calculated capture/composition/message
-/// plan cannot fit the hard pipeline budget. This is rejected before any page
-/// mutation or Chrome capture begins (#2170).
-pub const CAPTURE_PLAN_EXCEEDS_LIMIT: &str = "CAPTURE_PLAN_EXCEEDS_LIMIT";
 pub const A11Y_NOT_AVAILABLE: &str = "A11Y_NOT_AVAILABLE";
 pub const A11Y_ELEMENT_STALE: &str = "A11Y_ELEMENT_STALE";
 pub const A11Y_NO_FOREGROUND: &str = "A11Y_NO_FOREGROUND";
@@ -22,33 +17,7 @@ pub const A11Y_CDP_EXTENSION_DETACHED: &str = "A11Y_CDP_EXTENSION_DETACHED";
 pub const A11Y_CDP_EXTENSION_TIMEOUT: &str = "A11Y_CDP_EXTENSION_TIMEOUT";
 pub const A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED: &str = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 pub const CHROME_BRIDGE_EXTENSION_STALE: &str = "CHROME_BRIDGE_EXTENSION_STALE";
-/// The authenticated Chrome extension returned a missing or unregistered
-/// machine error identifier.
-///
-/// The original code/detail are retained in the diagnostic, but never
-/// reclassified as an unrelated browser failure.
-pub const CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION: &str =
-    "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION";
-/// The authenticated Chrome bridge refused a command response because its
-/// exact serialized HTTP envelope exceeded the shared bounded transport limit.
-pub const CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT: &str =
-    "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
-/// The extension executed a Chrome command, but the exact serialized result
-/// could not fit the bounded, authenticated terminal channel.
-///
-/// The command is never replayed; callers must request a smaller result.
-pub const A11Y_CDP_RESPONSE_TOO_LARGE: &str = "A11Y_CDP_RESPONSE_TOO_LARGE";
-/// A command-terminal envelope, acknowledgement, replay, digest, sequence, or
-/// ownership claim contradicted the daemon's ledger. The bridge fails closed.
-pub const CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR: &str = "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR";
-pub const CHROME_CAPTURE_VISIBLE_TAB_PENDING: &str = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
-/// The host-side exact Chrome extension management control could not reload or
-/// install the normal-profile bridge, or its independent profile/host readback
-/// did not prove the requested transition.
-pub const CHROME_BRIDGE_HOST_RELOAD_FAILED: &str = "CHROME_BRIDGE_HOST_RELOAD_FAILED";
 pub const CHROME_SCRIPTING_EXECUTE_FAILED: &str = "CHROME_SCRIPTING_EXECUTE_FAILED";
-pub const CHROME_SCRIPTING_EMPTY_RESULT: &str = "CHROME_SCRIPTING_EMPTY_RESULT";
-pub const CHROME_SCRIPTING_UNAVAILABLE: &str = "CHROME_SCRIPTING_UNAVAILABLE";
 pub const BROWSER_URL_SCHEME_UNSUPPORTED: &str = "BROWSER_URL_SCHEME_UNSUPPORTED";
 pub const CHROME_DOM_SELECTOR_INVALID: &str = "CHROME_DOM_SELECTOR_INVALID";
 pub const CHROME_DOM_ELEMENT_NOT_FOUND: &str = "CHROME_DOM_ELEMENT_NOT_FOUND";
@@ -59,71 +28,19 @@ pub const CHROME_DOM_ACTION_POSTCONDITION_FAILED: &str = "CHROME_DOM_ACTION_POST
 pub const BROWSER_WAIT_TIMEOUT: &str = "BROWSER_WAIT_TIMEOUT";
 /// Emitted when an evaluate expression outlives its `timeout_ms` budget.
 ///
-/// Distinct from `BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION`, which means CDP
-/// completed the transport operation and the evaluated page program threw.
-/// The message carries the elapsed and budget milliseconds so an agent can
-/// retry with a larger `timeout_ms` rather than guessing.
+/// Distinct from `A11Y_CDP_AXTREE_FAILED`, which signals a thrown JS exception.
+/// The message carries the elapsed and budget milliseconds so an agent can retry
+/// with a larger `timeout_ms` rather than guessing.
 pub const BROWSER_EVALUATE_TIMEOUT: &str = "BROWSER_EVALUATE_TIMEOUT";
-/// `Runtime.evaluate` completed in Chrome, but returned
-/// `exceptionDetails` for the caller's JavaScript.
-///
-/// This is a page-program failure, not a debugger attach/transport failure.
-pub const BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION: &str = "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION";
 pub const BROWSER_NAVIGATION_FAILED: &str = "BROWSER_NAVIGATION_FAILED";
-pub const CHROME_ACTIVE_ELEMENT_MISSING: &str = "CHROME_ACTIVE_ELEMENT_MISSING";
-pub const CHROME_ACTIVE_ELEMENT_NOT_EDITABLE: &str = "CHROME_ACTIVE_ELEMENT_NOT_EDITABLE";
-pub const CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH: &str = "CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH";
-pub const CHROME_BEFOREINPUT_CANCELLED: &str = "CHROME_BEFOREINPUT_CANCELLED";
-pub const CHROME_CLOCK_FAILED: &str = "CHROME_CLOCK_FAILED";
-pub const CHROME_FRAME_METADATA_FAILED: &str = "CHROME_FRAME_METADATA_FAILED";
-pub const CHROME_SET_FIELD_BAD_LOCATOR: &str = "CHROME_SET_FIELD_BAD_LOCATOR";
-pub const CHROME_SET_FIELD_NOT_FOUND: &str = "CHROME_SET_FIELD_NOT_FOUND";
-pub const CHROME_SET_FIELD_NOT_UNIQUE: &str = "CHROME_SET_FIELD_NOT_UNIQUE";
-pub const CHROME_SET_FIELD_SELECTOR_INVALID: &str = "CHROME_SET_FIELD_SELECTOR_INVALID";
-pub const CHROME_SET_FIELD_VALUE_MISMATCH: &str = "CHROME_SET_FIELD_VALUE_MISMATCH";
-pub const CHROME_STORAGE_ACTION_FAILED: &str = "CHROME_STORAGE_ACTION_FAILED";
-pub const CHROME_STORAGE_KEY_INVALID: &str = "CHROME_STORAGE_KEY_INVALID";
-pub const CHROME_STORAGE_OPERATION_UNSUPPORTED: &str = "CHROME_STORAGE_OPERATION_UNSUPPORTED";
-pub const CHROME_STORAGE_STATE_LOAD_FAILED: &str = "CHROME_STORAGE_STATE_LOAD_FAILED";
-pub const CHROME_STORAGE_STATE_READ_FAILED: &str = "CHROME_STORAGE_STATE_READ_FAILED";
-/// The requested Chrome tab target is absent from an authoritative
-/// `chrome.tabs.query({})` enumeration. This is a terminal, idempotent close
-/// outcome rather than a transport failure.
-pub const CHROME_TAB_TARGET_ABSENT: &str = "CHROME_TAB_TARGET_ABSENT";
-/// A caller-supplied browser wait predicate could not be compiled or threw in
-/// the exact target document. Distinct from debugger attach/transport failure.
-pub const CHROME_WAIT_PREDICATE_INVALID: &str = "CHROME_WAIT_PREDICATE_INVALID";
-pub const PAGE_VITALS_READ_FAILED: &str = "PAGE_VITALS_READ_FAILED";
-pub const SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED: &str =
-    "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED";
-pub const SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID: &str =
-    "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID";
-pub const SYNAPSE_CHROME_DAEMON_UNAVAILABLE: &str = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
-pub const SYNAPSE_CHROME_EXTENSION_ID_MISMATCH: &str = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 pub const A11Y_UIA_WORKER_TIMEOUT: &str = "A11Y_UIA_WORKER_TIMEOUT";
 pub const A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE: &str =
     "A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE";
 pub const DETECTION_MODEL_NOT_LOADED: &str = "DETECTION_MODEL_NOT_LOADED";
 pub const DETECTION_MODEL_INFER_FAILED: &str = "DETECTION_MODEL_INFER_FAILED";
 pub const DETECTION_NO_FRAME: &str = "DETECTION_NO_FRAME";
-/// The active profile asks for no detector inference at all (#2054).
-///
-/// Not a tool error: detection is profile-opt-in, so a profile with no
-/// `[detection]` model is a legitimate configuration. It is the `reason_code`
-/// carried by `SensorStatus::NotConfigured` on `diagnostics.detection_status`,
-/// and the `reason_code` of `health.subsystems.perception.perception_detection`,
-/// so neither surface can report a detector that never ran as `healthy`/`ok`.
-pub const DETECTION_NOT_CONFIGURED: &str = "DETECTION_NOT_CONFIGURED";
 pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
-/// Bound-tab OCR refused because the window renders a different tab (#1823).
-///
-/// The MCP session is bound to a specific browser tab, but visible-surface GDI
-/// capture can only observe whichever tab is currently rendered in that window.
-/// Returning OCR of the rendered tab under a different tab's binding is
-/// confidently-wrong perception, so the read fails closed with this code naming
-/// both the bound tab and the tab actually rendered.
-pub const OCR_TARGET_NOT_FOREGROUND: &str = "OCR_TARGET_NOT_FOREGROUND";
 // Per-agent active target (epic #720): each MCP session can bind its own window/CDP
 // target so observe/find/read_text perceive it without stealing the global foreground.
 pub const TARGET_WINDOW_NOT_FOUND: &str = "TARGET_WINDOW_NOT_FOUND";
@@ -138,9 +55,6 @@ pub const HUD_FIELD_NOT_DEFINED: &str = "HUD_FIELD_NOT_DEFINED";
 pub const HUD_EXTRACTION_FAILED: &str = "HUD_EXTRACTION_FAILED";
 pub const AUDIO_DEVICE_LOST: &str = "AUDIO_DEVICE_LOST";
 pub const AUDIO_LOOPBACK_INIT_FAILED: &str = "AUDIO_LOOPBACK_INIT_FAILED";
-pub const AUDIO_TIMELINE_DISCONTINUITY: &str = "AUDIO_TIMELINE_DISCONTINUITY";
-pub const AUDIO_TIMELINE_GAP: &str = "AUDIO_TIMELINE_GAP";
-pub const AUDIO_TIMELINE_INVALID: &str = "AUDIO_TIMELINE_INVALID";
 pub const AUDIO_STT_MODEL_NOT_LOADED: &str = "AUDIO_STT_MODEL_NOT_LOADED";
 
 // === Action (06 section 8.2) ===
@@ -158,29 +72,13 @@ pub const ACTION_FOREGROUND_LOST: &str = "ACTION_FOREGROUND_LOST";
 pub const ACTION_NO_OBSERVED_DELTA: &str = "ACTION_NO_OBSERVED_DELTA";
 pub const ACTION_VERIFY_SURFACE_UNAVAILABLE: &str = "ACTION_VERIFY_SURFACE_UNAVAILABLE";
 pub const ACTION_POSTCONDITION_FAILED: &str = "ACTION_POSTCONDITION_FAILED";
-/// An input-producing route omitted or contradicted its typed provenance.
-pub const ACTION_INPUT_PROVENANCE_INVALID: &str = "ACTION_INPUT_PROVENANCE_INVALID";
 pub const ACTION_LAUNCH_WINDOW_NOT_FOUND: &str = "ACTION_LAUNCH_WINDOW_NOT_FOUND";
 pub const ACTION_LAUNCH_FOREGROUND_FAILED: &str = "ACTION_LAUNCH_FOREGROUND_FAILED";
 pub const ACTION_LAUNCH_URL_NOT_REACHED: &str = "ACTION_LAUNCH_URL_NOT_REACHED";
-/// Chromium debug flags do not describe one coherent port/profile endpoint.
-pub const ACTION_LAUNCH_CDP_CONFIG_INVALID: &str = "ACTION_LAUNCH_CDP_CONFIG_INVALID";
-/// The spawned Chromium process did not publish a complete, valid CDP endpoint
-/// within the launch budget.
-pub const ACTION_LAUNCH_CDP_ATTESTATION_FAILED: &str = "ACTION_LAUNCH_CDP_ATTESTATION_FAILED";
-/// The port file, HTTP endpoint, listener PID, process generation, or browser
-/// WebSocket identity contradicted the launch owner.
-pub const ACTION_LAUNCH_CDP_IDENTITY_MISMATCH: &str = "ACTION_LAUNCH_CDP_IDENTITY_MISMATCH";
-/// Identity-bound process, registry, or owned-profile cleanup did not reach its
-/// independently verified terminal state.
-pub const ACTION_LAUNCH_CDP_CLEANUP_FAILED: &str = "ACTION_LAUNCH_CDP_CLEANUP_FAILED";
 pub const ACTION_AGENT_SPAWN_FAILED: &str = "ACTION_AGENT_SPAWN_FAILED";
 pub const ACTION_AGENT_SPAWN_SESSION_TIMEOUT: &str = "ACTION_AGENT_SPAWN_SESSION_TIMEOUT";
 pub const ACTION_AGENT_SPAWN_TASK_NOT_STARTED: &str = "ACTION_AGENT_SPAWN_TASK_NOT_STARTED";
 pub const ACTION_BUDGET_EXPIRED: &str = "ACTION_BUDGET_EXPIRED";
-/// A point-in-time action precondition proved that the Synapse daemon has no
-/// remaining memory headroom under its process-wide hard limit.
-pub const ACTION_RESOURCE_BUDGET_EXCEEDED: &str = "ACTION_RESOURCE_BUDGET_EXCEEDED";
 pub const ACTION_WINDOW_NOT_FOUND: &str = "ACTION_WINDOW_NOT_FOUND";
 pub const ACTION_WINDOW_AMBIGUOUS: &str = "ACTION_WINDOW_AMBIGUOUS";
 pub const ACTION_FOCUS_WINDOW_FAILED: &str = "ACTION_FOCUS_WINDOW_FAILED";
@@ -212,12 +110,10 @@ pub const REFLEX_PARAMS_INVALID: &str = "REFLEX_PARAMS_INVALID";
 pub const REFLEX_TARGET_INVALID: &str = "REFLEX_TARGET_INVALID";
 pub const REFLEX_FILTER_INVALID: &str = "REFLEX_FILTER_INVALID";
 pub const REFLEX_PRIORITY_INVALID: &str = "REFLEX_PRIORITY_INVALID";
-pub const REFLEX_AUDIT_TIMESTAMP_INVALID: &str = "REFLEX_AUDIT_TIMESTAMP_INVALID";
 pub const REFLEX_TICK_LATE: &str = "REFLEX_TICK_LATE";
 pub const REFLEX_TRACK_LOST: &str = "REFLEX_TRACK_LOST";
 pub const REFLEX_STARVED: &str = "REFLEX_STARVED";
 pub const REFLEX_DISABLED_BY_OPERATOR: &str = "REFLEX_DISABLED_BY_OPERATOR";
-pub const REFLEX_DURABLE_DEFINITION_MISSING: &str = "REFLEX_DURABLE_DEFINITION_MISSING";
 pub const REFLEX_LIFETIME_EXPIRED: &str = "REFLEX_LIFETIME_EXPIRED";
 pub const REFLEX_RECURSION_LIMIT: &str = "REFLEX_RECURSION_LIMIT";
 pub const REFLEX_ACTION_PERMISSION_DENIED: &str = "REFLEX_ACTION_PERMISSION_DENIED";
@@ -250,15 +146,8 @@ pub const SUBSCRIPTION_NOT_FOUND: &str = "SUBSCRIPTION_NOT_FOUND";
 pub const SUBSCRIPTION_CAP_REACHED: &str = "SUBSCRIPTION_CAP_REACHED";
 pub const TOOL_NOT_FOUND: &str = "TOOL_NOT_FOUND";
 pub const TOOL_PROFILE_POLICY_DENIED: &str = "TOOL_PROFILE_POLICY_DENIED";
-pub const MCP_TOOL_SURFACE_ATTESTATION_MISSING: &str = "MCP_TOOL_SURFACE_ATTESTATION_MISSING";
-pub const MCP_TOOL_SURFACE_ATTESTATION_STALE: &str = "MCP_TOOL_SURFACE_ATTESTATION_STALE";
-pub const MCP_TOOL_SURFACE_REINITIALIZATION_FAILED: &str =
-    "MCP_TOOL_SURFACE_REINITIALIZATION_FAILED";
 pub const TOOL_PARAMS_INVALID: &str = "TOOL_PARAMS_INVALID";
-/// Autonomous routine arming was refused because grounded eligibility failed.
-pub const ROUTINE_AUTONOMY_NOT_READY: &str = "ROUTINE_AUTONOMY_NOT_READY";
 pub const TOOL_INTERNAL_ERROR: &str = "TOOL_INTERNAL_ERROR";
-pub const HTTP_BIND_ADDRESS_INVALID: &str = "HTTP_BIND_ADDRESS_INVALID";
 pub const HTTP_BIND_NON_LOOPBACK_REFUSED: &str = "HTTP_BIND_NON_LOOPBACK_REFUSED";
 pub const HTTP_TOKEN_INVALID: &str = "HTTP_TOKEN_INVALID";
 pub const HTTP_ORIGIN_REFUSED: &str = "HTTP_ORIGIN_REFUSED";
@@ -269,8 +158,6 @@ pub const REPLAY_FORMAT_INVALID: &str = "REPLAY_FORMAT_INVALID";
 
 // === Storage (06 section 8.6) ===
 pub const STORAGE_OPEN_FAILED: &str = "STORAGE_OPEN_FAILED";
-pub const STORAGE_BACKEND_INVALID_CONFIG: &str = "STORAGE_BACKEND_INVALID_CONFIG";
-pub const STORAGE_BACKEND_UNIMPLEMENTED: &str = "STORAGE_BACKEND_UNIMPLEMENTED";
 pub const STORAGE_WRITE_FAILED: &str = "STORAGE_WRITE_FAILED";
 pub const STORAGE_READ_FAILED: &str = "STORAGE_READ_FAILED";
 pub const STORAGE_CORRUPTED: &str = "STORAGE_CORRUPTED";
@@ -281,38 +168,6 @@ pub const STORAGE_DISK_PRESSURE_LEVEL_3: &str = "STORAGE_DISK_PRESSURE_LEVEL_3";
 pub const STORAGE_DISK_PRESSURE_LEVEL_4: &str = "STORAGE_DISK_PRESSURE_LEVEL_4";
 pub const STORAGE_CF_HARD_CAP_REACHED: &str = "STORAGE_CF_HARD_CAP_REACHED";
 pub const STORAGE_GC_UNSAFE_EVICTION_REFUSED: &str = "STORAGE_GC_UNSAFE_EVICTION_REFUSED";
-/// A foreground MCP operation could not acquire the exclusive whole-corpus
-/// storage lane within its declared admission budget.
-///
-/// The owning pass continues; no foreground work was dispatched and no second
-/// corpus working set was admitted. Callers must observe the named owner's
-/// completion boundary before retrying instead of increasing transport timeouts.
-pub const STORAGE_MAINTENANCE_BUSY: &str = "STORAGE_MAINTENANCE_BUSY";
-pub const STORAGE_SEARCH_REBUILD_IN_PROGRESS: &str = "STORAGE_SEARCH_REBUILD_IN_PROGRESS";
-pub const STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS: &str =
-    "STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS";
-pub const STORAGE_PANEL_LIFECYCLE_IN_PROGRESS: &str = "STORAGE_PANEL_LIFECYCLE_IN_PROGRESS";
-pub const STORAGE_BACKUP_IN_PROGRESS: &str = "STORAGE_BACKUP_IN_PROGRESS";
-pub const STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS: &str = "STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS";
-
-/// Scheduled vault verification returned a non-green verdict (#1687/#1679).
-///
-/// Raised by `hygiene operation=vault_verify` when the restore verifier, the
-/// provenance hash chain, the raw-write commitments, or the vault lineage
-/// journal failed. Never downgraded to a warning — a vault that cannot prove
-/// itself is the #1875 condition arriving quietly.
-pub const HYGIENE_VAULT_VERIFY_FAILED: &str = "SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED";
-
-/// Scheduled vault verification could not run to completion (#2059).
-///
-/// Raised when a scan was refused by a resource budget — an aggregate
-/// materialization ceiling, an allocation refusal, an SST page-source ceiling —
-/// while every integrity predicate that *was* evaluated held. The vault is
-/// unverified, which is a real deficiency and stays fail-closed, but it is not
-/// the corruption alarm and must never carry the restore-from-backup
-/// remediation. Conflating the two is how the alarm that must be believed gets
-/// trained out of an operator.
-pub const HYGIENE_VAULT_VERIFY_UNVERIFIABLE: &str = "SYNAPSE_HYGIENE_VAULT_VERIFY_UNVERIFIABLE";
 
 // === Episodes (derived activity spans, issues #846/#847) ===
 pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
@@ -329,17 +184,6 @@ pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";
 pub const MODEL_LOAD_FAILED: &str = "MODEL_LOAD_FAILED";
 pub const MODEL_BACKEND_UNAVAILABLE: &str = "MODEL_BACKEND_UNAVAILABLE";
-/// An OPTIONAL model slot is physically absent from this executable's embedded
-/// model bundle (#1863).
-///
-/// This is not corruption and not a build defect: the slot table explicitly
-/// records the model as not packaged, so the dependent capability is genuinely
-/// unavailable on this build. Required models can never produce this code —
-/// their absence is refused at package time.
-pub const MODEL_EMBEDDED_SLOT_ABSENT: &str = "MODEL_EMBEDDED_SLOT_ABSENT";
-/// The running executable carries a model bundle written by an older,
-/// incompatible packager (#1863).
-pub const MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT: &str = "MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT";
 pub const MODEL_TOOLS_UNSUPPORTED: &str = "MODEL_TOOLS_UNSUPPORTED";
 /// A local-model turn produced neither a tool call nor any message content.
 ///
@@ -369,9 +213,6 @@ pub const NOTIFY_DISABLED_BY_MANIFEST: &str = "NOTIFY_DISABLED_BY_MANIFEST";
 pub const NOTIFY_XML_PAYLOAD_INVALID: &str = "NOTIFY_XML_PAYLOAD_INVALID";
 pub const NOTIFY_SHOW_FAILED: &str = "NOTIFY_SHOW_FAILED";
 pub const NOTIFY_DELIVERY_UNVERIFIED: &str = "NOTIFY_DELIVERY_UNVERIFIED";
-/// A deadline-gated notification was still queued when its authority expired;
-/// no platform Show call was made.
-pub const NOTIFY_DELIVERY_EXPIRED: &str = "NOTIFY_DELIVERY_EXPIRED";
 pub const NOTIFY_WORKER_FAILED: &str = "NOTIFY_WORKER_FAILED";
 
 // === Safety (06 section 8.9) ===

@@ -21,51 +21,39 @@ use super::{
 #[serde(rename_all = "snake_case")]
 pub enum AuditOperation {
     CommandQuery,
-    RepairLegacyProbeRow,
     LifecycleEvents,
     LifecycleExits,
     ProfileIntelligence,
     ExportBundle,
-    VerifyChain,
-    Reproduce,
 }
 
 impl AuditOperation {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::CommandQuery => "command_query",
-            Self::RepairLegacyProbeRow => "repair_legacy_probe_row",
             Self::LifecycleEvents => "lifecycle_events",
             Self::LifecycleExits => "lifecycle_exits",
             Self::ProfileIntelligence => "profile_intelligence",
             Self::ExportBundle => "export_bundle",
-            Self::VerifyChain => "verify_chain",
-            Self::Reproduce => "reproduce",
         }
     }
 
     pub(super) fn parse(raw: &str) -> Result<Self, ErrorData> {
         match raw {
             "command_query" => Ok(Self::CommandQuery),
-            "repair_legacy_probe_row" => Ok(Self::RepairLegacyProbeRow),
             "lifecycle_events" => Ok(Self::LifecycleEvents),
             "lifecycle_exits" => Ok(Self::LifecycleExits),
             "profile_intelligence" => Ok(Self::ProfileIntelligence),
             "export_bundle" => Ok(Self::ExportBundle),
-            "verify_chain" => Ok(Self::VerifyChain),
-            "reproduce" => Ok(Self::Reproduce),
             other => Err(invalid_operation(
                 AUDIT_TOOL,
                 other,
                 &[
                     "command_query",
-                    "repair_legacy_probe_row",
                     "lifecycle_events",
                     "lifecycle_exits",
                     "profile_intelligence",
                     "export_bundle",
-                    "verify_chain",
-                    "reproduce",
                 ],
                 AUDIT_SOT,
             )),
@@ -125,8 +113,6 @@ pub struct AuditParams {
     #[serde(default)]
     pub command_query: Option<AuditCommandQueryParams>,
     #[serde(default)]
-    pub repair_legacy_probe_row: Option<AuditLegacyProbeRepairParams>,
-    #[serde(default)]
     pub lifecycle_events: Option<AuditLifecycleTailParams>,
     #[serde(default)]
     pub lifecycle_exits: Option<AuditLifecycleTailParams>,
@@ -134,10 +120,6 @@ pub struct AuditParams {
     pub profile_intelligence: Option<AuditIntelligenceQueryParams>,
     #[serde(default)]
     pub export_bundle: Option<AuditExportBundleParams>,
-    #[serde(default)]
-    pub verify_chain: Option<AuditVerifyChainParams>,
-    #[serde(default)]
-    pub reproduce: Option<AuditReproduceParams>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -162,13 +144,10 @@ fn audit_operation_schema(_: &mut SchemaGenerator) -> Schema {
         "type": "string",
         "enum": [
             "command_query",
-            "repair_legacy_probe_row",
             "lifecycle_events",
             "lifecycle_exits",
             "profile_intelligence",
-            "export_bundle",
-            "verify_chain",
-            "reproduce"
+            "export_bundle"
         ]
     })
 }
@@ -211,42 +190,6 @@ pub struct AuditCommandQueryParams {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_kind: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditLegacyProbeRepairParams {
-    pub key_len_bytes: u64,
-    pub key_sha256: String,
-    pub value_len_bytes: u64,
-    pub value_sha256: String,
-    pub expected_revision_sha256: String,
-    #[schemars(length(min = 1, max = 512))]
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditVerifyChainParams {
-    /// Inclusive start sequence for an incremental re-walk. Omit both bounds to
-    /// verify the full chain from genesis to the durable head.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_seq: Option<u64>,
-    /// Exclusive end sequence for an incremental re-walk (defaults to the head).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to_seq: Option<u64>,
-    /// Optionally read back one decoded ledger entry by sequence (provenance
-    /// readback for any record), verified alongside the chain walk.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_seq: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditReproduceParams {
-    /// The content-addressed constellation id (32 lowercase hex chars) whose
-    /// recorded provenance binding is re-derived from the bytes.
-    pub cx_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -306,8 +249,6 @@ pub struct AuditResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_query: Option<AuditCommandQueryResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub repair_legacy_probe_row: Option<AuditLegacyProbeRepairResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_events: Option<AuditLifecycleTailResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_exits: Option<AuditLifecycleTailResponse>,
@@ -315,117 +256,6 @@ pub struct AuditResponse {
     pub profile_intelligence: Option<AuditIntelligenceQueryResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub export_bundle: Option<AuditExportBundleResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verify_chain: Option<AuditVerifyChainResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reproduce: Option<AuditReproduceResponse>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditLedgerEntryReadback {
-    pub seq: u64,
-    pub present: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ts: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload_len: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub self_verifies: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditVerifyChainResponse {
-    pub source_of_truth: String,
-    /// True only when the verified window re-walked and re-hashed intact.
-    pub intact: bool,
-    /// Stable verdict label: `intact` | `broken` | `corrupt`.
-    pub verdict: String,
-    pub head_height: u64,
-    pub verified_from_seq: u64,
-    pub verified_to_seq: u64,
-    pub entry_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tip_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quarantine_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub broken_expected_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub broken_found_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub corrupt_reason: Option<String>,
-    pub raw_commitments_intact: bool,
-    pub raw_commitment_seal_count: u64,
-    pub raw_commitment_count: u64,
-    pub raw_commitment_sealed_count: u64,
-    pub raw_commitment_pending_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_commitment_coverage_from_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_commitment_sealed_through_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_commitment_first_pending_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_commitment_failure: Option<String>,
-    /// Bounded stall window used by the exact-snapshot integrity scan.
-    pub reader_lease_duration_ms: u64,
-    /// Successful renewals of that same pinned snapshot while rows advanced.
-    pub reader_lease_renewal_count: u64,
-    /// True only when this chain provably covers the vault directory's whole
-    /// recorded history. When false, `intact` attests only the surviving chain:
-    /// the vault was replaced, or its lineage was not tracked from genesis
-    /// (issue #1875).
-    pub covers_full_history: bool,
-    /// `vault-genesis` | `lineage-seeded` | `post-reset`.
-    pub chain_origin: String,
-    /// Why coverage is what it is (#1884). A `partial-*` verdict describes where
-    /// the attested chain *starts*; `intact` is the separate integrity answer.
-    pub history_coverage: String,
-    /// `latest_seq` when this generation was recorded, in its own numbering — 0
-    /// for both a genesis vault and an emptied replacement, so it is not a
-    /// coverage proxy. Read `history_coverage` for coverage.
-    pub attested_from_seq: u64,
-    pub vault_generation: u64,
-    pub vault_reset_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub predecessor_vault_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub predecessor_high_water_seq: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry_readback: Option<AuditLedgerEntryReadback>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditReproduceResponse {
-    pub source_of_truth: String,
-    pub cx_id: String,
-    pub reproduced: bool,
-    pub recorded_seq: u64,
-    pub recorded_hash: String,
-    pub input_hash: String,
-    pub entry_present: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry_hash: Option<String>,
-    pub entry_self_verifies: bool,
-    pub subject_matches: bool,
-    pub coverage: String,
-    pub coverage_matches: bool,
-    pub drift: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -496,31 +326,6 @@ pub struct AuditCommandQueryRowSummary {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AuditLegacyProbeRepairResponse {
-    pub source_of_truth: String,
-    pub legacy_marker: String,
-    pub previous_key_len_bytes: u64,
-    pub previous_key_sha256: String,
-    pub previous_value_len_bytes: u64,
-    pub previous_value_sha256: String,
-    pub previous_revision_sha256: String,
-    pub source_row_absent: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub committed_seq: Option<u64>,
-    pub repair_audit: AuditRepairRowReadback,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AuditRepairRowReadback {
-    pub cf_name: String,
-    pub key_hex: String,
-    pub value_len_bytes: u64,
-    pub value_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct AuditLifecycleTailResponse {
     pub path: String,
     pub segment_count: usize,
@@ -530,7 +335,6 @@ pub struct AuditLifecycleTailResponse {
     pub matched_lines_seen: u64,
     pub oversized_lines_seen: u64,
     pub oversized_lines_skipped: u64,
-    pub oversized_lines_returned: u64,
     pub returned_count: usize,
     pub rows: Vec<AuditLifecycleRowSummary>,
 }
@@ -541,7 +345,6 @@ pub struct AuditLifecycleRowSummary {
     pub line_no: u64,
     pub raw_len_bytes: u64,
     pub raw_sha256: String,
-    pub oversized: bool,
     pub schema_version: Option<u64>,
     pub run_id: Option<String>,
     pub pid: Option<u64>,

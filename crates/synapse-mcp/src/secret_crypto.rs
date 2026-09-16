@@ -1,7 +1,7 @@
 //! At-rest secret protection via Windows DPAPI (CurrentUser scope).
 //!
 //! Cloud-model API keys are encrypted with `CryptProtectData` before they ever
-//! touch the Calyx vault and decrypted with `CryptUnprotectData` only in-process, only
+//! touch RocksDB and decrypted with `CryptUnprotectData` only in-process, only
 //! when a spawn or probe needs to authenticate. CurrentUser scope binds the
 //! ciphertext to the Windows account the daemon runs as: another local user, or
 //! the same database directory copied to a different machine, cannot decrypt
@@ -114,4 +114,46 @@ pub fn protect(_plaintext: &[u8]) -> Result<Vec<u8>> {
 #[cfg(not(windows))]
 pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>> {
     bail!("secure secret storage requires Windows DPAPI; this platform is unsupported")
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protect_then_unprotect_roundtrips_secret() {
+        let secret = b"sk-deepseek-live-EXAMPLE-0123456789abcdef";
+        let ciphertext = protect(secret).expect("protect");
+        // Ciphertext must not contain the plaintext anywhere.
+        assert!(
+            ciphertext
+                .windows(secret.len())
+                .all(|window| window != secret),
+            "DPAPI ciphertext must not contain the plaintext"
+        );
+        let recovered = unprotect(&ciphertext).expect("unprotect");
+        assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn unprotect_rejects_foreign_bytes() {
+        // Random bytes were never DPAPI-protected for this account/entropy.
+        let garbage = vec![0xA5_u8; 64];
+        assert!(
+            unprotect(&garbage).is_err(),
+            "unprotecting non-DPAPI bytes must fail, not return garbage"
+        );
+    }
+
+    #[test]
+    fn ciphertext_differs_each_call_but_both_decrypt() {
+        // DPAPI mixes randomness, so two ciphertexts of the same plaintext
+        // differ yet both decrypt — proves we are not just echoing input.
+        let secret = b"identical-plaintext";
+        let a = protect(secret).expect("protect a");
+        let b = protect(secret).expect("protect b");
+        assert_ne!(a, b, "DPAPI output should be salted per call");
+        assert_eq!(unprotect(&a).expect("a"), secret);
+        assert_eq!(unprotect(&b).expect("b"), secret);
+    }
 }

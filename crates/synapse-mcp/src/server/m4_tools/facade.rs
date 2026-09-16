@@ -103,35 +103,6 @@ pub(super) fn process_facade_delegate_error(
     )
 }
 
-pub(super) fn process_history_incomplete_error(
-    filters: &ProcessFilters,
-    scan_limit: usize,
-    scanned_tail_rows: usize,
-    matches_found: usize,
-    requested_matches: usize,
-) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "process history filtered query reached the hard {scan_limit}-row scan bound after finding only {matches_found} of {requested_matches} requested matches; completeness is unproven"
-        ),
-        Some(json!({
-            "code": error_codes::STORAGE_READ_FAILED,
-            "reason": "process_history_filter_scan_incomplete",
-            "operation": ProcessOperation::History.as_str(),
-            "source_of_truth": PROCESS_FACADE_SOURCE_OF_TRUTH,
-            "cf_name": cf::CF_PROCESS_HISTORY,
-            "filters": filters,
-            "scan_limit": scan_limit,
-            "scanned_tail_rows": scanned_tail_rows,
-            "matches_found": matches_found,
-            "requested_matches": requested_matches,
-            "complete": false,
-            "remediation": "narrow the PID/name/command-line filter, reduce unrelated history volume, or add a durable indexed query path before retrying; Synapse refuses to report an incomplete result as complete",
-        })),
-    )
-}
-
 pub(super) fn require_shell_text(
     operation: ShellOperation,
     value: Option<String>,
@@ -226,7 +197,6 @@ pub(super) fn process_unexpected_fields(
         .as_deref()
         .or_else(|| params.process_name_contains.as_deref())
         .or_else(|| params.command_line_contains.as_deref())
-        .or_else(|| params.ownership_token.as_deref())
         .map(str::to_owned)
         .or_else(|| params.pid.map(|pid| pid.to_string()))
         .unwrap_or_else(|| operation.as_str().to_owned());
@@ -405,12 +375,6 @@ pub(super) fn process_launch_params(params: ProcessParams) -> Result<ActLaunchPa
     if params.include_command_line.is_some() {
         unexpected.push("include_command_line");
     }
-    if params.ownership_token.is_some() {
-        unexpected.push("ownership_token");
-    }
-    if params.expected_revision.is_some() {
-        unexpected.push("expected_revision");
-    }
     process_unexpected_fields(ProcessOperation::Launch, &params, &unexpected)?;
     let target = require_process_text(
         ProcessOperation::Launch,
@@ -432,153 +396,7 @@ pub(super) fn process_launch_params(params: ProcessParams) -> Result<ActLaunchPa
         force_renderer_accessibility: params.force_renderer_accessibility,
         windows_console_window_state: params.windows_console_window_state,
         desktop: params.desktop,
-        output: params.output,
     })
-}
-
-pub(super) fn process_cdp_profile_status_token(
-    params: &ProcessParams,
-) -> Result<Option<String>, ErrorData> {
-    let mut unexpected = Vec::new();
-    if params.target.is_some() {
-        unexpected.push("target");
-    }
-    if params.args.is_some() {
-        unexpected.push("args");
-    }
-    if params.working_dir.is_some() {
-        unexpected.push("working_dir");
-    }
-    if params.env.is_some() {
-        unexpected.push("env");
-    }
-    if params.wait_for_window_title_regex.is_some() {
-        unexpected.push("wait_for_window_title_regex");
-    }
-    if params.timeout_ms.is_some() {
-        unexpected.push("timeout_ms");
-    }
-    if params.idempotency_key.is_some() {
-        unexpected.push("idempotency_key");
-    }
-    if params.cdp_debug.is_some() {
-        unexpected.push("cdp_debug");
-    }
-    if params.force_renderer_accessibility.is_some() {
-        unexpected.push("force_renderer_accessibility");
-    }
-    if params.windows_console_window_state.is_some() {
-        unexpected.push("windows_console_window_state");
-    }
-    if params.desktop.is_some() {
-        unexpected.push("desktop");
-    }
-    if params.output.is_some() {
-        unexpected.push("output");
-    }
-    if params.pid.is_some() {
-        unexpected.push("pid");
-    }
-    if params.process_name_contains.is_some() {
-        unexpected.push("process_name_contains");
-    }
-    if params.command_line_contains.is_some() {
-        unexpected.push("command_line_contains");
-    }
-    if params.limit.is_some() {
-        unexpected.push("limit");
-    }
-    if params.include_command_line.is_some() {
-        unexpected.push("include_command_line");
-    }
-    if params.expected_revision.is_some() {
-        unexpected.push("expected_revision");
-    }
-    process_unexpected_fields(ProcessOperation::CdpProfileStatus, params, &unexpected)?;
-    if params
-        .ownership_token
-        .as_deref()
-        .is_some_and(|token| token.trim().is_empty())
-    {
-        return Err(process_facade_error(
-            ProcessOperation::CdpProfileStatus,
-            "ownership_token",
-            "process cdp_profile_status ownership_token must be non-empty when supplied",
-            "omit ownership_token for a full census or provide the exact token directory name",
-        ));
-    }
-    Ok(params.ownership_token.clone())
-}
-
-pub(super) fn process_cdp_profile_repair_params(
-    params: &ProcessParams,
-) -> Result<(String, String), ErrorData> {
-    let mut unexpected = Vec::new();
-    if params.target.is_some() {
-        unexpected.push("target");
-    }
-    if params.args.is_some() {
-        unexpected.push("args");
-    }
-    if params.working_dir.is_some() {
-        unexpected.push("working_dir");
-    }
-    if params.env.is_some() {
-        unexpected.push("env");
-    }
-    if params.wait_for_window_title_regex.is_some() {
-        unexpected.push("wait_for_window_title_regex");
-    }
-    if params.timeout_ms.is_some() {
-        unexpected.push("timeout_ms");
-    }
-    if params.idempotency_key.is_some() {
-        unexpected.push("idempotency_key");
-    }
-    if params.cdp_debug.is_some() {
-        unexpected.push("cdp_debug");
-    }
-    if params.force_renderer_accessibility.is_some() {
-        unexpected.push("force_renderer_accessibility");
-    }
-    if params.windows_console_window_state.is_some() {
-        unexpected.push("windows_console_window_state");
-    }
-    if params.desktop.is_some() {
-        unexpected.push("desktop");
-    }
-    if params.output.is_some() {
-        unexpected.push("output");
-    }
-    if params.pid.is_some() {
-        unexpected.push("pid");
-    }
-    if params.process_name_contains.is_some() {
-        unexpected.push("process_name_contains");
-    }
-    if params.command_line_contains.is_some() {
-        unexpected.push("command_line_contains");
-    }
-    if params.limit.is_some() {
-        unexpected.push("limit");
-    }
-    if params.include_command_line.is_some() {
-        unexpected.push("include_command_line");
-    }
-    process_unexpected_fields(ProcessOperation::CdpProfileRepair, params, &unexpected)?;
-    let token = require_process_text(
-        ProcessOperation::CdpProfileRepair,
-        params.ownership_token.clone(),
-        "ownership_token",
-        ProcessOperation::CdpProfileRepair.as_str(),
-    )?;
-    let revision = require_process_text(
-        ProcessOperation::CdpProfileRepair,
-        params.expected_revision.clone(),
-        "expected_revision",
-        &token,
-    )?;
-    Ok((token, revision))
 }
 
 pub(super) fn validate_process_query_params(
@@ -619,15 +437,6 @@ pub(super) fn validate_process_query_params(
     if params.desktop.is_some() {
         unexpected.push("desktop");
     }
-    if params.output.is_some() {
-        unexpected.push("output");
-    }
-    if params.ownership_token.is_some() {
-        unexpected.push("ownership_token");
-    }
-    if params.expected_revision.is_some() {
-        unexpected.push("expected_revision");
-    }
     process_unexpected_fields(operation, params, &unexpected)?;
 
     for (field, value) in [
@@ -656,20 +465,12 @@ pub(super) fn validate_process_query_params(
     let limit = params.limit.unwrap_or(match operation {
         ProcessOperation::List => PROCESS_LIST_DEFAULT_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_DEFAULT_LIMIT,
-        ProcessOperation::Launch
-        | ProcessOperation::CdpProfileStatus
-        | ProcessOperation::CdpProfileRepair => {
-            unreachable!("operation is not a process table query")
-        }
+        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
     });
     let max_limit = match operation {
         ProcessOperation::List => PROCESS_LIST_MAX_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_MAX_LIMIT,
-        ProcessOperation::Launch
-        | ProcessOperation::CdpProfileStatus
-        | ProcessOperation::CdpProfileRepair => {
-            unreachable!("operation is not a process table query")
-        }
+        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
     };
     if limit == 0 || limit > max_limit {
         return Err(process_facade_error(
@@ -803,15 +604,7 @@ pub(super) fn process_history_response(
 ) -> Result<ProcessHistoryResponse, ErrorData> {
     let limit = validate_process_query_params(ProcessOperation::History, params)?;
     let filters = process_filters(params);
-    let filters_present = filters.pid.is_some()
-        || filters.process_name_contains.is_some()
-        || filters.command_line_contains.is_some();
-    let scan_limit = if filters_present {
-        PROCESS_HISTORY_MAX_SCAN_ROWS
-    } else {
-        limit
-    };
-    let mut rows = {
+    let rows = {
         let runtime = service.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             process_facade_error(
@@ -822,22 +615,17 @@ pub(super) fn process_history_response(
             )
         })?;
         runtime
-            .storage_cf_tail_rows(cf::CF_PROCESS_HISTORY, scan_limit.saturating_add(1))
+            .storage_cf_tail_rows(cf::CF_PROCESS_HISTORY, limit)
             .map_err(|error| {
                 process_facade_error(
                     ProcessOperation::History,
                     cf::CF_PROCESS_HISTORY,
                     format!("CF_PROCESS_HISTORY tail read failed: {error}"),
-                    "inspect the Calyx-backed column family and daemon storage logs",
+                    "inspect the RocksDB column family and daemon storage logs",
                 )
             })?
     };
     let scanned_tail_rows = rows.len();
-    let scan_limit_reached = rows.len() > scan_limit;
-    if scan_limit_reached {
-        rows.remove(0);
-    }
-    let cf_exhausted = !scan_limit_reached;
     let mut decoded_rows = Vec::new();
     for (key, value) in rows {
         let decoded = decode_json::<Value>(&value).map_err(|error| {
@@ -867,67 +655,20 @@ pub(super) fn process_history_response(
             status: json_string_field(&decoded, "status"),
             launched_at: json_string_field(&decoded, "launched_at"),
             command_line: json_string_field(&decoded, "command_line"),
-            row_kind: json_string_field(&decoded, "row_kind"),
-            launch_id: json_string_field(&decoded, "launch_id"),
-            process_creation_time_100ns: json_u64_field(&decoded, "process_creation_time_100ns"),
-            exit_code: json_u32_field(&decoded, "exit_code"),
-            completed_at: json_string_field(&decoded, "completed_at"),
-            termination_cause: json_string_field(&decoded, "termination_cause"),
-            stdout: json_output_artifact_field(&decoded, "stdout", &key)?,
-            stderr: json_output_artifact_field(&decoded, "stderr", &key)?,
         };
         if process_history_row_matches(&filters, &row) {
             decoded_rows.push(row);
         }
-    }
-    if decoded_rows.len() > limit {
-        decoded_rows = decoded_rows.split_off(decoded_rows.len() - limit);
-    }
-    let complete = decoded_rows.len() == limit || cf_exhausted;
-    if !complete {
-        return Err(process_history_incomplete_error(
-            &filters,
-            scan_limit,
-            scanned_tail_rows,
-            decoded_rows.len(),
-            limit,
-        ));
     }
     Ok(ProcessHistoryResponse {
         source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
         cf_name: cf::CF_PROCESS_HISTORY.to_owned(),
         returned_count: decoded_rows.len(),
         scanned_tail_rows,
-        scan_limit,
-        cf_exhausted,
-        complete,
         limit,
         filters,
         rows: decoded_rows,
     })
-}
-
-pub(super) fn json_output_artifact_field(
-    value: &Value,
-    field: &str,
-    key: &[u8],
-) -> Result<Option<ActLaunchOutputArtifactReadback>, ErrorData> {
-    let Some(raw) = value.get(field) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    serde_json::from_value(raw.clone())
-        .map(Some)
-        .map_err(|error| {
-            process_facade_error(
-                ProcessOperation::History,
-                hex_lower(key),
-                format!("CF_PROCESS_HISTORY {field} output artifact decode failed: {error}"),
-                "inspect the exact terminal history row and repair the writer/schema mismatch",
-            )
-        })
 }
 
 pub(super) fn json_u32_field(value: &Value, field: &str) -> Option<u32> {
@@ -935,10 +676,6 @@ pub(super) fn json_u32_field(value: &Value, field: &str) -> Option<u32> {
         .get(field)
         .and_then(Value::as_u64)
         .and_then(|raw| u32::try_from(raw).ok())
-}
-
-pub(super) fn json_u64_field(value: &Value, field: &str) -> Option<u64> {
-    value.get(field).and_then(Value::as_u64)
 }
 
 pub(super) fn json_string_field(value: &Value, field: &str) -> Option<String> {

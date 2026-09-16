@@ -1,0 +1,61 @@
+---
+source: crates/synapse-core/tests/reflex_types.rs
+expression: "round_trip(\"ReflexKind\", \"snapshot\", full_on_event_kind())?"
+---
+{
+  "kind": "on_event",
+  "when": {
+    "op": "and",
+    "args": [
+      {
+        "op": "kind",
+        "kind": "hud_value_changed"
+      },
+      {
+        "op": "source",
+        "source": "perception_hud"
+      },
+      {
+        "op": "data",
+        "path": "/field",
+        "predicate": {
+          "op": "eq",
+          "value": "hp"
+        }
+      },
+      {
+        "op": "data",
+        "path": "/new",
+        "predicate": {
+          "op": "lt",
+          "value": 20
+        }
+      }
+    ]
+  },
+  "then": {
+    "kind": "actions",
+    "actions": [
+      {
+        "kind": "key_press",
+        "key": {
+          "code": {
+            "kind": "named",
+            "value": "e"
+          },
+          "use_scancode": false
+        },
+        "hold_ms": 30,
+        "backend": "software"
+      },
+      {
+        "kind": "mouse_button",
+        "button": "left",
+        "action": "press",
+        "hold_ms": 16,
+        "backend": "software"
+      }
+    ]
+  },
+  "debounce_ms": 250
+}

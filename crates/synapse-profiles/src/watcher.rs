@@ -107,12 +107,11 @@ impl ProfileRuntime {
             path: profile_dir.clone(),
             message: source.to_string(),
         })?;
-        let watch_path = watcher_registration_path(&profile_dir)?;
         watcher
-            .watch(&watch_path, RecursiveMode::NonRecursive)
+            .watch(&profile_dir, RecursiveMode::NonRecursive)
             .map_err(|source| ProfileError::Watch {
                 path: profile_dir.clone(),
-                message: format!("{} (watch_path={})", source, watch_path.display()),
+                message: source.to_string(),
             })?;
 
         let runtime = Self {
@@ -199,12 +198,6 @@ impl ProfileRuntime {
             .profiles
             .get(profile_id)
             .map(|loaded| loaded.profile.clone()))
-    }
-
-    #[instrument(skip_all, fields(profile_id = profile_id))]
-    pub fn loaded_profile(&self, profile_id: &str) -> Result<Option<LoadedProfile>, ProfileError> {
-        let state = self.state.read().map_err(|_| ProfileError::StatePoisoned)?;
-        Ok(state.profiles.get(profile_id).cloned())
     }
 
     #[instrument(skip_all)]
@@ -332,29 +325,6 @@ impl ProfileRuntime {
             scope_changed,
         })
     }
-}
-
-#[cfg(windows)]
-fn watcher_registration_path(path: &Path) -> Result<PathBuf, ProfileError> {
-    let absolute = std::path::absolute(path).map_err(|source| ProfileError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut value = absolute.to_string_lossy().replace('/', "\\");
-    if value.starts_with(r"\\?\") || value.starts_with(r"\??\") {
-        return Ok(PathBuf::from(value));
-    }
-    if let Some(stripped) = value.strip_prefix(r"\\") {
-        value = format!(r"\\?\UNC\{stripped}");
-    } else {
-        value = format!(r"\\?\{value}");
-    }
-    Ok(PathBuf::from(value))
-}
-
-#[cfg(not(windows))]
-fn watcher_registration_path(path: &Path) -> Result<PathBuf, ProfileError> {
-    Ok(path.to_path_buf())
 }
 
 const fn effective_scope(scope: Option<ProfileUseScope>) -> ProfileUseScope {

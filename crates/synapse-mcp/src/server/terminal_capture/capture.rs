@@ -112,16 +112,7 @@ struct LiveTerminalState {
 static LIVE_TERMINAL_SESSIONS: OnceLock<Mutex<BTreeMap<String, Arc<LiveTerminalSession>>>> =
     OnceLock::new();
 
-/// The event ring bridges only the brief interval between subscribing and
-/// reading the authoritative shadow-screen snapshot. It is not terminal
-/// history: the asciicast and shadow screen are the Sources of Truth.
-/// Reader output is chunked at `TERMINAL_READER_CHUNK_BYTES`, so this bounds
-/// retained output to one MiB per actively attached terminal (plus small event
-/// metadata) instead of 128 MiB per terminal.
-const TERMINAL_READER_CHUNK_BYTES: usize = 8 * 1024;
-const LIVE_TERMINAL_EVENT_WINDOW_BYTES: usize = 1024 * 1024;
-const LIVE_TERMINAL_BROADCAST_CAPACITY: usize =
-    LIVE_TERMINAL_EVENT_WINDOW_BYTES / TERMINAL_READER_CHUNK_BYTES;
+const LIVE_TERMINAL_BROADCAST_CAPACITY: usize = 16_384;
 
 /// Specification for a capture session.
 #[derive(Clone, Debug)]
@@ -408,49 +399,6 @@ pub(crate) fn terminal_capture_session(spawn_id: &str) -> Option<Arc<LiveTermina
     let sessions = live_terminal_sessions();
     let sessions = sessions.lock().ok()?;
     sessions.get(spawn_id).cloned()
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LiveTerminalReapReadback {
-    pub sessions_before: usize,
-    pub dead_process_sessions_reaped: usize,
-    pub sessions_after: usize,
-}
-
-/// Removes terminal event rings whose physical child process no longer
-/// exists. The normal waiter remains the artifact finalizer; this periodic
-/// ownership sweep prevents a stalled waiter from retaining its session ring
-/// for the daemon lifetime.
-pub(crate) fn reap_dead_live_terminal_sessions() -> LiveTerminalReapReadback {
-    let mut sessions = match live_terminal_sessions().lock() {
-        Ok(sessions) => sessions,
-        Err(poisoned) => {
-            tracing::error!(
-                code = "PTY_CAPTURE_REGISTRY_LOCK_POISONED",
-                "recovering poisoned live-terminal registry during process sweep"
-            );
-            poisoned.into_inner()
-        }
-    };
-    let sessions_before = sessions.len();
-    sessions.retain(|spawn_id, session| {
-        let live = crate::m4::process_exists(session.process_id);
-        if !live {
-            tracing::info!(
-                code = "PTY_CAPTURE_DEAD_SESSION_REAPED",
-                spawn_id,
-                process_id = session.process_id,
-                source_of_truth = "OS process table",
-                "released live-terminal ring after its physical child process exited"
-            );
-        }
-        live
-    });
-    LiveTerminalReapReadback {
-        sessions_before,
-        dead_process_sessions_reaped: sessions_before.saturating_sub(sessions.len()),
-        sessions_after: sessions.len(),
-    }
 }
 
 fn register_live_terminal_session(session: Arc<LiveTerminalSession>) {
@@ -777,7 +725,7 @@ fn spawn_reader_thread(
             .map_err(|error| anyhow::anyhow!("ASCIICAST_HEADER_WRITE_FAILED: {error}"))?;
         let mut screen = ShadowScreen::new(cols, rows);
         let start = Instant::now();
-        let mut buffer = [0u8; TERMINAL_READER_CHUNK_BYTES];
+        let mut buffer = [0u8; 8192];
         let mut bytes_captured = 0u64;
         let mut output_events = 0u64;
         loop {
@@ -1121,3 +1069,118 @@ struct ReaderOutcome {
 /// streaming endpoint can dump the current screen on attach while the capture
 /// loop keeps feeding it. (Wired into the spawn path as #914 lands.)
 pub(crate) type SharedShadowScreen = Arc<Mutex<ShadowScreen>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::Value;
+
+    fn read_events(path: &Path) -> (Value, Vec<Value>) {
+        let text = std::fs::read_to_string(path).expect("read asciicast");
+        let mut lines = text.lines();
+        let header: Value = serde_json::from_str(lines.next().expect("header line")).expect("hdr");
+        let events = lines
+            .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("event json"))
+            .collect();
+        (header, events)
+    }
+
+    #[test]
+    fn terminal_query_responder_answers_cursor_position_request() {
+        let mut responder = TerminalQueryResponder::default();
+        let mut pty_input = Vec::new();
+
+        responder
+            .respond(b"\x1b[6n", &mut pty_input)
+            .expect("respond succeeds");
+
+        assert_eq!(pty_input, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn terminal_query_responder_handles_split_cursor_position_request() {
+        let mut responder = TerminalQueryResponder::default();
+        let mut pty_input = Vec::new();
+
+        responder
+            .respond(b"prefix\x1b[", &mut pty_input)
+            .expect("partial respond succeeds");
+        assert!(pty_input.is_empty());
+
+        responder
+            .respond(b"?6nsuffix\x1b[6n", &mut pty_input)
+            .expect("final respond succeeds");
+
+        assert_eq!(pty_input, b"\x1b[1;1R\x1b[1;1R");
+    }
+
+    #[test]
+    #[ignore = "supporting real-process integration evidence only; manual FSV remains separate: opens a real owned ConPTY and captures a child's output. Run from an INTERACTIVE console session (`cargo test -p synapse-mcp -- --ignored`). The conpty-hosted child fails DLL init (0xC0000142) or hangs under restricted automation window-stations, which is an environment limitation, not a capture-code defect — the byte->asciicast and byte->screen transforms are fully covered by the default-gate unit tests."]
+    fn captures_real_process_output_to_valid_asciicast_v3() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let asciicast_path = temp.path().join("session.cast");
+        let marker = "HELLO_CONPTY_7F3A9";
+
+        // A real child process writing to the owned pseudoconsole.
+        #[cfg(windows)]
+        let spec = CaptureSpec {
+            live_key: None,
+            program: "cmd.exe".to_owned(),
+            args: vec!["/c".to_owned(), format!("echo {marker}")],
+            cwd: Some(temp.path().to_path_buf()),
+            env: std::env::vars().collect(),
+            cols: 80,
+            rows: 24,
+            started_unix_secs: 1_700_000_000,
+            title: Some("conpty-regression".to_owned()),
+        };
+        #[cfg(not(windows))]
+        let spec = CaptureSpec {
+            live_key: None,
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), format!("echo {marker}")],
+            cwd: Some(temp.path().to_path_buf()),
+            env: std::env::vars().collect(),
+            cols: 80,
+            rows: 24,
+            started_unix_secs: 1_700_000_000,
+            title: Some("pty-regression".to_owned()),
+        };
+
+        let summary = capture_to_asciicast(&spec, &asciicast_path).expect("capture succeeds");
+
+        // Source of truth 1: the recording exists on disk and is valid v3.
+        assert!(asciicast_path.exists(), "asciicast file must be written");
+        let (header, events) = read_events(&asciicast_path);
+        assert_eq!(header["version"], 3, "must be asciicast v3");
+        assert_eq!(header["term"]["cols"], 80);
+        assert_eq!(header["term"]["rows"], 24);
+
+        // Source of truth 2: an output event carries the child's real stdout.
+        let captured_output: String = events
+            .iter()
+            .filter(|event| event[1] == "o")
+            .map(|event| event[2].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            captured_output.contains(marker),
+            "captured output must contain the echoed marker; got: {captured_output:?}"
+        );
+
+        // Source of truth 3: a terminating exit event with the child's code.
+        let exit_event = events.iter().rev().find(|event| event[1] == "x");
+        let exit_event = exit_event.expect("an exit event must terminate the recording");
+        assert_eq!(exit_event[2], "0", "echo exits 0");
+        assert_eq!(summary.exit_code, 0);
+
+        // Source of truth 4: the shadow screen rendered the same text.
+        assert!(
+            summary.final_screen_text.contains(marker),
+            "shadow screen must render the marker; got: {:?}",
+            summary.final_screen_text
+        );
+        assert!(summary.bytes_captured > 0 && summary.output_events > 0);
+    }
+}

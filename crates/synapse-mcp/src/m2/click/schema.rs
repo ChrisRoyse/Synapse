@@ -114,43 +114,12 @@ pub struct ActClickResponse {
     pub backend_used: String,
     pub backend_tier_used: String,
     pub required_foreground: bool,
-    /// #2063: exact worker route when the clicked element's window lives on a
-    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
-    /// Absent for ordinary daemon-desktop tiers. Recorded verbatim in the
-    /// `CF_ACTION_LOG` row so an auditor can tell the two apart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desktop_route: Option<String>,
-    /// #2063: the two HWNDs the hidden-desktop route used — what was clicked and
-    /// what was watched. Absent for ordinary daemon-desktop tiers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desktop_route_hwnds: Option<ActClickDesktopRouteHwnds>,
     pub tier_attempts: Vec<ActClickTierAttempt>,
     pub postcondition: ActClickPostcondition,
     pub press_hold_ms: u32,
     pub double_click_window_ms: u32,
     pub inter_click_delay_ms: u32,
     pub elapsed_ms: u32,
-}
-
-/// #2063: the exact HWNDs a hidden-desktop click used, so an auditor never has
-/// to infer which window was acted on and which one was verified.
-///
-/// In a classic Win32 dialog every control is its own window, so these two are
-/// normally different: the click is delivered to the control, but the effect it
-/// has (a sibling edit gaining a character, a dialog opening) is only visible
-/// from the top-level window. Rooting verification at the control was the #2063
-/// finding-1 defect — a delivered click reported as `ACTION_NO_OBSERVED_DELTA`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActClickDesktopRouteHwnds {
-    /// The HWND carried by the element id: the control that was invoked, and the
-    /// subject of the desktop-membership / staleness probe.
-    pub invoked_hwnd: i64,
-    /// `GA_ROOT` of `invoked_hwnd`, resolved by a worker attached to the owning
-    /// desktop. Root of the before/after verification subtree.
-    pub verify_root_hwnd: i64,
-    /// Depth cap of that verification subtree, measured from `verify_root_hwnd`.
-    pub verify_subtree_depth: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

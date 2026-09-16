@@ -7,10 +7,10 @@ use chrono::{DateTime, Utc};
 use rmcp::ErrorData;
 use serde_json::{Value, json};
 use synapse_core::{
-    EventSource, ForegroundContext, Observation, ObservationPersistedRow, Profile, ProfileBackends,
-    ProfileId, SCHEMA_VERSION, SessionId, StoredAppContext, StoredAuditContext,
-    StoredBackendPolicy, StoredEvent, StoredObservation, StoredProfileHistoryEntry, StoredSession,
-    error_codes, new_session_id,
+    EventSource, ForegroundContext, Observation, Profile, ProfileBackends, ProfileId,
+    SCHEMA_VERSION, SessionId, StoredAppContext, StoredAuditContext, StoredBackendPolicy,
+    StoredEvent, StoredObservation, StoredProfileHistoryEntry, StoredSession, error_codes,
+    new_session_id,
 };
 
 use super::SynapseService;
@@ -156,22 +156,16 @@ impl SynapseService {
         &self,
         observation: &Observation,
         reason: &'static str,
-    ) -> Result<ObservationPersistedRow, ErrorData> {
+    ) -> Result<(), ErrorData> {
         self.persist_observation_for_mcp_session(observation, reason, None)
     }
 
-    /// Writes the `CF_OBSERVATIONS` audit row and returns its durable identity.
-    ///
-    /// #2064: the key is minted here and used to write the row, so this is the
-    /// only place that can name it. Returning it — rather than only logging it
-    /// at INFO — is what makes the stored row reachable by the caller that
-    /// produced it, through `storage operation=row_read`.
     pub(super) fn persist_observation_for_mcp_session(
         &self,
         observation: &Observation,
         reason: &'static str,
         mcp_session_id: Option<&str>,
-    ) -> Result<ObservationPersistedRow, ErrorData> {
+    ) -> Result<(), ErrorData> {
         let (ts_ns, seq) = next_observation_key_parts();
         let observation_id = format!("observe-{ts_ns:020}-{seq:010}");
         let profile_info = match observation.foreground.profile_id.as_deref() {
@@ -242,24 +236,16 @@ impl SynapseService {
             reason,
         );
         self.write_event_row(&event)?;
-        let key_hex = hex_lower(&source_key);
         tracing::info!(
             code = "OBSERVATION_AUDIT_RECORDED",
             ts_ns,
             seq,
             observation_id,
-            key_hex,
             session_id = %session_id,
             mcp_session_id = mcp_session_id.unwrap_or("<global>"),
             "observation audit row written"
         );
-        Ok(ObservationPersistedRow {
-            cf_name: synapse_storage::cf::CF_OBSERVATIONS.to_owned(),
-            key_hex,
-            observation_id,
-            ts_ns,
-            key_seq: seq,
-        })
+        Ok(())
     }
 
     pub(super) fn current_action_audit_context(&self) -> Result<StoredAuditContext, ErrorData> {
@@ -717,21 +703,6 @@ fn observation_key(ts_ns: u64, seq: u32) -> Vec<u8> {
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
-}
-
-/// Lower-case hex encoding of a physical row key (#2064).
-///
-/// The same encoding `storage operation=anchors` and `storage
-/// operation=row_read` decode, so the key this returns can be passed straight
-/// back in without reformatting.
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
 }
 
 fn next_observation_key_parts() -> (u64, u32) {

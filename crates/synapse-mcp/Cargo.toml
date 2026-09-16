@@ -5,23 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
-# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
-# makes this crate `private` for `cargo deny check licenses` (#1930).
-publish.workspace = true
-# The shipped binary list is CLOSED (#2045).
-#
-# Cargo auto-discovers `src/bin/*.rs` as bin targets, and the two `[[bin]]`
-# blocks below did not turn that off — declaring some targets explicitly does
-# not disable autodiscovery of the rest. That is how `reactive_scheduler_fsv`
-# and `reactive_region_fsv` came to be linked into every `cargo build --release
-# -p synapse-mcp`: they were dropped into `src/bin/` as manual instruments and
-# silently became shipping binaries, against directive D1's ban on FSV harness
-# binaries. Nobody added them to a manifest, so no manifest review could catch
-# them.
-#
-# With `autobins = false` a new file under `src/bin/` builds nothing until
-# someone writes a `[[bin]]` block for it here — which is a reviewable act.
-autobins = false
 
 [[bin]]
 name = "synapse-mcp"
@@ -31,40 +14,20 @@ path = "src/main.rs"
 name = "synapse-chrome-native-host"
 path = "src/bin/synapse-chrome-native-host.rs"
 
-[[bin]]
-name = "synapse-supervisor-bootstrap"
-path = "src/bin/synapse-supervisor-bootstrap.rs"
-
-[build-dependencies]
-serde_json.workspace = true
-sha2.workspace = true
-
 [dependencies]
-calyx-anneal.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
-calyx-core.workspace = true
-calyx-registry.workspace = true
-calyx-sextant.workspace = true
-calyx-ward.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 http.workspace = true
+hyper.workspace = true
 image.workspace = true
 metrics.workspace = true
-# Pinned rather than floating: this crate installs the process-wide
-# `#[global_allocator]` (src/main.rs), so a silent minor bump would swap the
-# allocator under the daemon between builds. Version moves are a reviewable act.
-mimalloc = "0.1.52"
-# `mimalloc` intentionally does not expose `mi_collect`; this exact sys crate
-# owns that allocator's C API and enables the one narrow reclamation operation
-# used at Calyx streaming rebuild release boundaries.
-libmimalloc-sys = { version = "=0.1.49", features = ["extended"] }
 notify.workspace = true
 rmcp = { workspace = true, features = [
     "transport-streamable-http-server",
@@ -73,9 +36,6 @@ rmcp = { workspace = true, features = [
 ] }
 regex.workspace = true
 reqwest.workspace = true
-rayon.workspace = true
-calyx-oracle = { workspace = true }
-num-traits.workspace = true
 sse-stream.workspace = true
 schemars.workspace = true
 portable-pty = "0.9.0"
@@ -87,16 +47,10 @@ sysinfo.workspace = true
 tempfile.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
-# The installed daemon compiles no explicit GPU model/CUDA provider. Keep ORT
-# itself for the real CPU detector/STT models, but do not compile its CUDA
-# execution provider into this process. Capture separately uses GDI BitBlt,
-# which Windows/the display driver may accelerate internally.
 synapse-audio = { version = "0.1.0", path = "../synapse-audio" }
-synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
-synapse-chrome-bridge = { version = "0.1.0", path = "../synapse-chrome-bridge" }
-synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["ort"] }
+synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["directml"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
@@ -112,11 +66,22 @@ uuid.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
-[target.'cfg(not(windows))'.dependencies]
-tokio-tungstenite.workspace = true
-
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb.workspace = true
+
+[dev-dependencies]
+# Integration tests decode the written PNG/JPEG to physically verify pixel dimensions.
+image.workspace = true
+insta.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
+# Integration tests open the daemon's RocksDB directly to verify physical rows.
+synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
+synapse-core = { version = "0.1.0", path = "../synapse-core" }
+# Enables `lease::isolate_for_test` so parallel unit tests get a hermetic,
+# per-test input lease (issue #1574). Dev-only: excluded from release builds.
+synapse-action = { version = "0.1.0", path = "../synapse-action", features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "allow"

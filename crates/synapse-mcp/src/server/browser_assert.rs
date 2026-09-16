@@ -32,7 +32,8 @@ const ARIA_TOOL: &str = "browser_aria_snapshot";
 const ASSERT_TOOL: &str = "browser_assert";
 const DOM_TOOL: &str = "browser_dom";
 const DOM_SOURCE_OF_TRUTH: &str = "Chrome bridge/raw-CDP DOM/ARIA readback for the target tab";
-const DOM_READBACK_SOURCE_OF_TRUTH: &str = "browser_content/browser_locate/browser_inspect/browser_aria_snapshot/browser_assert same-target readback";
+const DOM_READBACK_SOURCE_OF_TRUTH: &str =
+    "browser_content/browser_locate/browser_inspect/browser_aria_snapshot same-target readback";
 const DOM_RESTRICTED_SCHEME_REMEDIATION: &str = "navigate the target tab to an http(s) URL or another Chrome-extension-scriptable URL before retrying browser_dom; Chrome extensions cannot script restricted URL schemes such as data:, about:, chrome:, chrome-extension:, devtools:, or view-source:";
 
 const DEFAULT_ARIA_MAX_NODES: usize = 500;
@@ -125,7 +126,6 @@ pub enum BrowserDomOperation {
     Locate,
     Inspect,
     AriaSnapshot,
-    Assert,
 }
 
 impl BrowserDomOperation {
@@ -135,7 +135,6 @@ impl BrowserDomOperation {
             Self::Locate => "locate",
             Self::Inspect => "inspect",
             Self::AriaSnapshot => "aria_snapshot",
-            Self::Assert => "assert",
         }
     }
 }
@@ -168,9 +167,6 @@ pub struct BrowserDomParams {
     /// `operation=aria_snapshot`: accessibility tree readback.
     #[serde(default)]
     pub aria_snapshot: Option<BrowserAriaSnapshotParams>,
-    /// `operation=assert`: strict, retry-bounded locator assertion readback.
-    #[serde(default)]
-    pub assert: Option<BrowserAssertParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -187,8 +183,6 @@ pub struct BrowserDomResponse {
     pub inspect: Option<BrowserInspectResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aria_snapshot: Option<BrowserAriaSnapshotResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assert: Option<BrowserAssertResponse>,
 }
 
 #[derive(Clone, Debug)]
@@ -383,8 +377,6 @@ struct NormalizedBrowserAssertParams {
     locator: BrowserAssertLocator,
     matcher: BrowserAssertMatcher,
     expected_text: Option<String>,
-    expected_text_match_value: Option<String>,
-    expected_text_regex: Option<Regex>,
     expected_value: Option<String>,
     expected_bool: Option<bool>,
     expected_count: Option<usize>,
@@ -435,7 +427,7 @@ struct AriaSnapshotBuild {
 #[tool_router(router = browser_assert_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree; operation=assert performs strict, retry-bounded locator assertions and returns actual-versus-expected readback. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected nested spec's target; a conflicting nested value fails closed. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected nested spec's target; a conflicting nested value fails closed. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_dom(
         &self,
@@ -489,16 +481,6 @@ impl SynapseService {
                 &mut spec.window_hwnd,
             )?;
         }
-        if let Some(spec) = params.assert.as_mut() {
-            merge_top_level_target(
-                DOM_TOOL,
-                "assert",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
         let source_id = browser_dom_source_id(&params);
         validate_browser_dom_params(&params)?;
         tracing::info!(
@@ -535,7 +517,6 @@ impl SynapseService {
                     None,
                     None,
                     None,
-                    None,
                 )))
             }
             BrowserDomOperation::Locate => {
@@ -562,7 +543,6 @@ impl SynapseService {
                     operation,
                     None,
                     Some(response.0),
-                    None,
                     None,
                     None,
                 )))
@@ -593,7 +573,6 @@ impl SynapseService {
                     None,
                     Some(response.0),
                     None,
-                    None,
                 )))
             }
             BrowserDomOperation::AriaSnapshot => {
@@ -618,36 +597,6 @@ impl SynapseService {
                     })?;
                 Ok(Json(browser_dom_response(
                     operation,
-                    None,
-                    None,
-                    None,
-                    Some(response.0),
-                    None,
-                )))
-            }
-            BrowserDomOperation::Assert => {
-                let spec = params.assert.ok_or_else(|| {
-                    browser_dom_facade_error(
-                        operation,
-                        source_id.clone(),
-                        "browser_dom operation=assert reached dispatch without its validated assert spec",
-                        "send exactly one assert spec containing a non-empty locator and matching expected value",
-                    )
-                })?;
-                let response = self
-                    .browser_assert(Parameters(spec), request_context)
-                    .await
-                    .map_err(|error| {
-                        browser_dom_delegate_error(
-                            operation,
-                            source_id.clone(),
-                            error,
-                            "bind the owned target and provide one strict locator assertion with a bounded timeout",
-                        )
-                    })?;
-                Ok(Json(browser_dom_response(
-                    operation,
-                    None,
                     None,
                     None,
                     None,
@@ -975,42 +924,15 @@ impl SynapseService {
     #[cfg(not(windows))]
     async fn browser_assert_impl(
         &self,
-        session_id: &str,
-        window_hwnd: i64,
-        cdp_target_id: &str,
-        params: &NormalizedBrowserAssertParams,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _params: &NormalizedBrowserAssertParams,
     ) -> Result<BrowserAssertResponse, ErrorData> {
-        if is_chrome_bridge_target_id(cdp_target_id) {
-            return browser_assert_bridge_loop(session_id, window_hwnd, cdp_target_id, params)
-                .await;
-        }
-        let owner = self
-            .cdp_target_owner_for_readback(ASSERT_TOOL, session_id, cdp_target_id)?
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "browser_assert exact raw-CDP target {cdp_target_id:?} has no session-owned endpoint record; refusing endpoint discovery from another browser process"
-                    ),
-                )
-            })?;
-        if owner.window_hwnd != window_hwnd {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "browser_assert owner/window mismatch for target {cdp_target_id:?}: owner hwnd={:#x}, resolved hwnd={window_hwnd:#x}",
-                    owner.window_hwnd
-                ),
-            ));
-        }
-        browser_assert_portable_loop(
-            session_id,
-            window_hwnd,
-            &owner.endpoint,
-            cdp_target_id,
-            params,
-        )
-        .await
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_assert is only available on Windows in this build",
+        ))
     }
 }
 
@@ -1020,7 +942,6 @@ fn validate_browser_dom_params(params: &BrowserDomParams) -> Result<(), ErrorDat
         ("locate", params.locate.is_some()),
         ("inspect", params.inspect.is_some()),
         ("aria_snapshot", params.aria_snapshot.is_some()),
-        ("assert", params.assert.is_some()),
     ];
     let supplied = fields
         .iter()
@@ -1047,7 +968,6 @@ fn browser_dom_response(
     locate: Option<BrowserLocateResponse>,
     inspect: Option<BrowserInspectResponse>,
     aria_snapshot: Option<BrowserAriaSnapshotResponse>,
-    assert: Option<BrowserAssertResponse>,
 ) -> BrowserDomResponse {
     BrowserDomResponse {
         operation,
@@ -1057,7 +977,6 @@ fn browser_dom_response(
         locate: locate.map(redact_browser_locate_response_urls),
         inspect: inspect.map(redact_browser_inspect_response_urls),
         aria_snapshot: aria_snapshot.map(redact_browser_aria_snapshot_response_urls),
-        assert: assert.map(redact_browser_assert_response_urls),
     }
 }
 
@@ -1089,13 +1008,6 @@ fn redact_browser_inspect_response_urls(
 fn redact_browser_aria_snapshot_response_urls(
     mut response: BrowserAriaSnapshotResponse,
 ) -> BrowserAriaSnapshotResponse {
-    response.url = redact_url_for_public_readback(&response.url);
-    response
-}
-
-fn redact_browser_assert_response_urls(
-    mut response: BrowserAssertResponse,
-) -> BrowserAssertResponse {
     response.url = redact_url_for_public_readback(&response.url);
     response
 }
@@ -1140,19 +1052,6 @@ fn browser_dom_source_id(params: &BrowserDomParams) -> String {
                 )
             })
             .unwrap_or_else(|| "missing_aria_snapshot_spec".to_owned()),
-        BrowserDomOperation::Assert => params
-            .assert
-            .as_ref()
-            .map(|spec| {
-                format!(
-                    "{};matcher={:?};locator_engine={:?};query_len={}",
-                    browser_dom_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
-                    spec.matcher,
-                    spec.locator.engine,
-                    spec.locator.query.len()
-                )
-            })
-            .unwrap_or_else(|| "missing_assert_spec".to_owned()),
     }
 }
 
@@ -1205,8 +1104,9 @@ fn browser_dom_delegate_error(
         restricted_chrome_scripting_scheme(&cause_code, error.message.as_ref(), &cause)
     {
         let message = format!(
-            "{DOM_TOOL} operation={} cannot read target {source_id}: Chrome extension scripting is unavailable for restricted URL scheme {scheme:?}",
-            operation.as_str()
+            "{DOM_TOOL} operation={} cannot read target {source_id}: Chrome extension scripting is unavailable for restricted URL scheme {scheme:?}; original error: {}",
+            operation.as_str(),
+            error.message
         );
         return ErrorData::new(
             error.code,
@@ -1220,7 +1120,7 @@ fn browser_dom_delegate_error(
                 "remediation": DOM_RESTRICTED_SCHEME_REMEDIATION,
                 "restricted_url_scheme": scheme,
                 "original_code": cause_code,
-                "cause": { "code": cause_code },
+                "cause": cause,
             })),
         );
     }
@@ -1450,53 +1350,18 @@ fn validate_browser_assert_params(
         1
     };
     let limit = params.locator.limit.unwrap_or(default_limit).clamp(1, 500);
-    let text_match = params.text_match.unwrap_or_default();
-    let should_normalize_whitespace = params.normalize_whitespace.unwrap_or(true);
-    let expected_text_match_value = params.expected_text.as_deref().map(|expected| {
-        if should_normalize_whitespace {
-            normalize_whitespace(expected)
-        } else {
-            expected.to_owned()
-        }
-    });
-    let expected_text_regex = if matches!(
-        (params.matcher, text_match),
-        (
-            BrowserAssertMatcher::ToHaveText,
-            BrowserAssertTextMatch::Regex
-        )
-    ) {
-        let pattern = expected_text_match_value.as_deref().ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "{ASSERT_TOOL} normalized regex matcher is missing validated expected_text"
-                ),
-            )
-        })?;
-        Some(Regex::new(pattern).map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("{ASSERT_TOOL} expected_text regex is invalid: {error}"),
-            )
-        })?)
-    } else {
-        None
-    };
 
     Ok(NormalizedBrowserAssertParams {
         locator: params.locator.clone(),
         matcher: params.matcher,
         expected_text: params.expected_text.clone(),
-        expected_text_match_value,
-        expected_text_regex,
         expected_value: params.expected_value.clone(),
         expected_bool: params.expected_bool,
         expected_count: params.expected_count,
         attribute_name: params.attribute_name.clone(),
         expected_attribute_value: params.expected_attribute_value.clone(),
-        text_match,
-        normalize_whitespace: should_normalize_whitespace,
+        text_match: params.text_match.unwrap_or_default(),
+        normalize_whitespace: params.normalize_whitespace.unwrap_or(true),
         negate: params.negate.unwrap_or(false),
         timeout_ms,
         interval_ms,
@@ -1748,6 +1613,7 @@ async fn browser_aria_snapshot_bridge(
     })
 }
 
+#[cfg(windows)]
 async fn browser_assert_bridge_loop(
     session_id: &str,
     window_hwnd: i64,
@@ -1819,6 +1685,7 @@ async fn browser_assert_bridge_loop(
     }
 }
 
+#[cfg(windows)]
 async fn browser_assert_bridge_poll(
     window_hwnd: i64,
     cdp_target_id: &str,
@@ -1856,7 +1723,7 @@ async fn browser_assert_bridge_poll(
     }
     if located.match_count == 0 {
         return Ok(AssertPoll {
-            pass: assertion_passes_without_element(params),
+            pass: false,
             url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: located.ready_state,
@@ -1869,10 +1736,7 @@ async fn browser_assert_bridge_poll(
     }
     if params.strict && located.match_count != 1 {
         return Ok(AssertPoll {
-            // Locator ambiguity is a resolution error, not an assertion value.
-            // Negation must never turn "we inspected no unique element" into
-            // success.
-            pass: false,
+            pass: apply_negate(false, params.negate),
             url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: located.ready_state,
@@ -1918,191 +1782,6 @@ async fn browser_assert_bridge_poll(
     )
 }
 
-#[cfg(not(windows))]
-async fn browser_assert_portable_loop(
-    session_id: &str,
-    window_hwnd: i64,
-    endpoint: &str,
-    cdp_target_id: &str,
-    params: &NormalizedBrowserAssertParams,
-) -> Result<BrowserAssertResponse, ErrorData> {
-    let started = Instant::now();
-    let mut poll_count = 0_u32;
-    loop {
-        poll_count = poll_count.saturating_add(1);
-        let poll = browser_assert_portable_poll(endpoint, cdp_target_id, params).await?;
-        let elapsed_ms = duration_millis(started.elapsed());
-        if poll.pass || elapsed_ms >= params.timeout_ms {
-            let timed_out = !poll.pass;
-            tracing::info!(
-                code = "CDP_BACKGROUND_ASSERT_PORTABLE",
-                session_id,
-                hwnd = window_hwnd,
-                endpoint,
-                cdp_target_id,
-                matcher = ?params.matcher,
-                pass = poll.pass,
-                timed_out,
-                poll_count,
-                elapsed_ms,
-                "readback=portable_raw_cdp.Runtime.evaluate outcome=assertion_terminal"
-            );
-            return Ok(browser_assert_response(
-                session_id,
-                window_hwnd,
-                endpoint.to_owned(),
-                cdp_target_id,
-                params,
-                poll,
-                poll_count,
-                elapsed_ms,
-                timed_out,
-                "portable_raw_cdp",
-                "Runtime.evaluate(locator state) + separate same-target page-state Runtime.evaluate",
-                "cdp",
-            ));
-        }
-        let remaining = params.timeout_ms.saturating_sub(elapsed_ms);
-        tokio::time::sleep(Duration::from_millis(params.interval_ms.min(remaining))).await;
-    }
-}
-
-#[cfg(not(windows))]
-async fn browser_assert_portable_poll(
-    endpoint: &str,
-    cdp_target_id: &str,
-    params: &NormalizedBrowserAssertParams,
-) -> Result<AssertPoll, ErrorData> {
-    let locator = serde_json::to_value(&params.locator).map_err(|error| {
-        mcp_error(
-            error_codes::OBSERVE_INTERNAL,
-            format!("{ASSERT_TOOL} portable locator serialization failed: {error}"),
-        )
-    })?;
-    let command_timeout_ms = params.interval_ms.max(1_000).min(5_000);
-    let evaluated = if let Some(root_backend_node_id) = params.root_backend_node_id {
-        super::portable_cdp::runtime_call_function_on(
-            endpoint,
-            cdp_target_id,
-            root_backend_node_id,
-            PORTABLE_ASSERT_POLL_FUNCTION,
-            &[locator],
-            true,
-            true,
-            command_timeout_ms,
-        )
-        .await?
-    } else {
-        let locator = serde_json::to_string(&locator).map_err(|error| {
-            mcp_error(
-                error_codes::OBSERVE_INTERNAL,
-                format!("{ASSERT_TOOL} portable locator expression serialization failed: {error}"),
-            )
-        })?;
-        let expression = format!("({PORTABLE_ASSERT_POLL_FUNCTION})(null,{locator})");
-        super::portable_cdp::runtime_evaluate(
-            endpoint,
-            cdp_target_id,
-            &expression,
-            true,
-            true,
-            command_timeout_ms,
-        )
-        .await?
-    };
-    let value = evaluated.value.as_object().ok_or_else(|| {
-        mcp_error(
-            error_codes::OBSERVE_INTERNAL,
-            format!(
-                "{ASSERT_TOOL} portable locator returned non-object value: {}",
-                evaluated.value
-            ),
-        )
-    })?;
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        let code = value
-            .get("error_code")
-            .and_then(Value::as_str)
-            .unwrap_or(error_codes::OBSERVE_INTERNAL);
-        let detail = value
-            .get("error_detail")
-            .and_then(Value::as_str)
-            .unwrap_or("portable locator failed without error_detail");
-        return Err(mcp_error(
-            code,
-            format!("{ASSERT_TOOL} portable locator failed: {detail}"),
-        ));
-    }
-    let match_count = value
-        .get("match_count")
-        .and_then(Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| {
-            mcp_error(
-                error_codes::OBSERVE_INTERNAL,
-                format!("{ASSERT_TOOL} portable locator omitted valid match_count"),
-            )
-        })?;
-    if matches!(params.matcher, BrowserAssertMatcher::ToHaveCount) {
-        return assert_count_poll_from_count(
-            match_count,
-            evaluated.url,
-            evaluated.title,
-            evaluated.ready_state,
-            params,
-        );
-    }
-    if match_count == 0 {
-        return Ok(AssertPoll {
-            pass: assertion_passes_without_element(params),
-            url: redact_url_for_public_readback(&evaluated.url),
-            title: evaluated.title,
-            ready_state: evaluated.ready_state,
-            match_count,
-            element_id: None,
-            actual: json!({"match_count": 0}),
-            expected: expected_value(params),
-            message: format!("{ASSERT_TOOL} locator matched no elements"),
-        });
-    }
-    if params.strict && match_count != 1 {
-        return Ok(AssertPoll {
-            pass: false,
-            url: redact_url_for_public_readback(&evaluated.url),
-            title: evaluated.title,
-            ready_state: evaluated.ready_state,
-            match_count,
-            element_id: None,
-            actual: json!({"match_count": match_count}),
-            expected: json!({"match_count": 1, "strict": true}),
-            message: format!(
-                "{ASSERT_TOOL} strict locator expected exactly one element but matched {match_count}"
-            ),
-        });
-    }
-    let state = value.get("element_state").cloned().ok_or_else(|| {
-        mcp_error(
-            error_codes::OBSERVE_INTERNAL,
-            format!("{ASSERT_TOOL} portable locator matched elements but omitted element_state"),
-        )
-    })?;
-    let state = serde_json::from_value::<AssertElementState>(state).map_err(|error| {
-        mcp_error(
-            error_codes::OBSERVE_INTERNAL,
-            format!("{ASSERT_TOOL} portable element state decode failed: {error}"),
-        )
-    })?;
-    assert_element_poll(
-        params,
-        state,
-        match_count,
-        None,
-        evaluated.url,
-        evaluated.title,
-        evaluated.ready_state,
-    )
-}
-
 #[cfg(windows)]
 async fn browser_assert_poll(
     endpoint: &str,
@@ -2124,7 +1803,7 @@ async fn browser_assert_poll(
     }
     if located.match_count == 0 {
         let poll = AssertPoll {
-            pass: assertion_passes_without_element(params),
+            pass: false,
             url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: String::new(),
@@ -2138,7 +1817,7 @@ async fn browser_assert_poll(
     }
     if params.strict && located.match_count != 1 {
         let poll = AssertPoll {
-            pass: false,
+            pass: apply_negate(false, params.negate),
             url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: String::new(),
@@ -2381,12 +2060,10 @@ fn assert_element_poll(
             )
         }
         BrowserAssertMatcher::ToHaveText => {
-            let expected_text = params.expected_text_match_value.as_deref().ok_or_else(|| {
+            let expected_raw = params.expected_text.as_deref().ok_or_else(|| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "{ASSERT_TOOL} to_have_text poll missing normalized validated expected_text"
-                    ),
+                    format!("{ASSERT_TOOL} to_have_text poll missing validated expected_text"),
                 )
             })?;
             let actual_text = if params.normalize_whitespace {
@@ -2394,12 +2071,12 @@ fn assert_element_poll(
             } else {
                 state.text.clone()
             };
-            let matched = text_matches(
-                &actual_text,
-                expected_text,
-                params.text_match,
-                params.expected_text_regex.as_ref(),
-            )?;
+            let expected_text = if params.normalize_whitespace {
+                normalize_whitespace(expected_raw)
+            } else {
+                expected_raw.to_owned()
+            };
+            let matched = text_matches(&actual_text, &expected_text, params.text_match);
             (
                 matched,
                 json!({"text": actual_text, "tag_name": state.tag_name}),
@@ -2485,37 +2162,13 @@ fn apply_negate(pass: bool, negate: bool) -> bool {
     if negate { !pass } else { pass }
 }
 
-fn assertion_passes_without_element(params: &NormalizedBrowserAssertParams) -> bool {
-    if matches!(params.matcher, BrowserAssertMatcher::ToBeVisible) {
-        // Playwright's hidden assertion treats an absent node as hidden. This
-        // facade expresses the same condition as either expected_bool=false or
-        // negate=true on the default visible expectation. Other element-state
-        // assertions still require an element to inspect.
-        apply_negate(!params.expected_bool.unwrap_or(true), params.negate)
-    } else {
-        false
-    }
-}
-
-fn text_matches(
-    actual: &str,
-    expected: &str,
-    mode: BrowserAssertTextMatch,
-    expected_regex: Option<&Regex>,
-) -> Result<bool, ErrorData> {
+fn text_matches(actual: &str, expected: &str, mode: BrowserAssertTextMatch) -> bool {
     match mode {
-        BrowserAssertTextMatch::Exact => Ok(actual == expected),
-        BrowserAssertTextMatch::Contains => Ok(actual.contains(expected)),
-        BrowserAssertTextMatch::Regex => expected_regex
-            .map(|regex| regex.is_match(actual))
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "{ASSERT_TOOL} regex matcher reached polling without its acceptance-bound compiled regex"
-                    ),
-                )
-            }),
+        BrowserAssertTextMatch::Exact => actual == expected,
+        BrowserAssertTextMatch::Contains => actual.contains(expected),
+        BrowserAssertTextMatch::Regex => {
+            Regex::new(expected).is_ok_and(|regex| regex.is_match(actual))
+        }
     }
 }
 
@@ -2768,190 +2421,6 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-#[cfg(not(windows))]
-const PORTABLE_ASSERT_POLL_FUNCTION: &str = r#"function(rootOverride, locator) {
-  try {
-    const root = rootOverride instanceof Element ? rootOverride : document.documentElement;
-    if (!(root instanceof Element)) {
-      return { ok: false, error_code: "CHROME_DOM_ELEMENT_NOT_FOUND", error_detail: "document.documentElement is absent" };
-    }
-    const normalize = value => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-    const tag = element => String(element?.tagName ?? "").toLowerCase();
-    const text = element => String(element?.innerText ?? element?.textContent ?? "");
-    const visible = element => {
-      if (!(element instanceof Element) || !element.isConnected) return false;
-      const style = getComputedStyle(element);
-      if (!style || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || Number(style.opacity) === 0) return false;
-      return Array.from(element.getClientRects?.() ?? []).some(rect => rect.width > 0 && rect.height > 0);
-    };
-    const enabled = element => !Boolean(element?.disabled) && String(element?.getAttribute?.("aria-disabled") ?? "").toLowerCase() !== "true";
-    const checked = element => {
-      if (element && "checked" in element) return Boolean(element.checked);
-      const value = String(element?.getAttribute?.("aria-checked") ?? "").toLowerCase();
-      return value === "true" ? true : value === "false" ? false : null;
-    };
-    const boolAttr = (element, name) => {
-      const value = String(element.getAttribute(name) ?? "").toLowerCase();
-      return value === "true" ? true : value === "false" ? false : null;
-    };
-    const inferRole = element => {
-      const explicit = normalize(element.getAttribute("role"));
-      if (explicit) return explicit;
-      const lower = tag(element);
-      if (lower === "a" && element.hasAttribute("href")) return "link";
-      if (lower === "button") return "button";
-      if (lower === "select") return "combobox";
-      if (lower === "textarea") return "textbox";
-      if (lower === "form") return "form";
-      if (/^h[1-6]$/.test(lower)) return "heading";
-      if (lower === "main") return "main";
-      if (lower === "nav") return "navigation";
-      if (lower === "section") return "region";
-      if (lower === "img") return "img";
-      if (lower === "input") {
-        const type = String(element.getAttribute("type") || "text").toLowerCase();
-        if (["button", "submit", "reset", "image"].includes(type)) return "button";
-        if (type === "checkbox") return "checkbox";
-        if (type === "radio") return "radio";
-        return "textbox";
-      }
-      return lower === "body" ? "document" : "generic";
-    };
-    const cssEscape = value => globalThis.CSS?.escape ? CSS.escape(value) : String(value).replace(/["\\]/g, "\\$&");
-    const accessibleName = element => {
-      const scope = element.getRootNode?.() || document;
-      const labelledBy = String(element.getAttribute("aria-labelledby") || "").trim();
-      if (labelledBy) {
-        const joined = labelledBy.split(/\s+/).map(id => scope.getElementById?.(id)?.textContent || "").join(" ").trim();
-        if (joined) return joined;
-      }
-      for (const attr of ["aria-label", "alt", "title", "placeholder", "value"]) {
-        const value = String(element.getAttribute(attr) || "").trim();
-        if (value) return value;
-      }
-      if (element.id) {
-        const label = scope.querySelector?.(`label[for="${cssEscape(element.id)}"]`);
-        if (label?.textContent?.trim()) return label.textContent;
-      }
-      const wrapping = element.closest?.("label");
-      return wrapping?.textContent?.trim() || element.textContent || "";
-    };
-    const allElements = rootElement => {
-      const out = [], seen = new Set();
-      const collect = node => {
-        if (!node) return;
-        if (node instanceof Element) {
-          if (seen.has(node)) return;
-          seen.add(node); out.push(node);
-          if (node.shadowRoot) for (const child of node.shadowRoot.children) collect(child);
-        }
-        if (node.children) for (const child of node.children) collect(child);
-      };
-      collect(rootElement);
-      return out;
-    };
-    const unique = elements => {
-      const out = [], seen = new Set();
-      for (const element of elements) if (element instanceof Element && !seen.has(element)) { seen.add(element); out.push(element); }
-      return out;
-    };
-    const cssCandidates = (rootElement, query) => {
-      if (!String(query).trim()) return [];
-      const found = [];
-      if (rootElement.matches?.(query)) found.push(rootElement);
-      const scopes = [rootElement, ...allElements(rootElement).flatMap(element => element.shadowRoot ? [element.shadowRoot] : [])];
-      for (const scope of scopes) for (const node of scope.querySelectorAll(query)) found.push(node);
-      return unique(found);
-    };
-    const matchesText = (actual, expected, exact, regex) => {
-      if (regex) return new RegExp(String(expected ?? "")).test(String(actual ?? ""));
-      return exact ? normalize(actual) === normalize(expected) : normalize(actual).includes(normalize(expected));
-    };
-    const layoutScore = (rect, anchors, relation) => {
-      let best = Infinity;
-      for (const anchor of anchors) {
-        let ok = true, dx = 0, dy = 0;
-        if (relation === "right-of") { ok = rect.left >= anchor.right; dx = rect.left - anchor.right; }
-        else if (relation === "left-of") { ok = rect.right <= anchor.left; dx = anchor.left - rect.right; }
-        else if (relation === "above") { ok = rect.bottom <= anchor.top; dy = anchor.top - rect.bottom; }
-        else if (relation === "below") { ok = rect.top >= anchor.bottom; dy = rect.top - anchor.bottom; }
-        else { dx = Math.max(anchor.left - rect.right, rect.left - anchor.right, 0); dy = Math.max(anchor.top - rect.bottom, rect.top - anchor.bottom, 0); }
-        if (ok) best = Math.min(best, Math.hypot(dx, dy));
-      }
-      return best;
-    };
-    const engine = String(locator?.engine || "css").toLowerCase();
-    const query = String(locator?.query || "");
-    let candidates;
-    if (engine === "css") candidates = cssCandidates(root, query);
-    else if (engine === "xpath") {
-      const snapshot = document.evaluate(query, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      candidates = [];
-      for (let index = 0; index < snapshot.snapshotLength; index += 1) {
-        const node = snapshot.snapshotItem(index); if (node instanceof Element) candidates.push(node);
-      }
-    } else if (engine === "text") candidates = allElements(root).filter(element => matchesText(text(element), query, locator.exact, locator.regex));
-    else if (engine === "role") candidates = allElements(root).filter(element => {
-      if (!locator.include_hidden && !visible(element)) return false;
-      if (normalize(inferRole(element)) !== normalize(query)) return false;
-      if (locator.name != null && !matchesText(accessibleName(element), locator.name, locator.name_exact, locator.name_regex)) return false;
-      if (locator.checked != null && checked(element) !== Boolean(locator.checked)) return false;
-      if (locator.disabled != null && !enabled(element) !== Boolean(locator.disabled)) return false;
-      if (locator.selected != null && boolAttr(element, "aria-selected") !== Boolean(locator.selected)) return false;
-      if (locator.pressed != null && boolAttr(element, "aria-pressed") !== Boolean(locator.pressed)) return false;
-      if (locator.expanded != null && boolAttr(element, "aria-expanded") !== Boolean(locator.expanded)) return false;
-      if (locator.level != null) {
-        const implicit = /^h[1-6]$/.test(tag(element)) ? Number(tag(element).slice(1)) : NaN;
-        if (Number(element.getAttribute("aria-level") || implicit) !== Number(locator.level)) return false;
-      }
-      return true;
-    });
-    else if (engine === "label") candidates = allElements(root).filter(element => ["input","textarea","select","button","output"].includes(tag(element)) && matchesText(accessibleName(element), query, locator.exact, locator.regex));
-    else if (engine === "placeholder") candidates = allElements(root).filter(element => matchesText(element.getAttribute("placeholder") || "", query, locator.exact, locator.regex));
-    else if (engine === "alttext") candidates = allElements(root).filter(element => matchesText(element.getAttribute("alt") || "", query, locator.exact, locator.regex));
-    else if (engine === "title") candidates = allElements(root).filter(element => matchesText(element.getAttribute("title") || "", query, locator.exact, locator.regex));
-    else if (engine === "testid") {
-      const attribute = String(locator.testid_attribute || "data-testid");
-      candidates = allElements(root).filter(element => matchesText(element.getAttribute(attribute) || "", query, locator.exact ?? true, locator.regex));
-    } else if (engine === "layout") {
-      const anchors = cssCandidates(root, String(locator.anchor || "")).map(element => element.getBoundingClientRect());
-      const relation = String(locator.relation || "near").toLowerCase();
-      const maxDistance = Number.isFinite(Number(locator.max_distance)) ? Number(locator.max_distance) : 50;
-      candidates = cssCandidates(root, query)
-        .map(element => ({ element, score: layoutScore(element.getBoundingClientRect(), anchors, relation) }))
-        .filter(entry => Number.isFinite(entry.score) && (relation !== "near" || entry.score <= maxDistance))
-        .sort((left, right) => left.score - right.score)
-        .map(entry => entry.element);
-    } else return { ok: false, error_code: "CHROME_DOM_SELECTOR_INVALID", error_detail: `unsupported locator engine ${JSON.stringify(engine)}` };
-    if (locator.has_text != null && String(locator.has_text).trim()) {
-      const expected = normalize(locator.has_text);
-      candidates = candidates.filter(element => normalize(text(element)).includes(expected));
-    }
-    if (Number.isSafeInteger(locator.nth)) {
-      const index = locator.nth < 0 ? candidates.length + locator.nth : locator.nth;
-      candidates = index >= 0 && index < candidates.length ? [candidates[index]] : [];
-    }
-    const selected = candidates[0] || null;
-    let elementState = null;
-    if (selected) {
-      const attributes = {};
-      for (const attribute of Array.from(selected.attributes || [])) attributes[attribute.name] = String(attribute.value ?? "");
-      elementState = {
-        tag_name: tag(selected),
-        text: text(selected),
-        value: "value" in selected ? String(selected.value ?? "") : null,
-        attributes,
-        is_visible: visible(selected),
-        is_enabled: enabled(selected),
-        is_checked: checked(selected)
-      };
-    }
-    return { ok: true, match_count: candidates.length, element_state: elementState };
-  } catch (error) {
-    return { ok: false, error_code: "CHROME_DOM_SELECTOR_INVALID", error_detail: String(error?.message || error) };
-  }
-}"#;
-
 #[cfg(windows)]
 const ASSERT_ELEMENT_FUNCTION: &str = r#"(el) => {
     const str = v => String(v == null ? "" : v);
@@ -2985,3 +2454,330 @@ const ASSERT_ELEMENT_FUNCTION: &str = r#"(el) => {
         is_checked: checked
     };
 }"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1551: top-level cdp_target_id/window_hwnd on the browser_dom envelope are
+    // accepted and alias the selected nested spec's target, resolving the SAME
+    // target as the equivalent nested-spec form.
+    #[test]
+    fn browser_dom_top_level_target_aliases_nested_spec_1551() {
+        let mut top_level: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "aria_snapshot": {},
+        }))
+        .expect("top-level cdp_target_id must deserialize under deny_unknown_fields");
+        let nested: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "aria_snapshot": { "cdp_target_id": "TARGET-1551-ABC" },
+        }))
+        .expect("nested cdp_target_id must deserialize");
+        let top_cdp = top_level.cdp_target_id.clone();
+        let top_hwnd = top_level.window_hwnd;
+        let spec = top_level
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        println!("readback=before cdp_target_id={:?}", spec.cdp_target_id);
+        merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after cdp_target_id={:?}", spec.cdp_target_id);
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1551-ABC"));
+        assert_eq!(
+            spec.cdp_target_id,
+            nested.aria_snapshot.expect("nested spec").cdp_target_id
+        );
+
+        // Top-level window_hwnd (0x1234) aliases the nested spec's window_hwnd.
+        let mut top_hwnd_params: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "window_hwnd": 0x1234,
+            "aria_snapshot": {},
+        }))
+        .expect("top-level window_hwnd must deserialize");
+        let t_cdp = top_hwnd_params.cdp_target_id.clone();
+        let t_hwnd = top_hwnd_params.window_hwnd;
+        let spec = top_hwnd_params
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        println!("readback=before window_hwnd={:?}", spec.window_hwnd);
+        merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            t_cdp.as_deref(),
+            t_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after window_hwnd={:?}", spec.window_hwnd);
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    #[test]
+    fn browser_dom_conflicting_top_level_target_fails_closed_1551() {
+        let mut params: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "aria_snapshot": { "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations must deserialize");
+        let top_cdp = params.cdp_target_id.clone();
+        let top_hwnd = params.window_hwnd;
+        let spec = params
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        let err = merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    #[test]
+    fn browser_dom_still_rejects_unknown_fields_1551() {
+        let err = serde_json::from_value::<BrowserDomParams>(json!({
+            "operation": "aria_snapshot",
+            "aria_snapshot": {},
+            "bogus_1551": true,
+        }))
+        .expect_err("deny_unknown_fields must still reject a genuinely unknown field");
+        println!("readback=unknown_rejected err={err}");
+    }
+    use synapse_core::{ElementId, Rect, element_id};
+
+    fn node(
+        runtime: &str,
+        parent: Option<&ElementId>,
+        role: &str,
+        name: &str,
+        depth: u32,
+    ) -> AccessibleNode {
+        AccessibleNode {
+            element_id: element_id(0x1000, runtime),
+            parent: parent.cloned(),
+            name: name.to_owned(),
+            role: role.to_owned(),
+            automation_id: None,
+            value: None,
+            bbox: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            enabled: true,
+            focused: false,
+            patterns: Vec::new(),
+            children_count: 0,
+            depth,
+        }
+    }
+
+    #[test]
+    fn aria_snapshot_renderer_is_stable_and_scopes_subtree() {
+        let root = element_id(0x1000, "cdcd000000000001");
+        let child = element_id(0x1000, "cdcd000000000002");
+        let nodes = vec![
+            node("cdcd000000000001", None, "main", "", 0),
+            node("cdcd000000000002", Some(&root), "button", "Save", 1),
+            node("cdcd000000000003", Some(&child), "text", "Now", 2),
+        ];
+        let built = build_aria_snapshot(&nodes, Some(&child.to_string()), 8).expect("snapshot");
+        assert_eq!(built.nodes.len(), 2);
+        assert_eq!(built.snapshot, "- button \"Save\"\n  - text \"Now\"");
+    }
+
+    #[test]
+    fn text_matching_modes_cover_exact_contains_regex() {
+        assert!(text_matches(
+            &normalize_whitespace("Save   changes"),
+            "Save changes",
+            BrowserAssertTextMatch::Exact
+        ));
+        assert!(text_matches(
+            "Save changes",
+            "changes",
+            BrowserAssertTextMatch::Contains
+        ));
+        assert!(text_matches(
+            "Save changes",
+            "Save\\s+changes",
+            BrowserAssertTextMatch::Regex
+        ));
+        assert!(!text_matches(
+            "Save changes",
+            "[",
+            BrowserAssertTextMatch::Regex
+        ));
+    }
+
+    #[test]
+    fn browser_assert_validation_edges() {
+        let base_locator = BrowserAssertLocator {
+            query: "#save".to_owned(),
+            ..Default::default()
+        };
+        let ok = validate_browser_assert_params(&BrowserAssertParams {
+            locator: base_locator.clone(),
+            matcher: BrowserAssertMatcher::ToHaveText,
+            expected_text: Some("Save".to_owned()),
+            timeout_ms: Some(100),
+            interval_ms: Some(10),
+            ..assert_defaults()
+        })
+        .expect("valid text assertion");
+        assert_eq!(ok.timeout_ms, 100);
+        assert_eq!(ok.interval_ms, 10);
+        assert!(ok.strict);
+
+        for error in [
+            validate_browser_assert_params(&BrowserAssertParams {
+                locator: base_locator.clone(),
+                matcher: BrowserAssertMatcher::ToHaveText,
+                ..assert_defaults()
+            })
+            .expect_err("to_have_text requires expected_text"),
+            validate_browser_assert_params(&BrowserAssertParams {
+                locator: BrowserAssertLocator {
+                    query: " ".to_owned(),
+                    ..Default::default()
+                },
+                matcher: BrowserAssertMatcher::ToBeVisible,
+                ..assert_defaults()
+            })
+            .expect_err("empty query rejected"),
+            validate_browser_assert_params(&BrowserAssertParams {
+                locator: base_locator,
+                matcher: BrowserAssertMatcher::ToHaveCount,
+                expected_count: Some(1),
+                interval_ms: Some(1),
+                ..assert_defaults()
+            })
+            .expect_err("interval rejected"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+    }
+
+    #[test]
+    fn browser_dom_delegate_error_reclassifies_restricted_url_scheme() {
+        let low_level = ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "pageContent read failed for tab 1: code=CHROME_SCRIPTING_EXECUTE_FAILED detail=Cannot access contents of url \"data:text/html,<h1>sentinel</h1>\". Extension manifest must request permission to access this host.",
+            Some(json!({
+                "code": error_codes::CHROME_SCRIPTING_EXECUTE_FAILED,
+            })),
+        );
+        let error = browser_dom_delegate_error(
+            BrowserDomOperation::Content,
+            "window_hwnd=0x1;cdp_target_id=chrome-tab:1",
+            low_level,
+            "verify the session owns the target tab, then retry browser_dom operation=content",
+        );
+        let data = error.data.as_ref().expect("facade data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::BROWSER_URL_SCHEME_UNSUPPORTED)
+        );
+        assert_eq!(
+            data.get("restricted_url_scheme").and_then(Value::as_str),
+            Some("data")
+        );
+        assert_eq!(
+            data.get("original_code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        assert_eq!(
+            data.pointer("/cause/code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        let remediation = data
+            .get("remediation")
+            .and_then(Value::as_str)
+            .expect("remediation");
+        assert!(remediation.contains("http(s) URL"));
+        assert!(!remediation.contains("owns the target"));
+        assert!(error.message.contains("restricted URL scheme"));
+    }
+
+    #[test]
+    fn browser_dom_delegate_error_keeps_generic_scripting_failures() {
+        let low_level = ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "pageContent read failed for tab 1: code=CHROME_SCRIPTING_EXECUTE_FAILED detail=execution context was destroyed",
+            Some(json!({
+                "code": error_codes::CHROME_SCRIPTING_EXECUTE_FAILED,
+            })),
+        );
+        let error = browser_dom_delegate_error(
+            BrowserDomOperation::Content,
+            "window_hwnd=0x1;cdp_target_id=chrome-tab:1",
+            low_level,
+            "verify the session owns the target tab, then retry browser_dom operation=content",
+        );
+        let data = error.data.as_ref().expect("facade data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        assert_eq!(
+            data.get("remediation").and_then(Value::as_str),
+            Some(
+                "verify the session owns the target tab, then retry browser_dom operation=content"
+            )
+        );
+        assert!(data.get("restricted_url_scheme").is_none());
+    }
+
+    fn assert_defaults() -> BrowserAssertParams {
+        BrowserAssertParams {
+            cdp_target_id: None,
+            window_hwnd: None,
+            locator: BrowserAssertLocator {
+                query: "#x".to_owned(),
+                ..Default::default()
+            },
+            matcher: BrowserAssertMatcher::ToBeVisible,
+            expected_text: None,
+            expected_value: None,
+            expected_bool: None,
+            expected_count: None,
+            attribute_name: None,
+            expected_attribute_value: None,
+            text_match: None,
+            normalize_whitespace: None,
+            negate: None,
+            timeout_ms: None,
+            interval_ms: None,
+        }
+    }
+}

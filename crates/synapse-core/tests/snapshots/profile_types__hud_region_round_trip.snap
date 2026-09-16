@@ -1,0 +1,12 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"HudRegion\", \"snapshot\", anchored_region())?"
+---
+{
+  "kind": "anchored_to_edge",
+  "edge": "bottom_left",
+  "x_offset": 220,
+  "y_offset": -50,
+  "w": 180,
+  "h": 18
+}

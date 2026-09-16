@@ -1,10 +1,10 @@
 //! Single-instance guard for the Synapse daemon (`--mode http`).
 //!
-//! Guarantees that at most one daemon process owns a given Calyx vault directory
-//! at a time. The guard is acquired at startup **before** storage is opened, so a
+//! Guarantees that at most one daemon process owns a given RocksDB directory at
+//! a time. The guard is acquired at startup **before** RocksDB is opened, so a
 //! duplicate launch fails fast with a clear, actionable error that names the
-//! current holder PID instead of surfacing later as a storage lock failure deep
-//! inside a tool call.
+//! current holder PID — instead of surfacing later as a cryptic RocksDB `LOCK`
+//! failure deep inside a tool call (the exact symptom that motivated this work).
 //!
 //! Mechanism: an OS advisory exclusive file lock (`fs2`) on `<db>/daemon.lock`.
 //! Chosen over a bare Win32 named mutex because the lock is released
@@ -28,20 +28,15 @@ use std::{
 
 use fs2::FileExt;
 
-/// Empty file created inside the Calyx vault directory used purely as the daemon
+/// Empty file created inside the RocksDB directory used purely as the daemon
 /// single-instance advisory lock token.
-///
-/// The name is owned by `synapse_calyx::vault_runtime` because vault backup must
-/// exclude exactly this file by name — a `LockFileEx` byte-range lock denies
-/// even this process a read through a second handle, so a backup that did not
-/// know the name died with `ERROR_LOCK_VIOLATION` against every live daemon.
-pub const DAEMON_LOCK_FILE: &str = synapse_calyx::vault_runtime::DAEMON_LOCK_FILE;
+pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
 /// Unlocked sidecar file holding the current lock holder's PID (diagnostics).
-pub const DAEMON_PID_FILE: &str = synapse_calyx::vault_runtime::DAEMON_PID_FILE;
+pub const DAEMON_PID_FILE: &str = "daemon.pid";
 
 /// Empty file inside the durable shell-job store used to exclude every other
-/// daemon, even when those daemons use different vault directories.
+/// daemon, even when those daemons use different RocksDB directories.
 pub const SHELL_JOB_STORE_LOCK_FILE: &str = "shell-job-store.lock";
 
 /// Unlocked sidecar identifying the process that owns the shell-job store.
@@ -144,7 +139,7 @@ pub struct SingleInstanceGuard {
 }
 
 /// Holds exclusive ownership of one canonical durable shell-job store for the
-/// daemon lifetime. This is deliberately independent from the storage guard:
+/// daemon lifetime. This is deliberately independent from the RocksDB guard:
 /// two daemons with different DB paths must still not recover or mutate the
 /// same durable shell jobs concurrently.
 #[must_use = "dropping the guard immediately releases the shell-job store lock"]
@@ -325,6 +320,15 @@ impl ShellJobStoreLockGuard {
         &self.lock_path
     }
 
+    /// Read the holder PID sidecar for a store-root alias, if both the root and
+    /// sidecar are readable. This does not prove that the PID is still alive.
+    #[cfg(test)]
+    #[must_use]
+    pub fn recorded_holder_pid(store_root: &Path) -> Option<u32> {
+        let canonical_root = fs::canonicalize(store_root).ok()?;
+        read_pid_file(&canonical_root.join(SHELL_JOB_STORE_PID_FILE))
+    }
+
     /// Remove the PID sidecar while ownership is still exclusive, read that
     /// filesystem Source of Truth back, and then release the advisory lock.
     /// Drop remains an unwind/early-return backstop, but graceful shutdown must
@@ -437,27 +441,20 @@ impl SingleInstanceGuard {
             &self.file,
             &self.lock_path,
             &self.pid_path,
-            "storage_single_instance",
+            "rocksdb_single_instance",
         );
         self.cleanup_attempted = true;
         result
     }
 }
 
-/// Close the independent shell-job lock first and the storage single-instance
+/// Close the independent shell-job lock first and the RocksDB single-instance
 /// lock second. Both attempts always run, and either failure rejects a graceful
 /// daemon verdict while retaining both physical readbacks.
 pub fn close_daemon_lifetime_locks(
     shell_job_store: ShellJobStoreLockGuard,
     single_instance: SingleInstanceGuard,
 ) -> Result<DaemonLifetimeLocksCloseReadback, DaemonLifetimeLocksCloseError> {
-    // This is the only graceful release point for the durable shell-job store,
-    // shared by the stdio and HTTP daemons. Recording the clean shutdown here is
-    // what lets the NEXT daemon incarnation tell an orderly stop apart from a
-    // crash/kill/power-loss when it reconciles orphaned `running` records
-    // (#1808). It runs before the lock is released so a successor can never
-    // observe the store unlocked without the marker already committed.
-    crate::m4::mark_shell_job_supervisor_clean_shutdown();
     let shell_job_store = shell_job_store.close();
     let single_instance = single_instance.close();
     let (shell_job_store, shell_error) = match shell_job_store {
@@ -687,7 +684,7 @@ impl Drop for SingleInstanceGuard {
                 &self.file,
                 &self.lock_path,
                 &self.pid_path,
-                "storage_single_instance",
+                "rocksdb_single_instance",
             );
         }
     }
@@ -703,5 +700,252 @@ impl Drop for ShellJobStoreLockGuard {
                 "shell_job_store",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{
+        DAEMON_PID_FILE, SHELL_JOB_STORE_LOCK_FILE, SHELL_JOB_STORE_PID_FILE,
+        ShellJobStoreLockError, ShellJobStoreLockGuard, SingleInstanceError, SingleInstanceGuard,
+        close_daemon_lifetime_locks, file_lock_error_is_contention,
+    };
+    use tempfile::TempDir;
+
+    /// The single-daemon invariant both `--mode http` and `--mode stdio` rely on:
+    /// a second acquire on the same DB path is refused and names the holder PID
+    /// (source of truth = the `daemon.pid` sidecar), and the lock frees once the
+    /// holder drops. Real filesystem, no mocks.
+    #[test]
+    fn second_acquire_same_db_is_refused_then_frees_on_drop() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path();
+
+        let first = SingleInstanceGuard::acquire(db).map_err(|err| anyhow::anyhow!("{err}"))?;
+        // Source of truth: the recorded holder PID is this process.
+        assert_eq!(
+            SingleInstanceGuard::recorded_holder_pid(db),
+            Some(std::process::id())
+        );
+
+        match SingleInstanceGuard::acquire(db) {
+            Ok(_) => anyhow::bail!("second acquire on the same DB path must be refused"),
+            Err(SingleInstanceError::AlreadyRunning { holder_pid, .. }) => {
+                assert_eq!(holder_pid, Some(std::process::id()));
+            }
+            Err(other) => anyhow::bail!("expected AlreadyRunning, got {other}"),
+        }
+
+        drop(first);
+        // After the holder drops, the lock is free and the PID sidecar is gone.
+        assert_eq!(SingleInstanceGuard::recorded_holder_pid(db), None);
+        let _reacquired =
+            SingleInstanceGuard::acquire(db).map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    /// The guard is scoped per-DB-path: two daemons on DIFFERENT DB paths are
+    /// allowed (legitimate test/secondary instances), so the guard is not
+    /// over-broad.
+    #[test]
+    fn different_db_paths_acquire_independently() -> anyhow::Result<()> {
+        let dir_a = TempDir::new()?;
+        let dir_b = TempDir::new()?;
+        let _guard_a =
+            SingleInstanceGuard::acquire(dir_a.path()).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let _guard_b =
+            SingleInstanceGuard::acquire(dir_b.path()).map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn shell_job_store_aliases_contend_and_lock_frees_on_drop() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("shell-jobs");
+        let alias_component = root.join("alias-component");
+        fs::create_dir_all(&alias_component)?;
+        let alias = alias_component.join("..");
+        let canonical_root = fs::canonicalize(&root)?;
+
+        let first =
+            ShellJobStoreLockGuard::acquire(&alias).map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(first.store_root(), canonical_root);
+        assert_eq!(
+            first.lock_path(),
+            canonical_root.join(SHELL_JOB_STORE_LOCK_FILE)
+        );
+        assert_eq!(
+            ShellJobStoreLockGuard::recorded_holder_pid(&root),
+            Some(std::process::id())
+        );
+
+        match ShellJobStoreLockGuard::acquire(&root) {
+            Ok(_) => anyhow::bail!("a canonical alias must not acquire the owned store"),
+            Err(ShellJobStoreLockError::AlreadyOwned {
+                store_root,
+                lock_path,
+                holder_pid,
+            }) => {
+                assert_eq!(store_root, canonical_root);
+                assert_eq!(lock_path, canonical_root.join(SHELL_JOB_STORE_LOCK_FILE));
+                assert_eq!(holder_pid, Some(std::process::id()));
+            }
+            Err(other) => anyhow::bail!("expected AlreadyOwned, got {other}"),
+        }
+
+        drop(first);
+        assert_eq!(ShellJobStoreLockGuard::recorded_holder_pid(&root), None);
+        let _reacquired =
+            ShellJobStoreLockGuard::acquire(&root).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn different_shell_job_store_roots_acquire_independently() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let root_a = dir.path().join("shell-jobs-a");
+        let root_b = dir.path().join("shell-jobs-b");
+
+        let guard_a =
+            ShellJobStoreLockGuard::acquire(&root_a).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let guard_b =
+            ShellJobStoreLockGuard::acquire(&root_b).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        assert_ne!(guard_a.store_root(), guard_b.store_root());
+        assert_ne!(guard_a.lock_path(), guard_b.lock_path());
+        Ok(())
+    }
+
+    #[test]
+    fn noncontention_filesystem_error_is_not_an_existing_holder() -> anyhow::Result<()> {
+        let contention = fs2::lock_contended_error();
+        assert!(file_lock_error_is_contention(&contention));
+        let dir = TempDir::new()?;
+        let missing_error = fs::read(dir.path().join("absent-lock-token"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("reading an absent real file unexpectedly succeeded"))?;
+        assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!file_lock_error_is_contention(&missing_error));
+        let deceptive_text = std::io::Error::other(
+            "lock violation: resource temporarily unavailable; operation would block",
+        );
+        assert!(
+            !file_lock_error_is_contention(&deceptive_text),
+            "contention classification must use the causal OS error, never message substrings"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pid_write_failure_reports_cleanup_failure_and_releases_lock() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path();
+        let pid_path = db.join(DAEMON_PID_FILE);
+        fs::create_dir(&pid_path)?;
+
+        let detail = match SingleInstanceGuard::acquire(db) {
+            Ok(_) => anyhow::bail!("a directory at daemon.pid must make PID publication fail"),
+            Err(SingleInstanceError::Io { detail, .. }) => detail,
+            Err(other) => anyhow::bail!("expected PID-publication I/O failure, got {other}"),
+        };
+        assert!(detail.contains("record holder pid at"), "{detail}");
+        assert!(detail.contains("kind="), "{detail}");
+        assert!(detail.contains("raw_os_error="), "{detail}");
+        assert!(
+            detail.contains("remove partial/stale pid sidecar"),
+            "cleanup failure must remain actionable: {detail}"
+        );
+
+        fs::remove_dir(&pid_path)?;
+        let _reacquired =
+            SingleInstanceGuard::acquire(db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn drop_unlocks_after_pid_sidecar_removal_failure() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path();
+        let pid_path = db.join(DAEMON_PID_FILE);
+        let guard = SingleInstanceGuard::acquire(db).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        fs::remove_file(&pid_path)?;
+        fs::create_dir(&pid_path)?;
+        drop(guard);
+
+        // A PID cleanup failure must not skip the subsequent unlock. Removing
+        // the synthetic obstruction and reacquiring proves the lock is free.
+        fs::remove_dir(&pid_path)?;
+        let _reacquired =
+            SingleInstanceGuard::acquire(db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_close_reads_both_real_pid_sidecars_absent_and_releases_both_locks()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path().join("db");
+        let shell_root = dir.path().join("shell-jobs");
+        let single =
+            SingleInstanceGuard::acquire(&db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let shell = ShellJobStoreLockGuard::acquire(&shell_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        let readback = close_daemon_lifetime_locks(shell, single)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        assert!(readback.shell_job_store.pid_sidecar_absent);
+        assert!(readback.shell_job_store.unlock_succeeded);
+        assert!(readback.single_instance.pid_sidecar_absent);
+        assert!(readback.single_instance.unlock_succeeded);
+        assert!(!db.join(DAEMON_PID_FILE).try_exists()?);
+        assert!(!shell_root.join(SHELL_JOB_STORE_PID_FILE).try_exists()?);
+
+        let single =
+            SingleInstanceGuard::acquire(&db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let shell = ShellJobStoreLockGuard::acquire(&shell_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        close_daemon_lifetime_locks(shell, single).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_close_aggregates_both_real_pid_obstructions_without_skipping_unlocks()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db = dir.path().join("db");
+        let shell_root = dir.path().join("shell-jobs");
+        let single =
+            SingleInstanceGuard::acquire(&db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let shell = ShellJobStoreLockGuard::acquire(&shell_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let db_pid = db.join(DAEMON_PID_FILE);
+        let shell_pid = shell_root.join(SHELL_JOB_STORE_PID_FILE);
+        fs::remove_file(&db_pid)?;
+        fs::create_dir(&db_pid)?;
+        fs::remove_file(&shell_pid)?;
+        fs::create_dir(&shell_pid)?;
+
+        let error = close_daemon_lifetime_locks(shell, single)
+            .expect_err("both real PID-sidecar obstructions must reject graceful close");
+        let detail = error.to_string();
+        assert!(detail.contains("shell_job_store"), "{detail}");
+        assert!(detail.contains("rocksdb_single_instance"), "{detail}");
+        assert!(!error.readback.shell_job_store.pid_sidecar_absent);
+        assert!(error.readback.shell_job_store.unlock_succeeded);
+        assert!(!error.readback.single_instance.pid_sidecar_absent);
+        assert!(error.readback.single_instance.unlock_succeeded);
+
+        fs::remove_dir(&db_pid)?;
+        fs::remove_dir(&shell_pid)?;
+        let single =
+            SingleInstanceGuard::acquire(&db).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let shell = ShellJobStoreLockGuard::acquire(&shell_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        close_daemon_lifetime_locks(shell, single).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(())
     }
 }

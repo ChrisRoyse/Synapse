@@ -1,0 +1,12 @@
+schema_version = 1
+kind = "registry_moderation_record"
+source_id = "registry.synthetic.local-fixture"
+moderation_queue_id = "modq.synthetic.reject.0001"
+contribution_id = "contrib.synthetic.audit.rejected"
+source_bundle_id = "audit.synthetic.edge.no_consent"
+status = "rejected"
+reason_code = "missing_operator_consent"
+reason = "Synthetic rejection: contribution bundle did not carry a non-empty operator_consent_id."
+reviewed_at = "2026-05-27T01:03:00Z"
+effective_package_state = "not_published"
+retry_allowed = false

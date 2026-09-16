@@ -105,10 +105,6 @@ pub struct ActSetFieldTextResponse {
     pub before_sha256: String,
     pub after_sha256: String,
     pub changed: bool,
-    /// #2056: exact worker route when the target window lives on a
-    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desktop_route: Option<String>,
     pub postcondition: ActPostcondition,
     pub elapsed_ms: u32,
 }
@@ -127,9 +123,6 @@ pub(crate) enum SetFieldTextRoute {
     },
     /// Anything else: `act_set_value` background tiers.
     NativeBackground,
-    /// #2056: the target window lives on a session-owned hidden desktop, so the
-    /// native tiers must run inside that desktop's worker.
-    HiddenDesktopBackground(super::hidden_desktop::HiddenDesktopValueRoute),
 }
 
 pub(crate) fn validate_set_field_text_params(
@@ -246,41 +239,6 @@ pub(crate) fn set_field_text_route(
     _element_id: &ElementId,
 ) -> Result<SetFieldTextRoute, ErrorData> {
     Ok(SetFieldTextRoute::NativeBackground)
-}
-
-/// #2056 routing entry point. Ordering is deliberate and fail-loud:
-///
-/// 1. A CDP web element id is desktop-agnostic (the transport is a socket), so
-///    it keeps the background CDP tier regardless of which desktop the browser
-///    window sits on.
-/// 2. Otherwise, if a session-owned hidden desktop physically owns the target
-///    HWND, the native tiers must run inside that desktop's worker. Resolution
-///    itself fails loud on a stale hidden HWND or an unsupported pattern.
-/// 3. Otherwise, the ordinary daemon-desktop routing applies.
-#[cfg(windows)]
-pub(crate) fn set_field_text_route_with_hidden_desktops(
-    element_id: &ElementId,
-    hidden_desktop_names: &[String],
-) -> Result<SetFieldTextRoute, ErrorData> {
-    if let Some(backend_node_id) = synapse_a11y::cdp_backend_from_element_id(element_id) {
-        return Ok(SetFieldTextRoute::Web { backend_node_id });
-    }
-    if let Some(route) = super::hidden_desktop::resolve_hidden_desktop_value_route(
-        TOOL,
-        element_id,
-        hidden_desktop_names,
-    )? {
-        return Ok(SetFieldTextRoute::HiddenDesktopBackground(route));
-    }
-    set_field_text_route(element_id)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn set_field_text_route_with_hidden_desktops(
-    element_id: &ElementId,
-    _hidden_desktop_names: &[String],
-) -> Result<SetFieldTextRoute, ErrorData> {
-    set_field_text_route(element_id)
 }
 
 /// Same predicate `act_type` uses to refuse Chromium UIA `ValuePattern`
@@ -442,56 +400,6 @@ pub(crate) async fn act_set_field_text_native(
         before_sha256: response.before_sha256,
         after_sha256: response.after_sha256,
         changed: response.changed,
-        desktop_route: response.desktop_route,
-        postcondition,
-        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-    })
-}
-
-/// #2056 native tier for a target on a session-owned hidden desktop: delegates
-/// to the `act_set_value` hidden-desktop worker route (`ValuePattern.SetValue`
-/// / `WM_SETTEXT` performed on that exact desktop, then an independent
-/// on-desktop readback) and re-shapes the verified result into the
-/// `act_set_field_text` wire response. `required_foreground` stays false — this
-/// route never activates a desktop, never takes the human foreground, and never
-/// emits raw input.
-pub(crate) async fn act_set_field_text_hidden_desktop(
-    params: &ActSetFieldTextParams,
-    route: super::hidden_desktop::HiddenDesktopValueRoute,
-    boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActSetFieldTextResponse, ErrorData> {
-    let started = std::time::Instant::now();
-    let response = super::set_value::act_set_value_hidden_desktop_with_boundary(
-        ActSetValueParams {
-            element_id: required_element_id(params)?.clone(),
-            text: params.text.clone(),
-            verify_timeout_ms: params.verify_timeout_ms,
-        },
-        route,
-        boundary,
-    )
-    .await?;
-    let postcondition = ActPostcondition {
-        detail: response
-            .postcondition
-            .detail
-            .map(|detail| format!("{TOOL} hidden-desktop tier: {detail}")),
-        ..response.postcondition
-    };
-    Ok(ActSetFieldTextResponse {
-        ok: response.ok,
-        method: response.method,
-        backend_tier_used: response.backend_tier_used,
-        required_foreground: response.required_foreground,
-        source_of_truth: response.source_of_truth,
-        requested_len: response.requested_len,
-        before_len: response.before_len,
-        after_len: response.after_len,
-        requested_sha256: response.requested_sha256,
-        before_sha256: response.before_sha256,
-        after_sha256: response.after_sha256,
-        changed: response.changed,
-        desktop_route: response.desktop_route,
         postcondition,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
@@ -587,7 +495,6 @@ pub(crate) fn finish_replace_response(
         before_sha256: before_sha256.clone(),
         after_sha256: after_sha256.clone(),
         changed,
-        desktop_route: None,
         postcondition: ActPostcondition {
             status: "verified_state".to_owned(),
             observed_delta: Some(changed),
@@ -704,4 +611,163 @@ fn locator_request_details(locator: &ActSetFieldTextLocator) -> Value {
             .map(|name| name.chars().count()),
         "automation_id_present": locator.automation_id.is_some(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use synapse_core::{Rect, UiaPattern};
+
+    use super::{
+        ActSetFieldTextLocator, ActSetFieldTextParams, chromium_editable_requires_foreground,
+        normalize_field_text, replaced_text_matches, validate_set_field_text_params,
+    };
+
+    fn metadata(
+        role: &str,
+        patterns: Vec<UiaPattern>,
+        enabled: bool,
+        keyboard_focusable: bool,
+    ) -> synapse_a11y::ElementMetadataReadback {
+        synapse_a11y::ElementMetadataReadback {
+            name: "synthetic".to_owned(),
+            role: role.to_owned(),
+            automation_id: None,
+            bbox: Rect {
+                x: 4,
+                y: 8,
+                w: 320,
+                h: 28,
+            },
+            enabled,
+            keyboard_focusable,
+            patterns,
+            value: Some("before".to_owned()),
+        }
+    }
+
+    #[test]
+    fn chromium_edit_routes_to_foreground_tier() {
+        let metadata = metadata("edit", vec![UiaPattern::Value], true, true);
+        println!(
+            "readback=route edge=chromium_edit metadata_role={}",
+            metadata.role
+        );
+        assert!(chromium_editable_requires_foreground(&metadata));
+    }
+
+    #[test]
+    fn chromium_contenteditable_document_routes_to_foreground_tier() {
+        let metadata = metadata(
+            "document",
+            vec![UiaPattern::Value, UiaPattern::Text],
+            true,
+            true,
+        );
+        assert!(chromium_editable_requires_foreground(&metadata));
+    }
+
+    #[test]
+    fn chromium_button_stays_on_native_tier() {
+        let metadata = metadata("button", vec![UiaPattern::Value], true, true);
+        assert!(!chromium_editable_requires_foreground(&metadata));
+    }
+
+    #[test]
+    fn disabled_chromium_edit_stays_on_native_tier() {
+        let metadata = metadata("edit", vec![UiaPattern::Value], false, true);
+        assert!(!chromium_editable_requires_foreground(&metadata));
+    }
+
+    #[test]
+    fn replace_verification_is_newline_normalized() {
+        println!(
+            "readback=verify edge=newlines before=line-a\\r\\nline-b requested=line-a\\nline-b"
+        );
+        assert!(replaced_text_matches("line-a\r\nline-b", "line-a\nline-b"));
+        assert!(replaced_text_matches("composer text\n", "composer text"));
+        assert!(!replaced_text_matches("other", "requested"));
+    }
+
+    #[test]
+    fn empty_replacement_matches_cleared_field() {
+        println!("readback=verify edge=empty after=\"\" requested=\"\"");
+        assert!(replaced_text_matches("", ""));
+        assert!(!replaced_text_matches("leftover", ""));
+    }
+
+    #[test]
+    fn normalize_strips_single_trailing_newline_only() {
+        assert_eq!(normalize_field_text("a\n"), "a");
+        assert_eq!(normalize_field_text("a\n\n"), "a\n");
+        assert_eq!(normalize_field_text("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn verify_timeout_out_of_range_fails_closed() {
+        let params: ActSetFieldTextParams = serde_json::from_value(serde_json::json!({
+            "element_id": "0x2a:0102",
+            "text": "value",
+            "verify_timeout_ms": 10
+        }))
+        .expect("params should deserialize");
+        let error = validate_set_field_text_params(&params)
+            .expect_err("verify_timeout_ms=10 must be rejected");
+        println!("readback=params edge=low_timeout error={error}");
+        assert!(error.message.contains("verify_timeout_ms"));
+    }
+
+    #[test]
+    fn empty_text_is_a_valid_clear_request() {
+        let params: ActSetFieldTextParams = serde_json::from_value(serde_json::json!({
+            "element_id": "0x2a:0102",
+            "text": ""
+        }))
+        .expect("params should deserialize");
+        println!(
+            "readback=params edge=empty_text verify_timeout_ms={}",
+            params.verify_timeout_ms
+        );
+        assert!(validate_set_field_text_params(&params).is_ok());
+        assert!(!params.auto_wait);
+        assert_eq!(
+            params.auto_wait_timeout_ms,
+            crate::m2::default_auto_wait_timeout_ms()
+        );
+    }
+
+    #[test]
+    fn locator_only_request_is_valid_when_identity_is_specific() {
+        let params: ActSetFieldTextParams = serde_json::from_value(serde_json::json!({
+            "locator": {
+                "window_hwnd": 0x2a,
+                "role": "document",
+                "name": "Message Body"
+            },
+            "text": "value"
+        }))
+        .expect("locator-only params should deserialize");
+        assert!(params.element_id.is_none());
+        assert!(validate_set_field_text_params(&params).is_ok());
+    }
+
+    #[test]
+    fn locator_rejects_empty_identity() {
+        let params = ActSetFieldTextParams {
+            element_id: None,
+            locator: Some(ActSetFieldTextLocator {
+                window_hwnd: Some(0x2a),
+                role: None,
+                name: None,
+                name_substring: None,
+                automation_id: None,
+            }),
+            text: "value".to_owned(),
+            verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+            auto_wait: false,
+            auto_wait_timeout_ms: crate::m2::default_auto_wait_timeout_ms(),
+        };
+        let error =
+            validate_set_field_text_params(&params).expect_err("empty locator must fail closed");
+        assert!(error.message.contains("locator requires"));
+    }
 }

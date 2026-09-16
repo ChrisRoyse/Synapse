@@ -12,44 +12,21 @@
 //! Errors out (non-zero exit) when the DB cannot be opened or a row fails to
 //! decode — a corrupt audit row is a finding, not something to skip.
 
-use std::path::Path;
-
-use synapse_storage::{
-    StorageBackendKind,
-    action_log::{diagnostic_for_invalid_row, validate_action_log_row},
-    cf, scan_cf_read_only,
-};
-
-const USAGE: &str = "usage: dump_action_log <db-path>";
+use synapse_storage::{Db, cf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let db_path = args.next().ok_or(USAGE)?;
-    if let Some(extra) = args.next() {
-        return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
-    }
-    let rows = scan_cf_read_only(
-        Path::new(&db_path),
-        synapse_core::SCHEMA_VERSION,
-        StorageBackendKind::Calyx,
-        cf::CF_ACTION_LOG,
-    )?;
+    let db_path = std::env::args()
+        .nth(1)
+        .ok_or("usage: dump_action_log <db-path>")?;
+    let db = Db::open(std::path::Path::new(&db_path), synapse_core::SCHEMA_VERSION)?;
+    let rows = db.scan_cf(cf::CF_ACTION_LOG)?;
     let mut invalid = 0usize;
-    for (key, value) in &rows {
-        match validate_action_log_row(key, value) {
-            Ok(record) => println!("{}", record.value),
+    for (_key, value) in &rows {
+        match serde_json::from_slice::<serde_json::Value>(value) {
+            Ok(record) => println!("{record}"),
             Err(error) => {
                 invalid += 1;
-                let diagnostic = diagnostic_for_invalid_row(key, value, &error);
-                eprintln!(
-                    "INVALID ROW failure_code={} detail={} key_len_bytes={} key_sha256={} value_len_bytes={} value_sha256={}",
-                    diagnostic.failure_code,
-                    diagnostic.failure_detail,
-                    diagnostic.key_len_bytes,
-                    diagnostic.key_sha256,
-                    diagnostic.value_len_bytes,
-                    diagnostic.value_sha256,
-                );
+                eprintln!("INVALID ROW: {error}");
             }
         }
     }

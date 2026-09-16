@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use synapse_core::DetectionBatch;
 
-/// Whether this crate was compiled with ONNX Runtime's CUDA execution
-/// provider. The installed daemon asserts this is false at compile time.
-pub const CUDA_EXECUTION_PROVIDER_COMPILED: bool = cfg!(feature = "cuda");
-
 mod download;
 mod ep;
 mod error;
@@ -18,23 +14,14 @@ pub use error::{
     ModelError, ModelResult, detection_infer_failed, detection_model_not_loaded, detection_no_frame,
 };
 pub use registry::{
-    COCO80_CLASS_MAP, DEFAULT_DETECTION_INPUT_SHAPE, DEFAULT_DETECTION_MODEL_ID,
-    EmbeddedModelBundle, EmbeddedModelSlot, ORT_EXTENSIONS_WHISPER_FILENAME,
-    ORT_EXTENSIONS_WHISPER_LENGTH, ORT_EXTENSIONS_WHISPER_SHA256, REGISTERED_MODELS,
-    RTDETR_V2_S_COCO_INT8_ONNX, RTDETR_V2_S_COCO_INT8_ONNX_DOWNLOAD_URL,
-    RTDETR_V2_S_COCO_INT8_ONNX_FILENAME, RTDETR_V2_S_COCO_INT8_ONNX_ID,
-    RTDETR_V2_S_COCO_INT8_ONNX_SHA256, RTDETR_V2_S_COCO_ONNX, RTDETR_V2_S_COCO_ONNX_DOWNLOAD_URL,
-    RTDETR_V2_S_COCO_ONNX_FILENAME, RTDETR_V2_S_COCO_ONNX_ID, RTDETR_V2_S_COCO_ONNX_LICENSE,
-    RTDETR_V2_S_COCO_ONNX_SHA256, RTDETR_V2_S_COCO_ONNX_SOURCE_MODEL,
-    RTDETR_V2_S_COCO_ONNX_SOURCE_REPO, RegisteredModel, WHISPER_TINY_INT8_ONNX,
-    WHISPER_TINY_INT8_ONNX_FILENAME, WHISPER_TINY_INT8_ONNX_ID, WHISPER_TINY_INT8_ONNX_LENGTH,
-    WHISPER_TINY_INT8_ONNX_RECIPE, WHISPER_TINY_INT8_ONNX_SHA256, default_detection_model,
-    default_detection_model_descriptor, embedded_model_bundle, embedded_model_bundle_at,
-    lightweight_cpu_detection_model, registered_model,
+    COCO80_CLASS_MAP, DEFAULT_DETECTION_INPUT_SHAPE, DEFAULT_DETECTION_MODEL_ID, REGISTERED_MODELS,
+    RTDETR_V2_S_COCO_ONNX, RTDETR_V2_S_COCO_ONNX_DOWNLOAD_URL, RTDETR_V2_S_COCO_ONNX_FILENAME,
+    RTDETR_V2_S_COCO_ONNX_ID, RTDETR_V2_S_COCO_ONNX_LICENSE, RTDETR_V2_S_COCO_ONNX_SHA256,
+    RTDETR_V2_S_COCO_ONNX_SOURCE_MODEL, RTDETR_V2_S_COCO_ONNX_SOURCE_REPO, RegisteredModel,
+    default_detection_model, default_detection_model_descriptor, registered_model,
 };
 pub use session::{
     LoadedModel, ModelLoader, OrtSessionFactory, SessionBuildResult, SessionFactory, SessionHandle,
-    VerifiedModelDescriptor,
 };
 pub use verify::{normalize_sha256, sha256_file};
 

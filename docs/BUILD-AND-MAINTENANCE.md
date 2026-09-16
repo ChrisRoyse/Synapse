@@ -11,9 +11,7 @@ system disk again.
 | `rust-lld` linker | `.cargo/config.toml` | Replaces slow MSVC `link.exe` for faster Windows linking. Missing linker state fails loudly. |
 | Dev incremental compilation | `Cargo.toml [profile.dev]` | Rebuilds only changed codegen units during the edit loop. |
 | Dependency debuginfo off | `Cargo.toml [profile.dev.package."*"]` | Avoids large dependency debug artifacts while keeping workspace panic line tables. |
-| Lightweight release optimization | `Cargo.toml [profile.release]` | Uses basic optimization for the installed CPU-only daemon so source installation does not feed the monolithic MCP crate to LLVM's multi-gigabyte level-3 optimizer. `release-max` retains level 3 + fat LTO for an explicit measured exception. |
 | `jobs = 32` | user Cargo config | Uses the configured host's logical cores for local builds. |
-| Cohesive crate seams | workspace crates | Lets Cargo schedule independent stable-rustc front ends and prevents unrelated main-crate edits from recompiling large subsystems. The Chrome bridge and native-host runtime live in `synapse-chrome-bridge`; both daemon binaries consume that one compiled artifact. |
 
 Use the fast local edit loop:
 
@@ -24,54 +22,6 @@ cargo build
 
 Use `cargo build --release` only when shipping or running the optimized daemon,
 not as compile feedback during edits.
-
-The local structural gate also requires Microsoft's `PSScriptAnalyzer` 1.25.0
-or newer. Gate 0d analyzes the complete shipping setup script against the
-Windows PowerShell 5.1 Desktop compatibility profile, in addition to parsing
-the exact ASCII bytes under both Windows PowerShell 5.1 and PowerShell 7. A
-missing analyzer or any incompatible command parameter, syntax, or .NET API is
-a hard failure:
-
-```powershell
-Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser
-pwsh -NoProfile -File .\scripts\lint.ps1 -PolicyOnly
-```
-
-Do not suppress compatibility findings. `scripts\synapse-setup.ps1` is
-deliberately launched by the MCP setup facade through the inbox Windows
-PowerShell 5.1 executable, so PowerShell 7-only APIs are production failures.
-
-`codegen-units = 16` parallelizes LLVM backend work; it does not make stable
-rustc's front end parallel. If a release timing report shows one large crate
-occupying the critical path, first locate a real high-cohesion ownership seam
-and extract that subsystem into one shared workspace crate. Do not duplicate the
-source with `#[path]`, create a second target directory, enable unstable rustc
-flags, or raise codegen units as a substitute for an architectural seam. Use
-`cargo build --release --timings` only for an explicit build investigation and
-read the generated timing artifact plus the built binary as the Sources of
-Truth.
-
-## Optional Standalone CUDA Compile Probe
-
-The absorbed Calyx workspace retains optional CUDA features for an explicitly
-requested standalone dependency compile/probe. This is not a supported
-installed-daemon configuration: `synapse-mcp` has no feature that forwards
-`calyx-cuda`, and `scripts\synapse-setup.ps1` neither detects nor publishes NVCC
-settings and rejects accelerator requests. Standard setup installs the binding
-CPU-only config (`math_backend="cpu"`, `vram_budget_bytes=0`).
-
-For the isolated compile probe on Windows with CUDA 13.x, configure these
-variables manually so `nvcc` can find MSVC `cl.exe` and dependency kernels use
-MSVC's conforming preprocessor:
-
-- `NVCC_CCBIN` -> Visual Studio `VC\Tools\MSVC\...\bin\Hostx64\x64`
-- `NVCC_APPEND_FLAGS` includes `-Xcompiler=/Zc:preprocessor`
-
-The standalone compile probe is:
-
-```powershell
-cargo check --manifest-path calyx\Cargo.toml --workspace --features "calyx-assay/cuda calyx-loom/cuda calyx-registry/cuda calyx-search/cuda calyx-sextant/cuda"
-```
 
 ## Defender Exclusions
 
@@ -119,25 +69,14 @@ closed if that suppression changes.
 - prunes merged or remote-gone worktrees without touching active, dirty, or
   unmerged work;
 - deletes local branches whose remote branch is gone;
-- removes stale Cargo artifacts and then enforces a 4 GiB ceiling on every
-  discovered `target/`, retaining the newest incremental artifacts;
-- bounds daemon crash stderr to 14 days/128 MiB (always retaining the newest)
-  and Codex startup schema snapshots to 14 days/256 MiB (retaining 16 newest).
-
-Cargo's built-in global-cache collector is checked on every substantive Cargo
-invocation via `.cargo/config.toml`; its upstream last-use policy removes
-downloaded entries after three months and locally regenerable entries after one
-month. This complements `cargo-sweep`: Cargo GC owns `$CARGO_HOME`, while the
-scheduled task owns workspace `target/` directories.
+- runs `cargo sweep` for stale build artifacts.
 
 ```powershell
 pwsh -File .\scripts\repo-maintenance.ps1
 pwsh -File .\scripts\repo-maintenance.ps1 -Apply
-# Override the per-target ceiling only when a measured workload requires it:
-pwsh -File .\scripts\repo-maintenance.ps1 -Apply -MaxTargetGB 6
 ```
 
-`scripts/install-maintenance-task.ps1` registers or removes the daily
+`scripts/install-maintenance-task.ps1` registers or removes the weekly
 non-elevated Scheduled Task:
 
 ```powershell
@@ -146,53 +85,12 @@ pwsh -File .\scripts\install-maintenance-task.ps1 -Remove
 Get-ScheduledTask -TaskName SynapseRepoMaintenance
 ```
 
-## Line Endings
-
-`.gitattributes` is the repository Source of Truth for line endings. It pins
-source, docs, manifests, PowerShell, and POSIX hook scripts to LF in the working
-tree even when a Windows checkout has `core.autocrlf=true`. Windows-only batch
-and solution formats are explicit CRLF exceptions. Binary assets are marked
-`binary` so Git never normalizes their bytes.
-
-When adding a new generated artifact or binary format, add an explicit
-`.gitattributes` rule in the same change. When adding a new text format, either
-let the repo default apply or add an explicit `text eol=lf` rule if the format is
-important enough to audit directly.
-
-Manual readback commands for the policy:
-
-```powershell
-git -c core.autocrlf=true diff --check
-git check-attr text eol -- .githooks/pre-push scripts/synapse-setup.ps1 Cargo.toml README.md tests/fixtures/audio/hello_world_5s.wav
-git ls-files --eol .githooks/pre-push scripts/synapse-setup.ps1 Cargo.toml README.md tests/fixtures/audio/hello_world_5s.wav
-```
-
-If an attribute change intentionally normalizes tracked text, stage it with:
-
-```powershell
-git add --renormalize .
-```
-
 ## Root Cause
 
 Parallel issue work created many throwaway git worktrees, each with its own
 multi-GB Cargo `target/`. Git does not automatically remove worktrees, and Cargo
 does not garbage-collect old `target/` artifacts. Scheduled worktree pruning plus
-the age-and-size `cargo sweep` policy keeps the checkout set and build artifacts
-bounded. Age-only cleanup is insufficient because frequently rebuilt profiles
-remain "recent" indefinitely; the size pass is the hard recurrence-prevention
-invariant.
-
-The running daemon has a separate lightweight envelope: zero GPU/VRAM, bounded
-Tokio/Rayon pools, a 1 MiB per-family memtable cap (about 128 MiB aggregate for
-a fully exercised vault), a 64 MiB aggregate SST-reader cache, and no retained
-full decoded SST indexes. Logical storage uses tiered TTL/byte caps (14-day raw
-transcripts, seven-day detailed reality, 30-day audit, 90-day summaries).
-Physical SST maintenance begins above 3 GiB, accelerates sequentially above
-5/7 GiB, and accepts a rewrite only when it either reduces file fan-out or
-physically reclaims at least five percent of the selected bytes. Disk-pressure
-admission starts shedding rebuildable work below the larger of 10 GiB or 10%
-free space; warnings begin at 15 GiB/15% so reclamation has time to run first.
+`cargo sweep` keeps the checkout set and build artifacts bounded.
 
 ## MCP Helper Process Hygiene
 
@@ -220,54 +118,3 @@ Classify these helpers from the process table before cleanup:
 Never kill broad `cmd.exe`, terminal, IDE, WSL, Codex, or Claude process sets to
 clean MCP helpers. If ownership cannot be proven, print the process Source of
 Truth and leave the process running.
-
-## Never Measure Latency While A Build Is Running
-
-This is a single-machine project, and the agent's own compiler is the heaviest
-process on the box. Any latency number collected while `cargo build`,
-`cargo check`, `cargo clippy` or `scripts/lint.ps1` is running is measuring the
-compiler, not the daemon.
-
-The host is a 2 P-core + 8 E-core i7-1355U. On a hybrid part under load the
-scheduler can park a thread on an E-core, or off-core entirely, for a long time.
-The effect is not marginal:
-
-- A `read_latest` — a point read of **one key** — was measured holding the
-  vault-wide row-table read guard for **743 ms** (#1955). It cannot do 743 ms of
-  work. It was descheduled.
-- The same scan, same code, same 200,000 rows, measured quiet and loaded:
-  `held_us=39,278 cpu_us=31,250` versus `held_us=284,392 cpu_us=125,000` — a
-  284 ms hold of which 159 ms was not running.
-- Worst commit stall moved **5.6x** and guard-event rate **14x** on one
-  unchanged binary, purely from build load (#1950).
-
-That is larger than most changes being measured, and it moves in the direction
-that flatters a change: a loaded "before" against a quiet "after" attributes the
-machine's idle CPU to the diff. #1952 ask 3 was abandoned for exactly this
-reason — there was no clean pre-deploy baseline and no way to recover one.
-
-### What to do instead
-
-1. **Batch every code change, then deploy once, then measure.** A deploy after
-   touching `synapse-calyx` is a full release rebuild; interleaving builds with
-   measurement windows costs more than it saves.
-2. **Read the self-identifying fields rather than trusting the wall clock.**
-   `CALYX_ASTER_ROW_READ_GUARD_SLOW` carries `cpu_us` and `starved`, and
-   `health` carries `calyx_row_guard_starved_total`. A window with a non-zero
-   starved count measured the machine; discard it rather than reasoning about
-   it. This is why those fields exist — a contaminated sample now says so
-   instead of relying on a reader noticing that a point read took 743 ms.
-3. **Distinguish "descheduled" from "blocked".** A thread waiting on a lock
-   consumes no CPU by definition, so a `cpu_us` near zero across a *wait* means
-   nothing and a starvation flag derived from it would be true unconditionally.
-   Only a region where a thread is supposed to be *running* — a scan holding a
-   guard, or a commit's locked region — can be checked this way.
-
-### Related standing rules
-
-- Never measure latency within **2 minutes of a daemon restart**; the vault is
-  still recovering and the numbers describe recovery, not steady state.
-- Prefer a **frozen vault copy** for any before/after that compares *values*
-  rather than structure. The live vault is a moving corpus, so a before/after
-  taken minutes apart measures drift plus the change with no way to separate
-  them. Structural counts are the exception and stay valid live.

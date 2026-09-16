@@ -11,7 +11,7 @@ exe = "explorer.exe"
 
 [capture]
 target = "foreground_window"
-min_update_interval_ms = 250
+min_update_interval_ms = 50
 cursor_visible = true
 
 [keymap]

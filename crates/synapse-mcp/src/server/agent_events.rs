@@ -11,7 +11,7 @@
 //! # Durability contract (#897 acceptance)
 //!
 //! [`record_agent_event`] uses `Db::put_batch`, which returns only after
-//! the row reaches the Calyx vault and its WAL. [`record_agent_event_durable`]
+//! the row reaches RocksDB with a synced WAL. [`record_agent_event_durable`]
 //! additionally calls `Db::flush()` at terminal lifecycle boundaries
 //! (exited, spawn failure, session deleted).
 //!
@@ -25,26 +25,20 @@
 //! `operation_committed` so callers know whether the primary effect stands.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
+    collections::BTreeSet,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::model::ErrorCode;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord};
+use serde_json::json;
+use synapse_core::{AgentEventKind, AgentEventRecord};
 use synapse_storage::{
-    CfRevisionGuard, Db, GroundingAnchorSource, RevisionedRawValue, StorageError, StorageResult,
-    agent_events::agent_event_key, agent_transcripts::agent_transcript_spawn_prefix, cf,
-    decode_json, encode_json,
+    Db, StorageError, StorageResult, agent_events::agent_event_key, cf, encode_json,
 };
-
-use crate::m3::grounding::{self, SOURCE_AGENT_EVENT};
 
 use super::ErrorData;
 use super::session_registry::{SessionRegistry, SharedSessionRegistry, unix_time_ms_now};
@@ -57,45 +51,15 @@ pub(crate) const MAX_AGENT_EVENT_VALUE_BYTES: usize = 16 * 1024;
 /// within one clock tick; wraps harmlessly because `ts_ns` dominates the key.
 static NEXT_AGENT_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// Calyx uses this code only after a WAL append may already be durable while
-/// the live MVCC view could not be made authoritative. Once an agent-event
-/// commit reaches that unresolved state, this process must never admit another
-/// logical retry: a fresh daemon/vault open is the recovery boundary that
-/// replays the durable WAL into one authoritative live view.
-const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
-    "CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED";
-static AGENT_EVENT_COMMIT_RECONCILIATION_LATCH: AtomicBool = AtomicBool::new(false);
-
-type ReconciledAtomicCommit = (u64, Vec<Option<[u8; 32]>>);
-
 static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<Weak<Mutex<SessionRegistry>>>>> =
     OnceLock::new();
 
 /// Physical readback of one persisted journal row.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentEventWriteReadback {
-    /// Observation timestamp carried by the encoded event value.
-    pub event_ts_ns: u64,
-    /// Durable journal-key timestamp.
     pub ts_ns: u64,
     pub seq: u32,
-    pub key: Vec<u8>,
-    pub committed_seq: u64,
-    pub committed_revision_sha256: [u8; 32],
-    pub value_sha256: [u8; 32],
     pub value_len_bytes: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct TransitionJournalIntent {
-    pub record_index: usize,
-    pub transition: super::agent_state::StateTransition,
-}
-
-pub(crate) struct CommittedAgentEventBatch {
-    pub records: Vec<AgentEventRecord>,
-    pub readbacks: Vec<AgentEventWriteReadback>,
-    source_rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Current unix time in nanoseconds. A clock before the epoch yields 0,
@@ -165,7 +129,8 @@ pub(crate) fn record_agent_events(
     db: &Db,
     records: &[AgentEventRecord],
 ) -> StorageResult<Vec<AgentEventWriteReadback>> {
-    let readbacks = super::agent_state::record_agent_events_transactionally(db, records)?;
+    let readbacks = record_agent_events_unobserved(db, records)?;
+    super::agent_state::observe_recorded_events(db, records);
     refresh_installed_session_registry_activity(records);
     Ok(readbacks)
 }
@@ -253,1216 +218,89 @@ fn agent_event_counts_as_session_activity(kind: AgentEventKind) -> bool {
     )
 }
 
-fn ensure_agent_event_commit_reconciliation_clear() -> StorageResult<()> {
-    if AGENT_EVENT_COMMIT_RECONCILIATION_LATCH.load(Ordering::Acquire) {
-        return Err(agent_event_commit_reconciliation_error(
-            "admission_rejected_by_process_latch",
-            "a preceding agent-event transaction has an unresolved durable outcome",
-        ));
-    }
-    Ok(())
-}
-
-fn latch_agent_event_commit_reconciliation(
-    stage: &'static str,
-    detail: impl Into<String>,
-) -> StorageError {
-    let detail = detail.into();
-    let was_latched = AGENT_EVENT_COMMIT_RECONCILIATION_LATCH.swap(true, Ordering::AcqRel);
-    tracing::error!(
-        code = CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
-        stage,
-        was_latched,
-        detail,
-        remediation = "stop this daemon, reopen the Calyx vault so the durable WAL is replayed into a fresh MVCC view, inspect the reported physical journal/cursor identities, and do not retry the logical event operation in this process",
-        "agent-event durable commit outcome is unresolved; process-wide event writes are now fail-stop latched"
-    );
-    agent_event_commit_reconciliation_error(stage, detail)
-}
-
-/// The one statement of what to do about a latched agent-event commit
-/// fail-stop, so the message text and the structured field cannot drift apart.
-const AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION: &str = "stop this daemon, reopen the Calyx vault from durable WAL truth, inspect the exact journal/projection rows named by the preceding error, and do not retry the logical operation in this process";
-
-fn agent_event_commit_reconciliation_error(
-    stage: &'static str,
-    detail: impl Into<String>,
-) -> StorageError {
-    StorageError::CalyxWriteFailed {
-        cf_name: "<agent-event-journal-and-projection>".to_owned(),
-        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
-        detail: format!(
-            "AGENT_EVENT_COMMIT_FAIL_STOP_LATCHED: stage={stage}; {}; remediation={AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION}",
-            detail.into()
-        ),
-        // Also a field, not only text inside `detail`, so the facade that
-        // reports this failure forwards the real fix instead of substituting a
-        // generic one (#1911).
-        remediation: AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION,
-        committed_seq: None,
-    }
-}
-
 /// The raw journal write path, without the state-machine projection. Only
 /// the state machine itself uses this directly (its own transition rows must
 /// not re-enter the reducer).
-pub(crate) fn commit_agent_event_records_with_intents(
+pub(crate) fn record_agent_events_unobserved(
     db: &Db,
     records: &[AgentEventRecord],
-    intents: &[TransitionJournalIntent],
-) -> StorageResult<CommittedAgentEventBatch> {
-    const MAX_COMMIT_ATTEMPTS: usize = 16;
-    ensure_agent_event_commit_reconciliation_clear()?;
-    let encoded = records
-        .iter()
-        .map(|record| {
-            validate_and_encode(record).inspect_err(|error| {
-                tracing::error!(
-                    code = "AGENT_EVENT_WRITE_FAILED",
-                    kind = ?record.kind,
-                    session_id = ?record.session_id,
-                    spawn_id = ?record.spawn_id,
-                    reason_code = ?record.reason_code,
-                    detail = %error,
-                    "agent event refused before atomic journal/projection write"
-                );
-            })
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    if records.is_empty() {
-        if intents.is_empty() {
-            return Ok(CommittedAgentEventBatch {
-                records: Vec::new(),
-                readbacks: Vec::new(),
-                source_rows: Vec::new(),
-            });
-        }
-        return Err(StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail:
-                "AGENT_EVENT_WRITE_FAILED: transition intents cannot target an empty event batch"
-                    .to_owned(),
-        });
-    }
-    let mut unique_intent_anchors = BTreeSet::new();
-    for intent in intents {
-        let record = records.get(intent.record_index).ok_or_else(|| StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_WRITE_FAILED: transition intent record_index={} is outside record_count={}",
-                intent.record_index,
-                records.len()
-            ),
-        })?;
-        super::agent_state::validate_transition_record_identity(record, &intent.transition)?;
-        if !unique_intent_anchors.insert(intent.transition.anchor.as_str()) {
-            return Err(StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!(
-                    "AGENT_EVENT_WRITE_FAILED: atomic batch has more than one final projection cursor for anchor {:?}",
-                    intent.transition.anchor
-                ),
-            });
-        }
-    }
-
-    // #2140: the complete retained projection is reconciled before the next
-    // source mutation, and this guard remains held through atomic commit plus
-    // exact readback. No agent-event writer can race the backfill or publish a
-    // source row without its spawn-index row.
-    let mut spawn_index_guard = super::agent_event_spawn_index::lock_projection()?;
-    super::agent_event_spawn_index::ensure_projection_locked(db, &mut spawn_index_guard)?;
-
-    for commit_attempt in 1..=MAX_COMMIT_ATTEMPTS {
-        let mut journal_rows = Vec::with_capacity(records.len());
-        let mut unique_keys = BTreeSet::new();
-        for (record, value) in records.iter().zip(&encoded) {
-            let seq = NEXT_AGENT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
-            let key = agent_event_key(record.ts_ns, seq);
-            if !unique_keys.insert(key.clone()) {
-                tracing::warn!(
-                    code = "AGENT_EVENT_KEY_COLLISION_RETRY",
-                    commit_attempt,
-                    ts_ns = record.ts_ns,
-                    seq,
-                    "process-local sequence wrapped inside one batch; replanning all append-only keys"
-                );
-                journal_rows.clear();
-                break;
-            }
-            journal_rows.push((key, value.clone()));
-        }
-        if journal_rows.len() != records.len() {
-            continue;
-        }
-
-        let spawn_index_rows = journal_rows
-            .iter()
-            .zip(records)
-            .map(|((source_key, source_value), record)| {
-                super::agent_event_spawn_index::index_row_for_record(
-                    source_key,
-                    source_value,
-                    record,
-                )
-            })
-            .filter_map(Result::transpose)
-            .collect::<StorageResult<Vec<_>>>()?;
-
-        let mut projection_rows = Vec::with_capacity(intents.len().saturating_mul(2));
-        for intent in intents {
-            let (journal_key, journal_value) = &journal_rows[intent.record_index];
-            let (journal_ts_ns, journal_seq) =
-                synapse_storage::agent_events::decode_agent_event_key(journal_key)?;
-            let prepared = super::escalation::prepare_pending_projection_cursor(
-                db,
-                &intent.transition,
-                super::escalation::TransitionGeneration {
-                    journal_ts_ns,
-                    journal_seq,
-                },
-                journal_key,
-                journal_value,
-                unix_time_ms_now(),
-            )
-            .map_err(|error| StorageError::WriteFailed {
-                cf_name: cf::CF_KV.to_owned(),
-                detail: format!(
-                    "AGENT_EVENT_PROJECTION_CURSOR_PREPARE_FAILED: anchor={:?} generation=({journal_ts_ns},{journal_seq}) detail={}",
-                    intent.transition.anchor, error.message
-                ),
-            })?;
-            projection_rows.push((
-                prepared.cursor_key,
-                prepared.cursor_value,
-                prepared.expected_cursor_revision_sha256,
-            ));
-            projection_rows.push((
-                prepared.index_key,
-                prepared.index_value,
-                prepared.expected_index_revision_sha256,
-            ));
-        }
-
-        let mut guards =
-            Vec::with_capacity(journal_rows.len() + spawn_index_rows.len() + projection_rows.len());
-        for (key, _value) in &journal_rows {
-            guards.push(CfRevisionGuard::new(cf::CF_AGENT_EVENTS, key.clone(), None));
-        }
-        for (key, _value) in &spawn_index_rows {
-            guards.push(CfRevisionGuard::new(
-                cf::CF_AGENT_EVENT_SPAWN_INDEX,
-                key.clone(),
-                None,
-            ));
-        }
-        for (key, _value, expected_revision) in &projection_rows {
-            guards.push(CfRevisionGuard::new(
-                cf::CF_KV,
-                key.clone(),
-                *expected_revision,
-            ));
-        }
-        let kv_rows = projection_rows
-            .iter()
-            .map(|(key, value, _expected)| (key.clone(), value.clone()))
-            .collect::<Vec<_>>();
-        let mut batches = Vec::with_capacity(3);
-        batches.push((cf::CF_AGENT_EVENTS, journal_rows.clone()));
-        if !spawn_index_rows.is_empty() {
-            batches.push((cf::CF_AGENT_EVENT_SPAWN_INDEX, spawn_index_rows.clone()));
-        }
-        if !kv_rows.is_empty() {
-            batches.push((cf::CF_KV, kv_rows.clone()));
-        }
-        let outcome = match db.put_cf_batches_if_revisions_pressure_bypass(guards.clone(), batches)
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                match reconcile_failed_atomic_event_commit(
-                    db,
-                    &guards,
-                    &journal_rows,
-                    &spawn_index_rows,
-                    &kv_rows,
-                    &error,
-                )? {
-                    Some((committed_seq, committed_revisions)) => {
-                        tracing::error!(
-                            code = "AGENT_EVENT_COMMIT_RECONCILED_AFTER_ERROR",
-                            commit_attempt,
-                            committed_seq,
-                            record_count = records.len(),
-                            transition_cursor_count = intents.len(),
-                            spawn_index_row_count = spawn_index_rows.len(),
-                            transition_projection_row_count = projection_rows.len(),
-                            original_error = %error,
-                            "all atomic journal/projection rows physically matched after the backend returned an error; accepting the committed reality"
-                        );
-                        return exact_committed_event_batch(
-                            db,
-                            records,
-                            &journal_rows,
-                            &spawn_index_rows,
-                            &kv_rows,
-                            committed_seq,
-                            &committed_revisions,
-                        )
-                        .map_err(|readback_error| {
-                            latch_agent_event_commit_reconciliation(
-                                "reconciled_commit_exact_readback_failed",
-                                format!(
-                                    "atomic rows matched the proposed values after backend_error={error}, but their exact revision/value readback failed: {readback_error}"
-                                ),
-                            )
-                        });
-                    }
-                    None => return Err(error),
-                }
-            }
-        };
-        if !outcome.applied {
-            tracing::warn!(
-                code = "AGENT_EVENT_ATOMIC_REVISION_RETRY",
-                commit_attempt,
-                max_attempts = MAX_COMMIT_ATTEMPTS,
-                conflict_guard_index = outcome
-                    .conflict
-                    .as_ref()
-                    .map(|conflict| conflict.guard_index),
-                conflict_key_len = outcome.conflict.as_ref().map(|conflict| conflict.key.len()),
-                observed_seq = outcome.committed_seq,
-                "append-only journal/projection transaction lost a physical revision race; replanning keys and cursor revisions"
-            );
-            continue;
-        }
-        return exact_committed_event_batch(
-            db,
-            records,
-            &journal_rows,
-            &spawn_index_rows,
-            &kv_rows,
-            outcome.committed_seq,
-            &outcome.committed_revisions_sha256,
-        )
-        .map_err(|readback_error| {
-            latch_agent_event_commit_reconciliation(
-                "known_applied_commit_exact_readback_failed",
-                format!(
-                    "backend reported applied=true committed_seq={}, but exact revision/value readback failed: {readback_error}",
-                    outcome.committed_seq
-                ),
-            )
-        });
-    }
-    Err(StorageError::WriteFailed {
-        cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-        detail: format!(
-            "AGENT_EVENT_WRITE_FAILED: atomic journal/projection transaction could not acquire stable journal/cursor/Pending-index revisions after {MAX_COMMIT_ATTEMPTS} attempts"
-        ),
-    })
-}
-
-fn exact_committed_event_batch(
-    db: &Db,
-    records: &[AgentEventRecord],
-    journal_rows: &[(Vec<u8>, Vec<u8>)],
-    spawn_index_rows: &[(Vec<u8>, Vec<u8>)],
-    cursor_rows: &[(Vec<u8>, Vec<u8>)],
-    committed_seq: u64,
-    committed_revisions: &[Option<[u8; 32]>],
-) -> StorageResult<CommittedAgentEventBatch> {
-    let expected_guard_count = journal_rows
-        .len()
-        .saturating_add(spawn_index_rows.len())
-        .saturating_add(cursor_rows.len());
-    if committed_revisions.len() != expected_guard_count {
-        return Err(StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed revision count={} expected={expected_guard_count} committed_seq={committed_seq}",
-                committed_revisions.len()
-            ),
-        });
-    }
-    let mut readbacks = Vec::with_capacity(journal_rows.len());
-    for (index, ((key, expected_value), record)) in journal_rows.iter().zip(records).enumerate() {
-        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed journal put has no revision: index={index} committed_seq={committed_seq}"
-            ),
-        })?;
-        let physical = exact_revisioned_row(
-            db,
-            cf::CF_AGENT_EVENTS,
-            key,
-            expected_value,
-            revision,
-            "agent journal row",
-        )?;
-        let (ts_ns, seq) = synapse_storage::agent_events::decode_agent_event_key(key)?;
-        readbacks.push(AgentEventWriteReadback {
-            event_ts_ns: record.ts_ns,
-            ts_ns,
-            seq,
-            key: key.clone(),
-            committed_seq,
-            committed_revision_sha256: physical.revision_sha256,
-            value_sha256: Sha256::digest(expected_value).into(),
-            value_len_bytes: expected_value.len(),
-        });
-    }
-    for (offset, (key, expected_value)) in spawn_index_rows.iter().enumerate() {
-        let index = journal_rows.len() + offset;
-        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed spawn-index put has no revision: index={index} committed_seq={committed_seq}"
-            ),
-        })?;
-        let _physical = exact_revisioned_row(
-            db,
-            cf::CF_AGENT_EVENT_SPAWN_INDEX,
-            key,
-            expected_value,
-            revision,
-            "agent-event spawn-index row",
-        )?;
-    }
-    for (offset, (key, expected_value)) in cursor_rows.iter().enumerate() {
-        let index = journal_rows.len() + spawn_index_rows.len() + offset;
-        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
-            cf_name: cf::CF_KV.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed projection cursor put has no revision: index={index} committed_seq={committed_seq}"
-            ),
-        })?;
-        let _physical = exact_revisioned_row(
-            db,
-            cf::CF_KV,
-            key,
-            expected_value,
-            revision,
-            "transition projection cursor/index row",
-        )?;
-    }
-    Ok(CommittedAgentEventBatch {
-        records: records.to_vec(),
-        readbacks,
-        source_rows: journal_rows.to_vec(),
-    })
-}
-
-fn exact_revisioned_row(
-    db: &Db,
-    cf_name: &str,
-    key: &[u8],
-    expected_value: &[u8],
-    expected_revision: [u8; 32],
-    identity: &str,
-) -> StorageResult<RevisionedRawValue> {
-    let physical = db.get_cf_revisioned(cf_name, key)?.ok_or_else(|| StorageError::ReadFailed {
-        cf_name: cf_name.to_owned(),
-        detail: format!(
-            "AGENT_EVENT_COMMIT_READBACK_MISSING: {identity} is absent immediately after commit key={} key_len={}",
-            synapse_storage::constellations::hex_encode(key),
-            key.len(),
-        ),
-    })?;
-    let actual_value = physical.value.as_deref().ok_or_else(|| StorageError::ReadFailed {
-        cf_name: cf_name.to_owned(),
-        detail: format!(
-            "AGENT_EVENT_COMMIT_READBACK_EXPIRED: {identity} is physically present but logically expired immediately after commit key={} key_len={}",
-            synapse_storage::constellations::hex_encode(key),
-            key.len(),
-        ),
-    })?;
-    if physical.revision_sha256 != expected_revision || actual_value != expected_value {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf_name.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_COMMIT_READBACK_MISMATCH: {identity} revision_matches={} bytes_match={} key={} key_len={} expected_len={} actual_len={}",
-                physical.revision_sha256 == expected_revision,
-                actual_value == expected_value,
-                synapse_storage::constellations::hex_encode(key),
-                key.len(),
-                expected_value.len(),
-                actual_value.len()
-            ),
-        });
-    }
-    Ok(physical)
-}
-
-fn reconcile_failed_atomic_event_commit(
-    db: &Db,
-    guards: &[CfRevisionGuard],
-    journal_rows: &[(Vec<u8>, Vec<u8>)],
-    spawn_index_rows: &[(Vec<u8>, Vec<u8>)],
-    cursor_rows: &[(Vec<u8>, Vec<u8>)],
-    original_error: &StorageError,
-) -> StorageResult<Option<ReconciledAtomicCommit>> {
-    let durable_commit_ambiguous =
-        original_error.code() == CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
-    let planned = journal_rows
-        .iter()
-        .map(|(key, value)| (cf::CF_AGENT_EVENTS, key, value))
-        .chain(
-            spawn_index_rows
-                .iter()
-                .map(|(key, value)| (cf::CF_AGENT_EVENT_SPAWN_INDEX, key, value)),
-        )
-        .chain(
-            cursor_rows
-                .iter()
-                .map(|(key, value)| (cf::CF_KV, key, value)),
-        )
-        .collect::<Vec<_>>();
-    if planned.len() != guards.len() {
-        let detail = format!(
-            "AGENT_EVENT_COMMIT_RECONCILIATION_INVALID: planned_rows={} guards={} original_error={original_error}",
-            planned.len(),
-            guards.len()
-        );
-        return Err(if durable_commit_ambiguous {
-            latch_agent_event_commit_reconciliation("invalid_reconciliation_plan", detail)
-        } else {
-            StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail,
-            }
-        });
-    }
-    let mut all_new = true;
-    let mut all_old = true;
-    let mut committed_revisions = Vec::with_capacity(planned.len());
-    let mut evidence = Vec::with_capacity(planned.len());
-    for (index, ((cf_name, key, expected_value), guard)) in
-        planned.into_iter().zip(guards).enumerate()
-    {
-        let physical = match db.get_cf_revisioned(cf_name, key) {
-            Ok(physical) => physical,
-            Err(read_error) if durable_commit_ambiguous => {
-                return Err(latch_agent_event_commit_reconciliation(
-                    "ambiguous_commit_physical_read_failed",
-                    format!(
-                        "could not classify proposed row index={index} cf={cf_name} key_len={} after original_error={original_error}: {read_error}",
-                        key.len()
-                    ),
-                ));
-            }
-            Err(read_error) => return Err(read_error),
-        };
-        let is_new = physical
-            .as_ref()
-            .and_then(|row| row.value.as_deref())
-            .is_some_and(|value| value == expected_value);
-        let is_old = match (&physical, guard.expected_revision_sha256) {
-            (None, None) => true,
-            (Some(row), Some(expected_revision)) => {
-                row.revision_sha256 == expected_revision && !is_new
-            }
-            _ => false,
-        };
-        all_new &= is_new;
-        all_old &= is_old;
-        committed_revisions.push(if is_new {
-            physical.as_ref().map(|row| row.revision_sha256)
-        } else {
-            None
-        });
-        evidence.push(format!(
-            "index={index}:cf={cf_name}:key_len={}:new={is_new}:old={is_old}:revision_present={}",
-            key.len(),
-            physical.is_some()
-        ));
-    }
-    if all_new {
-        let committed_seq = if durable_commit_ambiguous {
-            original_error.committed_seq().ok_or_else(|| {
-                latch_agent_event_commit_reconciliation(
-                    "ambiguous_commit_missing_wal_sequence",
-                    format!(
-                        "all proposed rows matched physical reality, but the Calyx error did not identify their exact wal_seq; refusing to substitute a potentially unrelated global latest_seq: original_error={original_error}; evidence={}",
-                        evidence.join(",")
-                    ),
-                )
-            })?
-        } else {
-            db.calyx_vault_status()?
-                .latest_seq
-                .ok_or_else(|| StorageError::ReadFailed {
-                    cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                    detail: "AGENT_EVENT_COMMIT_RECONCILIATION_FAILED: Calyx status has no latest_seq after exact committed-row readback".to_owned(),
-                })?
-        };
-        return Ok(Some((committed_seq, committed_revisions)));
-    }
-    if all_old {
-        if durable_commit_ambiguous {
-            return Err(latch_agent_event_commit_reconciliation(
-                "ambiguous_commit_all_old_live_read",
-                format!(
-                    "Calyx reported that the WAL may already contain this transaction, but every live row still matched its pre-commit guard. An all-old MVCC read cannot prove the logical operation uncommitted and must never authorize retry: original_error={original_error}; evidence={}",
-                    evidence.join(",")
-                ),
-            ));
-        }
-        return Ok(None);
-    }
-    Err(latch_agent_event_commit_reconciliation(
-        "mixed_or_divergent_physical_state",
-        format!(
-            "backend error left mixed or divergent physical state; daemon must not retry. original_error={original_error}; evidence={}",
-            evidence.join(",")
-        ),
-    ))
-}
-
-pub(crate) fn project_committed_agent_event_artifacts(
-    db: &Db,
-    committed: &CommittedAgentEventBatch,
-) {
-    let projection_rows = committed
-        .records
-        .iter()
-        .zip(&committed.source_rows)
-        .map(|(record, (source_key, raw_bytes))| {
-            (source_key.clone(), raw_bytes.clone(), record.clone())
-        })
-        .collect::<Vec<_>>();
-    match db.put_agent_event_constellations(&projection_rows) {
-        Ok(constellations) if constellations.len() == committed.records.len() => {
-            for (((record, readback), (_source_key, _raw_bytes)), constellation) in committed
-                .records
-                .iter()
-                .zip(&committed.readbacks)
-                .zip(&committed.source_rows)
-                .zip(constellations)
-            {
-                tracing::debug!(
-                    code = "AGENT_EVENT_RECORDED",
-                    kind = ?record.kind,
-                    event_ts_ns = readback.event_ts_ns,
-                    journal_ts_ns = readback.ts_ns,
-                    seq = readback.seq,
-                    committed_seq = readback.committed_seq,
-                    session_id = ?record.session_id,
-                    spawn_id = ?record.spawn_id,
-                    value_len_bytes = readback.value_len_bytes,
-                    value_sha256 = %synapse_storage::constellations::hex_encode(&readback.value_sha256),
-                    constellation_panel = constellation.panel_name,
-                    constellation_disposition = constellation.disposition.as_str(),
-                    constellation_cx_id = %constellation.cx_id,
-                    "readback=CF_AGENT_EVENTS edge=atomic_journal_projection_commit"
-                );
-            }
-        }
-        Ok(constellations) => tracing::error!(
-            code = "CALYX_AGENT_EVENT_CONSTELLATION_BATCH_READBACK_MISMATCH",
-            expected_rows = committed.records.len(),
-            actual_reports = constellations.len(),
-            operation_committed = true,
-            "agent event journal transaction committed but ordered constellation batch cardinality diverged"
-        ),
-        Err(error) => tracing::error!(
-            code = "CALYX_AGENT_EVENT_CONSTELLATION_BATCH_FAILED",
-            record_count = committed.records.len(),
-            operation_committed = true,
-            detail = %error,
-            "agent event journal transaction committed but native Calyx constellation batch failed; inspect/reconcile the content-addressed projection"
-        ),
-    }
-    if let Err(error) = anchor_agent_event_outcomes(db, &committed.records, &committed.source_rows)
-    {
-        tracing::error!(
-            code = "AGENT_EVENT_OUTCOME_ANCHOR_FAILED",
-            record_count = committed.records.len(),
-            operation_committed = true,
-            detail = %error,
-            "agent event journal/projection transaction committed but a native Calyx outcome anchor failed; physical journal remains authoritative"
-        );
-    }
-}
-
-fn anchor_agent_event_outcomes(
-    db: &Db,
-    records: &[AgentEventRecord],
-    source_rows: &[(Vec<u8>, Vec<u8>)],
-) -> StorageResult<()> {
-    // #2117 made one materialization feed the whole batch; #2140 makes that
-    // materialization seek each exact spawn prefix and verify only its pointed
-    // journal rows. The earlier full pass decoded 46,539 rows per batch on the
-    // deployed family even when the requested spawn owned one terminal row.
-    //
-    // A batch with no terminal record names no spawns and scans nothing at all.
-    let terminal_spawns = records
-        .iter()
-        .filter(|record| terminal_agent_outcome(record).is_some())
-        .filter_map(|record| nonblank_option(record.spawn_id.as_deref()))
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<String>>();
-    let terminal_rows = SpawnTerminalEventRows::materialize(db, &terminal_spawns)?;
-
-    let tool_anchor_sources = records
-        .iter()
-        .zip(source_rows)
-        .filter(|(record, _source)| record.kind == AgentEventKind::ToolCallFinished)
-        .map(
-            |(record, (source_key, source_value))| GroundingAnchorSource {
-                source_cf: cf::CF_AGENT_EVENTS,
-                source_key: source_key.clone(),
-                raw_bytes: source_value.clone(),
-                anchor: grounding::bool_anchor(
-                    "synapse:agent_tool_call_success",
-                    !tool_call_error_present(record),
-                    SOURCE_AGENT_EVENT,
-                    grounding::observed_at_ms_from_ns(record.ts_ns),
-                ),
-            },
-        )
-        .collect::<Vec<_>>();
-    if !tool_anchor_sources.is_empty() {
-        let expected = tool_anchor_sources.len() as u64;
-        let evidence = tool_anchor_sources
-            .iter()
-            .map(|source| {
-                json!({
-                    "source_key_sha256": synapse_storage::constellations::sha256_hex(&source.source_key),
-                    "source_value_sha256": synapse_storage::constellations::sha256_hex(&source.raw_bytes),
-                })
-            })
-            .collect::<Vec<_>>();
-        let payload = json!({
-            "mode": "agent-event-tool-outcome-batch",
-            "source_cf": cf::CF_AGENT_EVENTS,
-            "source_count": expected,
-            "source_evidence": evidence,
-        });
-        let report = db.put_grounding_anchors_for_sources(tool_anchor_sources, &payload)?;
-        if report.requested_anchor_count != expected
-            || report.readback_exact_match_count != expected
-        {
-            return Err(StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!(
-                    "agent tool-call outcome anchor batch readback mismatch: expected={expected} requested={} physical_exact_matches={}",
-                    report.requested_anchor_count, report.readback_exact_match_count
-                ),
-            });
-        }
-        tracing::debug!(
-            code = "AGENT_TOOL_CALL_OUTCOME_BATCH_ANCHORED",
-            requested = expected,
-            written = report.written_anchor_count,
-            existing = report.existing_anchor_count,
-            physical_exact_matches = report.readback_exact_match_count,
-            "tool-call error presence grounded in one native Calyx anchor batch"
-        );
-    }
-
+) -> StorageResult<Vec<AgentEventWriteReadback>> {
+    let mut rows = Vec::with_capacity(records.len());
+    let mut readbacks = Vec::with_capacity(records.len());
     for record in records {
-        let Some(_outcome) = terminal_agent_outcome(record) else {
-            continue;
-        };
-        let Some(spawn_id) = nonblank_option(record.spawn_id.as_deref()) else {
-            tracing::warn!(
-                code = "AGENT_END_STATE_ANCHOR_SKIPPED_NO_SPAWN_ID",
-                ts_ns = record.ts_ns,
+        let encoded = validate_and_encode(record).inspect_err(|error| {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
                 kind = ?record.kind,
-                end_state = ?record.end_state,
-                "terminal agent event has no spawn_id, so no spawn event/transcript constellation set can be grounded"
+                session_id = ?record.session_id,
+                spawn_id = ?record.spawn_id,
+                reason_code = ?record.reason_code,
+                detail = %error,
+                "agent event refused before write"
             );
-            continue;
-        };
-        finalize_spawn_transcripts_for_terminal_event(db, spawn_id, record)?;
-        let Some(canonical) = canonical_spawn_terminal_event(&terminal_rows, spawn_id)? else {
-            continue;
-        };
-        anchor_spawn_terminal_event_rows(db, &terminal_rows, spawn_id)?;
-        anchor_spawn_transcript_rows(db, spawn_id, canonical.outcome, canonical.observed_ts_ns)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn anchor_spawn_end_state_from_storage(
-    db: &Db,
-    spawn_id: &str,
-) -> StorageResult<Option<&'static str>> {
-    // One verified spawn-prefix materialization feeds both the canonical
-    // decision and the anchor write.
-    let terminal_rows =
-        SpawnTerminalEventRows::materialize(db, &BTreeSet::from([spawn_id.to_owned()]))?;
-    let Some(canonical) = canonical_spawn_terminal_event(&terminal_rows, spawn_id)? else {
-        return Ok(None);
-    };
-    anchor_spawn_terminal_event_rows(db, &terminal_rows, spawn_id)?;
-    anchor_spawn_transcript_rows(db, spawn_id, canonical.outcome, canonical.observed_ts_ns)?;
-    Ok(Some(canonical.outcome))
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SpawnTerminalObservation {
-    outcome: &'static str,
-    observed_ts_ns: u64,
-}
-
-/// One `CF_AGENT_EVENTS` row that carries a terminal outcome for a spawn of
-/// interest, kept exactly as the scan produced it.
-///
-/// The key is retained **undecoded**: `canonical_spawn_terminal_event` is the
-/// site that decodes it and raises the key/record timestamp-drift error, and it
-/// must keep raising that error at the same point in the batch it did when it
-/// ran its own scan.
-struct SpawnTerminalEventRow {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    record: AgentEventRecord,
-    outcome: &'static str,
-}
-
-/// The terminal `CF_AGENT_EVENTS` rows of a named set of spawns, in source-key
-/// order, materialized through the exact spawn index (#2117, #2140).
-///
-/// Every index pointer is independently point-read and digest-verified against
-/// the journal before it reaches this type. An incomplete or divergent index
-/// fails closed; there is no whole-family fallback that could hide projection
-/// drift or restore the original `O(all retained events)` cost.
-struct SpawnTerminalEventRows {
-    rows_scanned: usize,
-    by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>>,
-}
-
-impl SpawnTerminalEventRows {
-    fn materialize(db: &Db, spawns: &BTreeSet<String>) -> StorageResult<Self> {
-        let mut by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>> = BTreeMap::new();
-        if spawns.is_empty() {
-            // Nothing to look for. The index is not read at all — the common
-            // case on the write path, where most batches carry no terminal
-            // record.
-            return Ok(Self {
-                rows_scanned: 0,
-                by_spawn,
-            });
-        }
-        let indexed = super::agent_event_spawn_index::read_for_spawns(db, spawns)?;
-        let rows_scanned = indexed.rows_scanned;
-        for (spawn_id, rows) in indexed.by_spawn {
-            for row in rows {
-                let Some(outcome) = terminal_agent_outcome(&row.record) else {
-                    continue;
-                };
-                by_spawn
-                    .entry(spawn_id.clone())
-                    .or_default()
-                    .push(SpawnTerminalEventRow {
-                        key: row.source_key,
-                        value: row.source_value,
-                        record: row.record,
-                        outcome,
-                    });
-            }
-        }
-        tracing::debug!(
-            code = "AGENT_END_STATE_TERMINAL_ROWS_MATERIALIZED",
-            spawns_requested = spawns.len(),
-            spawns_matched = by_spawn.len(),
-            index_rows_scanned = rows_scanned,
-            terminal_rows = by_spawn.values().map(Vec::len).sum::<usize>(),
-            index_cf = cf::CF_AGENT_EVENT_SPAWN_INDEX,
-            source_cf = cf::CF_AGENT_EVENTS,
-            "readback=spawn-prefix index scan plus exact digest-verified CF_AGENT_EVENTS point reads shared by canonical end-state and anchor publication"
-        );
-        Ok(Self {
-            rows_scanned,
-            by_spawn,
-        })
-    }
-
-    fn rows_for(&self, spawn_id: &str) -> &[SpawnTerminalEventRow] {
-        self.by_spawn.get(spawn_id).map_or(&[], Vec::as_slice)
-    }
-}
-
-fn canonical_spawn_terminal_event(
-    terminal_rows: &SpawnTerminalEventRows,
-    spawn_id: &str,
-) -> StorageResult<Option<SpawnTerminalObservation>> {
-    let mut canonical: Option<SpawnTerminalObservation> = None;
-    for row in terminal_rows.rows_for(spawn_id) {
-        let key = &row.key;
-        let record = &row.record;
-        let outcome = row.outcome;
-        let (key_ts_ns, _seq) = synapse_storage::agent_events::decode_agent_event_key(key)
-            .map_err(|error| StorageError::ReadFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!("agent end-state anchor scan found corrupt event key: {error}"),
-            })?;
-        if key_ts_ns != record.ts_ns {
-            return Err(StorageError::ReadFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!(
-                    "agent end-state anchor scan found event key/record timestamp drift for spawn {spawn_id}: key_ts_ns={key_ts_ns} record_ts_ns={}",
-                    record.ts_ns
-                ),
-            });
-        }
-        match canonical {
-            Some(existing) if existing.outcome != outcome => {
-                // #2072 ask 2/4 (the end-state-scan site): two different
-                // terminal outcomes recorded for one spawn is a WRITER
-                // disagreement, not corruption — the same classification the
-                // anchor-batch path adopted. Bailing here (the old behaviour,
-                // an untyped `ReadFailed` with the cause buried in a string)
-                // meant a contested spawn could never be anchored at all: a
-                // permanent, invisible latch. The declared rule, stated out
-                // loud like the batch path's keep-first: the EARLIEST observed
-                // terminal outcome is canonical — a terminal state does not
-                // change, so a later disagreeing observation is the suspect
-                // one — matching the earliest-wins ordering the non-conflict
-                // arms below already apply. The conflict is preserved as
-                // evidence, not resolved silently: one typed record per
-                // conflicting observation, naming the spawn and both sides
-                // exactly, consumed the same way as
-                // CALYX_GROUNDING_ANCHOR_BATCH_CONFLICT — by a reader, while
-                // the physical rows (both of them) stay on disk for the
-                // census.
-                tracing::error!(
-                    code = "AGENT_EVENT_TERMINAL_OUTCOME_CONFLICT",
-                    spawn_id,
-                    canonical_outcome = existing.outcome,
-                    canonical_observed_ts_ns = existing.observed_ts_ns,
-                    conflicting_outcome = outcome,
-                    conflicting_observed_ts_ns = record.ts_ns,
-                    conflicting_event_key = %synapse_storage::constellations::hex_encode(key),
-                    cf_name = cf::CF_AGENT_EVENTS,
-                    rule = "earliest_terminal_observation_wins",
-                    "spawn has conflicting terminal outcomes; the earliest observation stays canonical and this later disagreeing observation is recorded, not adopted — reconcile the disagreeing writers"
-                );
-                if record.ts_ns < existing.observed_ts_ns {
-                    // The disagreeing observation is actually the EARLIER one
-                    // (scan order is not time order): the declared rule makes
-                    // it canonical, and the record above still names both
-                    // sides.
-                    canonical = Some(SpawnTerminalObservation {
-                        outcome,
-                        observed_ts_ns: record.ts_ns,
-                    });
-                }
-            }
-            Some(existing) if existing.observed_ts_ns <= record.ts_ns => {}
-            _ => {
-                canonical = Some(SpawnTerminalObservation {
-                    outcome,
-                    observed_ts_ns: record.ts_ns,
-                });
-            }
-        }
-    }
-    Ok(canonical)
-}
-
-fn anchor_spawn_terminal_event_rows(
-    db: &Db,
-    terminal_rows: &SpawnTerminalEventRows,
-    spawn_id: &str,
-) -> StorageResult<()> {
-    let rows = terminal_rows.rows_for(spawn_id).iter().collect::<Vec<_>>();
-    let projection_rows = rows
-        .iter()
-        .map(|row| (row.key.clone(), row.value.clone(), row.record.clone()))
-        .collect::<Vec<_>>();
-    let reports = db.put_agent_event_constellations(&projection_rows)?;
-    if reports.len() != rows.len() {
-        return Err(StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "terminal agent-event constellation batch readback mismatch: spawn_id={spawn_id} expected={} actual={}",
-                rows.len(),
-                reports.len()
-            ),
-        });
-    }
-    let anchor_sources = rows
-        .iter()
-        .map(|row| GroundingAnchorSource {
-            source_cf: cf::CF_AGENT_EVENTS,
-            source_key: row.key.clone(),
-            raw_bytes: row.value.clone(),
-            anchor: grounding::enum_anchor(
-                "synapse:agent_end_state",
-                row.outcome,
-                SOURCE_AGENT_EVENT,
-                grounding::observed_at_ms_from_ns(row.record.ts_ns),
-            ),
-        })
-        .collect::<Vec<_>>();
-    if !anchor_sources.is_empty() {
-        let expected = anchor_sources.len() as u64;
-        let payload = json!({
-            "mode": "agent-terminal-event-outcome-batch",
-            "source_cf": cf::CF_AGENT_EVENTS,
-            "spawn_id_sha256": synapse_storage::constellations::sha256_hex(spawn_id.as_bytes()),
-            "source_count": expected,
-        });
-        let report = db.put_grounding_anchors_for_sources(anchor_sources, &payload)?;
-        if report.requested_anchor_count != expected
-            || report.readback_exact_match_count != expected
-        {
-            return Err(StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!(
-                    "terminal agent-event anchor batch readback mismatch: spawn_id={spawn_id} expected={expected} requested={} physical_exact_matches={}",
-                    report.requested_anchor_count, report.readback_exact_match_count
-                ),
-            });
-        }
-    }
-    tracing::info!(
-        code = "AGENT_END_STATE_EVENT_ROWS_ANCHORED",
-        spawn_id,
-        event_rows = rows.len(),
-        index_rows_scanned = terminal_rows.rows_scanned,
-        "terminal agent outcomes grounded on terminal spawn event constellations"
-    );
-    Ok(())
-}
-
-fn anchor_spawn_transcript_rows(
-    db: &Db,
-    spawn_id: &str,
-    outcome: &'static str,
-    observed_ts_ns: u64,
-) -> StorageResult<()> {
-    let mut anchor_sources = Vec::new();
-    let mut projection_rows = Vec::new();
-    let prefix = agent_transcript_spawn_prefix(spawn_id);
-    for (source_key, source_value) in db.scan_cf_prefix(cf::CF_AGENT_TRANSCRIPTS, &prefix)? {
-        let record: AgentTranscriptRecord = decode_json(&source_value)?;
-        projection_rows.push((source_key.clone(), source_value.clone(), record));
-        anchor_sources.push(GroundingAnchorSource {
-            source_cf: cf::CF_AGENT_TRANSCRIPTS,
-            source_key,
-            raw_bytes: source_value,
-            anchor: grounding::enum_anchor(
-                "synapse:agent_end_state",
-                outcome,
-                SOURCE_AGENT_EVENT,
-                grounding::observed_at_ms_from_ns(observed_ts_ns),
-            ),
-        });
-    }
-    for (chunk_index, chunk) in projection_rows
-        .chunks(super::agent_transcripts::MAX_AGENT_TRANSCRIPT_COMMIT_ROWS)
-        .enumerate()
-    {
-        let reports = db.put_agent_transcript_constellations(chunk)?;
-        if reports.len() != chunk.len() {
-            return Err(StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-                detail: format!(
-                    "agent end-state transcript constellation batch readback mismatch: spawn_id={spawn_id} chunk_index={chunk_index} expected={} actual={}",
-                    chunk.len(),
-                    reports.len()
-                ),
-            });
-        }
-    }
-    let requested = anchor_sources.len();
-    let report = if anchor_sources.is_empty() {
-        None
-    } else {
-        let payload = transcript_end_state_anchor_batch_payload(
-            spawn_id,
-            outcome,
-            observed_ts_ns,
-            &anchor_sources,
-        );
-        Some(
-            db.put_grounding_anchors_for_sources(anchor_sources, &payload)
-                .map_err(|error| StorageError::WriteFailed {
-                    cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-                    detail: format!("agent end-state transcript anchor batch failed: {error}"),
-                })?,
-        )
-    };
-    if let Some(report) = &report {
-        if report.readback_exact_match_count != u64::try_from(requested).unwrap_or(u64::MAX) {
-            return Err(StorageError::WriteFailed {
-                cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-                detail: format!(
-                    "agent end-state transcript anchor batch readback mismatch: requested={requested} readback_exact_match_count={}",
-                    report.readback_exact_match_count
-                ),
-            });
-        }
-    }
-    tracing::info!(
-        code = "AGENT_END_STATE_TRANSCRIPT_ROWS_ANCHORED",
-        spawn_id,
-        outcome,
-        transcript_rows = requested,
-        written_anchor_count = report.as_ref().map(|report| report.written_anchor_count),
-        existing_anchor_count = report.as_ref().map(|report| report.existing_anchor_count),
-        readback_exact_match_count = report
-            .as_ref()
-            .map(|report| report.readback_exact_match_count),
-        ledger_seq = ?report.as_ref().and_then(|report| report.ledger_seq),
-        "terminal agent outcome grounded on all current spawn transcript constellations"
-    );
-    Ok(())
-}
-
-fn transcript_end_state_anchor_batch_payload(
-    spawn_id: &str,
-    outcome: &str,
-    observed_ts_ns: u64,
-    sources: &[GroundingAnchorSource],
-) -> Value {
-    let rows = sources
-        .iter()
-        .map(|source| {
-            json!({
-                "source_key_sha256": synapse_storage::constellations::sha256_hex(&source.source_key),
-                "source_value_sha256": synapse_storage::constellations::sha256_hex(&source.raw_bytes),
-                "anchor_kind_sha256": synapse_storage::constellations::sha256_hex(source.anchor.kind_label.as_bytes()),
-                "anchor_source_sha256": synapse_storage::constellations::sha256_hex(source.anchor.source.as_bytes()),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "schema": "synapse.grounding_anchor_batch.v1",
-        "source_cf": cf::CF_AGENT_TRANSCRIPTS,
-        "spawn_id_sha256": synapse_storage::constellations::sha256_hex(spawn_id.as_bytes()),
-        "outcome_sha256": synapse_storage::constellations::sha256_hex(outcome.as_bytes()),
-        "observed_at_ms": grounding::observed_at_ms_from_ns(observed_ts_ns),
-        "source_count": sources.len(),
-        "sources": rows,
-    })
-}
-
-fn finalize_spawn_transcripts_for_terminal_event(
-    db: &Db,
-    spawn_id: &str,
-    record: &AgentEventRecord,
-) -> StorageResult<()> {
-    let Some(log_dir) = terminal_event_log_dir(record) else {
-        return Ok(());
-    };
-    let log_dir = Path::new(&log_dir);
-    if !log_dir.is_dir() {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-            detail: format!(
-                "terminal agent event for spawn {spawn_id} named missing transcript log dir {}",
-                log_dir.display()
-            ),
-        });
-    }
-    let outcome = super::agent_transcripts::finalize_spawn_transcripts_result(db, spawn_id, log_dir)
-        .map_err(|error| StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-            detail: format!(
-                "terminal agent event for spawn {spawn_id} could not finalize transcript rows before anchoring: {error}"
-            ),
         })?;
-    tracing::info!(
-        code = "AGENT_END_STATE_TRANSCRIPT_FINALIZED_BEFORE_ANCHOR",
-        spawn_id,
-        new_rows = outcome.new_parsed_rows + outcome.new_invalid_rows,
-        lines_total = outcome.lines_ingested_total,
-        skipped = outcome.skipped,
-        source_complete = outcome.source_complete,
-        "terminal agent event finalized transcript source before grounding transcript rows"
-    );
-    Ok(())
-}
-
-fn terminal_event_log_dir(record: &AgentEventRecord) -> Option<String> {
-    record
-        .payload
-        .get("log_dir")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let completion_path = record
-                .payload
-                .get("completion_status_path")
-                .and_then(Value::as_str)?;
-            Path::new(completion_path)
-                .parent()
-                .map(|path| path.display().to_string())
-        })
-}
-
-fn terminal_agent_outcome(record: &AgentEventRecord) -> Option<&'static str> {
-    match record.kind {
-        AgentEventKind::Killed => Some("killed"),
-        AgentEventKind::Exited => match record.end_state {
-            Some(AgentEndState::Success) => Some("completed"),
-            Some(AgentEndState::Error | AgentEndState::Indeterminate) | None => Some("failed"),
-        },
-        _ => None,
+        let seq = NEXT_AGENT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        readbacks.push(AgentEventWriteReadback {
+            ts_ns: record.ts_ns,
+            seq,
+            value_len_bytes: encoded.len(),
+        });
+        rows.push((agent_event_key(record.ts_ns, seq), encoded));
     }
+    if rows.is_empty() {
+        return Ok(readbacks);
+    }
+    db.put_batch(cf::CF_AGENT_EVENTS, rows)
+        .inspect_err(|error| {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
+                record_count = records.len(),
+                first_kind = ?records.first().map(|record| record.kind),
+                detail = %error,
+                "agent event batch enqueue failed"
+            );
+        })?;
+    for (record, readback) in records.iter().zip(&readbacks) {
+        tracing::debug!(
+            code = "AGENT_EVENT_RECORDED",
+            kind = ?record.kind,
+            ts_ns = readback.ts_ns,
+            seq = readback.seq,
+            session_id = ?record.session_id,
+            spawn_id = ?record.spawn_id,
+            value_len_bytes = readback.value_len_bytes,
+            "readback=CF_AGENT_EVENTS edge=enqueued"
+        );
+    }
+    Ok(readbacks)
 }
 
-pub(crate) fn tool_call_error_present(record: &AgentEventRecord) -> bool {
-    record
-        .attributes
-        .error_type
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || matches!(record.end_state, Some(AgentEndState::Error))
-        || payload_has_error(&record.payload)
-}
-
-fn payload_has_error(payload: &Value) -> bool {
-    let Some(object) = payload.as_object() else {
-        return false;
-    };
-    object
-        .get("error")
-        .is_some_and(|value| !value.is_null() && value != "")
-        || object.get("is_error").and_then(Value::as_bool) == Some(true)
-        || object.get("ok").and_then(Value::as_bool) == Some(false)
-        || object.get("success").and_then(Value::as_bool) == Some(false)
-        || object
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| {
-                let status = status.trim().to_ascii_lowercase();
-                matches!(status.as_str(), "error" | "failed" | "failure")
-            })
-        || object
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .is_some_and(|exit_code| exit_code != 0)
-}
-
-fn nonblank_option(value: Option<&str>) -> Option<&str> {
-    value.and_then(|value| {
-        let value = value.trim();
-        (!value.is_empty()).then_some(value)
-    })
-}
-
-/// Terminal-event compatibility entry point. The atomic guarded Calyx write
-/// already returns after its WAL/MVCC commit is durable; no second fallible
-/// flush is allowed to turn a known commit into an ambiguous retry signal.
+/// [`record_agent_event`] plus an explicit `Db::flush()` so the row is
+/// readable and crash-durable before this returns. Reserved for terminal
+/// lifecycle events (exited, killed, spawn failure, session deleted).
 ///
 /// # Errors
 ///
-/// Returns [`StorageError::WriteFailed`] from the atomic write/readback path.
+/// Returns [`StorageError::WriteFailed`] from the write or the flush.
 pub(crate) fn record_agent_event_durable(
     db: &Db,
     record: &AgentEventRecord,
 ) -> StorageResult<AgentEventWriteReadback> {
-    record_agent_event(db, record)
+    let readback = record_agent_event(db, record)?;
+    db.flush().inspect_err(|error| {
+        tracing::error!(
+            code = "AGENT_EVENT_WRITE_FAILED",
+            kind = ?record.kind,
+            ts_ns = readback.ts_ns,
+            seq = readback.seq,
+            detail = %error,
+            "agent event terminal flush failed"
+        );
+    })?;
+    Ok(readback)
 }
 
-pub(crate) fn validate_and_encode(record: &AgentEventRecord) -> StorageResult<Vec<u8>> {
+fn validate_and_encode(record: &AgentEventRecord) -> StorageResult<Vec<u8>> {
     record
         .validate()
         .map_err(|detail| StorageError::WriteFailed {
@@ -1517,4 +355,218 @@ pub(crate) fn agent_event_tool_error(
             "operation_committed": operation_committed,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::Value;
+    use synapse_core::{AgentEventKind, GenAiOperationName};
+    use synapse_storage::decode_json;
+
+    use super::*;
+    use crate::server::session_registry::{SessionRegistry, SpawnedAgentRead};
+
+    fn open_temp_db() -> (tempfile::TempDir, Db) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(&temp.path().join("db"), synapse_core::SCHEMA_VERSION)
+            .expect("temp DB must open");
+        (temp, db)
+    }
+
+    fn event(session_id: &str, kind: AgentEventKind) -> AgentEventRecord {
+        let mut record = AgentEventRecord::new(unix_time_ns_now(), kind);
+        record.session_id = Some(session_id.to_owned());
+        record
+    }
+
+    fn spawned_agent(spawn_id: &str) -> SpawnedAgentRead {
+        SpawnedAgentRead {
+            spawn_id: spawn_id.to_owned(),
+            cli: "codex".to_owned(),
+            launcher_process_id: 123,
+            agent_process_id: Some(456),
+            started_by_session_id: Some("parent".to_owned()),
+            launched_at_unix_ms: 990,
+            launch_target: "pwsh.exe".to_owned(),
+            log_dir: format!("C:\\temp\\{spawn_id}"),
+            template_id: None,
+            template_version: None,
+            control: None,
+        }
+    }
+
+    #[test]
+    fn batched_write_lands_physical_rows_after_flush() {
+        let (_temp, db) = open_temp_db();
+        let before = db
+            .scan_cf(cf::CF_AGENT_EVENTS)
+            .expect("scan before must work");
+        assert!(before.is_empty(), "fresh CF must start empty");
+
+        let mut record = event("journal-test-session", AgentEventKind::MessageSent);
+        record.attributes.operation_name = Some(GenAiOperationName::InvokeAgent);
+        let readback = record_agent_event(&db, &record).expect("write must enqueue");
+        db.flush().expect("flush must succeed");
+
+        let rows = db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan after");
+        assert_eq!(rows.len(), 1, "exactly the written row must exist");
+        let (key, value) = &rows[0];
+        let (ts_ns, seq) =
+            synapse_storage::agent_events::decode_agent_event_key(key).expect("key must decode");
+        assert_eq!(ts_ns, readback.ts_ns);
+        assert_eq!(seq, readback.seq);
+        let decoded: AgentEventRecord = decode_json(value).expect("row must decode");
+        assert_eq!(decoded, record);
+        let raw: Value = serde_json::from_slice(value).expect("row must be JSON");
+        assert_eq!(
+            raw["attributes"]["gen_ai.operation.name"], "invoke_agent",
+            "OTel attribute names must be stored verbatim: {raw}"
+        );
+    }
+
+    #[test]
+    fn durable_write_is_readable_without_extra_flush() {
+        let (_temp, db) = open_temp_db();
+        let mut record = event("durable-session", AgentEventKind::Exited);
+        record.reason_code = Some("test_teardown".to_owned());
+        record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
+        record_agent_event_durable(&db, &record).expect("durable write");
+
+        let rows = db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan");
+        assert_eq!(rows.len(), 1, "durable row must be readable immediately");
+    }
+
+    #[test]
+    fn invalid_record_is_refused_and_nothing_is_written() {
+        let (_temp, db) = open_temp_db();
+        let anonymous = AgentEventRecord::new(unix_time_ns_now(), AgentEventKind::Exited);
+        let error = record_agent_event(&db, &anonymous).expect_err("anonymous must refuse");
+        assert!(
+            error.to_string().contains("AGENT_EVENT_INVALID"),
+            "structured detail expected: {error}"
+        );
+        db.flush().expect("flush");
+        let rows = db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan");
+        assert!(rows.is_empty(), "refused write must leave no rows");
+    }
+
+    #[test]
+    fn oversized_payload_is_refused_with_byte_counts() {
+        let (_temp, db) = open_temp_db();
+        let mut record = event("oversize-session", AgentEventKind::MessageSent);
+        record.payload = serde_json::json!({
+            "blob": "x".repeat(MAX_AGENT_EVENT_VALUE_BYTES)
+        });
+        let error = record_agent_event(&db, &record).expect_err("oversize must refuse");
+        assert!(error.to_string().contains("cap is"), "{error}");
+        db.flush().expect("flush");
+        assert!(
+            db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan").is_empty(),
+            "refused oversize write must leave no rows"
+        );
+    }
+
+    #[test]
+    fn batch_with_one_invalid_record_writes_nothing() {
+        let (_temp, db) = open_temp_db();
+        let good = event("batch-session", AgentEventKind::MessageReceived);
+        let anonymous = AgentEventRecord::new(unix_time_ns_now(), AgentEventKind::MessageReceived);
+        let error =
+            record_agent_events(&db, &[good, anonymous]).expect_err("mixed batch must refuse");
+        assert!(error.to_string().contains("AGENT_EVENT_INVALID"), "{error}");
+        db.flush().expect("flush");
+        assert!(
+            db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan").is_empty(),
+            "all-or-nothing: no row from a refused batch"
+        );
+    }
+
+    #[test]
+    fn same_tick_events_keep_distinct_ordered_keys() {
+        let (_temp, db) = open_temp_db();
+        let mut first = event("tick-session", AgentEventKind::LeaseAcquired);
+        first.ts_ns = 42;
+        let mut second = event("tick-session", AgentEventKind::LeaseReleased);
+        second.ts_ns = 42;
+        let readbacks =
+            record_agent_events(&db, &[first, second]).expect("same-tick batch must write");
+        db.flush().expect("flush");
+        let rows = db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan");
+        assert_eq!(rows.len(), 2, "both same-tick rows must persist");
+        assert!(
+            readbacks[0].seq < readbacks[1].seq,
+            "sequence must strictly increase within a tick: {readbacks:?}"
+        );
+        assert!(rows[0].0 < rows[1].0, "keys must iterate in seq order");
+    }
+
+    #[test]
+    fn activity_events_refresh_registry_last_seen_by_session_or_spawn() {
+        let registry = Arc::new(Mutex::new(SessionRegistry::default()));
+        {
+            let mut guard = registry.lock().expect("registry lock");
+            guard.record_seen(
+                "session-direct",
+                Some("tools/call:get_target".to_owned()),
+                1_000,
+            );
+            guard.record_spawned_agent(
+                "session-spawn",
+                spawned_agent("agent-spawn-event-heartbeat"),
+                1_000,
+            );
+        }
+
+        let mut direct = event("session-direct", AgentEventKind::ToolCallStarted);
+        direct.ts_ns = 2_000_000_000;
+        let mut spawn_only = AgentEventRecord::new(2_000_000_001, AgentEventKind::TurnFinished);
+        spawn_only.spawn_id = Some("agent-spawn-event-heartbeat".to_owned());
+
+        let refreshed = refresh_session_registry_activity_from_agent_events(
+            &registry,
+            &[direct, spawn_only],
+            2_000,
+        );
+        assert_eq!(refreshed, vec!["session-direct", "session-spawn"]);
+
+        let reads = registry.lock().expect("registry lock").reads(2_001);
+        let direct = reads
+            .iter()
+            .find(|read| read.session_id == "session-direct")
+            .expect("direct session");
+        assert_eq!(direct.last_seen_unix_ms, 2_000);
+        assert_eq!(direct.last_action.as_deref(), Some("tools/call:get_target"));
+        let spawned = reads
+            .iter()
+            .find(|read| read.session_id == "session-spawn")
+            .expect("spawn session");
+        assert_eq!(spawned.last_seen_unix_ms, 2_000);
+    }
+
+    #[test]
+    fn activity_refresh_ignores_terminal_unknown_and_closed_rows() {
+        let registry = Arc::new(Mutex::new(SessionRegistry::default()));
+        {
+            let mut guard = registry.lock().expect("registry lock");
+            guard.record_seen("closed-session", None, 1_000);
+            guard.record_closed("closed-session", 1_100);
+        }
+
+        let exited = event("closed-session", AgentEventKind::Exited);
+        let unknown = event("unknown-session", AgentEventKind::MessageReceived);
+        let refreshed = refresh_session_registry_activity_from_agent_events(
+            &registry,
+            &[exited, unknown],
+            2_000,
+        );
+        assert!(refreshed.is_empty());
+
+        let reads = registry.lock().expect("registry lock").reads(2_001);
+        assert_eq!(reads.len(), 1, "unknown activity must not create a row");
+        assert_eq!(reads[0].session_id, "closed-session");
+        assert_eq!(reads[0].lifecycle, "closed");
+        assert_eq!(reads[0].last_seen_unix_ms, 1_100);
+    }
 }

@@ -16,7 +16,6 @@
 
 use std::{
     collections::HashMap,
-    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -78,179 +77,61 @@ pub fn is_chromium_family(process_name: &str) -> bool {
 
 // === Launched-port registry =================================================
 //
-// `act_launch` registers a fully attested endpoint, not a bare port. The exact
-// process generations and browser WebSocket identity make a stale row or port
-// reuse distinguishable from the launched browser (#2166).
+// `act_launch` (#684) registers the ephemeral debug port it opened for a
+// browser it launched, keyed by the browser's process id. The observe/find
+// probe consults this registry first so a Synapse-launched browser is attached
+// without any default-port collision or manual flag.
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LaunchedCdpRegistration {
-    pub registration_id: String,
-    pub launch_pid: u32,
-    pub launch_process_creation_time_100ns: Option<u64>,
-    pub listener_pid: u32,
-    pub listener_process_creation_time_100ns: Option<u64>,
-    pub port: u16,
-    pub browser_id: String,
-    pub browser_websocket_url: String,
-    pub user_data_dir_sha256: String,
-}
-
-/// Independent OS + HTTP readback for one loopback CDP listener. Launch code
-/// uses this before publishing a registry row; probe code repeats the same
-/// checks before trusting that row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CdpListenerIdentity {
-    pub listener_pid: u32,
-    pub listener_process_creation_time_100ns: Option<u64>,
-    pub browser_websocket_url: String,
-}
-
-/// Reads the physical owner of `port`, that process generation, and the browser
-/// WebSocket identity advertised by `/json/version`. Exactly one IPv4 loopback
-/// listener must own the port; ambiguity is a hard failure.
-pub fn inspect_local_cdp_listener(
-    port: u16,
-    connect_timeout: Duration,
-) -> Result<CdpListenerIdentity, String> {
-    if port == 0 {
-        return Err("refused to inspect invalid CDP listener port 0".to_owned());
-    }
-    #[cfg(windows)]
-    {
-        let listener_pids = tcp_listener_owner_pids(port)?;
-        let [listener_pid] = listener_pids.as_slice() else {
-            return Err(format!(
-                "CDP port {port} must have exactly one IPv4 listener owner; actual_pids={listener_pids:?}"
-            ));
-        };
-        let listener_process_creation_time_100ns =
-            Some(process_creation_time_100ns(*listener_pid)?);
-        let browser_websocket_url = fetch_browser_websocket_url(port, connect_timeout)?;
-        Ok(CdpListenerIdentity {
-            listener_pid: *listener_pid,
-            listener_process_creation_time_100ns,
-            browser_websocket_url,
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let browser_websocket_url = fetch_browser_websocket_url(port, connect_timeout)?;
-        Ok(CdpListenerIdentity {
-            listener_pid: 0,
-            listener_process_creation_time_100ns: None,
-            browser_websocket_url,
-        })
-    }
-}
-
-/// Reads the creation identity of one local process generation. Windows is the
-/// ownership authority for Synapse launch transactions; other platforms report
-/// that this authority is unavailable instead of inventing an identity.
-pub fn inspect_process_creation_time_100ns(pid: u32) -> Result<Option<u64>, String> {
-    #[cfg(windows)]
-    {
-        process_creation_time_100ns(pid).map(Some)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-        Err("process creation FILETIME authority is Windows-only".to_owned())
-    }
-}
-
-fn registry() -> &'static Mutex<HashMap<u32, LaunchedCdpRegistration>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u32, LaunchedCdpRegistration>>> = OnceLock::new();
+fn registry() -> &'static Mutex<HashMap<u32, u16>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u32, u16>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Publishes an endpoint only after `act_launch` has attested every field.
-pub fn register_launched_endpoint(registration: LaunchedCdpRegistration) -> Result<(), String> {
-    let mut map = registry()
-        .lock()
-        .map_err(|_| "launched CDP registry lock poisoned".to_owned())?;
-    if let Some(existing) = map.get(&registration.launch_pid)
-        && existing != &registration
-    {
-        return Err(format!(
-            "launched CDP registry already contains a contradictory row for pid {} existing_registration_id={} incoming_registration_id={}",
-            registration.launch_pid, existing.registration_id, registration.registration_id
-        ));
+/// Records the CDP debug `port` that `act_launch` opened for browser process
+/// `pid`, so a later `observe`/`find` can find it.
+pub fn register_launched_port(pid: u32, port: u16) {
+    if let Ok(mut map) = registry().lock() {
+        map.insert(pid, port);
+        tracing::info!(
+            code = "A11Y_CDP_PORT_REGISTERED",
+            pid,
+            port,
+            "registered Synapse-launched CDP debug port"
+        );
     }
-    if let Some(existing) = map.values().find(|existing| {
-        existing.registration_id != registration.registration_id
-            && (existing.listener_pid == registration.listener_pid
-                || existing.port == registration.port
-                || existing.browser_websocket_url == registration.browser_websocket_url)
-    }) {
-        return Err(format!(
-            "launched CDP registry endpoint identity is already owned: existing_launch_pid={} existing_registration_id={} incoming_launch_pid={} incoming_registration_id={} listener_pid={} port={}",
-            existing.launch_pid,
-            existing.registration_id,
-            registration.launch_pid,
-            registration.registration_id,
-            registration.listener_pid,
-            registration.port
-        ));
-    }
-    tracing::info!(
-        code = "A11Y_CDP_ENDPOINT_REGISTERED",
-        pid = registration.launch_pid,
-        listener_pid = registration.listener_pid,
-        port = registration.port,
-        registration_id = %registration.registration_id,
-        browser_id = %registration.browser_id,
-        "registered an identity-attested Synapse-launched CDP endpoint"
-    );
-    map.insert(registration.launch_pid, registration);
-    Ok(())
 }
 
-/// Removes only the exact row owned by the caller. A PID-reused or replacement
-/// registration is never evicted by stale cleanup.
-pub fn forget_launched_endpoint(pid: u32, registration_id: &str) -> Result<bool, String> {
-    let mut map = registry()
-        .lock()
-        .map_err(|_| "launched CDP registry lock poisoned".to_owned())?;
-    let Some(existing) = map.get(&pid) else {
-        return Ok(false);
-    };
-    if existing.registration_id != registration_id {
-        return Err(format!(
-            "refused to evict launched CDP pid {pid}: expected registration_id={registration_id} actual={}",
-            existing.registration_id
-        ));
+/// Removes a registered port (e.g. when the browser process exits).
+pub fn forget_launched_port(pid: u32) {
+    if let Ok(mut map) = registry().lock() {
+        map.remove(&pid);
     }
-    map.remove(&pid);
-    Ok(true)
 }
 
-/// The attested endpoint registered for `pid` by `act_launch`, if any.
-pub fn launched_endpoint_for_pid(pid: u32) -> Result<Option<LaunchedCdpRegistration>, String> {
+/// The CDP debug port registered for `pid` by `act_launch`, if any.
+#[must_use]
+pub fn launched_port_for_pid(pid: u32) -> Option<u16> {
     registry()
         .lock()
-        .map_err(|_| "launched CDP registry lock poisoned".to_owned())
-        .map(|map| {
-            map.get(&pid).cloned().or_else(|| {
-                map.values()
-                    .find(|registration| registration.listener_pid == pid)
-                    .cloned()
-            })
-        })
+        .ok()
+        .and_then(|map| map.get(&pid).copied())
 }
 
-/// The CDP debug port registered for `pid`, retained for diagnostics callers.
-pub fn launched_port_for_pid(pid: u32) -> Result<Option<u16>, String> {
-    launched_endpoint_for_pid(pid)
-        .map(|registration| registration.map(|registration| registration.port))
-}
-
-/// Ports permitted for `pid`. An attested launch permits only its exact port;
-/// configured/default ports are returned only when no launch row exists.
-pub fn candidate_ports_for_pid(pid: u32) -> Result<Vec<u16>, String> {
-    if let Some(port) = launched_port_for_pid(pid)? {
-        return Ok(vec![port]);
+/// The ordered list of ports to probe for `pid`: the registered launched port
+/// (if any) first, then the env-configured / default port list. De-duplicated,
+/// order-preserving.
+#[must_use]
+pub fn candidate_ports_for_pid(pid: u32) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Some(port) = launched_port_for_pid(pid) {
+        ports.push(port);
     }
-    Ok(configured_ports())
+    for port in configured_ports() {
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    ports
 }
 
 fn configured_ports() -> Vec<u16> {
@@ -334,351 +215,6 @@ pub fn probe_chromium_cdp_blocking(
     )
 }
 
-/// Probes CDP for a concrete process. A registered launch is an exact identity
-/// contract: mismatch evicts that exact stale row and returns a typed failure;
-/// it never tries configured/default ports as a substitute (#2166).
-#[must_use]
-pub fn probe_chromium_cdp_for_pid_blocking(
-    process_name: &str,
-    pid: u32,
-    connect_timeout: Duration,
-) -> CdpDiagnostics {
-    let registration = match launched_endpoint_for_pid(pid) {
-        Ok(Some(registration)) => registration,
-        Ok(None) => {
-            return probe_chromium_cdp_blocking(process_name, &configured_ports(), connect_timeout);
-        }
-        Err(detail) => {
-            tracing::error!(
-                code = error_codes::ACTION_LAUNCH_CDP_IDENTITY_MISMATCH,
-                pid,
-                detail = %detail,
-                "launched CDP registry is unreadable; refusing configured/default port fallback"
-            );
-            return CdpDiagnostics::unreachable_with_probe(
-                process_name,
-                error_codes::ACTION_LAUNCH_CDP_IDENTITY_MISMATCH,
-                Vec::new(),
-                detail,
-            );
-        }
-    };
-    match validate_launched_registration_blocking(&registration, connect_timeout) {
-        Ok(()) => ok_diagnostics(process_name, registration.port, vec![registration.port]),
-        Err(detail) => {
-            let eviction =
-                forget_launched_endpoint(registration.launch_pid, &registration.registration_id);
-            let detail = format!(
-                "registered launched CDP identity mismatch: {detail}; exact_registry_eviction={eviction:?}; registration_id={}",
-                registration.registration_id
-            );
-            tracing::error!(
-                code = error_codes::ACTION_LAUNCH_CDP_IDENTITY_MISMATCH,
-                pid,
-                port = registration.port,
-                registration_id = %registration.registration_id,
-                detail = %detail,
-                "rejected stale or contradictory launched CDP endpoint"
-            );
-            CdpDiagnostics::unreachable_with_probe(
-                process_name,
-                error_codes::ACTION_LAUNCH_CDP_IDENTITY_MISMATCH,
-                vec![registration.port],
-                detail,
-            )
-        }
-    }
-}
-
-#[cfg(windows)]
-fn validate_launched_registration_blocking(
-    registration: &LaunchedCdpRegistration,
-    connect_timeout: Duration,
-) -> Result<(), String> {
-    let launch_creation = process_creation_time_100ns(registration.launch_pid)?;
-    if registration.launch_process_creation_time_100ns != Some(launch_creation) {
-        return Err(format!(
-            "launch process generation mismatch pid={} recorded={:?} actual={launch_creation}",
-            registration.launch_pid, registration.launch_process_creation_time_100ns
-        ));
-    }
-    let listener_creation = process_creation_time_100ns(registration.listener_pid)?;
-    if registration.listener_process_creation_time_100ns != Some(listener_creation) {
-        return Err(format!(
-            "listener process generation mismatch pid={} recorded={:?} actual={listener_creation}",
-            registration.listener_pid, registration.listener_process_creation_time_100ns
-        ));
-    }
-    let listener_pids = tcp_listener_owner_pids(registration.port)?;
-    if listener_pids != vec![registration.listener_pid] {
-        return Err(format!(
-            "listener ownership mismatch port={} recorded_pid={} actual_pids={listener_pids:?}",
-            registration.port, registration.listener_pid
-        ));
-    }
-    let actual_websocket = fetch_browser_websocket_url(registration.port, connect_timeout)?;
-    if actual_websocket != registration.browser_websocket_url {
-        return Err(format!(
-            "browser websocket identity mismatch recorded={:?} actual={actual_websocket:?}",
-            registration.browser_websocket_url
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn validate_launched_registration_blocking(
-    registration: &LaunchedCdpRegistration,
-    connect_timeout: Duration,
-) -> Result<(), String> {
-    let actual_websocket = fetch_browser_websocket_url(registration.port, connect_timeout)?;
-    if actual_websocket != registration.browser_websocket_url {
-        return Err(format!(
-            "browser websocket identity mismatch recorded={:?} actual={actual_websocket:?}",
-            registration.browser_websocket_url
-        ));
-    }
-    Ok(())
-}
-
-fn fetch_browser_websocket_url(port: u16, timeout: Duration) -> Result<String, String> {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|error| format!("connect 127.0.0.1:{port}: {error}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("set CDP read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("set CDP write timeout: {error}"))?;
-    write!(
-        stream,
-        "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|error| format!("write CDP version request: {error}"))?;
-    let bytes = read_bounded_http_response(&mut stream, port)?;
-    let response = std::str::from_utf8(&bytes)
-        .map_err(|error| format!("CDP version response is not UTF-8: {error}"))?;
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "CDP version response has no HTTP header terminator".to_owned())?;
-    let status = head.lines().next().unwrap_or_default();
-    if !status.contains(" 200 ") {
-        return Err(format!("CDP version endpoint returned {status:?}"));
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|error| format!("decode CDP /json/version: {error}"))?;
-    value
-        .get("webSocketDebuggerUrl")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "CDP /json/version omitted webSocketDebuggerUrl".to_owned())
-}
-
-fn read_bounded_http_response(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>, String> {
-    const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-    const MAX_HEADER_BYTES: usize = 64 * 1024;
-    let mut bytes = Vec::new();
-    let mut expected_total = None;
-    loop {
-        let mut chunk = [0_u8; 8192];
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|error| format!("read CDP version response: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "CDP /json/version response exceeds {MAX_RESPONSE_BYTES}-byte limit on port {port}"
-            ));
-        }
-        if expected_total.is_none() {
-            if let Some(header_end) = find_http_header_end(&bytes) {
-                if header_end > MAX_HEADER_BYTES {
-                    return Err(format!(
-                        "CDP /json/version HTTP headers exceed {MAX_HEADER_BYTES} bytes on port {port}"
-                    ));
-                }
-                let header = std::str::from_utf8(&bytes[..header_end])
-                    .map_err(|error| format!("CDP version HTTP headers are not UTF-8: {error}"))?;
-                let content_length = strict_http_content_length(header)?;
-                let total = header_end
-                    .checked_add(4)
-                    .and_then(|value| value.checked_add(content_length))
-                    .ok_or_else(|| "CDP version HTTP response length overflow".to_owned())?;
-                if total > MAX_RESPONSE_BYTES {
-                    return Err(format!(
-                        "CDP /json/version framed response length {total} exceeds {MAX_RESPONSE_BYTES} bytes on port {port}"
-                    ));
-                }
-                expected_total = Some(total);
-            } else if bytes.len() > MAX_HEADER_BYTES {
-                return Err(format!(
-                    "CDP /json/version HTTP header terminator not found within {MAX_HEADER_BYTES} bytes on port {port}"
-                ));
-            }
-        }
-        if expected_total.is_some_and(|total| bytes.len() >= total) {
-            break;
-        }
-    }
-    let Some(expected_total) = expected_total else {
-        return Err("CDP version response ended before complete HTTP headers".to_owned());
-    };
-    if bytes.len() != expected_total {
-        return Err(format!(
-            "CDP version HTTP framing mismatch: expected_total={expected_total} actual_total={}",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
-}
-
-fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn strict_http_content_length(header: &str) -> Result<usize, String> {
-    let mut content_length = None;
-    for line in header.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("malformed CDP version HTTP header line: {line:?}"));
-        };
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(format!(
-                "CDP version HTTP response uses unsupported transfer-encoding {value:?}; expected one bounded Content-Length"
-            ));
-        }
-        if !name.eq_ignore_ascii_case("content-length") {
-            continue;
-        }
-        if content_length.is_some() {
-            return Err(
-                "CDP version HTTP response contains duplicate Content-Length headers".to_owned(),
-            );
-        }
-        content_length =
-            Some(value.trim().parse::<usize>().map_err(|error| {
-                format!("invalid CDP version Content-Length {value:?}: {error}")
-            })?);
-    }
-    content_length.ok_or_else(|| {
-        "CDP version HTTP response omitted the required bounded Content-Length header".to_owned()
-    })
-}
-
-#[cfg(windows)]
-fn process_creation_time_100ns(pid: u32) -> Result<u64, String> {
-    use windows::Win32::{
-        Foundation::{CloseHandle, FILETIME},
-        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
-    };
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-        .map_err(|error| format!("OpenProcess pid={pid}: {error}"))?;
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    let result = unsafe {
-        GetProcessTimes(
-            handle,
-            &raw mut creation,
-            &raw mut exit,
-            &raw mut kernel,
-            &raw mut user,
-        )
-    }
-    .map_err(|error| format!("GetProcessTimes pid={pid}: {error}"));
-    let close =
-        unsafe { CloseHandle(handle) }.map_err(|error| format!("CloseHandle pid={pid}: {error}"));
-    result?;
-    close?;
-    let value = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
-    (value != 0)
-        .then_some(value)
-        .ok_or_else(|| format!("GetProcessTimes pid={pid} returned zero creation time"))
-}
-
-#[cfg(windows)]
-fn tcp_listener_owner_pids(port: u16) -> Result<Vec<u32>, String> {
-    use windows::Win32::{
-        Foundation::ERROR_INSUFFICIENT_BUFFER,
-        NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
-        },
-        Networking::WinSock::AF_INET,
-    };
-    let mut byte_len = 0_u32;
-    let first = unsafe {
-        GetExtendedTcpTable(
-            None,
-            &raw mut byte_len,
-            true,
-            u32::from(AF_INET.0),
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if first != ERROR_INSUFFICIENT_BUFFER.0 || byte_len == 0 {
-        return Err(format!(
-            "GetExtendedTcpTable size query failed status={first} byte_len={byte_len}"
-        ));
-    }
-    let word_len = usize::try_from(byte_len)
-        .map_err(|_| format!("TCP table byte length does not fit usize: {byte_len}"))?
-        .div_ceil(std::mem::size_of::<u32>());
-    let mut storage = vec![0_u32; word_len];
-    let status = unsafe {
-        GetExtendedTcpTable(
-            Some(storage.as_mut_ptr().cast()),
-            &raw mut byte_len,
-            true,
-            u32::from(AF_INET.0),
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if status != 0 {
-        return Err(format!(
-            "GetExtendedTcpTable listener query failed status={status} byte_len={byte_len}"
-        ));
-    }
-    let table = unsafe { &*storage.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>() };
-    let count = usize::try_from(table.dwNumEntries).map_err(|_| {
-        format!(
-            "TCP listener count does not fit usize: {}",
-            table.dwNumEntries
-        )
-    })?;
-    let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
-    let mut pids = Vec::new();
-    for row in rows {
-        let raw_port = u16::try_from(row.dwLocalPort).map_err(|_| {
-            format!(
-                "GetExtendedTcpTable returned out-of-range local port value {} for pid {}",
-                row.dwLocalPort, row.dwOwningPid
-            )
-        })?;
-        if u16::from_be(raw_port) != port {
-            continue;
-        }
-        let local_address = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
-        if !local_address.is_loopback() {
-            return Err(format!(
-                "CDP port {port} is not loopback-only: listener pid={} local_address={local_address}",
-                row.dwOwningPid
-            ));
-        }
-        pids.push(row.dwOwningPid);
-    }
-    pids.sort_unstable();
-    pids.dedup();
-    Ok(pids)
-}
-
 /// Async CDP reachability probe (used by tests and the async attach path).
 pub async fn probe_chromium_cdp(
     process_name: &str,
@@ -719,12 +255,8 @@ pub async fn probe_chromium_cdp(
 #[must_use]
 pub fn endpoint_for_window(hwnd: i64) -> Option<String> {
     let context = crate::foreground_context(hwnd).ok()?;
-    probe_chromium_cdp_for_pid_blocking(
-        &context.process_name,
-        context.pid,
-        Duration::from_millis(250),
-    )
-    .endpoint
+    let ports = candidate_ports_for_pid(context.pid);
+    probe_chromium_cdp_blocking(&context.process_name, &ports, Duration::from_millis(250)).endpoint
 }
 
 #[cfg(windows)]

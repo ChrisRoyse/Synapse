@@ -16,29 +16,7 @@ pub(super) fn storage_response(
         readback_source_of_truth: readback,
         inspect: None,
         summary: None,
-        snapshot_gc_status: None,
         gc_once: None,
-        anchors: None,
-        row_read: None,
-        snapshot_open: None,
-        snapshot_read: None,
-        snapshot_release: None,
-        temporal_panels: None,
-        corpus_histogram: None,
-        panel_coverage: None,
-        temporal_rerank: None,
-        temporal_backfill: None,
-        search_rebuild: None,
-        transcript_order_status: None,
-        transcript_order_rebuild: None,
-        panel_lifecycle: None,
-        find_similar: None,
-        retire_orphan_slot_cfs: None,
-        retire_search_generation: None,
-        backup: None,
-        backup_status: None,
-        restore_verify: None,
-        intelligence: None,
     };
     fill(&mut response);
     response
@@ -59,8 +37,6 @@ pub(super) fn model_response(
         register: None,
         update: None,
         remove: None,
-        recommend: None,
-        r#override: None,
     };
     fill(&mut response);
     response
@@ -79,17 +55,6 @@ pub(super) fn hygiene_response(
         scan_storage: None,
         flags: None,
         report: None,
-        grounding_gap: None,
-        blind_spot: None,
-        drift: None,
-        vault_verify: None,
-        kernel: None,
-        kernel_rebuild: None,
-        guard_calibrate: None,
-        guard_verify: None,
-        anneal_status: None,
-        anneal_search_propose: None,
-        anneal_rollback: None,
     };
     fill(&mut response);
     response
@@ -106,8 +71,6 @@ pub(super) fn setup_response(
         readback_source_of_truth: readback,
         status: None,
         doctor: None,
-        launchd_service: None,
-        host_transition: None,
     };
     fill(&mut response);
     response

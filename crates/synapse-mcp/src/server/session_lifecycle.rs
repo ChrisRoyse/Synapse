@@ -17,14 +17,14 @@ use serde::Serialize;
 use serde_json::json;
 use synapse_action::ActionHandle;
 use synapse_core::error_codes;
-use synapse_storage::{Db, cf, decode_json};
+use synapse_storage::{Db, cf};
 
 use crate::{
     http::sse::SseState,
     m1::mcp_error,
     m2::SharedSessionClipboardBuffers,
     m3::SharedM3State,
-    m4::{self, LaunchTerminalCaptureControl, OwnedProcessJob},
+    m4::{self, OwnedProcessJob},
 };
 
 use super::{
@@ -43,29 +43,10 @@ const DAEMON_RESTART_BROWSER_CONTINUITY_GRACE: Duration = Duration::from_mins(30
 pub(crate) const HTTP_STALE_REASON: &str = "http_stale";
 pub(crate) const SPAWN_COMPLETED_REASON: &str = "spawn_completed";
 pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_process_exited";
-/// #1800 teardown reason for an rmcp-registered but idle-abandoned HTTP session.
-pub(crate) const ABANDONED_IDLE_REASON: &str = "session_abandoned_idle";
-
-/// #1800: an abandoned Streamable-HTTP session identified for proactive reaping,
-/// carrying exactly the fields the reaper structured-logs (session id, total age,
-/// idle age, and last activity) so accumulation is attributable per session.
-#[derive(Clone, Debug)]
-pub(crate) struct AbandonedHttpSession {
-    pub session_id: String,
-    pub age_ms: u64,
-    pub last_seen_ms_ago: u64,
-    pub last_action: Option<String>,
-    pub client_name: Option<String>,
-    pub agent_kind: String,
-}
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
-/// Process-local transport rejection authority. The value preserves the exact
-/// cause that first terminated a session so the HTTP 404 can tell a reconnecting
-/// client whether expiry, operator teardown, or stale tool discovery forced the
-/// new initialize cycle.
-pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeMap<String, String>>>;
+pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeSet<String>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTeardownOptions {
@@ -103,9 +84,6 @@ pub(crate) struct SessionProcessResource {
     pub agent_cli: Option<String>,
     pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
-    pub terminal_capture_control: Option<LaunchTerminalCaptureControl>,
-    pub terminal_history_key: Option<String>,
-    pub cdp_resource: Option<m4::CdpLaunchResource>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -178,9 +156,6 @@ impl SessionProcessResource {
             agent_cli: None,
             process_job: Some(process_job),
             desktop_lease: None,
-            terminal_capture_control: None,
-            terminal_history_key: None,
-            cdp_resource: None,
         }
     }
 
@@ -194,21 +169,6 @@ impl SessionProcessResource {
         desktop_lease: Option<m4::LaunchDesktopLease>,
     ) -> Self {
         self.desktop_lease = desktop_lease;
-        self
-    }
-
-    pub(crate) fn with_terminal_capture(
-        mut self,
-        control: Option<LaunchTerminalCaptureControl>,
-        terminal_history_key: Option<String>,
-    ) -> Self {
-        self.terminal_capture_control = control;
-        self.terminal_history_key = terminal_history_key;
-        self
-    }
-
-    pub(crate) fn with_cdp_resource(mut self, resource: Option<m4::CdpLaunchResource>) -> Self {
-        self.cdp_resource = resource;
         self
     }
 }
@@ -341,9 +301,6 @@ pub struct SessionContinuityCleanupReport {
     pub profile_row_existed_before: bool,
     pub profile_row_deleted: bool,
     pub profile_row_exists_after: bool,
-    pub tool_surface_attestation_row_existed_before: bool,
-    pub tool_surface_attestation_row_deleted: bool,
-    pub tool_surface_attestation_row_exists_after: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -379,17 +336,8 @@ pub struct SessionCdpCleanupReport {
     pub closed: usize,
     pub already_absent: usize,
     pub endpoint_unreachable: usize,
-    pub stale_prior_session_owner_reclaimed: usize,
     pub persisted_rows_deleted: usize,
     pub failed: usize,
-    /// Closes refused because operator panic disabled mutation admission
-    /// (#1801). Counted inside `failed`: this is a fail-closed retention, not a
-    /// success, and the owner row is kept for retry once panic clears.
-    pub operator_panic_refused: usize,
-    /// Closes not attempted this pass because a live operator-panic backoff
-    /// makes the attempt deterministically refusable. Also counted inside
-    /// `failed` so no caller can read a deferral as progress.
-    pub operator_panic_deferred: usize,
     pub target_ids: Vec<String>,
     pub error_messages: Vec<String>,
 }
@@ -451,7 +399,6 @@ pub struct SessionProcessCleanupItem {
     pub desktop_window_termination_status: Option<String>,
     pub desktop_window_process_ids_after: Vec<u32>,
     pub remaining_process_ids_after: Vec<u32>,
-    pub cdp_cleanup: Option<m4::CdpLaunchCleanupReadback>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -813,42 +760,25 @@ impl SynapseService {
         &self,
         resource: SessionProcessResource,
     ) -> Result<(), ErrorData> {
-        self.register_session_process_resource_recoverable(resource)
-            .map_err(|(error, _resource)| error)
-    }
-
-    pub(crate) fn register_session_process_resource_recoverable(
-        &self,
-        resource: SessionProcessResource,
-    ) -> Result<(), (ErrorData, SessionProcessResource)> {
         let session_id = resource.session_id.clone();
         let pid = resource.pid;
-        let mut guard = match self.session_processes.lock() {
-            Ok(guard) => guard,
-            Err(_error) => {
-                return Err((
-                    mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        "session process resource ledger lock poisoned",
-                    ),
-                    resource,
-                ));
-            }
-        };
+        let mut guard = self.session_processes.lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session process resource ledger lock poisoned",
+            )
+        })?;
         let processes = guard.entry(session_id.clone()).or_default();
         if processes.contains_key(&pid) {
-            return Err((
-                ErrorData::new(
-                    ErrorCode(-32099),
-                    format!("session process resource already registered for pid {pid}"),
-                    Some(json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "session_id": session_id,
-                        "pid": pid,
-                        "reason": "duplicate_session_process_resource",
-                    })),
-                ),
-                resource,
+            return Err(ErrorData::new(
+                ErrorCode(-32099),
+                format!("session process resource already registered for pid {pid}"),
+                Some(json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "session_id": session_id,
+                    "pid": pid,
+                    "reason": "duplicate_session_process_resource",
+                })),
             ));
         }
         processes.insert(pid, resource);
@@ -1002,7 +932,7 @@ impl SessionLifecycleState {
     pub(crate) fn is_session_terminated(&self, session_id: &str) -> bool {
         self.terminated_sessions
             .lock()
-            .is_ok_and(|terminated| terminated.contains_key(session_id))
+            .is_ok_and(|terminated| terminated.contains(session_id))
     }
 
     pub(crate) async fn teardown_session(
@@ -1091,11 +1021,9 @@ impl SessionLifecycleState {
         report.reason.clone_from(&registry_reason);
         report.subscriptions = self.cleanup_subscriptions(session_id);
         report.session_store = self.delete_session_store_row(session_id);
-        report.registry =
-            self.record_registry_closed(session_id, &registry_reason, &report.processes);
+        report.registry = self.record_registry_closed(session_id, &registry_reason);
         report.finalize();
         if report.failure_count == 0 {
-            clear_teardown_failure_streak(session_id);
             tracing::info!(
                 code = "MCP_SESSION_TEARDOWN_COMPLETED",
                 session_id,
@@ -1104,36 +1032,14 @@ impl SessionLifecycleState {
                 "readback=session_lifecycle after=all_owned_resources_reclaimed"
             );
         } else {
-            // The 250 ms stale-session sweep re-drives teardown for the same
-            // session while a fail-closed cleanup keeps refusing. The outer
-            // retry loop already demotes its repeat to WARN after the first
-            // occurrence; this inner log did not, so every retry still emitted a
-            // fresh ERROR carrying no new information (#1801). Report the
-            // transition at ERROR and the steady state at WARN with its exact
-            // streak length, so the condition stays fully visible without a
-            // per-tick ERROR storm.
-            let streak = note_teardown_failure_streak(session_id);
-            if streak <= 1 {
-                tracing::error!(
-                    code = "MCP_SESSION_TEARDOWN_FAILED",
-                    session_id,
-                    reason = %report.reason,
-                    failure_count = report.failure_count,
-                    consecutive_teardown_failures = streak,
-                    report = ?report,
-                    "session lifecycle teardown encountered cleanup failures"
-                );
-            } else {
-                tracing::warn!(
-                    code = "MCP_SESSION_TEARDOWN_FAILED",
-                    session_id,
-                    reason = %report.reason,
-                    failure_count = report.failure_count,
-                    consecutive_teardown_failures = streak,
-                    report = ?report,
-                    "session lifecycle teardown still failing on the same session (first occurrence logged at ERROR)"
-                );
-            }
+            tracing::error!(
+                code = "MCP_SESSION_TEARDOWN_FAILED",
+                session_id,
+                reason = %report.reason,
+                failure_count = report.failure_count,
+                report = ?report,
+                "session lifecycle teardown encountered cleanup failures"
+            );
         }
         Ok(report)
     }
@@ -1172,50 +1078,20 @@ impl SessionLifecycleState {
                 return report;
             }
         };
-        // #1800: the continuity readback and the lease-row delete are both
-        // synchronous CF_SESSIONS operations. Keep their ordering around the
-        // input cleanup exactly as-is, but run each on the blocking pool so the
-        // enclosing per-session deadline stays enforceable while storage is
-        // contended. See `admit_shutdown_storage_step`.
-        report.browser_continuity = {
-            let lifecycle = self.clone();
-            let owned_session_id = session_id.to_owned();
-            match admit_shutdown_storage_step(session_id, "browser_continuity_readback", move || {
-                lifecycle.browser_continuity_for_daemon_shutdown(&owned_session_id)
-            })
-            .await
-            {
-                Ok(continuity) => continuity,
-                Err(detail) => SessionShutdownBrowserContinuityReport {
-                    source_of_truth: "UNPROVEN: in-memory session target/CDP owner registries + CF_SESSIONS persisted target/CDP owner rows were not read".to_owned(),
-                    recovery_action: "browser continuity for this session is unknown; after restart inspect session_list/session_status(include_closed) before adopting any Chrome tab".to_owned(),
-                    failed: true,
-                    error_message: Some(detail),
-                    ..SessionShutdownBrowserContinuityReport::default()
-                },
-            }
-        };
+        report.browser_continuity = self.browser_continuity_for_daemon_shutdown(session_id);
         report.process_jobs =
             self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
-        let lease_row_delete = {
-            let m3_state = Arc::clone(&self.m3_state);
-            let owned_session_id = session_id.to_owned();
-            admit_shutdown_storage_step(session_id, "session_lease_row_delete", move || {
-                super::session_continuity::delete_persisted_session_lease_row(
-                    &m3_state,
-                    &owned_session_id,
-                )
-            })
-            .await
-        };
-        match lease_row_delete {
-            Ok(Ok(readback)) => {
+        match super::session_continuity::delete_persisted_session_lease_row(
+            &self.m3_state,
+            session_id,
+        ) {
+            Ok(readback) => {
                 report.lease_row_existed_before = readback.row_existed_before;
                 report.lease_row_deleted = readback.row_deleted;
                 report.lease_row_exists_after = readback.row_exists_after;
             }
-            Ok(Err(error)) | Err(error) => {
+            Err(error) => {
                 report.failed = true;
                 report.error_message = Some(error);
             }
@@ -1278,61 +1154,6 @@ impl SessionLifecycleState {
         for resource in resources.values_mut() {
             let mut status = "no_job_handle".to_owned();
             let mut error_message = None;
-            if let (Some(control), Some(terminal_history_key)) = (
-                resource.terminal_capture_control.as_ref(),
-                resource.terminal_history_key.as_deref(),
-            ) {
-                let initial_status =
-                    self.process_terminal_history_final_status(terminal_history_key);
-                if let Ok(Some(final_status)) = &initial_status {
-                    status = format!("terminal_already_verified:{final_status}");
-                } else {
-                    if let Err(error) = &initial_status {
-                        report.failed = report.failed.saturating_add(1);
-                        error_message = Some(format!(
-                            "initial captured terminal readback failed before forced completion: {error}"
-                        ));
-                    }
-                    if let Err(error) = control.mark_termination_cause("daemon_shutdown_forced") {
-                        report.failed = report.failed.saturating_add(1);
-                        error_message = Some(error);
-                    }
-                    if resource.process_job.is_some() {
-                        report.job_handles_before = report.job_handles_before.saturating_add(1);
-                    } else {
-                        report.failed = report.failed.saturating_add(1);
-                        error_message = Some(
-                            "captured launch had no armed Job Object during daemon shutdown"
-                                .to_owned(),
-                        );
-                    }
-                    drop(resource.process_job.take());
-                    match self.wait_for_process_terminal_history(
-                        terminal_history_key,
-                        PROCESS_JOB_CLOSE_WAIT,
-                    ) {
-                        Ok(final_status) => {
-                            status = format!("capture_terminal_verified:{final_status}");
-                        }
-                        Err(error) => {
-                            report.failed = report.failed.saturating_add(1);
-                            status = "capture_terminal_verification_failed".to_owned();
-                            error_message = Some(error);
-                        }
-                    }
-                    report.items.push(SessionProcessRestartHandoffItem {
-                        tool: resource.tool.to_owned(),
-                        pid: resource.pid,
-                        resource_id: resource.resource_id.clone(),
-                        launch_target: resource.launch_target.clone(),
-                        agent_cli: resource.agent_cli.clone(),
-                        registered_at_unix_ms: resource.registered_at_unix_ms,
-                        status,
-                        error_message,
-                    });
-                    continue;
-                }
-            }
             if let Some(process_job) = resource.process_job.as_mut() {
                 report.job_handles_before = report.job_handles_before.saturating_add(1);
                 match process_job.disarm_kill_on_close(
@@ -1371,66 +1192,6 @@ impl SessionLifecycleState {
             "readback=session_process_ledger edge=daemon_shutdown after=kill_on_close_disarmed"
         );
         report
-    }
-
-    fn process_terminal_history_final_status(
-        &self,
-        terminal_history_key: &str,
-    ) -> Result<Option<String>, String> {
-        let runtime = self
-            .authority_service
-            .reflex_runtime()
-            .map_err(|error| format!("read reflex runtime failed: {}", error.message))?;
-        let runtime = runtime.lock().map_err(|_error| {
-            "reflex runtime lock poisoned while reading captured process terminal history"
-                .to_owned()
-        })?;
-        let key = terminal_history_key.as_bytes();
-        let rows = runtime
-            .storage_cf_prefix_rows(cf::CF_PROCESS_HISTORY, key, 2)
-            .map_err(|error| format!("captured process terminal CF read failed: {error}"))?;
-        let Some((_row_key, row_bytes)) = rows.iter().find(|(row_key, _value)| row_key == key)
-        else {
-            return Ok(None);
-        };
-        let row = decode_json::<serde_json::Value>(row_bytes)
-            .map_err(|error| format!("captured process terminal row decode failed: {error}"))?;
-        if row.get("row_kind").and_then(serde_json::Value::as_str) != Some("process_terminal") {
-            return Err(format!(
-                "captured process terminal key holds non-terminal row_kind={:?}",
-                row.get("row_kind")
-            ));
-        }
-        let status = row
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "captured process terminal row has no string status".to_owned())?;
-        let outputs_final = row.get("stdout").is_some_and(serde_json::Value::is_object)
-            && row.get("stderr").is_some_and(serde_json::Value::is_object);
-        Ok(outputs_final.then(|| status.to_owned()))
-    }
-
-    fn wait_for_process_terminal_history(
-        &self,
-        terminal_history_key: &str,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let deadline = Instant::now() + timeout;
-        let mut last_error = None;
-        loop {
-            match self.process_terminal_history_final_status(terminal_history_key) {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {}
-                Err(error) => last_error = Some(error),
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "captured process terminal row did not reach independently verified final output state within {} ms; terminal_history_key={terminal_history_key}; last_error={last_error:?}",
-                    timeout.as_millis()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
     }
 
     pub(crate) async fn cleanup_expired_lease_inputs_once(&self) {
@@ -1648,98 +1409,7 @@ impl SessionLifecycleState {
         candidates
     }
 
-    pub(crate) fn prune_closed_session_registry(
-        &self,
-        now_unix_ms: u64,
-    ) -> super::session_registry::SessionRegistryPruneReadback {
-        match self.session_registry.lock() {
-            Ok(mut registry) => registry.prune_closed(now_unix_ms),
-            Err(poisoned) => {
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    "session registry lock poisoned during closed-entry pruning; recovering ownership"
-                );
-                poisoned.into_inner().prune_closed(now_unix_ms)
-            }
-        }
-    }
-
-    /// #1800: identify Streamable-HTTP sessions that are still registered in the
-    /// rmcp session manager (so `stale_session_candidates` treats them as "live"
-    /// and never reaps them) yet have made no MCP request for longer than
-    /// `abandon_after_ms`. These are abandoned client/FSV sessions: the client
-    /// vanished without a DELETE, so the only other expiry is the rmcp
-    /// keep-alive/idle timeout (24h by default). Left unreaped they accumulate
-    /// (54 live at the 2026-07-23T11:03 shutdown) and every one becomes shutdown
-    /// work. A session backing a still-live spawned agent is excluded via the
-    /// real process probe (#1238), exactly as the stale-candidate scan does, so
-    /// an agent doing native work between MCP calls is never reaped.
-    pub(crate) fn abandoned_http_session_candidates(
-        &self,
-        active_sessions: &BTreeSet<String>,
-        abandon_after_ms: u64,
-        now_unix_ms: u64,
-    ) -> Vec<AbandonedHttpSession> {
-        let reads = match self.session_registry.lock() {
-            Ok(registry) => registry.reads(now_unix_ms),
-            Err(_poisoned) => {
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    "session registry lock poisoned during abandoned-session scan; skipping this pass"
-                );
-                return Vec::new();
-            }
-        };
-        let live_spawn_sessions = live_spawned_session_ids(&reads, &|pid| m4::process_exists(pid));
-        let mut candidates = Vec::new();
-        for read in &reads {
-            if read.closed_at_unix_ms.is_some() {
-                continue;
-            }
-            // Only reap sessions the rmcp manager still holds; orphaned resource
-            // ledgers are the existing stale-candidate path's responsibility.
-            if !active_sessions.contains(&read.session_id) {
-                continue;
-            }
-            if live_spawn_sessions.contains(&read.session_id) {
-                continue;
-            }
-            if read.last_seen_ms_ago <= abandon_after_ms {
-                continue;
-            }
-            candidates.push(AbandonedHttpSession {
-                session_id: read.session_id.clone(),
-                age_ms: now_unix_ms.saturating_sub(read.started_at_unix_ms),
-                last_seen_ms_ago: read.last_seen_ms_ago,
-                last_action: read.last_action.clone(),
-                client_name: read.client_name.clone(),
-                agent_kind: read.agent_kind.clone(),
-            });
-        }
-        candidates
-    }
-
-    /// #1800: the spawned-agent liveness scan runs one synchronous OS handle
-    /// probe (`m4::process_exists`) per registered spawned session and sits on
-    /// the daemon-shutdown critical path with no deadline above it at all.
-    /// Admit it to the blocking pool so the shutdown driver keeps a real yield
-    /// point while it runs. Fails closed: an unproven scan is an error, never
-    /// an empty set treated as "nothing live".
-    pub(crate) async fn live_spawned_session_ids_for_shutdown(
-        &self,
-    ) -> Result<BTreeSet<String>, String> {
-        let lifecycle = self.clone();
-        match admit_shutdown_storage_step("*", "live_spawned_session_liveness_scan", move || {
-            lifecycle.live_spawned_session_ids_for_shutdown_blocking()
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(detail) => Err(detail),
-        }
-    }
-
-    fn live_spawned_session_ids_for_shutdown_blocking(&self) -> Result<BTreeSet<String>, String> {
+    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
         let registry_reads = match self.session_registry.lock() {
             Ok(registry) => registry.reads(unix_time_ms_now()),
             Err(_poisoned) => {
@@ -1910,11 +1580,8 @@ impl SessionLifecycleState {
     fn mark_terminated_session(&self, report: &mut SessionTeardownReport) {
         match self.terminated_sessions.lock() {
             Ok(mut terminated) => {
-                report.already_terminated = terminated.contains_key(&report.session_id);
-                report.marked_terminated = !report.already_terminated;
-                terminated
-                    .entry(report.session_id.clone())
-                    .or_insert_with(|| report.reason.clone());
+                report.already_terminated = terminated.contains(&report.session_id);
+                report.marked_terminated = terminated.insert(report.session_id.clone());
             }
             Err(_error) => {
                 report.termination_marker_failed = true;
@@ -2051,27 +1718,6 @@ impl SessionLifecycleState {
                 });
             }
         }
-        match self
-            .authority_service
-            .delete_session_tool_surface_attestation_for_terminated_session(session_id)
-        {
-            Ok((existed_before, deleted)) => {
-                report.tool_surface_attestation_row_existed_before = existed_before;
-                report.tool_surface_attestation_row_deleted = deleted;
-                report.tool_surface_attestation_row_exists_after = false;
-            }
-            Err(error) => {
-                report.failed = true;
-                report.tool_surface_attestation_row_exists_after = true;
-                let detail = error.message.to_string();
-                report.error_message = Some(match report.error_message.take() {
-                    Some(existing) => {
-                        format!("{existing}; tool-surface attestation cleanup: {detail}")
-                    }
-                    None => detail,
-                });
-            }
-        }
         report
     }
 
@@ -2195,17 +1841,6 @@ impl SessionLifecycleState {
             if job_handle_dropped {
                 report.job_close_attempted = report.job_close_attempted.saturating_add(1);
             }
-            let terminal_capture_pending =
-                resource.terminal_history_key.as_deref().is_some_and(|key| {
-                    !matches!(self.process_terminal_history_final_status(key), Ok(Some(_)))
-                });
-            if (!remaining_after_natural_wait.is_empty() || terminal_capture_pending)
-                && let Some(control) = resource.terminal_capture_control.as_ref()
-                && let Err(error) = control.mark_termination_cause("session_cleanup_forced")
-            {
-                completion_artifact_cleanup_error = Some(error);
-                synapse_action::record_operator_panic_safety_incident();
-            }
             drop(resource.process_job.take());
             let (after_job_drop, _waited_ms) =
                 m4::wait_for_owned_process_tree_exit(&process_ids, PROCESS_JOB_CLOSE_WAIT);
@@ -2264,22 +1899,6 @@ impl SessionLifecycleState {
                     ),
                 }
             }
-            let cdp_owned_before = resource.cdp_resource.is_some();
-            let cdp_cleanup = if remaining.is_empty() {
-                resource
-                    .cdp_resource
-                    .take()
-                    .map(m4::cleanup_launched_cdp_resource)
-            } else {
-                None
-            };
-            let cdp_cleanup_succeeded = if cdp_owned_before {
-                cdp_cleanup
-                    .as_ref()
-                    .is_some_and(|readback| !readback.failed)
-            } else {
-                true
-            };
             let desktop_close = resource
                 .desktop_lease
                 .take()
@@ -2304,7 +1923,7 @@ impl SessionLifecycleState {
                 remaining.sort_unstable();
                 remaining.dedup();
             }
-            if remaining.is_empty() && desktop_cleanup_succeeded && cdp_cleanup_succeeded {
+            if remaining.is_empty() && desktop_cleanup_succeeded {
                 report.terminated = report.terminated.saturating_add(1);
             } else {
                 report.failed = report.failed.saturating_add(1);
@@ -2338,7 +1957,6 @@ impl SessionLifecycleState {
                 desktop_window_termination_status,
                 desktop_window_process_ids_after,
                 remaining_process_ids_after: remaining,
-                cdp_cleanup,
             });
         }
         report
@@ -2434,7 +2052,6 @@ impl SessionLifecycleState {
         &self,
         session_id: &str,
         reason: &str,
-        processes: &SessionProcessCleanupReport,
     ) -> SessionRegistryCleanupReport {
         let transitioned = match self.session_registry.lock() {
             Ok(mut registry) => {
@@ -2458,12 +2075,9 @@ impl SessionLifecycleState {
             error_message: None,
         };
         if transitioned {
-            // Terminal lifecycle fact: journal it durably (#897). For spawned
-            // agents the process cleanup report includes the exact spawn
-            // completion artifact, so the event must carry that spawn id and
-            // end state instead of degrading the outcome to a session-only
-            // indeterminate exit.
-            match self.journal_session_exited_event(session_id, reason, processes) {
+            // Terminal lifecycle fact: journal it durably (#897). The agent's
+            // task outcome is unknown to teardown, hence `indeterminate`.
+            match self.journal_session_exited_event(session_id, reason) {
                 Ok(()) => report.journal_event_written = true,
                 Err(error) => {
                     report.failed = true;
@@ -2474,12 +2088,7 @@ impl SessionLifecycleState {
         report
     }
 
-    fn journal_session_exited_event(
-        &self,
-        session_id: &str,
-        reason: &str,
-        processes: &SessionProcessCleanupReport,
-    ) -> Result<(), String> {
+    fn journal_session_exited_event(&self, session_id: &str, reason: &str) -> Result<(), String> {
         let db = session_store_db(&self.m3_state)?;
         let mut record = synapse_core::AgentEventRecord::new(
             super::agent_events::unix_time_ns_now(),
@@ -2487,19 +2096,8 @@ impl SessionLifecycleState {
         );
         record.session_id = Some(session_id.to_owned());
         record.reason_code = Some(reason.to_owned());
+        record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
         record.attributes.conversation_id = Some(session_id.to_owned());
-        if let Some(spawn_exit) = spawned_agent_exit_attribution(processes) {
-            record.spawn_id = Some(spawn_exit.spawn_id.clone());
-            record.end_state = Some(spawn_exit.end_state());
-            if let Some(agent_cli) = spawn_exit.agent_cli.as_deref() {
-                record.attributes.agent_name = Some(agent_cli.to_owned());
-                record.attributes.provider_name =
-                    super::agent_events::provider_for_agent_kind(agent_cli);
-            }
-            record.payload = spawn_exit.payload();
-        } else {
-            record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
-        }
         super::agent_events::record_agent_event_durable(&db, &record)
             .map(|_readback| ())
             .map_err(|error| format!("journal session exited event: {error}"))
@@ -2609,21 +2207,6 @@ async fn cleanup_session_cdp_targets(
         ..SessionCdpCleanupReport::default()
     };
     for (owner_key, owner) in owned {
-        // #1801: an operator-panic-refused close is deterministically refused
-        // until panic clears, so probing it every 250 ms produced ~30.4k
-        // ERROR/day carrying no new information. Defer the attempt while its
-        // backoff is live. This never changes the disposition: the owner row is
-        // retained exactly as before and teardown still reports failure.
-        let backoff_key = operator_panic_backoff_key(session_id, &owner_key, &owner.cdp_target_id);
-        if let Some(remaining) = operator_panic_close_deferred(&backoff_key) {
-            report.failed = report.failed.saturating_add(1);
-            report.operator_panic_deferred = report.operator_panic_deferred.saturating_add(1);
-            report.error_messages.push(format!(
-                "CDP close deferred by operator-panic backoff for {}ms; owner row retained (fail-closed)",
-                remaining.as_millis()
-            ));
-            continue;
-        }
         match close_cdp_target_for_cleanup(&owner.cdp_target_id, &owner).await {
             Ok(close_outcome) => {
                 match super::session_continuity::delete_persisted_cdp_target_owner_row(
@@ -2662,24 +2245,6 @@ async fn cleanup_session_cdp_targets(
                     CdpCleanupCloseOutcome::EndpointUnreachable => {
                         report.endpoint_unreachable = report.endpoint_unreachable.saturating_add(1);
                     }
-                    CdpCleanupCloseOutcome::StalePriorSessionOwnerReclaimed => {
-                        report.stale_prior_session_owner_reclaimed =
-                            report.stale_prior_session_owner_reclaimed.saturating_add(1);
-                    }
-                }
-                // Resolved: drop any operator-panic backoff and record the
-                // transition out of refusal with its exact cost (#1801).
-                if let Some((refusals, elapsed)) = clear_operator_panic_close_backoff(&backoff_key)
-                {
-                    tracing::info!(
-                        code = "MCP_SESSION_CDP_OPERATOR_PANIC_REFUSAL_RESOLVED",
-                        session_id,
-                        cdp_target_id = %owner.cdp_target_id,
-                        close_outcome = close_outcome.as_str(),
-                        total_refusals = refusals,
-                        refused_for_ms = elapsed.as_millis() as u64,
-                        "CDP close succeeded after operator-panic mutation admission was restored"
-                    );
                 }
                 tracing::info!(
                     code = "MCP_SESSION_CDP_TARGET_CLEANUP",
@@ -2694,55 +2259,15 @@ async fn cleanup_session_cdp_targets(
             Err(detail) => {
                 report.failed = report.failed.saturating_add(1);
                 report.error_messages.push(detail.clone());
-                #[cfg(windows)]
-                let panic_refused = chrome_bridge_close_refused_by_operator_panic(&detail);
-                #[cfg(not(windows))]
-                let panic_refused = false;
-                if panic_refused {
-                    // Fail-closed disposition is unchanged: the tab may still be
-                    // open, the owner row is retained, and teardown reports
-                    // failure. Only the LOG is transition-based (#1801).
-                    report.operator_panic_refused = report.operator_panic_refused.saturating_add(1);
-                    let (should_log, refusals, suppressed, elapsed) =
-                        note_operator_panic_close_refusal(&backoff_key);
-                    if should_log {
-                        tracing::error!(
-                            code = error_codes::A11Y_CDP_AXTREE_FAILED,
-                            session_id,
-                            hwnd = owner.window_hwnd,
-                            endpoint = %owner.endpoint,
-                            cdp_target_id = %owner.cdp_target_id,
-                            refusal_kind = "operator_panic_mutation_admission_disabled",
-                            consecutive_refusals = refusals,
-                            suppressed_since_last_log = suppressed,
-                            refused_for_ms = elapsed.as_millis() as u64,
-                            detail = %detail,
-                            "session lifecycle could not close CDP target: operator panic has mutation admission disabled; owner row retained (fail-closed) and retried with backoff until panic clears"
-                        );
-                    }
-                } else {
-                    if let Some((refusals, elapsed)) =
-                        clear_operator_panic_close_backoff(&backoff_key)
-                    {
-                        tracing::info!(
-                            code = "MCP_SESSION_CDP_OPERATOR_PANIC_REFUSAL_CHANGED",
-                            session_id,
-                            cdp_target_id = %owner.cdp_target_id,
-                            prior_consecutive_refusals = refusals,
-                            refused_for_ms = elapsed.as_millis() as u64,
-                            "CDP close stopped being refused by operator panic and now fails for a different reason"
-                        );
-                    }
-                    tracing::error!(
-                        code = error_codes::A11Y_CDP_AXTREE_FAILED,
-                        session_id,
-                        hwnd = owner.window_hwnd,
-                        endpoint = %owner.endpoint,
-                        cdp_target_id = %owner.cdp_target_id,
-                        detail = %detail,
-                        "session lifecycle removed CDP owner but failed to close target"
-                    );
-                }
+                tracing::error!(
+                    code = error_codes::A11Y_CDP_AXTREE_FAILED,
+                    session_id,
+                    hwnd = owner.window_hwnd,
+                    endpoint = %owner.endpoint,
+                    cdp_target_id = %owner.cdp_target_id,
+                    detail = %detail,
+                    "session lifecycle removed CDP owner but failed to close target"
+                );
             }
         }
     }
@@ -2763,13 +2288,6 @@ enum CdpCleanupCloseOutcome {
     Closed,
     AlreadyAbsent,
     EndpointUnreachable,
-    /// The bridge refused the close because the persisted owner belongs to a
-    /// *prior* Chrome browser session (`browser_session_continuity_matched=false`
-    /// / "durable owners belong to a prior browser session"). Chrome tab ids are
-    /// not stable across browser restarts, so this tab id can never be closed by
-    /// any future retry — the owner row is reclaimed as terminally unclosable
-    /// instead of re-failing the 250 ms stale sweep forever.
-    StalePriorSessionOwnerReclaimed,
 }
 
 impl CdpCleanupCloseOutcome {
@@ -2778,7 +2296,6 @@ impl CdpCleanupCloseOutcome {
             Self::Closed => "closed",
             Self::AlreadyAbsent => "already_absent",
             Self::EndpointUnreachable => "endpoint_unreachable",
-            Self::StalePriorSessionOwnerReclaimed => "stale_prior_session_owner_reclaimed",
         }
     }
 }
@@ -2810,30 +2327,10 @@ async fn close_cdp_target_for_cleanup(
     if is_chrome_bridge_endpoint(&owner.endpoint) {
         return crate::chrome_debugger_bridge::close_tab(owner.window_hwnd, target_id)
             .await
-            .map(|closed| {
-                if closed.already_absent {
-                    CdpCleanupCloseOutcome::AlreadyAbsent
-                } else {
-                    CdpCleanupCloseOutcome::Closed
-                }
-            })
+            .map(|_closed| CdpCleanupCloseOutcome::Closed)
             .or_else(|error| {
-                if chrome_bridge_close_target_already_absent(error.code()) {
+                if chrome_bridge_close_target_already_absent(error.detail(), target_id) {
                     Ok(CdpCleanupCloseOutcome::AlreadyAbsent)
-                } else if chrome_bridge_close_refused_for_stale_prior_browser_session(
-                    error.detail(),
-                ) {
-                    tracing::warn!(
-                        code = "MCP_SESSION_CDP_STALE_PRIOR_SESSION_OWNER_RECLAIMED",
-                        hwnd = owner.window_hwnd,
-                        endpoint = %owner.endpoint,
-                        cdp_target_id = %owner.cdp_target_id,
-                        detail = %error.detail(),
-                        "session lifecycle reclaimed persisted CDP owner row whose tab id \
-                         belongs to a dead prior Chrome browser session; the bridge \
-                         mutation gate proves it can never be closed by retrying"
-                    );
-                    Ok(CdpCleanupCloseOutcome::StalePriorSessionOwnerReclaimed)
                 } else {
                     Err(error.detail().to_owned())
                 }
@@ -2864,233 +2361,11 @@ fn is_chrome_bridge_endpoint(endpoint: &str) -> bool {
         && (endpoint.ends_with("/chrome.tabs") || endpoint.ends_with("/chrome.debugger"))
 }
 
-/// A CDP target absent from the extension's authoritative `chrome.tabs.query`
-/// read is already in the desired closed state. Classify only the trusted
-/// machine-readable code: Chrome runtime prose is unstable and must never
-/// decide whether a persisted owner row is deleted.
 #[cfg(windows)]
-fn chrome_bridge_close_target_already_absent(code: &str) -> bool {
-    code == error_codes::CHROME_TAB_TARGET_ABSENT
-}
-
-/// Recognises the extension's operator-panic mutation-admission refusal (#1801).
-///
-/// This refusal is a GENUINE fail-closed retention: operator panic disabled
-/// mutation admission, the tab may well still be open, and the owner row must
-/// be kept so teardown is retried once panic clears. It is deliberately NOT a
-/// terminal outcome and is never reclassified as success. It is recognised only
-/// so the sweep can stop hammering an action whose precondition is currently
-/// unsatisfiable, and stop logging an expected steady state at ERROR cadence.
-///
-/// The stale-prior-browser-session variant carries its own continuity markers
-/// and is classified terminal elsewhere, so exclude it here.
-#[cfg(windows)]
-fn chrome_bridge_close_refused_by_operator_panic(detail: &str) -> bool {
-    detail.contains("refusing closeTab")
-        && detail.contains("operator panic disabled extension mutation admission")
-        && !chrome_bridge_close_refused_for_stale_prior_browser_session(detail)
-}
-
-/// Consecutive failed teardown attempts per session id, with the last time each
-/// was observed so abandoned entries can be dropped (#1801).
-///
-/// An entry is inserted only for a session actively failing teardown and removed
-/// on its first success. A session that stops being retried (its owner rows were
-/// deleted, or the daemon stopped sweeping it) never reaches that success path,
-/// so stale entries are pruned by age once the map is large enough for growth to
-/// matter.
-static TEARDOWN_FAILURE_STREAKS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<String, (u64, Instant)>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-
-/// A session whose teardown has not been retried for this long is not being
-/// swept any more; its streak entry is unreachable bookkeeping.
-const TEARDOWN_FAILURE_STREAK_TTL: Duration = Duration::from_hours(1);
-/// Only prune once the map is large enough for growth to matter.
-const TEARDOWN_FAILURE_STREAK_PRUNE_THRESHOLD: usize = 64;
-
-/// Records one failed teardown for `session_id` and returns the streak length.
-///
-/// A poisoned lock returns 1 (log at ERROR). Losing visibility of a fail-closed
-/// teardown failure is the one outcome worth extra noise.
-fn note_teardown_failure_streak(session_id: &str) -> u64 {
-    let Ok(mut guard) = TEARDOWN_FAILURE_STREAKS.lock() else {
-        return 1;
-    };
-    let now = Instant::now();
-    if guard.len() > TEARDOWN_FAILURE_STREAK_PRUNE_THRESHOLD {
-        guard.retain(|_id, (_streak, last_seen)| {
-            now.saturating_duration_since(*last_seen) < TEARDOWN_FAILURE_STREAK_TTL
-        });
-    }
-    let entry = guard.entry(session_id.to_owned()).or_insert((0, now));
-    entry.0 = entry.0.saturating_add(1);
-    entry.1 = now;
-    entry.0
-}
-
-/// Clears the streak once this session tears down cleanly, so a later failure
-/// on the same id reports as a fresh transition at ERROR.
-fn clear_teardown_failure_streak(session_id: &str) {
-    if let Ok(mut guard) = TEARDOWN_FAILURE_STREAKS.lock() {
-        guard.remove(session_id);
-    }
-}
-
-/// Per-target state for an operator-panic-blocked CDP close (#1801).
-///
-/// The 250 ms stale-session sweep previously re-attempted a deterministically
-/// refused close on every tick and logged each refusal at ERROR (~30.4k/day on
-/// 2026-07-23). Both halves were wrong for the same reason: the refusal is a
-/// function of a global operator-panic condition that cannot change between
-/// ticks, so neither the attempt nor the log carried new information.
-///
-/// The fix is to report state TRANSITIONS and to back off between probes, while
-/// keeping the refusal fully visible: the first refusal still logs at ERROR, a
-/// periodic roll-up keeps the condition and its exact duration/attempt counts
-/// observable, and clearing logs an explicit resolution.
-#[derive(Debug)]
-struct OperatorPanicCloseBackoff {
-    first_refused_at: Instant,
-    refusals: u64,
-    suppressed_since_last_log: u64,
-    last_logged_at: Instant,
-    next_attempt_at: Instant,
-    backoff: Duration,
-}
-
-/// First retry delay after an operator-panic refusal. Equal to one sweep tick,
-/// so the very next tick still probes once before backing off.
-const OPERATOR_PANIC_CLOSE_BACKOFF_MIN: Duration = Duration::from_millis(250);
-/// Ceiling on the retry delay. Panic clears are operator-driven and rare, so a
-/// bounded 30 s probe keeps recovery prompt without a per-tick storm.
-const OPERATOR_PANIC_CLOSE_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// How often a still-refusing target re-logs, as a roll-up carrying the exact
-/// suppressed count and elapsed duration.
-const OPERATOR_PANIC_CLOSE_ROLLUP_INTERVAL: Duration = Duration::from_mins(5);
-/// An entry whose next probe was due this long ago has not been refused since,
-/// so its target is gone (session torn down, owner row deleted) and the entry is
-/// unreachable bookkeeping. Without this the map would grow without bound across
-/// a long-lived daemon's sessions.
-const OPERATOR_PANIC_CLOSE_ENTRY_TTL: Duration = Duration::from_hours(1);
-/// Only sweep once the map is large enough for growth to matter, so the common
-/// case stays a single hash lookup.
-const OPERATOR_PANIC_CLOSE_PRUNE_THRESHOLD: usize = 64;
-
-static OPERATOR_PANIC_CLOSE_BACKOFFS: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<String, OperatorPanicCloseBackoff>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-
-fn operator_panic_backoff_key(session_id: &str, owner_key: &str, target_id: &str) -> String {
-    format!("{session_id}|{owner_key}|{target_id}")
-}
-
-/// Whether this target's close attempt is currently deferred by backoff.
-///
-/// A poisoned lock returns `false` (attempt anyway): degrading to the old
-/// always-attempt behaviour is correct, because skipping a close on the basis
-/// of unreadable state would be the one outcome that could strand a tab.
-fn operator_panic_close_deferred(key: &str) -> Option<Duration> {
-    let guard = OPERATOR_PANIC_CLOSE_BACKOFFS.lock().ok()?;
-    let entry = guard.get(key)?;
-    let now = Instant::now();
-    (entry.next_attempt_at > now).then(|| entry.next_attempt_at.duration_since(now))
-}
-
-/// Records one operator-panic refusal and returns whether the caller should log
-/// it, plus the roll-up counters when it should.
-fn note_operator_panic_close_refusal(key: &str) -> (bool, u64, u64, Duration) {
-    let now = Instant::now();
-    let Ok(mut guard) = OPERATOR_PANIC_CLOSE_BACKOFFS.lock() else {
-        // Unreadable state: log it. Never silently drop a fail-closed refusal.
-        return (true, 1, 0, Duration::ZERO);
-    };
-    // Drop entries for targets that stopped being refused entirely — their
-    // session ended or their owner row was deleted, so nothing will ever clear
-    // them through the normal success/other-error paths. Swept here rather than
-    // in the per-sweep deferral check so the hot path stays a lookup.
-    if guard.len() > OPERATOR_PANIC_CLOSE_PRUNE_THRESHOLD {
-        let before = guard.len();
-        guard.retain(|_key, entry| {
-            now.saturating_duration_since(entry.next_attempt_at) < OPERATOR_PANIC_CLOSE_ENTRY_TTL
-        });
-        let pruned = before.saturating_sub(guard.len());
-        if pruned > 0 {
-            tracing::debug!(
-                code = "MCP_SESSION_CDP_OPERATOR_PANIC_BACKOFF_PRUNED",
-                pruned,
-                retained = guard.len(),
-                "dropped operator-panic CDP backoff entries whose targets stopped being refused"
-            );
-        }
-    }
-    match guard.get_mut(key) {
-        None => {
-            guard.insert(
-                key.to_owned(),
-                OperatorPanicCloseBackoff {
-                    first_refused_at: now,
-                    refusals: 1,
-                    suppressed_since_last_log: 0,
-                    last_logged_at: now,
-                    next_attempt_at: now + OPERATOR_PANIC_CLOSE_BACKOFF_MIN,
-                    backoff: OPERATOR_PANIC_CLOSE_BACKOFF_MIN,
-                },
-            );
-            (true, 1, 0, Duration::ZERO)
-        }
-        Some(entry) => {
-            entry.refusals = entry.refusals.saturating_add(1);
-            entry.backoff = (entry.backoff * 2).min(OPERATOR_PANIC_CLOSE_BACKOFF_MAX);
-            entry.next_attempt_at = now + entry.backoff;
-            if now.duration_since(entry.last_logged_at) >= OPERATOR_PANIC_CLOSE_ROLLUP_INTERVAL {
-                let suppressed = entry.suppressed_since_last_log;
-                entry.suppressed_since_last_log = 0;
-                entry.last_logged_at = now;
-                (
-                    true,
-                    entry.refusals,
-                    suppressed,
-                    now.duration_since(entry.first_refused_at),
-                )
-            } else {
-                entry.suppressed_since_last_log = entry.suppressed_since_last_log.saturating_add(1);
-                (
-                    false,
-                    entry.refusals,
-                    entry.suppressed_since_last_log,
-                    now.duration_since(entry.first_refused_at),
-                )
-            }
-        }
-    }
-}
-
-/// Clears backoff state once this target stops being panic-refused, returning
-/// the total refusal count and elapsed duration for an explicit resolution log.
-fn clear_operator_panic_close_backoff(key: &str) -> Option<(u64, Duration)> {
-    let mut guard = OPERATOR_PANIC_CLOSE_BACKOFFS.lock().ok()?;
-    let entry = guard.remove(key)?;
-    Some((entry.refusals, entry.first_refused_at.elapsed()))
-}
-
-/// Terminal-refusal classifier for the 2026-07-23 session-leak livelock: the
-/// bridge refuses `closeTab` because its durable owner ledger belongs to a
-/// *prior* Chrome browser session (a worker restart stranded an in-flight
-/// mutation the stale-owner repair structurally cannot clear, so the mutation
-/// gate stays closed). Chrome tab ids are meaningless across browser restarts,
-/// therefore no retry can ever close this tab id — retaining the persisted
-/// owner row only re-fails teardown every 250 ms forever (the exact
-/// `MCP_SESSION_TEARDOWN_FAILED` → `TOOL_INTERNAL_ERROR` storm observed at
-/// `active_session_count=12`). Both markers are emitted by the bridge's
-/// storage-state readback inside the refusal detail; require the refusal
-/// itself plus at least one continuity proof so a live-tab operator-panic
-/// refusal (no continuity mismatch) stays fail-closed.
-#[cfg(windows)]
-fn chrome_bridge_close_refused_for_stale_prior_browser_session(detail: &str) -> bool {
-    detail.contains("refusing closeTab")
-        && (detail.contains("durable owners belong to a prior browser session")
-            || detail.contains("browser_session_continuity_matched=false"))
+fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
+    detail.contains("targetIdHint")
+        && detail.contains(target_id)
+        && detail.contains("did not match any chrome.tabs tab id")
 }
 
 #[cfg(not(windows))]
@@ -3148,6 +2423,12 @@ fn spawned_agent_probe_pids(read: &super::session_registry::SessionRegistryRead)
         pids.push(spawned_agent.launcher_process_id);
     }
     pids
+}
+
+#[cfg(test)]
+fn spawned_agent_process_exited(read: &super::session_registry::SessionRegistryRead) -> bool {
+    let pids = spawned_agent_probe_pids(read);
+    !pids.is_empty() && pids.iter().all(|pid| !m4::process_exists(*pid))
 }
 
 /// Partitions spawned-agent registry sessions by a real liveness probe (#1238).
@@ -3247,93 +2528,6 @@ fn persisted_cdp_target_owner_readbacks_for_session(
     Ok(owners)
 }
 
-/// #1800: run one synchronous daemon-shutdown step on the dedicated blocking
-/// pool instead of inline on an async runtime worker.
-///
-/// Every Calyx/RocksDB and OS-probe call reached from the daemon-shutdown
-/// session cleanup is synchronous. Polled inline, such a step never returns
-/// `Poll::Pending`, so the task owning it never yields — and a
-/// `tokio::time::timeout` wrapped around that task is unenforceable, because
-/// the timer future is only polled by the very task the step has frozen.
-///
-/// Physical evidence: on 2026-07-25 the shutdown driver thread (`threadName:
-/// main`) emitted `AUTHORITY_TRANSACTIONS_DRAINED` at `10:21:38.580732Z` and
-/// then produced no log line at all until `MCP_SESSION_LEASE_CONTINUITY_DELETED`
-/// at `10:21:54.058883Z` — 15.4 s frozen inside a nominal 5 s per-session
-/// deadline, resuming 63 ms after a background
-/// `CALYX_ASTER_MANIFEST_GENERATIONS_RECLAIMED` pass released the storage lock
-/// on a `tokio-rt-worker`. On 2026-07-23 the same stall, multiplied by 54
-/// abandoned HTTP sessions, carried the shutdown past the installer's 60 s
-/// budget and into the 90 s `MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED` kill.
-///
-/// Admitting the step to the blocking pool (the same doctrine the storage
-/// maintenance path already logs as `STORAGE_MAINTENANCE_ADMITTED`) turns the
-/// surrounding `.await` into a real yield point, so every deadline stacked
-/// above it becomes physically enforceable and one wedged storage lock can no
-/// longer freeze the shutdown driver.
-///
-/// Fails closed: a panicking or cancelled blocking step is reported as an
-/// unproven step, never as success.
-async fn admit_shutdown_storage_step<T, F>(
-    session_id: &str,
-    step: &'static str,
-    work: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let started = Instant::now();
-    let owned_session_id = session_id.to_owned();
-    match tokio::task::spawn_blocking(move || {
-        tracing::info!(
-            code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED",
-            session_id = owned_session_id,
-            step,
-            execution_context = "tokio_spawn_blocking_closure",
-            "admitted a daemon-shutdown session step onto the dedicated blocking pool off the async runtime workers"
-        );
-        let value = work();
-        tracing::info!(
-            code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_COMPLETED",
-            session_id = owned_session_id,
-            step,
-            execution_context = "tokio_spawn_blocking_closure",
-            elapsed_ms = duration_millis_u64(started.elapsed()),
-            "completed a daemon-shutdown session step on the dedicated blocking pool"
-        );
-        value
-    })
-    .await
-    {
-        Ok(value) => {
-            tracing::debug!(
-                code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_JOINED",
-                session_id,
-                step,
-                elapsed_ms = duration_millis_u64(started.elapsed()),
-                "joined a completed daemon-shutdown session step from the blocking pool"
-            );
-            Ok(value)
-        }
-        Err(error) => {
-            let detail = format!(
-                "daemon-shutdown session step '{step}' for session {session_id} did not complete on the blocking pool after {} ms: {error}; the step's effect on storage is UNPROVEN. remediation=search synapse.log for code=MCP_SESSION_SHUTDOWN_STORAGE_STEP_FAILED with this session_id/step, fix the panic it names, then re-run the shutdown; lifetime locks are retained until it is proven",
-                duration_millis_u64(started.elapsed())
-            );
-            tracing::error!(
-                code = error_codes::TOOL_INTERNAL_ERROR,
-                detail_code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_FAILED",
-                session_id,
-                step,
-                detail,
-                "daemon-shutdown session step could not be proven complete on the blocking pool"
-            );
-            Err(detail)
-        }
-    }
-}
-
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -3361,138 +2555,6 @@ fn cleanup_observed_ok_completion(processes: &SessionProcessCleanupReport) -> bo
     })
 }
 
-#[derive(Clone, Debug)]
-struct SpawnExitAttribution {
-    spawn_id: String,
-    agent_cli: Option<String>,
-    completion_status_path: Option<String>,
-    completion_status: Option<String>,
-    completion_status_read_error: Option<String>,
-    exit_code: Option<i64>,
-    error_message: Option<String>,
-    final_message_bytes: Option<u64>,
-    fallback_final_message_written: Option<bool>,
-}
-
-impl SpawnExitAttribution {
-    fn end_state(&self) -> synapse_core::AgentEndState {
-        match (self.completion_status.as_deref(), self.exit_code) {
-            (Some("ok"), Some(0) | None) => synapse_core::AgentEndState::Success,
-            (Some("running") | None, _) => synapse_core::AgentEndState::Indeterminate,
-            (Some("ok"), Some(_)) => synapse_core::AgentEndState::Error,
-            (Some(_), _) => synapse_core::AgentEndState::Error,
-        }
-    }
-
-    fn payload(&self) -> serde_json::Value {
-        json!({
-            "source_of_truth": "session process cleanup report + agent spawn completion-status.json",
-            "completion_status_path": self.completion_status_path,
-            "completion_status": self.completion_status,
-            "completion_status_read_error": self.completion_status_read_error,
-            "exit_code": self.exit_code,
-            "error_message": self.error_message,
-            "final_message_bytes": self.final_message_bytes,
-            "fallback_final_message_written": self.fallback_final_message_written,
-        })
-    }
-}
-
-fn spawned_agent_exit_attribution(
-    processes: &SessionProcessCleanupReport,
-) -> Option<SpawnExitAttribution> {
-    let item = processes.items.iter().find(|item| {
-        item.tool == ACT_SPAWN_AGENT_TOOL_NAME
-            && item
-                .resource_id
-                .as_deref()
-                .is_some_and(|spawn_id| spawn_id.starts_with("agent-spawn-"))
-    })?;
-    let mut read = item
-        .completion_status_path
-        .as_deref()
-        .map(read_spawn_completion_for_exit)
-        .unwrap_or_else(|| SpawnCompletionRead {
-            status: item.completion_status_before_cleanup.clone(),
-            read_error: Some(
-                "session process cleanup item had no completion_status_path".to_owned(),
-            ),
-            ..SpawnCompletionRead::default()
-        });
-    if read.status.is_none() {
-        read.status
-            .clone_from(&item.completion_status_before_cleanup);
-    }
-    Some(SpawnExitAttribution {
-        spawn_id: item.resource_id.clone()?,
-        agent_cli: item.agent_cli.clone(),
-        completion_status_path: item.completion_status_path.clone(),
-        completion_status: read.status,
-        completion_status_read_error: read.read_error,
-        exit_code: read.exit_code,
-        error_message: read.error_message,
-        final_message_bytes: read.final_message_bytes,
-        fallback_final_message_written: read.fallback_final_message_written,
-    })
-}
-
-#[derive(Clone, Debug, Default)]
-struct SpawnCompletionRead {
-    status: Option<String>,
-    read_error: Option<String>,
-    exit_code: Option<i64>,
-    error_message: Option<String>,
-    final_message_bytes: Option<u64>,
-    fallback_final_message_written: Option<bool>,
-}
-
-fn read_spawn_completion_for_exit(path: &str) -> SpawnCompletionRead {
-    let path = Path::new(path);
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return SpawnCompletionRead {
-                read_error: Some(format!(
-                    "read completion-status.json at {}: {error}",
-                    path.display()
-                )),
-                ..SpawnCompletionRead::default()
-            };
-        }
-    };
-    let status = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(status) => status,
-        Err(error) => {
-            return SpawnCompletionRead {
-                read_error: Some(format!(
-                    "parse completion-status.json at {}: {error}",
-                    path.display()
-                )),
-                ..SpawnCompletionRead::default()
-            };
-        }
-    };
-    SpawnCompletionRead {
-        status: status
-            .get("status")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
-        read_error: None,
-        exit_code: status.get("exit_code").and_then(|value| value.as_i64()),
-        error_message: status
-            .get("error_message")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.chars().take(512).collect::<String>()),
-        final_message_bytes: status
-            .get("final_message_bytes")
-            .and_then(|value| value.as_u64()),
-        fallback_final_message_written: status
-            .get("fallback_final_message_written")
-            .and_then(|value| value.as_bool()),
-    }
-}
-
 fn spawned_agent_completion_status(log_dir: &str) -> Option<String> {
     completion_status_from_file(&Path::new(log_dir).join("completion-status.json"))
 }
@@ -3516,9 +2578,12 @@ fn session_store_db(m3_state: &SharedM3State) -> Result<Arc<Db>, String> {
 }
 
 fn session_store_row_exists(db: &Db, key: &[u8]) -> Result<bool, String> {
-    db.get_cf(cf::CF_KV, key)
+    db.scan_cf_prefix(cf::CF_KV, key)
         .map_err(|error| error.to_string())
-        .map(|value| value.is_some())
+        .map(|rows| {
+            rows.into_iter()
+                .any(|(row_key, _value)| row_key.as_slice() == key)
+        })
 }
 
 fn validate_lifecycle_session_id(session_id: &str) -> Result<(), ErrorData> {
@@ -3555,4 +2620,541 @@ fn session_teardown_error(report: SessionTeardownReport) -> ErrorData {
             "report": report,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        num::NonZeroUsize,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::server::session_registry::{SessionRegistryRead, SpawnedAgentRead};
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+
+    use super::*;
+
+    fn service_with_temp_db(path: &Path) -> anyhow::Result<SynapseService> {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+    }
+
+    fn spawned_read(
+        session_id: &str,
+        agent_process_id: Option<u32>,
+        launcher_process_id: u32,
+        closed: bool,
+    ) -> SessionRegistryRead {
+        SessionRegistryRead {
+            session_id: session_id.to_owned(),
+            transport: "http".to_owned(),
+            client_name: Some("claude-code".to_owned()),
+            client_version: Some("test".to_owned()),
+            protocol_version: Some("test".to_owned()),
+            agent_kind: "claude".to_owned(),
+            lifecycle: if closed { "closed" } else { "live" }.to_owned(),
+            started_at_unix_ms: 1_000,
+            last_seen_unix_ms: 1_000,
+            last_seen_ms_ago: 0,
+            stale_after_ms: 300_000,
+            closed_at_unix_ms: closed.then_some(1_100),
+            last_action: Some("tools/call:act_launch".to_owned()),
+            last_reason_code: None,
+            spawned_agent: Some(SpawnedAgentRead {
+                spawn_id: "spawn-test".to_owned(),
+                cli: "claude".to_owned(),
+                launcher_process_id,
+                agent_process_id,
+                started_by_session_id: Some("parent".to_owned()),
+                launched_at_unix_ms: 999,
+                launch_target: "pwsh.exe".to_owned(),
+                log_dir: r"C:\temp\spawn-test".to_owned(),
+                template_id: None,
+                template_version: None,
+                control: None,
+            }),
+        }
+    }
+
+    fn spawned_read_with_log_dir(session_id: &str, log_dir: &Path) -> SessionRegistryRead {
+        let mut read = spawned_read(session_id, Some(1234), 0, false);
+        read.spawned_agent.as_mut().expect("spawned agent").log_dir = log_dir.display().to_string();
+        read
+    }
+
+    fn exited_child_pid() -> u32 {
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new("cmd.exe");
+            command.args(["/C", "exit", "0"]);
+            command.creation_flags(0x0800_0000);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "true"]);
+            command
+        };
+        let mut child = command
+            .spawn()
+            .expect("short-lived child should spawn for process liveness regression");
+        let pid = child.id();
+        let status = child
+            .wait()
+            .expect("short-lived child should produce exit status");
+        assert!(status.success(), "short-lived child exited with {status}");
+        for _ in 0..50 {
+            if !m4::process_exists(pid) {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("short-lived child pid {pid} still appears live after exit");
+    }
+
+    #[test]
+    fn spawned_agent_live_process_is_not_exit_candidate() {
+        let read = spawned_read("live-session", Some(std::process::id()), 0, false);
+
+        assert!(!spawned_agent_process_exited(&read));
+    }
+
+    #[test]
+    fn spawned_agent_dead_process_is_exit_candidate() {
+        let dead_pid = exited_child_pid();
+        let read = spawned_read("dead-session", Some(dead_pid), 0, false);
+
+        assert!(spawned_agent_process_exited(&read));
+    }
+
+    #[test]
+    fn spawned_agent_closed_session_is_not_exit_candidate() {
+        let dead_pid = exited_child_pid();
+        let read = spawned_read("closed-session", Some(dead_pid), 0, true);
+
+        assert!(!spawned_agent_process_exited(&read));
+    }
+
+    // #1238: a spawned agent whose process is alive must be protected from
+    // idle-driven teardown. It is live no matter how long since its last
+    // MCP call. Injected `process_alive` makes the rule deterministic.
+    #[test]
+    fn live_spawned_process_is_protected_not_exited() {
+        let reads = vec![spawned_read("live", Some(1234), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| true);
+        assert!(live.contains("live"));
+        assert!(exited.is_empty());
+    }
+
+    #[test]
+    fn dead_spawned_process_is_exit_candidate_not_live() {
+        let reads = vec![spawned_read("dead", Some(1234), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+        assert!(live.is_empty());
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0].session_id, "dead");
+    }
+
+    #[test]
+    fn dead_agent_process_with_live_launcher_is_protected_until_completion_artifact() {
+        let reads = vec![spawned_read("launcher-live", Some(111), 222, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|pid| pid == 222);
+
+        assert!(
+            live.contains("launcher-live"),
+            "the launcher still writes final completion-status artifacts"
+        );
+        assert!(
+            exited.is_empty(),
+            "the inner agent pid alone going away is not a terminal verdict"
+        );
+    }
+
+    #[test]
+    fn dead_agent_and_launcher_processes_are_exit_candidate() {
+        let reads = vec![spawned_read("both-dead", Some(111), 222, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+
+        assert!(live.is_empty());
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0].session_id, "both-dead");
+    }
+
+    #[test]
+    fn live_spawned_session_ids_include_only_process_alive_spawns() {
+        let mut plain = spawned_read("plain", Some(111), 0, false);
+        plain.spawned_agent = None;
+        let reads = vec![
+            spawned_read("live-agent", Some(111), 0, false),
+            spawned_read("live-launcher", Some(222), 333, false),
+            spawned_read("dead", Some(444), 0, false),
+            spawned_read("closed", Some(555), 0, true),
+            plain,
+        ];
+
+        let live = live_spawned_session_ids(&reads, &|pid| pid == 111 || pid == 333);
+
+        assert_eq!(
+            live,
+            BTreeSet::from(["live-agent".to_owned(), "live-launcher".to_owned()])
+        );
+    }
+
+    #[test]
+    fn closed_spawned_session_is_neither_live_nor_exit() {
+        let reads = vec![spawned_read("closed", Some(1234), 0, true)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+        assert!(
+            live.is_empty(),
+            "a closed session has no running child to protect"
+        );
+        assert!(
+            exited.is_empty(),
+            "a closed session is already torn down; not a fresh reap candidate"
+        );
+    }
+
+    #[test]
+    fn non_spawn_session_is_ignored_by_partition() {
+        let mut read = spawned_read("plain", Some(1234), 0, false);
+        read.spawned_agent = None;
+        let reads = [read];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| true);
+        assert!(live.is_empty());
+        assert!(exited.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chrome_bridge_missing_tab_detail_is_already_absent_cleanup() {
+        assert!(chrome_bridge_close_target_already_absent(
+            "targetIdHint chrome-tab:600751161 did not match any chrome.tabs tab id",
+            "chrome-tab:600751161"
+        ));
+        assert!(!chrome_bridge_close_target_already_absent(
+            "targetIdHint chrome-tab:600751161 did not match any chrome.tabs tab id",
+            "chrome-tab:other"
+        ));
+    }
+
+    #[test]
+    fn cdp_cleanup_report_exposes_unreachable_endpoint_reclaims() {
+        let report = SessionCdpCleanupReport {
+            persisted_owned_before: 2,
+            endpoint_unreachable: 2,
+            persisted_rows_deleted: 2,
+            target_ids: vec!["dead-target-a".to_owned(), "dead-target-b".to_owned()],
+            ..SessionCdpCleanupReport::default()
+        };
+        let json = serde_json::to_value(report).expect("serialize report");
+
+        assert_eq!(json["endpoint_unreachable"], 2);
+        assert_eq!(json["persisted_rows_deleted"], 2);
+        assert_eq!(
+            CdpCleanupCloseOutcome::EndpointUnreachable.as_str(),
+            "endpoint_unreachable"
+        );
+    }
+
+    #[test]
+    fn restart_grace_defers_persisted_browser_continuity_stale_candidate() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service_with_temp_db(temp.path())?;
+        let session_id = "issue1443-restart-browser-session";
+        service.persist_session_target(
+            session_id,
+            &SessionTarget::Cdp {
+                window_hwnd: 0x1443,
+                cdp_target_id: "chrome-tab:1443".to_owned(),
+            },
+        )?;
+
+        let mut lifecycle = service.session_lifecycle_state()?;
+        let active_sessions = BTreeSet::new();
+        let candidates_during_grace = lifecycle.stale_session_candidates(&active_sessions);
+        assert!(
+            !candidates_during_grace.contains_key(session_id),
+            "persisted browser target must remain recoverable immediately after daemon restart"
+        );
+
+        lifecycle.started_at = Instant::now()
+            .checked_sub(DAEMON_RESTART_BROWSER_CONTINUITY_GRACE)
+            .and_then(|instant| instant.checked_sub(Duration::from_millis(1)))
+            .expect("restart grace test duration must fit in Instant range");
+        let candidates_after_grace = lifecycle.stale_session_candidates(&active_sessions);
+        assert_eq!(
+            candidates_after_grace.get(session_id),
+            Some(&HTTP_STALE_REASON),
+            "abandoned persisted browser target must become a normal cleanup candidate after grace"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_browser_continuity_report_preserves_cdp_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service_with_temp_db(temp.path())?;
+        let session_id = "issue1443-shutdown-browser-session";
+        let target_id = "chrome-tab:shutdown-1443";
+        service.persist_session_target(
+            session_id,
+            &SessionTarget::Cdp {
+                window_hwnd: 0x1443,
+                cdp_target_id: target_id.to_owned(),
+            },
+        )?;
+        service
+            .session_targets_ref()
+            .lock()
+            .expect("session target lock")
+            .insert(
+                session_id.to_owned(),
+                SessionTarget::Cdp {
+                    window_hwnd: 0x1443,
+                    cdp_target_id: target_id.to_owned(),
+                },
+            );
+        service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: session_id.to_owned(),
+            window_hwnd: 0x1443,
+            endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs".to_owned(),
+            chrome_window_id: Some(1443),
+            capture_window_hwnd: None,
+            cdp_target_id: target_id.to_owned(),
+            requested_url:
+                "https://example.invalid/issue1443?body=SYNAPSE_SECRET_1484#frag=SYNAPSE_HASH_1484"
+                    .to_owned(),
+            target_url:
+                "https://example.invalid/issue1443?body=SYNAPSE_SECRET_1484#frag=SYNAPSE_HASH_1484"
+                    .to_owned(),
+            created_at_unix_ms: 1_443,
+        })?;
+
+        let lifecycle = service.session_lifecycle_state()?;
+        let report = lifecycle.browser_continuity_for_daemon_shutdown(session_id);
+
+        assert!(matches!(
+            report.memory_target_before,
+            Some(SessionTargetShutdownReadback::Cdp { .. })
+        ));
+        assert!(matches!(
+            report.persisted_target_before,
+            Some(SessionTargetShutdownReadback::Cdp { .. })
+        ));
+        assert_eq!(report.memory_cdp_owner_count_before, 1);
+        assert_eq!(report.persisted_cdp_owner_count_before, 1);
+        assert_eq!(report.cdp_target_owners.len(), 1);
+        assert_eq!(
+            report.cdp_target_owners[0].requested_url,
+            "https://example.invalid/redacted?redacted#redacted"
+        );
+        assert_eq!(
+            report.cdp_target_owners[0].target_url,
+            "https://example.invalid/redacted?redacted#redacted"
+        );
+        assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_SECRET_1484"));
+        assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_HASH_1484"));
+        assert!(!report.tab_close_attempted);
+        assert!(!report.tab_close_succeeded);
+        assert!(report.recovery_action.contains("rebind"));
+        assert!(!report.failed);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_spawn_exit_uses_normal_terminal_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("completion-status.json"),
+            r#"{"status":"ok"}"#,
+        )
+        .expect("write completion status");
+        let read = spawned_read_with_log_dir("completed", temp.path());
+
+        assert_eq!(spawned_agent_exit_reason(&read), SPAWN_COMPLETED_REASON);
+    }
+
+    #[test]
+    fn failed_spawn_exit_stays_process_exited_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("completion-status.json"),
+            r#"{"status":"error"}"#,
+        )
+        .expect("write completion status");
+        let read = spawned_read_with_log_dir("failed", temp.path());
+
+        assert_eq!(
+            spawned_agent_exit_reason(&read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_completion_status_stays_process_exited_reason() {
+        let missing = tempfile::tempdir().expect("tempdir");
+        let missing_read = spawned_read_with_log_dir("missing", missing.path());
+        assert_eq!(
+            spawned_agent_exit_reason(&missing_read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+
+        let invalid = tempfile::tempdir().expect("tempdir");
+        fs::write(invalid.path().join("completion-status.json"), b"not-json")
+            .expect("write invalid status");
+        let invalid_read = spawned_read_with_log_dir("invalid", invalid.path());
+        assert_eq!(
+            spawned_agent_exit_reason(&invalid_read),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+    }
+
+    fn process_cleanup_with_completion_status_path(path: &Path) -> SessionProcessCleanupReport {
+        SessionProcessCleanupReport {
+            owned_before: 1,
+            terminated: 1,
+            items: vec![SessionProcessCleanupItem {
+                tool: ACT_SPAWN_AGENT_TOOL_NAME.to_owned(),
+                pid: 42,
+                resource_id: Some("agent-spawn-ut-reconcile".to_owned()),
+                launch_target: "codex".to_owned(),
+                agent_cli: Some("codex".to_owned()),
+                registered_at_unix_ms: 1_000,
+                process_ids_before: Vec::new(),
+                live_process_ids_before: Vec::new(),
+                job_handle_dropped: false,
+                natural_exit_wait_ms: 0,
+                force_termination_status: None,
+                completion_status_path: Some(path.display().to_string()),
+                completion_status_before_cleanup: None,
+                completion_artifact_cleanup_status: None,
+                completion_artifact_cleanup_error: None,
+                desktop_name: None,
+                desktop_close_attempted: false,
+                desktop_close_succeeded: None,
+                desktop_close_error: None,
+                desktop_window_process_ids_before: Vec::new(),
+                desktop_window_termination_attempted: false,
+                desktop_window_termination_status: None,
+                desktop_window_process_ids_after: Vec::new(),
+                remaining_process_ids_after: Vec::new(),
+            }],
+            ..SessionProcessCleanupReport::default()
+        }
+    }
+
+    #[test]
+    fn teardown_exit_reason_reconciles_after_cleanup_observes_ok_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let status_path = temp.path().join("completion-status.json");
+        fs::write(&status_path, r#"{"status":"ok"}"#).expect("write completion status");
+        let processes = process_cleanup_with_completion_status_path(&status_path);
+
+        assert_eq!(
+            reconciled_teardown_exit_reason(SPAWNED_AGENT_PROCESS_EXITED_REASON, &processes),
+            SPAWN_COMPLETED_REASON
+        );
+        assert_eq!(
+            reconciled_teardown_exit_reason(HTTP_STALE_REASON, &processes),
+            HTTP_STALE_REASON
+        );
+
+        fs::write(&status_path, r#"{"status":"error"}"#).expect("write error status");
+        let processes = process_cleanup_with_completion_status_path(&status_path);
+        assert_eq!(
+            reconciled_teardown_exit_reason(SPAWNED_AGENT_PROCESS_EXITED_REASON, &processes),
+            SPAWNED_AGENT_PROCESS_EXITED_REASON
+        );
+    }
+
+    // Regression evidence against the real OS process table (#1238): no
+    // injected probe. A genuinely-running spawned process, even with a long-
+    // stale `last_seen` (it made no MCP calls), is protected from teardown;
+    // once actually killed it flips to a reap candidate. This is the exact
+    // signal the fix relies on, proven against reality.
+    #[test]
+    fn real_live_process_protected_until_actually_killed() {
+        #[cfg(windows)]
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            // Spawn ping.exe DIRECTLY (not via cmd /C) so the pid we track is
+            // the process kill() terminates; no orphaned grandchild. Null the
+            // streams so the 60s child cannot spam the test harness.
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            command.stdout(std::process::Stdio::null());
+            command.stderr(std::process::Stdio::null());
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            command
+                .spawn()
+                .expect("long-lived child should spawn for liveness regression")
+        };
+        #[cfg(not(windows))]
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("long-lived child should spawn for liveness regression");
+
+        let pid = child.id();
+        assert!(
+            m4::process_exists(pid),
+            "freshly spawned child must be live in the OS process table"
+        );
+
+        // last_seen far in the past (id arg is unused for stale modelling here;
+        // the point is the probe, not the clock): the process is the truth.
+        let reads = vec![spawned_read("real-live", Some(pid), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|probe| m4::process_exists(probe));
+        assert!(
+            live.contains("real-live"),
+            "a live spawned process must be protected from idle teardown"
+        );
+        assert!(exited.is_empty(), "a live process is not a reap candidate");
+
+        child.kill().expect("kill the regression child");
+        let _ = child.wait();
+        for _ in 0..200 {
+            if !m4::process_exists(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !m4::process_exists(pid),
+            "child must be gone from the OS process table after kill"
+        );
+
+        let (live_after, exited_after) =
+            partition_spawned_sessions(&reads, &|probe| m4::process_exists(probe));
+        assert!(
+            live_after.is_empty(),
+            "a dead process must NOT be protected"
+        );
+        assert_eq!(exited_after.len(), 1, "a dead spawn is a reap candidate");
+        assert_eq!(exited_after[0].session_id, "real-live");
+    }
 }

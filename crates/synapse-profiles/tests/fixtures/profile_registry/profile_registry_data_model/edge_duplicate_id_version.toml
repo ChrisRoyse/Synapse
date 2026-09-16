@@ -1,0 +1,14 @@
+schema_version = 1
+kind = "registry_install_edge"
+case = "duplicate_id_version"
+existing_key = "profile_registry/v1/package/profile.synthetic.governance/0.1.0"
+incoming_key = "profile_registry/v1/package/profile.synthetic.governance/0.1.0"
+existing_manifest_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+incoming_manifest_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+
+[expected_policy]
+outcome = "reject"
+reason_code = "duplicate_package_version_conflict"
+cf_profiles_rows_added = 0
+cf_kv_rows_added = 0
+partial_install_allowed = false

@@ -32,9 +32,6 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$McpUrl,
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 1800000)]
-    [int]$ReadinessTimeoutMs,
     [string]$Model = "",
     [string]$NotifyScriptPath = "",
     [switch]$RequireApprovalGate
@@ -212,248 +209,19 @@ function Get-FreeTcpPort {
     }
 }
 
-function Get-TextTail([string]$Path, [int]$MaxChars = 4096) {
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $null
-    }
-    try {
-        $text = [string](Get-Content -Raw -LiteralPath $Path -Encoding UTF8)
-        if ($text.Length -le $MaxChars) {
-            return $text
-        }
-        return $text.Substring($text.Length - $MaxChars)
-    } catch {
-        return "SYNAPSE_CODEX_APP_SERVER_TAIL_READ_FAILED: $($_.Exception.Message)"
-    }
-}
-
-function Invoke-AppServerProbe([string]$Url) {
-    try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 1
-        return [pscustomobject]@{
-            ok = ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
-            status_code = [int]$response.StatusCode
-            error = $null
-        }
-    } catch {
-        $statusCode = $null
-        $responseProperty = $_.Exception.PSObject.Properties['Response']
-        if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
-            $statusCodeProperty = $responseProperty.Value.PSObject.Properties['StatusCode']
-            if ($null -ne $statusCodeProperty) {
-                try { $statusCode = [int]$statusCodeProperty.Value } catch {}
-            }
-        }
-        return [pscustomobject]@{
-            ok = $false
-            status_code = $statusCode
-            error = $_.Exception.Message
-        }
-    }
-}
-
-function Get-AppServerProcessEvidence([System.Diagnostics.Process]$Process) {
-    $Process.Refresh()
-    $hasExited = $Process.HasExited
-    $exitCode = $null
-    if ($hasExited) {
-        $exitCode = $Process.ExitCode
-    }
-    return [ordered]@{
-        process_id = [int]$Process.Id
-        has_exited = $hasExited
-        exit_code = $exitCode
-    }
-}
-
-function Write-AppServerProbeEvidence(
-    [string]$Stage,
-    [string]$Url,
-    [int]$Attempt,
-    [int64]$ElapsedMs,
-    $Probe
-) {
-    if ($Probe.ok -or $Attempt -eq 1 -or ($Attempt % 10) -eq 0) {
-        Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-            direction = 'local'
-            phase = 'app_server_readiness_probe'
-            stage = $Stage
-            url = $Url
-            attempt = $Attempt
-            elapsed_ms = $ElapsedMs
-            ok = [bool]$Probe.ok
-            status_code = $Probe.status_code
-            error = $Probe.error
-            at_unix_ms = Get-UnixMs
-        })
-    }
-}
-
-function Throw-AppServerReadinessFailure(
-    [string]$Reason,
-    [string]$ReadyUrl,
-    [string]$HealthUrl,
-    [int]$TimeoutMs,
-    [int64]$ElapsedMs,
-    [System.Diagnostics.Process]$Process,
-    [int]$ReadyAttempts,
-    [int]$HealthAttempts,
-    $LastReadyProbe,
-    $LastHealthProbe
-) {
-    $failure = [ordered]@{
-        code = 'SYNAPSE_CODEX_APP_SERVER_READINESS_FAILED'
-        reason = $Reason
-        endpoint = $script:Endpoint
-        ready_url = $ReadyUrl
-        health_url = $HealthUrl
-        timeout_ms = $TimeoutMs
-        elapsed_ms = $ElapsedMs
-        ready_attempts = $ReadyAttempts
-        health_attempts = $HealthAttempts
-        last_ready_probe = $LastReadyProbe
-        last_health_probe = $LastHealthProbe
-        process = Get-AppServerProcessEvidence -Process $Process
-        app_server_stdout_tail = Get-TextTail -Path $AppServerStdoutPath
-        app_server_stderr_tail = Get-TextTail -Path $AppServerStderrPath
-        at_unix_ms = Get-UnixMs
-    }
-    Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-        direction = 'local'
-        phase = 'app_server_readiness_failed'
-        failure = $failure
-        at_unix_ms = Get-UnixMs
-    })
-    Write-Control @{
-        app_server_readiness_status = 'failed'
-        app_server_readiness_failure_json = ($failure | ConvertTo-Json -Compress -Depth 100)
-    }
-    throw ("SYNAPSE_CODEX_APP_SERVER_READINESS_FAILED: " + ($failure | ConvertTo-Json -Compress -Depth 100))
-}
-
-function Wait-AppServerReady(
-    [string]$ReadyUrl,
-    [string]$HealthUrl,
-    [int]$TimeoutMs,
-    [System.Diagnostics.Process]$Process
-) {
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+function Wait-AppServerReady([string]$Url, [int]$TimeoutMs) {
     $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($TimeoutMs)
-    $readyAttempts = 0
-    $healthAttempts = 0
-    $readyAccepted = $false
-    $lastReadyProbe = $null
-    $lastHealthProbe = $null
-    Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-        direction = 'local'
-        phase = 'app_server_readiness_started'
-        endpoint = $script:Endpoint
-        ready_url = $ReadyUrl
-        health_url = $HealthUrl
-        timeout_ms = $TimeoutMs
-        process = Get-AppServerProcessEvidence -Process $Process
-        at_unix_ms = Get-UnixMs
-    })
-    Write-Control @{
-        app_server_readiness_status = 'waiting_readyz'
-        app_server_readiness_timeout_ms = $TimeoutMs
-        app_server_ready_url = $ReadyUrl
-        app_server_health_url = $HealthUrl
-    }
     do {
-        $processEvidence = Get-AppServerProcessEvidence -Process $Process
-        if ($processEvidence.has_exited) {
-            Throw-AppServerReadinessFailure `
-                -Reason 'process_exited_before_readiness' `
-                -ReadyUrl $ReadyUrl `
-                -HealthUrl $HealthUrl `
-                -TimeoutMs $TimeoutMs `
-                -ElapsedMs $stopwatch.ElapsedMilliseconds `
-                -Process $Process `
-                -ReadyAttempts $readyAttempts `
-                -HealthAttempts $healthAttempts `
-                -LastReadyProbe $lastReadyProbe `
-                -LastHealthProbe $lastHealthProbe
-        }
-
-        if (-not $readyAccepted) {
-            $readyAttempts++
-            $lastReadyProbe = Invoke-AppServerProbe -Url $ReadyUrl
-            Write-AppServerProbeEvidence `
-                -Stage 'readyz' `
-                -Url $ReadyUrl `
-                -Attempt $readyAttempts `
-                -ElapsedMs $stopwatch.ElapsedMilliseconds `
-                -Probe $lastReadyProbe
-            if ($lastReadyProbe.ok) {
-                $readyAccepted = $true
-                Write-Control @{
-                    app_server_readiness_status = 'waiting_healthz'
-                    app_server_readyz_status_code = $lastReadyProbe.status_code
-                    app_server_readyz_elapsed_ms = $stopwatch.ElapsedMilliseconds
-                }
-            }
-        }
-
-        if ($readyAccepted) {
-            $healthAttempts++
-            $lastHealthProbe = Invoke-AppServerProbe -Url $HealthUrl
-            Write-AppServerProbeEvidence `
-                -Stage 'healthz' `
-                -Url $HealthUrl `
-                -Attempt $healthAttempts `
-                -ElapsedMs $stopwatch.ElapsedMilliseconds `
-                -Probe $lastHealthProbe
-            if ($lastHealthProbe.ok) {
-                $processEvidence = Get-AppServerProcessEvidence -Process $Process
-                if ($processEvidence.has_exited) {
-                    Throw-AppServerReadinessFailure `
-                        -Reason 'process_exited_after_health_probe' `
-                        -ReadyUrl $ReadyUrl `
-                        -HealthUrl $HealthUrl `
-                        -TimeoutMs $TimeoutMs `
-                        -ElapsedMs $stopwatch.ElapsedMilliseconds `
-                        -Process $Process `
-                        -ReadyAttempts $readyAttempts `
-                        -HealthAttempts $healthAttempts `
-                        -LastReadyProbe $lastReadyProbe `
-                        -LastHealthProbe $lastHealthProbe
-                }
-                Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-                    direction = 'local'
-                    phase = 'app_server_readiness_succeeded'
-                    endpoint = $script:Endpoint
-                    ready_url = $ReadyUrl
-                    health_url = $HealthUrl
-                    elapsed_ms = $stopwatch.ElapsedMilliseconds
-                    ready_attempts = $readyAttempts
-                    health_attempts = $healthAttempts
-                    process = $processEvidence
-                    at_unix_ms = Get-UnixMs
-                })
-                Write-Control @{
-                    app_server_readiness_status = 'healthy'
-                    app_server_healthz_status_code = $lastHealthProbe.status_code
-                    app_server_readiness_elapsed_ms = $stopwatch.ElapsedMilliseconds
-                    app_server_ready_attempts = $readyAttempts
-                    app_server_health_attempts = $healthAttempts
-                }
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 1
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                 return
             }
+        } catch {
+            Start-Sleep -Milliseconds 100
         }
-        Start-Sleep -Milliseconds 100
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
-    Throw-AppServerReadinessFailure `
-        -Reason 'readiness_timeout' `
-        -ReadyUrl $ReadyUrl `
-        -HealthUrl $HealthUrl `
-        -TimeoutMs $TimeoutMs `
-        -ElapsedMs $stopwatch.ElapsedMilliseconds `
-        -Process $Process `
-        -ReadyAttempts $readyAttempts `
-        -HealthAttempts $healthAttempts `
-        -LastReadyProbe $lastReadyProbe `
-        -LastHealthProbe $lastHealthProbe
+    throw "codex app-server did not become ready at $Url within ${TimeoutMs}ms"
 }
 
 function Get-ChildProcessIds([int]$ParentPid) {
@@ -498,49 +266,10 @@ function Get-CodexLaunchSpec([object[]]$AppArgs) {
     return [pscustomobject]@{ File = $path; Args = $AppArgs }
 }
 
-function Connect-AppServer([string]$Endpoint, [int]$TimeoutMs) {
+function Connect-AppServer([string]$Endpoint) {
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
-    $cancellation = [System.Threading.CancellationTokenSource]::new($TimeoutMs)
-    Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-        direction = 'client'
-        phase = 'app_server_websocket_connect_started'
-        endpoint = $Endpoint
-        timeout_ms = $TimeoutMs
-        at_unix_ms = Get-UnixMs
-    })
-    try {
-        [void]$socket.ConnectAsync([Uri]$Endpoint, $cancellation.Token).GetAwaiter().GetResult()
-        Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-            direction = 'client'
-            phase = 'app_server_websocket_connect_succeeded'
-            endpoint = $Endpoint
-            state = [string]$socket.State
-            at_unix_ms = Get-UnixMs
-        })
-        Write-Control @{
-            app_server_websocket_status = 'open'
-            app_server_websocket_opened_at_unix_ms = Get-UnixMs
-        }
-        return $socket
-    } catch {
-        $detail = $_.Exception.Message
-        Add-JsonLine -Path $EventsPath -Value ([ordered]@{
-            direction = 'client'
-            phase = 'app_server_websocket_connect_failed'
-            endpoint = $Endpoint
-            timeout_ms = $TimeoutMs
-            error = $detail
-            at_unix_ms = Get-UnixMs
-        })
-        Write-Control @{
-            app_server_websocket_status = 'failed'
-            app_server_websocket_error = $detail
-        }
-        $socket.Dispose()
-        throw "SYNAPSE_CODEX_APP_SERVER_WEBSOCKET_CONNECT_FAILED: endpoint=$Endpoint timeout_ms=$TimeoutMs error=$detail"
-    } finally {
-        $cancellation.Dispose()
-    }
+    [void]$socket.ConnectAsync([Uri]$Endpoint, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    return $socket
 }
 
 function Send-WebSocketJson($Socket, [object]$Message) {
@@ -775,7 +504,6 @@ try {
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($EventsPath)) | Out-Null
     $port = Get-FreeTcpPort
     $script:Endpoint = "ws://127.0.0.1:$port"
-    $readyUrl = "http://127.0.0.1:$port/readyz"
     $healthUrl = "http://127.0.0.1:$port/healthz"
 
     $appArgs = @(
@@ -803,12 +531,8 @@ try {
     $script:TurnStatus = 'app_server_started'
     Write-Control @{}
 
-    Wait-AppServerReady `
-        -ReadyUrl $readyUrl `
-        -HealthUrl $healthUrl `
-        -TimeoutMs $ReadinessTimeoutMs `
-        -Process $appServer
-    $socket = Connect-AppServer -Endpoint $script:Endpoint -TimeoutMs $ReadinessTimeoutMs
+    Wait-AppServerReady -Url $healthUrl -TimeoutMs 15000
+    $socket = Connect-AppServer $script:Endpoint
 
     Send-WebSocketJson $socket ([ordered]@{
         id = 1

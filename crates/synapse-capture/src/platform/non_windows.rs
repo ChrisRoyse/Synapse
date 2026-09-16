@@ -1,14 +1,14 @@
 use synapse_core::{Point, Rect};
 
 use crate::{
-    CaptureConfig, CaptureError, CaptureThreadPriority, CapturedBgraBitmap, CapturedFrame,
+    CaptureConfig, CaptureError, CaptureThreadPriority, CapturedBgraBitmap,
     CapturedWindowBgraBitmap, DpiAwarenessStatus, controller::CaptureThreadContext,
 };
 
 /// Builds the error returned by every capture entry point on non-Windows builds.
 ///
-/// Real screen capture in Synapse is implemented only on Windows through the
-/// CPU/GDI `BitBlt` backend. Earlier non-Windows builds
+/// Real screen capture in Synapse is implemented only on Windows (DXGI Desktop
+/// Duplication and `Windows.Graphics.Capture`). Earlier non-Windows builds
 /// produced *synthetic* placeholder frames here, which silently fed fabricated
 /// pixels into perception. That is mock data masquerading as a real capture and
 /// is intentionally removed: a build that cannot see the screen must fail loudly
@@ -16,7 +16,8 @@ use crate::{
 #[cfg(not(windows))]
 fn capture_backend_unavailable() -> CaptureError {
     let detail = format!(
-        "real CPU/GDI screen capture is implemented only on Windows; this {} build has no capture backend. Run the Windows \
+        "real screen capture is implemented only on Windows (DXGI Desktop Duplication / \
+         Windows.Graphics.Capture); this {} build has no capture backend. Run the Windows \
          synapse-mcp build to perceive a real desktop. Synthetic/placeholder frames are \
          intentionally not produced so perception never reports fabricated pixels.",
         std::env::consts::OS
@@ -31,7 +32,7 @@ fn capture_backend_unavailable() -> CaptureError {
 
 #[cfg(not(windows))]
 #[allow(clippy::needless_pass_by_value)]
-pub fn run_gdi_capture(
+pub fn run_graphics_capture(
     _config: CaptureConfig,
     _ctx: CaptureThreadContext,
 ) -> Result<(), CaptureError> {
@@ -39,10 +40,11 @@ pub fn run_gdi_capture(
 }
 
 #[cfg(not(windows))]
-pub fn capture_gdi_frame(
-    _config: &CaptureConfig,
-    _frame_seq: u64,
-) -> Result<CapturedFrame, CaptureError> {
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_dxgi_capture(
+    _config: CaptureConfig,
+    _ctx: CaptureThreadContext,
+) -> Result<(), CaptureError> {
     Err(capture_backend_unavailable())
 }
 
@@ -78,10 +80,6 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 pub fn window_capture_region(_hwnd: i64) -> Result<Rect, CaptureError> {
-    Err(capture_backend_unavailable())
-}
-
-pub fn window_printwindow_capture_region(_hwnd: i64) -> Result<Rect, CaptureError> {
     Err(capture_backend_unavailable())
 }
 
@@ -133,4 +131,38 @@ pub fn validate_hwnd_impl(_hwnd: i64) -> Result<(), CaptureError> {
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 pub fn validate_monitor_impl(_monitor_index: u32) -> Result<(), CaptureError> {
     Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    /// The non-Windows capture path must fail loudly with the
+    /// `CAPTURE_GRAPHICS_API_UNSUPPORTED` code and a detail that explains the
+    /// real cause, instead of fabricating synthetic frames.
+    #[test]
+    fn capture_backend_unavailable_reports_graphics_api_unsupported() {
+        let err = capture_backend_unavailable();
+        assert_eq!(
+            err.code(),
+            synapse_core::error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED
+        );
+        match err {
+            CaptureError::GraphicsApiUnsupported { detail } => {
+                assert!(
+                    detail.contains("only on Windows"),
+                    "detail should name the Windows-only constraint: {detail}"
+                );
+                assert!(
+                    detail.to_lowercase().contains("synthetic"),
+                    "detail should state synthetic frames are not produced: {detail}"
+                );
+                assert!(
+                    detail.contains(std::env::consts::OS),
+                    "detail should name the current platform: {detail}"
+                );
+            }
+            other => panic!("expected GraphicsApiUnsupported, got {other:?}"),
+        }
+    }
 }

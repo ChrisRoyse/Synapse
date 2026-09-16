@@ -95,19 +95,12 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
                 "foreground activation input nudge failed before SetForegroundWindow retry"
             );
         }
-        // #2082: everything between the attach and the detach can block on a
-        // hung or hidden-desktop target — `SwitchToThisWindow` and
-        // `SetForegroundWindow` most of all; Raymond Chen's "I warned you: the
-        // dangers of attaching input queues" documents exactly this hang, and
-        // Microsoft's own `AttachThreadInput` guidance is that attaching the
-        // queues of threads not designed for each other makes deadlock likely.
-        // While attached, the human's input queue is joined to this daemon
-        // thread, so an early return or a panic in that window leaves the human
-        // unable to click or type. The attachments are therefore RAII: the
-        // detach is a `Drop` obligation, in reverse order, on every exit path
-        // including an unwind.
-        let attached_foreground = AttachedInputQueue::attach(current_thread, foreground_thread);
-        let attached_target = AttachedInputQueue::attach(current_thread, target_thread);
+        let attached_foreground = foreground_thread != 0
+            && foreground_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
+        let attached_target = target_thread != 0
+            && target_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, target_thread, true) }.as_bool();
 
         restore_window_for_focus(hwnd);
         let _ = unsafe { BringWindowToTop(hwnd) };
@@ -115,8 +108,12 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
         let focused = unsafe { SetForegroundWindow(hwnd) }.as_bool()
             || native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize);
 
-        drop(attached_target);
-        drop(attached_foreground);
+        if attached_target {
+            let _ = unsafe { AttachThreadInput(current_thread, target_thread, false) };
+        }
+        if attached_foreground {
+            let _ = unsafe { AttachThreadInput(current_thread, foreground_thread, false) };
+        }
 
         if focused {
             Ok(())
@@ -129,82 +126,6 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
     }
 }
 
-/// Issues one ordinary `SetForegroundWindow` call for the exact supplied HWND.
-/// The caller must independently verify the physical foreground identity and
-/// decide whether a bounded ALT-unlock retry is authorized.
-pub fn set_foreground_window_exact(hwnd: i64) -> A11yResult<bool> {
-    let hwnd = hwnd_from_wire_value(hwnd)?;
-    Ok(unsafe { SetForegroundWindow(hwnd) }.as_bool())
-}
-
-/// Emits the fully paired ALT press/release used by Windows' documented
-/// foreground-lock protocol. Partial insertion is an error and the release is
-/// reissued before returning so ALT cannot remain stranded.
-pub fn send_foreground_activation_nudge_exact() -> A11yResult<()> {
-    send_foreground_activation_nudge()
-}
-
-/// RAII attachment of this thread's input queue to another thread's.
-///
-/// `AttachThreadInput(a, b, true)` joins the two threads' input queues; until it
-/// is undone with `false`, keyboard and mouse events for both are processed in
-/// one serialized stream. Leaving that attachment in place — because a call in
-/// between returned early, blocked forever, or panicked — is one of the ways
-/// Synapse can leave the operator unable to click or type (#2082), so the detach
-/// is a `Drop` obligation rather than a straight-line statement.
-///
-/// [`Self::attach`] returns `None` (an inert guard) when there is nothing to
-/// attach: a null thread id, the same thread, or a refused attach. Only a
-/// successful attach ever produces a detach.
-#[derive(Debug)]
-struct AttachedInputQueue {
-    from_thread: u32,
-    to_thread: u32,
-}
-
-impl AttachedInputQueue {
-    fn attach(from_thread: u32, to_thread: u32) -> Option<Self> {
-        if to_thread == 0 || to_thread == from_thread {
-            return None;
-        }
-        // SAFETY: both arguments are plain thread ids; the call touches no
-        // caller-owned memory.
-        let attached = unsafe { AttachThreadInput(from_thread, to_thread, true) }.as_bool();
-        if !attached {
-            return None;
-        }
-        Some(Self {
-            from_thread,
-            to_thread,
-        })
-    }
-}
-
-impl Drop for AttachedInputQueue {
-    fn drop(&mut self) {
-        // SAFETY: mirrors the successful attach in `attach` with the same ids.
-        let detached = unsafe { AttachThreadInput(self.from_thread, self.to_thread, false) };
-        if !detached.as_bool() {
-            tracing::error!(
-                code = "FOREGROUND_INPUT_QUEUE_DETACH_FAILED",
-                from_thread = self.from_thread,
-                to_thread = self.to_thread,
-                "AttachThreadInput detach returned false; the human's input queue may still be attached to this daemon thread"
-            );
-        }
-    }
-}
-
-/// Synthesizes the `VK_MENU` tap that unblocks `SetForegroundWindow`.
-///
-/// The down and the up are a **single** `SendInput` batch, so the OS inserts
-/// them as one indivisible pair and no user-mode code — including a panic — can
-/// run between them. The only remaining strand risk is a partial insertion, so
-/// that case retries the key-up on its own rather than returning an error and
-/// leaving `Alt` down: a stranded `Alt` turns every subsequent keystroke into a
-/// menu accelerator, which is precisely the operator symptom in #2082. Release
-/// is emitted regardless of whether the press succeeded — a redundant key-up is
-/// a no-op in the input queue, an unpaired key-down is not.
 fn send_foreground_activation_nudge() -> A11yResult<()> {
     let inputs = [
         virtual_key_input(VK_MENU, KEYBD_EVENT_FLAGS(0)),
@@ -218,40 +139,13 @@ fn send_foreground_activation_nudge() -> A11yResult<()> {
     let expected = u32::try_from(inputs.len())
         .map_err(|_err| A11yError::internal("foreground nudge input count overflow"))?;
     if sent == expected {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(A11yError::internal(format!(
+            "SendInput inserted {sent}/{} events for foreground activation nudge",
+            inputs.len()
+        )))
     }
-    let released = force_release_menu_key();
-    tracing::error!(
-        code = "FOREGROUND_ACTIVATION_NUDGE_PARTIAL",
-        sent,
-        expected,
-        alt_release_retry_ok = released,
-        "the VK_MENU activation nudge did not fully insert; the Alt key-up was re-emitted on its own so Alt cannot stay stranded"
-    );
-    Err(A11yError::internal(format!(
-        "SendInput inserted {sent}/{} events for foreground activation nudge; the Alt key-up was re-emitted (retry_ok={released})",
-        inputs.len()
-    )))
-}
-
-/// Re-emits the bare `VK_MENU` key-up, retried, ignoring every other outcome.
-///
-/// This is the release path, so it may not fail quietly: it retries and reports
-/// whether the OS took it.
-fn force_release_menu_key() -> bool {
-    let Ok(cb_size) = i32::try_from(mem::size_of::<INPUT>()) else {
-        return false;
-    };
-    let release = [virtual_key_input(VK_MENU, KEYEVENTF_KEYUP)];
-    for _attempt in 0..3 {
-        // SAFETY: one initialized keyboard INPUT record with the exact cbSize.
-        // A duplicate key-up for an already-up key is a no-op in the input
-        // queue, which is what makes the retry safe.
-        if unsafe { SendInput(&release, cb_size) } == 1 {
-            return true;
-        }
-    }
-    false
 }
 
 const fn virtual_key_input(vkey: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {

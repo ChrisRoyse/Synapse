@@ -1,0 +1,98 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.minecraft.java.curated"
+package_version = "0.1.0"
+profile_id = "minecraft.java"
+profile_version = "1.0.0"
+created_at = "2026-05-27T20:05:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic curated starter package fixture for Synapse issues #416/#482."
+
+[source]
+kind = "bundled"
+uri = "https://github.com/ChrisRoyse/Synapse"
+revision = "m5-r22-minecraft-curated-fixture"
+built_by = "codex"
+generated_by = "synapse-curated-starter-registry-v1"
+
+[[targets]]
+target_id = "minecraft.java"
+target_kind = "game"
+app_id = "minecraft.java"
+process_name = "javaw.exe"
+title_regex = "Minecraft.*[0-9]+\\.[0-9]+"
+app_version = "official launcher installed; Microsoft sign-in/license required before Java runtime evidence"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = ["minecraft.java", "luanti.minetest"]
+
+[assumptions.display]
+min_width = 1280
+min_height = 720
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software", "vigem"]
+
+[[input.models]]
+id = "rtdetr_v2_s_coco_onnx"
+version = "0.1.0"
+digest = "sha256:583a236ac21c95a7fd94f284fc21485e42355bfef82c27011ba78fbc09ee87e2"
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "single_player"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = true
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T20:05:00Z"
+summary = "Initial Minecraft Java curated starter registry fixture."
+
+[hashes]
+profile_toml_sha256 = "sha256:4054a4d0195574b719f7ef7bd2abcd4ce4522de2b1882d0d8f270d1be7904a98"
+package_sha256 = "sha256:4824824824824824824824824824824824824824824824824824824824824824"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/minecraft.java.toml"
+assets = [
+  "profiles/assets/minecraft.java/hearts/full.png",
+  "profiles/assets/minecraft.java/hearts/half.png",
+  "profiles/assets/minecraft.java/hearts/empty.png",
+  "profiles/assets/minecraft.java/hunger/full.png",
+  "profiles/assets/minecraft.java/hunger/half.png",
+  "profiles/assets/minecraft.java/hunger/empty.png",
+]
+
+[metadata]
+registry_family = "profile-registry/audit-data"
+quality_signal = "profile_quality.minecraft.java"
+local_registry_row = "profile_registry/v1/package/profile.minecraft.java.curated/0.1.0"
+"runtime.minecraft.configured_host_status" = "launcher_installed_sign_in_required_java_runtime_not_verified"
+"runtime.minecraft.launcher_path" = "C:\\Program Files (x86)\\Minecraft Launcher\\MinecraftLauncher.exe"
+"runtime.minecraft.evidence_policy" = "real Minecraft Java runtime evidence requires process/window/world/log SoT readback before claims"
+"runtime.minecraft.operator_boundary" = "microsoft_sign_in_and_java_license_required_before_javaw_world_log_sot_readback"
+"analogue.luanti.profile_id" = "luanti.minetest"
+"analogue.luanti.world_name" = "synapse_benchmark_mtg"
+"curated.seed_set_id" = "starter.v1"
+"curated.target_id" = "minecraft.java"
+"curated.tier" = "game.seed"
+"curated.priority" = "p1"
+"curated.status" = "shipped"
+"curated.backlog_issue" = "#416,#482"
+"curated.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,storage_inspect,profile_quality_refresh,minecraft_process_window_readback,minecraft_world_log_readback,luanti_analogue_readback"
+"curated.safe_default_backend_policy" = "auto; operator-owned local single-player worlds only; no remote server automation; no credential/payment/account changes; audit export requires explicit consent"

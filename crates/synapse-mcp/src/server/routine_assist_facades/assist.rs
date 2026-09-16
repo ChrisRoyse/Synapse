@@ -5,21 +5,16 @@ use crate::m3::{
     intent::{IntentCurrentParams, IntentCurrentResponse},
     intent_events::{IntentDetectOutcome, IntentDetectTickParams},
     suggestions::{
-        SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionDeclineParams,
-        SuggestionDeclineResponse, SuggestionListParams, SuggestionListResponse,
-        SuggestionTickParams, SuggestionTickResponse,
+        SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionListParams,
+        SuggestionListResponse, SuggestionTickParams, SuggestionTickResponse,
     },
-};
-use crate::server::mcp_usage::{
-    McpUsageGuideParams, McpUsageGuidePolicyParams, McpUsageGuidePromoteParams,
-    McpUsageGuideResponse, McpUsageGuideRollbackParams, McpUsagePolicyResponse,
-    McpUsagePromotionResponse,
 };
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 
 pub(super) const ASSIST_TOOL: &str = "assist";
-const ASSIST_SOURCE_OF_TRUTH: &str = "CF_KV suggestion/v1 + intent tracker/events + CF_ROUTINES/CF_ROUTINE_STATE + CF_KV mcp-usage/v1 + Calyx syn-mcp-usage-v1 + Anchors";
+const ASSIST_SOURCE_OF_TRUTH: &str =
+    "CF_KV suggestion/v1 + intent tracker/events + CF_ROUTINES/CF_ROUTINE_STATE";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,11 +24,6 @@ pub enum AssistOperation {
     SuggestionTick,
     SuggestionList,
     SuggestionAccept,
-    SuggestionDecline,
-    Guide,
-    GuidePolicy,
-    GuidePromote,
-    GuideRollback,
 }
 
 impl AssistOperation {
@@ -44,11 +34,6 @@ impl AssistOperation {
             Self::SuggestionTick => "suggestion_tick",
             Self::SuggestionList => "suggestion_list",
             Self::SuggestionAccept => "suggestion_accept",
-            Self::SuggestionDecline => "suggestion_decline",
-            Self::Guide => "guide",
-            Self::GuidePolicy => "guide_policy",
-            Self::GuidePromote => "guide_promote",
-            Self::GuideRollback => "guide_rollback",
         }
     }
 }
@@ -67,16 +52,6 @@ pub struct AssistParams {
     pub suggestion_list: Option<SuggestionListParams>,
     #[serde(default)]
     pub suggestion_accept: Option<SuggestionAcceptParams>,
-    #[serde(default)]
-    pub suggestion_decline: Option<SuggestionDeclineParams>,
-    #[serde(default)]
-    pub guide: Option<McpUsageGuideParams>,
-    #[serde(default)]
-    pub guide_policy: Option<McpUsageGuidePolicyParams>,
-    #[serde(default)]
-    pub guide_promote: Option<McpUsageGuidePromoteParams>,
-    #[serde(default)]
-    pub guide_rollback: Option<McpUsageGuideRollbackParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -95,16 +70,6 @@ pub struct AssistResponse {
     pub suggestion_list: Option<SuggestionListResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion_accept: Option<SuggestionAcceptResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suggestion_decline: Option<SuggestionDeclineResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide: Option<McpUsageGuideResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide_policy: Option<McpUsagePolicyResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide_promote: Option<McpUsagePromotionResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide_rollback: Option<McpUsagePromotionResponse>,
 }
 
 pub(super) async fn handle(
@@ -269,94 +234,6 @@ pub(super) async fn handle(
                 |out| out.suggestion_accept = Some(response),
             )))
         }
-        AssistOperation::SuggestionDecline => {
-            let spec = params
-                .0
-                .suggestion_decline
-                .ok_or_else(|| missing_assist_spec("suggestion_decline"))?;
-            let source_id = spec.suggestion_id.clone();
-            let response = service
-                    .suggestion_decline(Parameters(spec))
-                    .await
-                    .map_err(|error| {
-                        assist_delegate_error(
-                            operation,
-                            source_id,
-                            error,
-                            "pass the exact durable suggestion/v1 id (not a routine_id) and inspect the CF_KV suggestion row plus its Calyx Anchors rows",
-                        )
-                    })?
-                    .0;
-            Ok(Json(assist_response(
-                operation,
-                format!(
-                    "CF_KV suggestion decline suggestion_id={} replay={} declined_ts_ns={} anchor_cx_id={} anchor_exact_matches={}",
-                    response.suggestion.suggestion_id,
-                    response.replay,
-                    response.declined_ts_ns,
-                    response.anchor.cx_id,
-                    response.anchor.readback_exact_match_count
-                ),
-                |out| out.suggestion_decline = Some(response),
-            )))
-        }
-        AssistOperation::Guide => {
-            let spec = params.0.guide.ok_or_else(|| missing_assist_spec("guide"))?;
-            let response = super::super::mcp_usage::guide(service, spec)?;
-            Ok(Json(assist_response(
-                operation,
-                format!(
-                    "MCP usage guide route_id={} evidence_rows={}",
-                    response.route_id, response.evidence_rows
-                ),
-                |out| out.guide = Some(response),
-            )))
-        }
-        AssistOperation::GuidePolicy => {
-            let spec = params
-                .0
-                .guide_policy
-                .ok_or_else(|| missing_assist_spec("guide_policy"))?;
-            let response = super::super::mcp_usage::write_policy(service, spec)?;
-            Ok(Json(assist_response(
-                operation,
-                format!(
-                    "MCP usage policy row={} enabled={}",
-                    response.policy.row_key, response.policy.enabled
-                ),
-                |out| out.guide_policy = Some(response),
-            )))
-        }
-        AssistOperation::GuidePromote => {
-            let spec = params
-                .0
-                .guide_promote
-                .ok_or_else(|| missing_assist_spec("guide_promote"))?;
-            let response = super::super::mcp_usage::promote(service, spec)?;
-            Ok(Json(assist_response(
-                operation,
-                format!(
-                    "MCP usage promotion id={} state={}",
-                    response.promotion_id, response.state
-                ),
-                |out| out.guide_promote = Some(response),
-            )))
-        }
-        AssistOperation::GuideRollback => {
-            let spec = params
-                .0
-                .guide_rollback
-                .ok_or_else(|| missing_assist_spec("guide_rollback"))?;
-            let response = super::super::mcp_usage::rollback(service, spec)?;
-            Ok(Json(assist_response(
-                operation,
-                format!(
-                    "MCP usage promotion rollback id={} state={}",
-                    response.promotion_id, response.state
-                ),
-                |out| out.guide_rollback = Some(response),
-            )))
-        }
     }
 }
 
@@ -370,11 +247,6 @@ pub(super) fn validate_assist_facade_params(params: &AssistParams) -> Result<(),
             ("suggestion_tick", params.suggestion_tick.is_some()),
             ("suggestion_list", params.suggestion_list.is_some()),
             ("suggestion_accept", params.suggestion_accept.is_some()),
-            ("suggestion_decline", params.suggestion_decline.is_some()),
-            ("guide", params.guide.is_some()),
-            ("guide_policy", params.guide_policy.is_some()),
-            ("guide_promote", params.guide_promote.is_some()),
-            ("guide_rollback", params.guide_rollback.is_some()),
         ],
     )
 }
@@ -421,11 +293,6 @@ fn assist_response(
         suggestion_tick: None,
         suggestion_list: None,
         suggestion_accept: None,
-        suggestion_decline: None,
-        guide: None,
-        guide_policy: None,
-        guide_promote: None,
-        guide_rollback: None,
     };
     populate(&mut response);
     response

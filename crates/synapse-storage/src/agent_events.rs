@@ -10,7 +10,7 @@
 //! error, never a silent skip.
 //!
 //! Durability contract (#897 acceptance): journal rows use `Db::put_batch`,
-//! which returns only after the row reaches the Calyx vault and its WAL.
+//! which returns only after the row reaches `RocksDB` with a synced WAL.
 //! Writers of terminal lifecycle events (exited/killed/spawn failure) also
 //! call `Db::flush()` at the lifecycle boundary.
 
@@ -18,11 +18,6 @@ use crate::{StorageError, StorageResult, cf};
 
 /// Encoded key length: 8-byte timestamp plus 4-byte sequence.
 pub const AGENT_EVENT_KEY_LEN: usize = 12;
-
-/// Maximum durable agent identifier length accepted by `AgentEventRecord`.
-/// Kept here as the byte-level codec bound; identifiers are visible ASCII, so
-/// the record's character and encoded-byte lengths are identical.
-const AGENT_EVENT_INDEX_MAX_SPAWN_BYTES: usize = 512;
 
 /// Encodes a `CF_AGENT_EVENTS` row key.
 #[must_use]
@@ -71,108 +66,39 @@ pub fn decode_agent_event_key(key: &[u8]) -> StorageResult<(u64, u32)> {
     Ok((ts_ns, seq))
 }
 
-/// Exact prefix for one spawn in `CF_AGENT_EVENT_SPAWN_INDEX`.
-///
-/// A length frame, rather than a delimiter, makes every visible-ASCII spawn id
-/// prefix-safe even when it contains punctuation.
-///
-/// # Errors
-///
-/// Returns a structured read failure when the identifier is empty, over the
-/// durable record bound, or contains bytes outside visible ASCII.
-pub fn agent_event_spawn_index_prefix(spawn_id: &str) -> StorageResult<Vec<u8>> {
-    let bytes = spawn_id.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > AGENT_EVENT_INDEX_MAX_SPAWN_BYTES
-        || !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte))
-    {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_SPAWN_INDEX_ID_INVALID: spawn_id must be 1..={AGENT_EVENT_INDEX_MAX_SPAWN_BYTES} visible ASCII bytes, got len={}",
-                bytes.len()
-            ),
-        });
-    }
-    let len = u16::try_from(bytes.len()).map_err(|_error| StorageError::ReadFailed {
-        cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-        detail: format!(
-            "AGENT_EVENT_SPAWN_INDEX_ID_INVALID: spawn_id length {} does not fit u16",
-            bytes.len()
-        ),
-    })?;
-    let mut prefix = Vec::with_capacity(2 + bytes.len());
-    prefix.extend_from_slice(&len.to_be_bytes());
-    prefix.extend_from_slice(bytes);
-    Ok(prefix)
-}
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
 
-/// Encodes one spawn-index key, preserving the primary journal key order.
-///
-/// # Errors
-///
-/// Returns a structured read failure when the spawn id or source journal key
-/// violates its canonical codec.
-pub fn agent_event_spawn_index_key(spawn_id: &str, source_key: &[u8]) -> StorageResult<Vec<u8>> {
-    let _identity = decode_agent_event_key(source_key)?;
-    let mut key = agent_event_spawn_index_prefix(spawn_id)?;
-    key.extend_from_slice(source_key);
-    Ok(key)
-}
+    use super::*;
 
-/// Decodes and validates one complete spawn-index key.
-///
-/// # Errors
-///
-/// Returns a structured read failure for an invalid length frame, spawn id, or
-/// source journal-key suffix.
-pub fn decode_agent_event_spawn_index_key(key: &[u8]) -> StorageResult<(String, Vec<u8>)> {
-    if key.len() < 2 + AGENT_EVENT_KEY_LEN {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_SPAWN_INDEX_KEY_INVALID: key is {} bytes, shorter than the framed minimum {}",
-                key.len(),
-                2 + AGENT_EVENT_KEY_LEN
-            ),
-        });
+    #[test]
+    fn key_orders_chronologically_then_by_seq() {
+        let earlier = agent_event_key(1_000, u32::MAX);
+        let later = agent_event_key(1_001, 0);
+        assert!(earlier < later, "timestamp must dominate ordering");
+        let first = agent_event_key(1_000, 1);
+        let second = agent_event_key(1_000, 2);
+        assert!(first < second, "sequence must break same-tick ties");
     }
-    let spawn_len = usize::from(u16::from_be_bytes([key[0], key[1]]));
-    let expected_len = 2_usize
-        .checked_add(spawn_len)
-        .and_then(|value| value.checked_add(AGENT_EVENT_KEY_LEN))
-        .ok_or_else(|| StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: "AGENT_EVENT_SPAWN_INDEX_KEY_INVALID: framed key length overflow".to_owned(),
-        })?;
-    if spawn_len == 0 || spawn_len > AGENT_EVENT_INDEX_MAX_SPAWN_BYTES || key.len() != expected_len
-    {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_SPAWN_INDEX_KEY_INVALID: framed spawn_len={spawn_len} total_len={} expected_total_len={expected_len}",
-                key.len()
-            ),
-        });
+
+    #[test]
+    fn decode_rejects_wrong_length() {
+        let error = decode_agent_event_key(&[0_u8; 11]).expect_err("11 bytes must be rejected");
+        assert!(
+            error.to_string().contains("AGENT_EVENT_KEY_INVALID"),
+            "error must carry the structured detail: {error}"
+        );
     }
-    let spawn_bytes = &key[2..2 + spawn_len];
-    if !spawn_bytes.iter().all(|byte| (b'!'..=b'~').contains(byte)) {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail:
-                "AGENT_EVENT_SPAWN_INDEX_KEY_INVALID: spawn id contains non-visible-ASCII bytes"
-                    .to_owned(),
-        });
-    }
-    let spawn_id = String::from_utf8(spawn_bytes.to_vec()).map_err(|error| {
-        StorageError::ReadFailed {
-            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
-            detail: format!(
-                "AGENT_EVENT_SPAWN_INDEX_KEY_INVALID: spawn id is not UTF-8 despite ASCII validation: {error}"
-            ),
+
+    proptest! {
+        #[test]
+        fn key_roundtrip(ts_ns in any::<u64>(), seq in any::<u32>()) {
+            let key = agent_event_key(ts_ns, seq);
+            prop_assert_eq!(key.len(), AGENT_EVENT_KEY_LEN);
+            let (decoded_ts, decoded_seq) = decode_agent_event_key(&key).expect("roundtrip");
+            prop_assert_eq!(decoded_ts, ts_ns);
+            prop_assert_eq!(decoded_seq, seq);
         }
-    })?;
-    let source_key = key[2 + spawn_len..].to_vec();
-    let _identity = decode_agent_event_key(&source_key)?;
-    Ok((spawn_id, source_key))
+    }
 }

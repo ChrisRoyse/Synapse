@@ -1,0 +1,15 @@
+schema_version = 1
+kind = "registry_install_edge"
+case = "incompatible_schema_version"
+source_id = "registry.synthetic.local-fixture"
+package_id = "profile.synthetic.future_schema"
+package_version = "0.1.0"
+incoming_registry_schema_version = 99
+supported_registry_schema_version = 1
+
+[expected_policy]
+outcome = "reject"
+reason_code = "registry_schema_version_unsupported"
+cf_profiles_rows_added = 0
+cf_kv_rows_added = 0
+partial_install_allowed = false

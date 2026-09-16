@@ -27,62 +27,13 @@ use synapse_core::error_codes;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseAcquireParams {
-    /// Lease lifetime in milliseconds. Must be in [100, 300000]. The lease is
+    /// Lease lifetime in milliseconds. Must be in [100, 30000]. The lease is
     /// renewed on every leased action and on a repeat acquire by the holder, so
     /// a short TTL is the safety floor against a crashed holder, not a hard cap
     /// on how long real work can take.
-    ///
-    /// Omitted means "whatever the default is", which is **not** the same
-    /// request as naming that number (#2078): an explicitly named TTL may
-    /// deliberately shorten this session's own live window, a defaulted one
-    /// never may.
-    #[serde(default)]
-    #[schemars(
-        default = "default_lease_ttl_ms_schema",
-        range(min = 100, max = 300000)
-    )]
-    pub ttl_ms: Option<u64>,
-}
-
-/// Why an acquisition's TTL is the number it is — the discriminator for the
-/// non-reducing lease rule (#2065 / #2071 / #2078).
-///
-/// #2071 established the rule as an **action-tier** rule and deliberately left
-/// `lease::try_acquire`'s `Renewed` branch assigning `lease.ttl = ttl`, so an
-/// explicit lease verb can still shorten a window on purpose. The distinction
-/// that carve-out actually turns on is not *which tool* ran, but whether the
-/// caller **named** the number: nobody can deliberately shorten a window with a
-/// TTL they never asked for and cannot see.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LeaseTtlIntent {
-    /// The caller of an explicit lease verb named this exact TTL. Honored as
-    /// given, including when it shortens this session's own live lease.
-    CallerRequested,
-    /// A default or a facade-internal constant the tool chose for its own
-    /// window. Treated as a **floor**: it may raise the lease, never lower it
-    /// below what the same session's live lease still has left.
-    ToolSized,
-}
-
-impl LeaseTtlIntent {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::CallerRequested => "caller_requested",
-            Self::ToolSized => "tool_sized",
-        }
-    }
-}
-
-impl ControlLeaseAcquireParams {
-    /// Resolves the requested TTL and how it was chosen. An omitted `ttl_ms`
-    /// falls back to `DEFAULT_LEASE_TTL_MS` exactly as before, but is tagged
-    /// `ToolSized` so the fallback cannot silently clamp a live lease down.
-    pub(super) fn requested_ttl_ms_and_intent(&self) -> (u64, LeaseTtlIntent) {
-        match self.ttl_ms {
-            Some(ttl_ms) => (ttl_ms, LeaseTtlIntent::CallerRequested),
-            None => (default_lease_ttl_ms(), LeaseTtlIntent::ToolSized),
-        }
-    }
+    #[serde(default = "default_lease_ttl_ms")]
+    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 30000))]
+    pub ttl_ms: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -91,20 +42,14 @@ pub struct ControlLeaseHandoffParams {
     /// Live MCP session id that should receive the foreground input lease.
     pub to_session: String,
     /// Fresh lease lifetime in milliseconds for the recipient. Must be in
-    /// [100, 300000] like `control_lease_acquire`.
+    /// [100, 30000] like `control_lease_acquire`.
     #[serde(default = "default_lease_ttl_ms")]
-    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 300000))]
+    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 30000))]
     pub ttl_ms: u64,
 }
 
 const fn default_lease_ttl_ms() -> u64 {
     synapse_action::DEFAULT_LEASE_TTL_MS
-}
-
-/// Schema-only default for the optional `ttl_ms`, so the advertised tool schema
-/// still documents the number an omitted field resolves to.
-const fn default_lease_ttl_ms_schema() -> Option<u64> {
-    Some(synapse_action::DEFAULT_LEASE_TTL_MS)
 }
 
 /// Flattened lease snapshot returned by every lease tool. `LeaseStatus` lives in
@@ -224,8 +169,7 @@ impl SynapseService {
             "tool.invocation kind=control_lease_acquire"
         );
         let params = params.0;
-        let (requested_ttl_ms, ttl_intent) = params.requested_ttl_ms_and_intent();
-        validate_lease_ttl_ms("control_lease_acquire", requested_ttl_ms)?;
+        validate_lease_ttl_ms("control_lease_acquire", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
         let operator_panic_epoch_at_entry =
             arm_control_lease_operator_panic_gate("control_lease_acquire", &session_id)?;
@@ -244,47 +188,18 @@ impl SynapseService {
             operator_panic_epoch_at_entry,
             "after_session_validation_before_mutation",
         )?;
-        self.control_lease_acquire_authority_locked_sized(
-            "control_lease_acquire",
-            requested_ttl_ms,
-            ttl_intent,
-            session_id,
-        )
+        self.control_lease_acquire_authority_locked(params, session_id)
     }
 
-    /// #2078: the single acquisition transaction, with the non-reducing rule
-    /// applied up front and audited.
-    ///
-    /// Also the internal transaction step for callers that already hold this
-    /// session's authority gate — `act operation=foreground` and
-    /// `act operation=lease_acquire`.
-    ///
-    /// `tool` names the lane that asked (it appears on the
-    /// `INPUT_LEASE_ACTION_TTL_SIZED` line); the command-audit row keeps the
-    /// `control_lease_acquire` identity it has always had, so existing audit
-    /// queries are unaffected.
-    pub(super) fn control_lease_acquire_authority_locked_sized(
+    /// Internal transaction step for callers that already hold this session's
+    /// authority gate (notably `act operation=foreground`).
+    pub(super) fn control_lease_acquire_authority_locked(
         &self,
-        tool: &'static str,
-        requested_ttl_ms: u64,
-        ttl_intent: LeaseTtlIntent,
+        params: ControlLeaseAcquireParams,
         session_id: String,
     ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
-        // Restore first: the caller floor is read from the in-memory lease, and
-        // a session-continuity row that has not been restored yet would read as
-        // "nothing left" and let the floor collapse to zero.
         self.restore_session_lease_if_needed(&session_id)?;
-        let sizing =
-            effective_lease_acquire_ttl_ms(tool, &session_id, requested_ttl_ms, ttl_intent);
-        let command_payload = json!({
-            "ttl_ms": sizing.lease_ttl_ms,
-            "requested_ttl_ms": sizing.requested_ttl_ms,
-            "caller_lease_remaining_ms": sizing.caller_lease_remaining_ms,
-            "ttl_intent": sizing.intent.as_str(),
-            "reduced_caller_ttl": sizing.reduced_caller_ttl(),
-            "ttl_sizing_reason": sizing.reason,
-            "tool": tool,
-        });
+        let command_payload = json!({ "ttl_ms": params.ttl_ms });
         let command_before = json!({
             "source_of_truth": "synapse_action::lease",
             "caller": lease_status_for_session(&session_id),
@@ -299,7 +214,7 @@ impl SynapseService {
             Value::Null,
             "pending",
         ))?;
-        let response = match acquire_lease_for_session(&session_id, sizing.lease_ttl_ms) {
+        let response = match acquire_lease_for_session(&session_id, params.ttl_ms) {
             Ok(response) => response,
             Err(error) => {
                 self.command_audit_final(
@@ -919,103 +834,6 @@ pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(
     ))
 }
 
-/// The decision record for one lease-acquisition TTL, kept whole so the
-/// response audit and the log line cannot disagree about it.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct LeaseAcquireTtlSizing {
-    /// What the lane asked for (a caller's `ttl_ms`, or the default/lane
-    /// constant that stood in for one).
-    requested_ttl_ms: u64,
-    /// What this same session's live lease still had left at decision time.
-    caller_lease_remaining_ms: u64,
-    /// What will actually be installed.
-    lease_ttl_ms: u64,
-    intent: LeaseTtlIntent,
-    reason: &'static str,
-}
-
-impl LeaseAcquireTtlSizing {
-    const fn reduced_caller_ttl(&self) -> bool {
-        self.lease_ttl_ms < self.caller_lease_remaining_ms
-    }
-}
-
-/// #2078: applies the non-reducing lease rule at the **control lane**, the third
-/// acquisition door — the one #2071's m2-tools funnel did not cover.
-///
-/// `act operation=foreground` acquires its escalation window through
-/// `control_lease_acquire_authority_locked` with a facade-internal 30 000 ms it
-/// chose for itself. `lease::try_acquire`'s `Renewed` branch assigns
-/// `lease.ttl = ttl` unconditionally, so a caller holding 60 000 ms with ~47 600
-/// ms left came back holding 30 000 ms — persisted to `CF_SESSIONS`, reported as
-/// `acquired_lease:false`, and with no `INPUT_LEASE_ACTION_TTL_SIZED` line to
-/// reconstruct it from. Physically reproduced on daemon PID 27852,
-/// `f1e429a1c58f`.
-///
-/// The rule here is #2071's, verbatim, plus its own carve-out made explicit:
-///
-/// - [`LeaseTtlIntent::ToolSized`] — `max(requested, owner_remaining).min(MAX)`.
-///   The lane's own requirement stays a floor and can raise the window; it can
-///   never clamp it down.
-/// - [`LeaseTtlIntent::CallerRequested`] — honored exactly, including a
-///   deliberate shorten. #2071 kept `try_acquire`'s `Renewed` branch assigning
-///   unconditionally for precisely this case, and that stays true.
-///
-/// The floor comes from [`synapse_action::lease::owner_remaining_ttl_ms`], which
-/// expires a lapsed lease first and ignores one owned by anyone else, so this
-/// can only preserve authority the same session provably still holds. Nothing
-/// here widens `MAX_LEASE_TTL_MS`, touches the #2057 per-emission fence, or adds
-/// a grace window.
-fn effective_lease_acquire_ttl_ms(
-    tool: &'static str,
-    session_id: &str,
-    requested_ttl_ms: u64,
-    intent: LeaseTtlIntent,
-) -> LeaseAcquireTtlSizing {
-    let caller_lease_remaining_ms = lease::owner_remaining_ttl_ms(session_id);
-    let (lease_ttl_ms, reason) = match intent {
-        LeaseTtlIntent::CallerRequested => (
-            requested_ttl_ms,
-            "explicit_caller_ttl_honored_including_deliberate_shorten",
-        ),
-        LeaseTtlIntent::ToolSized => {
-            let sized = requested_ttl_ms
-                .max(caller_lease_remaining_ms)
-                .min(synapse_action::MAX_LEASE_TTL_MS);
-            let reason = if caller_lease_remaining_ms > requested_ttl_ms {
-                "caller_lease_remaining_preserved"
-            } else {
-                "tool_required_floor"
-            };
-            (sized, reason)
-        }
-    };
-    let sizing = LeaseAcquireTtlSizing {
-        requested_ttl_ms,
-        caller_lease_remaining_ms,
-        lease_ttl_ms,
-        intent,
-        reason,
-    };
-    tracing::info!(
-        code = "INPUT_LEASE_ACTION_TTL_SIZED",
-        tool,
-        session_id,
-        action_required_ttl_ms = requested_ttl_ms,
-        caller_lease_remaining_ms,
-        lease_ttl_ms,
-        ttl_ms_before = caller_lease_remaining_ms,
-        ttl_ms_after = lease_ttl_ms,
-        reduced_caller_ttl = sizing.reduced_caller_ttl(),
-        ttl_intent = intent.as_str(),
-        reason,
-        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
-        source_of_truth = "synapse_action::lease::owner_remaining_ttl_ms before the lease mutation",
-        "readback=input_lease control-lane lease TTL sized; a tool-sized TTL never shortens a live same-owner lease"
-    );
-    sizing
-}
-
 /// Acquire/renew the lease for `session_id`. Contended → `ACTION_FOREGROUND_LEASE_BUSY`.
 /// Split out from the `#[tool]` method so the full outcome logic is unit-testable
 /// without constructing an MCP `RequestContext`.
@@ -1026,10 +844,6 @@ fn acquire_lease_for_session(
     let ttl = lease::ttl_from_ms(ttl_ms);
     match lease::try_acquire(session_id, ttl) {
         LeaseOutcome::Acquired(status) => {
-            // A lease owner change invalidates any process-global destination
-            // armed by the prior owner. The new owner must bind/focus its own
-            // exact target before raw input can dispatch (#1830).
-            crate::m2::foreground_fence::disarm("foreground_input_lease_acquired_by_new_owner");
             tracing::info!(
                 code = "INPUT_LEASE_ACQUIRED",
                 session_id = %session_id,
@@ -1091,7 +905,6 @@ fn acquire_lease_for_session(
 fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, ErrorData> {
     match lease::release(session_id) {
         Ok(status) => {
-            crate::m2::foreground_fence::disarm("foreground_input_lease_released");
             tracing::info!(
                 code = "INPUT_LEASE_RELEASED",
                 session_id = %session_id,
@@ -1105,14 +918,11 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
         Err(error) => match &error {
             // #1556: releasing an unheld/expired lease is the *expected* end
             // state of a correct short-TTL client whose happy path outlived the
-            // lease. Make it idempotent: success with a physically
+            // lease (TTL max 30s). Make it idempotent: success with a physically
             // honest readback (released=false, was_held=false, holder=null). The
             // caller still audits it. Erroring here trained callers to swallow
             // release errors, which masked the one case that matters below.
             LeaseError::NotHeld { holder: None, .. } => {
-                crate::m2::foreground_fence::disarm(
-                    "foreground_input_lease_release_confirmed_not_held",
-                );
                 tracing::info!(
                     code = "INPUT_LEASE_RELEASE_NOOP",
                     session_id = %session_id,
@@ -1136,7 +946,6 @@ fn handoff_lease_for_session(
 ) -> Result<synapse_action::LeaseHandoff, ErrorData> {
     match lease::handoff(from_session_id, to_session_id, lease::ttl_from_ms(ttl_ms)) {
         Ok(handoff) => {
-            crate::m2::foreground_fence::disarm("foreground_input_lease_handed_off");
             tracing::info!(
                 code = "INPUT_LEASE_HANDED_OFF",
                 from_session_id,
@@ -1746,4 +1555,376 @@ fn lease_not_held_error(session_id: &str, error: &synapse_action::LeaseError) ->
             "holder_session_id": holder,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        acquire_lease_for_session, control_lease_operator_panic_state_result,
+        handoff_lease_for_session, lease_status_for_session, release_lease_for_session,
+        validate_lease_ttl_ms,
+    };
+    use crate::test_support;
+    use synapse_core::error_codes;
+
+    const TEST_RESET_REASON: &str = "lease_tools_test_reset";
+
+    fn error_code(error: &rmcp::ErrorData) -> Option<String> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    fn error_u64(error: &rmcp::ErrorData, field: &str) -> Option<u64> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    fn error_bool(error: &rmcp::ErrorData, field: &str) -> Option<bool> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    #[test]
+    fn raw_lease_operator_panic_gate_rejects_changed_epoch_and_pending_k2() {
+        control_lease_operator_panic_state_result(
+            "control_lease_acquire",
+            "panic-gate-session",
+            41,
+            41,
+            false,
+            "before_authority_gate_wait",
+        )
+        .expect("stable, terminal safety state must admit a new lease request");
+
+        let changed = control_lease_operator_panic_state_result(
+            "control_lease_acquire",
+            "panic-gate-session",
+            41,
+            42,
+            false,
+            "after_authority_gate_wait",
+        )
+        .expect_err("a panic generation published while authority waited must reject");
+        assert_eq!(
+            error_code(&changed).as_deref(),
+            Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+        );
+        assert_eq!(
+            error_u64(&changed, "operator_panic_epoch_at_entry"),
+            Some(41)
+        );
+        assert_eq!(error_u64(&changed, "operator_panic_epoch_after"), Some(42));
+        assert_eq!(
+            changed
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("CONTROL_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED")
+        );
+
+        let pending = control_lease_operator_panic_state_result(
+            "control_lease_status",
+            "panic-gate-session",
+            42,
+            42,
+            true,
+            "before_authority_gate_wait",
+        )
+        .expect_err("the same published epoch must remain denied until K2 is terminal");
+        assert_eq!(
+            error_code(&pending).as_deref(),
+            Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+        );
+        assert_eq!(
+            error_bool(&pending, "operator_panic_safety_pending"),
+            Some(true)
+        );
+        assert_eq!(
+            pending
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("CONTROL_LEASE_STATUS_OPERATOR_PANIC_PREARMED")
+        );
+
+        for (tool, detail_code) in [
+            (
+                "dashboard_control_lease_force_release",
+                "DASHBOARD_CONTROL_LEASE_FORCE_RELEASE_OPERATOR_PANIC_PREARMED",
+            ),
+            (
+                "dashboard_control_lease_handoff",
+                "DASHBOARD_CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED",
+            ),
+        ] {
+            let dashboard_error = control_lease_operator_panic_state_result(
+                tool,
+                synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID,
+                42,
+                42,
+                true,
+                "dashboard_admission",
+            )
+            .expect_err("dashboard lease mutation must fail closed while panic safety is pending");
+            assert_eq!(
+                error_code(&dashboard_error).as_deref(),
+                Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+            );
+            assert_eq!(
+                dashboard_error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("detail_code"))
+                    .and_then(serde_json::Value::as_str),
+                Some(detail_code)
+            );
+        }
+    }
+
+    #[test]
+    fn lease_ttl_validator_rejects_out_of_range_with_structured_bounds() {
+        let below = validate_lease_ttl_ms("control_lease_acquire", 99)
+            .expect_err("below-min ttl must fail closed");
+        assert_eq!(
+            error_code(&below).as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            error_u64(&below, "min_ttl_ms"),
+            Some(synapse_action::MIN_LEASE_TTL_MS)
+        );
+        assert_eq!(
+            error_u64(&below, "max_ttl_ms"),
+            Some(synapse_action::MAX_LEASE_TTL_MS)
+        );
+        assert_eq!(error_u64(&below, "ttl_ms"), Some(99));
+
+        let above = validate_lease_ttl_ms("control_lease_handoff", 30_001)
+            .expect_err("above-max ttl must fail closed");
+        assert_eq!(
+            error_code(&above).as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(error_u64(&above, "ttl_ms"), Some(30_001));
+
+        validate_lease_ttl_ms("control_lease_acquire", synapse_action::MIN_LEASE_TTL_MS)
+            .expect("minimum boundary ttl should be accepted");
+        validate_lease_ttl_ms("control_lease_acquire", synapse_action::MAX_LEASE_TTL_MS)
+            .expect("maximum boundary ttl should be accepted");
+    }
+
+    #[test]
+    fn acquire_then_status_then_release_round_trip() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let session = "regression-tool-acquire";
+        let acquired = acquire_lease_for_session(session, 5_000)
+            .map_err(|error| anyhow::anyhow!("acquire failed: {error:?}"))?;
+        assert_eq!(acquired.outcome, "acquired");
+        assert!(acquired.held);
+        assert!(acquired.is_owner);
+        assert_eq!(acquired.owner_session_id.as_deref(), Some(session));
+
+        // Source of truth: a separate status read reflects the holder.
+        let status = lease_status_for_session(session);
+        assert!(status.held);
+        assert!(status.is_owner);
+        assert_eq!(status.owner_session_id.as_deref(), Some(session));
+        println!(
+            "readback=input_lease step=after_acquire held={} owner={:?} expires_in_ms={:?}",
+            status.held, status.owner_session_id, status.expires_in_ms
+        );
+
+        let released = release_lease_for_session(session)
+            .map_err(|error| anyhow::anyhow!("release failed: {error:?}"))?;
+        assert_eq!(released.outcome, "released");
+        assert!(!released.held);
+
+        let after = lease_status_for_session(session);
+        assert!(!after.held);
+        assert_eq!(after.owner_session_id, None);
+        println!(
+            "readback=input_lease step=after_release held={} owner={:?}",
+            after.held, after.owner_session_id
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn second_session_is_refused_busy_with_holder() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let owner = "regression-tool-busy-owner";
+        let contender = "regression-tool-busy-contender";
+        let _held = acquire_lease_for_session(owner, 5_000)
+            .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
+
+        let error = match acquire_lease_for_session(contender, 5_000) {
+            Ok(response) => anyhow::bail!("contender unexpectedly acquired: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&error).as_deref(),
+            Some(error_codes::ACTION_FOREGROUND_LEASE_BUSY)
+        );
+        let holder = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("holder_session_id"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(holder, Some(owner));
+
+        // Source of truth: owner still holds; contender did not block.
+        let status = lease_status_for_session(owner);
+        assert_eq!(status.owner_session_id.as_deref(), Some(owner));
+        println!(
+            "readback=input_lease step=busy requesting={contender} holder={:?}",
+            status.owner_session_id
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_handoff_transfers_to_recipient_and_prior_owner_is_busy() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let owner = "regression-tool-handoff-owner";
+        let recipient = "regression-tool-handoff-recipient";
+        let _held = acquire_lease_for_session(owner, 5_000)
+            .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
+
+        let handoff = handoff_lease_for_session(owner, recipient, 6_000)
+            .map_err(|error| anyhow::anyhow!("handoff failed: {error:?}"))?;
+        assert_eq!(handoff.prior.owner_session_id.as_deref(), Some(owner));
+        assert_eq!(handoff.current.owner_session_id.as_deref(), Some(recipient));
+
+        let recipient_status = lease_status_for_session(recipient);
+        assert!(recipient_status.is_owner);
+        assert_eq!(
+            recipient_status.owner_session_id.as_deref(),
+            Some(recipient)
+        );
+        let owner_error = match acquire_lease_for_session(owner, 5_000) {
+            Ok(response) => anyhow::bail!("prior owner unexpectedly reacquired: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&owner_error).as_deref(),
+            Some(error_codes::ACTION_FOREGROUND_LEASE_BUSY)
+        );
+        println!(
+            "readback=input_lease step=handoff owner_before={:?} owner_after={:?}",
+            handoff.prior.owner_session_id, recipient_status.owner_session_id
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn non_owner_release_errors_not_held() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let owner = "regression-tool-nonowner-owner";
+        let intruder = "regression-tool-nonowner-intruder";
+        let _held = acquire_lease_for_session(owner, 5_000)
+            .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
+
+        let error = match release_lease_for_session(intruder) {
+            Ok(response) => anyhow::bail!("intruder unexpectedly released: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&error).as_deref(),
+            Some(error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD)
+        );
+        // Owner's lease survives the intruder's failed release.
+        assert!(lease_status_for_session(owner).is_owner);
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn release_when_unheld_is_idempotent_success() -> anyhow::Result<()> {
+        // #1556: no lease is held; releasing must succeed as a no-op with a
+        // physically honest readback, not ACTION_FOREGROUND_LEASE_NOT_HELD.
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        test_support::reset_lease(TEST_RESET_REASON);
+        let session = "regression-tool-idempotent-release";
+
+        let response = release_lease_for_session(session)
+            .map_err(|error| anyhow::anyhow!("unheld release must succeed: {error:?}"))?;
+
+        assert_eq!(response.outcome, "not_held");
+        assert_eq!(response.released, Some(false));
+        assert_eq!(response.was_held, Some(false));
+        assert!(!response.held);
+        assert_eq!(response.owner_session_id, None);
+        println!(
+            "readback=input_lease step=idempotent_release outcome={} released={:?} was_held={:?} held={}",
+            response.outcome, response.released, response.was_held, response.held
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn release_after_own_lease_expired_is_idempotent_success() -> anyhow::Result<()> {
+        // #1556: the common real case — a short-TTL client whose happy path
+        // outlived its lease. `ttl_from_ms` clamps the requested TTL up to
+        // MIN_LEASE_TTL_MS (100ms), so the sleep must exceed that floor for the
+        // lease to *genuinely* lapse; a shorter sleep leaves it live and would
+        // silently test the wrong path (release of a still-owned lease).
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        test_support::reset_lease(TEST_RESET_REASON);
+        let session = "regression-tool-expired-release";
+        let _held = acquire_lease_for_session(session, 1)
+            .map_err(|error| anyhow::anyhow!("acquire failed: {error:?}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            synapse_action::MIN_LEASE_TTL_MS + 50,
+        ));
+
+        let response = release_lease_for_session(session)
+            .map_err(|error| anyhow::anyhow!("expired-lease release must succeed: {error:?}"))?;
+
+        // release() reaps the lapsed grant (expire_if_lapsed) *before* the owner
+        // check, so nothing remains to free: the honest readback is a no-op
+        // (not_held / released=false / was_held=false / no owner) — and crucially
+        // still a SUCCESS, never the ACTION_FOREGROUND_LEASE_NOT_HELD error that
+        // #1556 measured on ~45% of real release calls.
+        assert_eq!(response.outcome, "not_held");
+        assert_eq!(response.released, Some(false));
+        assert_eq!(response.was_held, Some(false));
+        assert!(!response.held);
+        assert_eq!(response.owner_session_id, None);
+        println!(
+            "readback=input_lease step=expired_owner_release outcome={} released={:?} was_held={:?} held={}",
+            response.outcome, response.released, response.was_held, response.held
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn repeat_acquire_by_owner_renews() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let session = "regression-tool-renew";
+        let _first = acquire_lease_for_session(session, 5_000)
+            .map_err(|error| anyhow::anyhow!("first acquire failed: {error:?}"))?;
+        let second = acquire_lease_for_session(session, 5_000)
+            .map_err(|error| anyhow::anyhow!("renew failed: {error:?}"))?;
+        assert_eq!(second.outcome, "renewed");
+        assert!(second.is_owner);
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
 }

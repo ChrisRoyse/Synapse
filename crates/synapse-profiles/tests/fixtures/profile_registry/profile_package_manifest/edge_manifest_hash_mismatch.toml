@@ -1,0 +1,13 @@
+schema_version = 1
+kind = "profile_package_manifest_edge"
+case = "manifest_hash_mismatch"
+fixture_manifest_path = "crates/synapse-profiles/tests/fixtures/profile_registry/profile_package_manifest/happy_package_manifest.toml"
+expected_manifest_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+actual_manifest_digest = "sha256:e48f1b1b1549d1eaeba3f9df8ecca8228e009b0d38e39880a07ab214ae1269b2"
+
+[expected_policy]
+outcome = "reject"
+reason_code = "manifest_digest_mismatch"
+installed_manifest_written = false
+cf_profiles_rows_added = 0
+partial_install_allowed = false

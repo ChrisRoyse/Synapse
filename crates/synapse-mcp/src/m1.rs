@@ -1,8 +1,4 @@
 mod detection;
-pub(crate) use detection::{
-    detection_bundle_readback, run_detection_worker_from_cli,
-    run_detection_worker_from_process_args, validate_detection_backend_policy,
-};
 mod ocr;
 mod search;
 mod sources;
@@ -14,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use synapse_capture::{
     CAPTURE_CHANNEL_CAPACITY, CaptureBackend, CaptureConfig, CaptureController, CaptureTarget,
-    CaptureThreadPriority, MAX_CAPTURE_INTERVAL_MS, MIN_CAPTURE_INTERVAL_MS,
-    NO_EXPLICIT_GPU_API_CAPTURE_BACKEND, resolve_capture_target,
+    CaptureThreadPriority, resolve_capture_target,
 };
 use synapse_core::{
     AccessibleNode, CaptureRuntimeReadback, ElementId, FocusedElement, ForegroundContext,
@@ -24,8 +19,8 @@ use synapse_core::{
 };
 use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode};
 
+pub use detection::populate_detection_from_state;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
-pub use detection::{detection_inference_gate, populate_detection_from_state};
 #[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
 pub use ocr::{
@@ -45,7 +40,8 @@ use sources::{
 };
 
 pub type SharedM1State = Arc<Mutex<M1State>>;
-const MIN_CAPTURE_UPDATE_INTERVAL_MS: u64 = MIN_CAPTURE_INTERVAL_MS;
+const MIN_CAPTURE_UPDATE_INTERVAL_MS: u64 = 16;
+const MIN_CAPTURE_UPDATE_INTERVAL_MS_U32: u32 = 16;
 
 #[derive(Debug)]
 pub struct M1State {
@@ -56,16 +52,7 @@ pub struct M1State {
     pub perception_mode: PerceptionMode,
     pub manual_perception_mode: Option<PerceptionMode>,
     pub detection_config: DetectionRuntimeConfig,
-    /// Where `detection_config` came from and when it took effect (#2054).
-    ///
-    /// Health has to answer "since when has detection been off", and the only
-    /// honest answer is the moment this config was installed: either daemon
-    /// start with the built-in default (no detector), or the profile apply
-    /// that replaced it. Recorded here rather than inferred so the health
-    /// payload never dates a configuration it cannot prove.
-    pub detection_config_source: String,
-    pub detection_config_applied_unix_ms: u64,
-    pub detection_runtime: Option<DetectionRuntime>,
+    pub detection_runtime: DetectionRuntime,
     pub synthetic: Option<ObservationInput>,
     pub force_no_perception: bool,
     pub force_observe_internal: bool,
@@ -99,9 +86,7 @@ impl M1State {
             perception_mode: PerceptionMode::Auto,
             manual_perception_mode: None,
             detection_config: default_detection_config(),
-            detection_config_source: "daemon_default:no_profile_applied".to_owned(),
-            detection_config_applied_unix_ms: unix_ms_now(),
-            detection_runtime: Some(DetectionRuntime::default()),
+            detection_runtime: DetectionRuntime::default(),
             synthetic,
             force_no_perception,
             force_observe_internal,
@@ -123,7 +108,9 @@ impl M1State {
                 ),
                 generation: self.capture_controller.generation(),
                 min_update_interval_ms: Some(
-                    u32::try_from(self.capture_config.min_update_interval_ms).unwrap_or(u32::MAX),
+                    u32::try_from(self.capture_config.min_update_interval_ms)
+                        .unwrap_or(u32::MAX)
+                        .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
                 ),
                 cursor_visible: Some(self.capture_config.cursor_visible),
                 dirty_region_only: Some(self.capture_config.dirty_region_only),
@@ -136,24 +123,14 @@ impl M1State {
                 channel_capacity: CAPTURE_CHANNEL_CAPACITY,
                 thread_priority: None,
                 stop_requested: false,
-                worker_finished: false,
-                terminal_error_code: None,
-                terminal_error_message: None,
             };
         };
 
         let stats = handle.stats();
-        let terminal_error = stats.terminal_error();
         let active_config = handle.config();
         let latest_frame = stats.latest_frame();
         CaptureRuntimeReadback {
-            status: if terminal_error.is_some() {
-                "failed".to_owned()
-            } else if stats.worker_finished() {
-                "stopped".to_owned()
-            } else {
-                "running".to_owned()
-            },
+            status: "running".to_owned(),
             target: Some(observation_target_from_capture_target(
                 &handle.target().target,
             )),
@@ -163,7 +140,9 @@ impl M1State {
             selected_backend: Some(capture_backend_name(handle.target().backend).to_owned()),
             generation: self.capture_controller.generation(),
             min_update_interval_ms: Some(
-                u32::try_from(active_config.min_update_interval_ms).unwrap_or(u32::MAX),
+                u32::try_from(active_config.min_update_interval_ms)
+                    .unwrap_or(u32::MAX)
+                    .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
             ),
             cursor_visible: Some(active_config.cursor_visible),
             dirty_region_only: Some(active_config.dirty_region_only),
@@ -176,9 +155,6 @@ impl M1State {
             channel_capacity: handle.channel_capacity(),
             thread_priority: Some(capture_thread_priority_name(stats.thread_priority())),
             stop_requested: handle.is_stop_requested(),
-            worker_finished: stats.worker_finished(),
-            terminal_error_code: terminal_error.as_ref().map(|error| error.code.clone()),
-            terminal_error_message: terminal_error.map(|error| error.message),
         }
     }
 }
@@ -186,30 +162,6 @@ impl M1State {
 impl Default for M1State {
     fn default() -> Self {
         Self::from_env()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct M1ObservationSnapshot {
-    pub active_capture_config: ObservationCaptureConfig,
-    pub capture_runtime: CaptureRuntimeReadback,
-    pub perception_mode: PerceptionMode,
-    pub synthetic: Option<ObservationInput>,
-    pub force_no_perception: bool,
-    pub force_observe_internal: bool,
-}
-
-impl M1ObservationSnapshot {
-    #[must_use]
-    pub fn from_state(state: &M1State) -> Self {
-        Self {
-            active_capture_config: state.active_capture_config.clone(),
-            capture_runtime: state.capture_runtime_readback(),
-            perception_mode: state.perception_mode,
-            synthetic: state.synthetic.clone(),
-            force_no_perception: state.force_no_perception,
-            force_observe_internal: state.force_observe_internal,
-        }
     }
 }
 
@@ -234,13 +186,6 @@ pub struct ObserveParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
-    /// When present, transcribe this many seconds from the live loopback tail.
-    /// The request implies `include: ["audio"]` and the result is persisted in
-    /// the observation row before the call returns.
-    #[serde(default)]
-    pub transcribe_audio_seconds: Option<f64>,
-    #[serde(default)]
-    pub transcribe_audio_language: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -282,63 +227,6 @@ pub struct FindParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
-    /// Fused **memory** recall instead of perception (#1676): per-slot dense
-    /// (cosine) and sparse lexical (BM25) recall over the persisted Calyx search
-    /// generation, fused at the rank level by Reciprocal Rank Fusion (`k = 60`,
-    /// 1-based ranks). Answers "which stored records are like this one / like
-    /// this text / carry exactly this field value", not "what is on screen".
-    /// Every hit carries its per-lens rank contributions, the lenses that agreed
-    /// and dissented, verified ledger provenance, and each consulted lane's
-    /// exact scoring law.
-    ///
-    /// `query_mode=by_text` is **lexical**: it matches records sharing literal
-    /// word tokens with the query and cannot match a paraphrase, because no
-    /// Synapse lens is a semantic text embedding (#1898). `query_mode=by_exact`
-    /// takes `exact_slot` + `exact_value` and confirms every hash-bucket
-    /// candidate against its authoritative source field, so collisions are
-    /// dropped and counted rather than returned (#1899).
-    ///
-    /// Mutually exclusive with every perception filter above: the two read
-    /// different sources of truth and are never merged. Fails closed (naming
-    /// `storage operation=search_rebuild`) when the persisted generation is
-    /// missing, stale, or marked rebuild-required.
-    #[serde(default)]
-    pub similar: Option<crate::m3::storage::StorageFindSimilarParams>,
-}
-
-impl FindParams {
-    /// Names the perception-only fields this request actually set, so a request
-    /// that mixes perception filters with fused memory recall can be refused by
-    /// exact field rather than with a vague parameter error.
-    #[must_use]
-    pub fn present_perception_fields(&self) -> Vec<&'static str> {
-        let mut present = Vec::new();
-        if self.query.is_some() {
-            present.push("query");
-        }
-        if self.role.is_some() {
-            present.push("role");
-        }
-        if self.name_substring.is_some() {
-            present.push("name_substring");
-        }
-        if self.automation_id.is_some() {
-            present.push("automation_id");
-        }
-        if self.scope.is_some() {
-            present.push("scope");
-        }
-        if self.limit.is_some() {
-            present.push("limit");
-        }
-        if self.in_window.is_some() {
-            present.push("in_window");
-        }
-        if self.window_hwnd.is_some() {
-            present.push("window_hwnd");
-        }
-        present
-    }
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -353,19 +241,11 @@ pub enum FindScope {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FindResponse {
-    /// Perception element/entity hits. Empty on a fused-memory (`similar`) call:
-    /// fused hits are a different kind of evidence over a different source of
-    /// truth and are never folded in here.
     pub results: Vec<FindResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspected_injection: Vec<synapse_core::SuspectedInjectionAnnotation>,
-    /// Present only for a fused-memory call (#1676): the RRF-fused hits with
-    /// per-lens contributions, the persisted generation manifest they were read
-    /// from, and the explicit Ward guard-state readback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub similar: Option<crate::m3::storage::StorageFindSimilarResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -553,18 +433,16 @@ pub struct CaptureGifParams {
     /// Total recording window in milliseconds (default 3000, max 60000).
     #[serde(default)]
     pub duration_ms: Option<u64>,
-    /// Delay between captured frames in milliseconds (default 500, min 250).
+    /// Delay between captured frames in milliseconds (default 500, min 100).
     #[serde(default)]
-    #[schemars(range(min = 250))]
     pub interval_ms: Option<u64>,
     /// Window HWND to record. Defaults to this session's bound target window.
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Downscale (aspect-preserving) so each frame's longest edge never exceeds
-    /// this. Default 800; accepted range 1..=2048.
+    /// this. Default 800; set 0 to disable.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 2048))]
     pub max_long_edge: Option<u32>,
     #[serde(default)]
     pub overwrite: bool,
@@ -593,9 +471,8 @@ pub struct CaptureGifResponse {
 pub struct BrowserScreenshotParams {
     /// Output PNG/JPEG file path. Must be absolute.
     pub path: String,
-    /// Raw-CDP target id. Defaults to this MCP session's active target. Normal
-    /// authenticated Chrome bridge targets (`chrome-tab:<id>`) fail closed;
-    /// launch a dedicated non-default Synapse automation profile.
+    /// CDP/normal-bridge target id. Defaults to this MCP session's active CDP
+    /// target. Normal Chrome bridge targets are shaped like `chrome-tab:<id>`.
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     /// Browser HWND that owns the target. Required only when passing an
@@ -609,13 +486,11 @@ pub struct BrowserScreenshotParams {
     /// scopes. Uses page/document coordinates, not viewport or screen coords.
     #[serde(default)]
     pub clip: Option<Rect>,
-    /// Raw-CDP element id returned by `browser_locate` /
+    /// Normal bridge element id returned by `browser_locate` /
     /// `browser_aria_snapshot`. Required with `scope=element`.
     #[serde(default)]
     pub element_id: Option<String>,
-    /// Elements whose captured pixels are replaced after the bounded extension
-    /// composite is independently decoded and before encode. No page-DOM
-    /// overlay is created (#2214).
+    /// Elements to obscure before capture. Restored after capture.
     #[serde(default)]
     pub masks: Vec<BrowserScreenshotMask>,
     /// Image format. Defaults to the file extension.
@@ -624,8 +499,8 @@ pub struct BrowserScreenshotParams {
     /// JPEG quality 0..=100. Ignored for PNG.
     #[serde(default)]
     pub quality: Option<u8>,
-    /// Request transparent page background for PNG. The raw-CDP background
-    /// override is always cleared before the call returns.
+    /// Request transparent page background for PNG. The normal bridge also
+    /// restores any inline background changes after capture.
     #[serde(default)]
     pub omit_background: bool,
     #[serde(default)]
@@ -687,8 +562,7 @@ pub struct BrowserScreenshotResponse {
     pub bytes_written: u64,
     pub bitmap_sha256: String,
     pub cdp_target_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tab_id: Option<u32>,
+    pub tab_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_window_id: Option<i64>,
     pub url: String,
@@ -699,31 +573,7 @@ pub struct BrowserScreenshotResponse {
     pub scroll_width_css: f64,
     pub scroll_height_css: f64,
     pub tile_count: usize,
-    /// Exact bridge compositor implementation required by the daemon.
-    pub composition_mode: String,
-    pub capture_plan_schema: String,
-    pub capture_plan_hard_peak_budget_bytes: u64,
-    pub capture_plan_estimated_peak_bytes: u64,
-    pub capture_plan_native_message_budget_bytes: u64,
-    pub capture_plan_estimated_native_message_bytes: u64,
-    pub capture_plan_actual_native_message_bytes: u64,
-    pub capture_plan_actual_max_tile_data_url_bytes: u64,
-    pub capture_plan_actual_composite_blob_bytes: u64,
-    pub capture_plan_surface_released: bool,
-    /// Caller-requested mask count. Equal to resolved/applied counts on success.
     pub mask_count: usize,
-    pub mask_requested_count: usize,
-    pub mask_resolved_count: usize,
-    pub mask_applied_count: usize,
-    pub mask_partial_intersection_count: usize,
-    /// Conservative overwrite operations in the bounded composite. Pixels
-    /// covered by overlapping masks are counted once per overwrite.
-    pub mask_pixel_write_count: u64,
-    pub mask_backend: String,
-    /// SHA-256 over document generation plus ordered page-CSS rectangles and
-    /// exact RGBA bytes. It proves what was redacted without exposing selectors.
-    pub mask_commitment_sha256: String,
-    pub document_generation_sha256: String,
     pub omit_background: bool,
     pub required_foreground: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -733,40 +583,24 @@ pub struct BrowserScreenshotResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_os_foreground_after_restore_hwnd: Option<i64>,
     pub restored_human_os_foreground: bool,
-    pub foreground_transaction: BrowserScreenshotForegroundTransactionReadback,
     pub backend_tier_used: String,
     pub source_of_truth: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserScreenshotForegroundIdentityReadback {
+    /// Stable machine-readable code when the screenshot was degraded from the
+    /// normal page-screenshot lane. Absent on a full-fidelity bridge capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hwnd: Option<i64>,
+    pub degradation_code: Option<String>,
+    /// Physical readback source used to preserve target metadata during a
+    /// degraded capture. Absent on a full-fidelity bridge capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
+    pub fallback_metadata_source: Option<String>,
+    /// #1341/#1343: set when the normal Chrome bridge `captureVisibleTab` lane
+    /// disconnected mid-capture (the MV3 service worker drops the WebSocket on
+    /// some GPU/WebGL-heavy pages) and the screenshot was instead produced by a
+    /// passive WGC capture of the owning Chrome window. Carries the original
+    /// bridge error so the caller knows the image is a whole-window fallback,
+    /// not a viewport/clip/element capture. Absent on a normal bridge capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_started_at_100ns: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserScreenshotForegroundTransactionReadback {
-    pub required: bool,
-    pub attempted: bool,
-    pub restored: bool,
-    pub operator_superseded: bool,
-    pub outcome: String,
-    pub restore_method: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_set_foreground_window_result: Option<bool>,
-    pub alt_unlock_attempted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alt_unlock_set_foreground_window_result: Option<bool>,
-    pub prior_foreground: BrowserScreenshotForegroundIdentityReadback,
-    pub acquired_chrome_foreground: BrowserScreenshotForegroundIdentityReadback,
-    pub current_before_restore: BrowserScreenshotForegroundIdentityReadback,
-    pub final_foreground: BrowserScreenshotForegroundIdentityReadback,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -829,8 +663,7 @@ pub struct BrowserPdfResponse {
     pub pdf_sha256: String,
     pub capture_backend: String,
     pub cdp_target_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tab_id: Option<u32>,
+    pub tab_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_window_id: Option<i64>,
     pub url: String,
@@ -1078,7 +911,6 @@ pub struct HiddenDesktopPipFrameResponse {
 pub struct SetCaptureTargetParams {
     pub target: CaptureTargetParam,
     #[serde(default)]
-    #[schemars(range(min = 250, max = 60_000))]
     pub min_update_interval_ms: Option<u64>,
     #[serde(default)]
     pub cursor_visible: Option<bool>,
@@ -1314,33 +1146,6 @@ pub struct CdpCloseTabParams {
     pub cdp_target_id: String,
 }
 
-/// Non-fatal detail for a close whose PHYSICAL outcome was proven by an
-/// independent `chrome.tabs.query` readback because the Chrome bridge never
-/// returned a terminal acknowledgement for the `closeTab` command itself
-/// (#2032).
-///
-/// The extension issues `chrome.tabs.remove` before any awaited readback, so a
-/// delivered-but-unacknowledged `closeTab` (caller timeout, transport loss, or
-/// an in-extension absence-readback timeout) can have physically closed the
-/// tab. When that happens the verdict must come from `chrome.tabs` — the Source
-/// of Truth — and the lost acknowledgement must still be reported here, loudly
-/// and exactly, never swallowed and never turned into "close failed".
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpCloseAcknowledgementFailure {
-    /// Exact bridge error code for the failed/lost `closeTab` acknowledgement
-    /// (e.g. `A11Y_CDP_EXTENSION_TIMEOUT`).
-    pub code: String,
-    /// Exact bridge error detail for the failed/lost acknowledgement.
-    pub detail: String,
-    /// The independent readback that proved the physical outcome instead.
-    pub absence_readback: String,
-    /// True when `target_count_before` is NOT an observed value: the
-    /// acknowledgement that would have carried it never arrived, so the field
-    /// repeats the post-close count rather than a measured pre-close count.
-    pub target_count_before_unobserved: bool,
-}
-
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CdpCloseTabResponse {
@@ -1348,9 +1153,6 @@ pub struct CdpCloseTabResponse {
     pub window_hwnd: i64,
     pub endpoint: String,
     pub cdp_target_id: String,
-    /// True when this call issued `closeTab` for the exact target AND an
-    /// independent `chrome.tabs` readback shows the target absent afterwards.
-    /// Derived from the Source of Truth, never from the bridge acknowledgement.
     pub closed: bool,
     pub target_count_before: u32,
     pub target_count_after: u32,
@@ -1358,11 +1160,6 @@ pub struct CdpCloseTabResponse {
     pub previous: Option<TargetWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<TargetWire>,
-    /// Present only when `closed` was decided by the independent
-    /// `chrome.tabs.query` readback because the `closeTab` acknowledgement
-    /// failed or never arrived (#2032).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_acknowledgement_failure: Option<CdpCloseAcknowledgementFailure>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -1526,11 +1323,6 @@ pub struct BrowserTabsMutation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_cdp_target_id: Option<String>,
     pub closed: bool,
-    /// Present only for `operation=close` when `closed` was decided by the
-    /// independent `chrome.tabs.query` readback because the `closeTab`
-    /// acknowledgement failed or never arrived (#2032).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_acknowledgement_failure: Option<CdpCloseAcknowledgementFailure>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1781,10 +1573,8 @@ pub struct WindowListResponse {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadParams {
     /// Optional reconnect wait budget. Defaults to 10000 ms and is capped at
-    /// 30000 ms. This budget starts after the connected extension acknowledges
-    /// its bounded `chrome.runtime.reload` schedule. The tool returns only after
-    /// separate host, physical profile-row, and service-worker SHA readbacks
-    /// observe a new clean extension registration.
+    /// 30000 ms. The tool returns only after a separate bridge host readback
+    /// observes a new extension registration.
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
 }
@@ -1844,30 +1634,29 @@ pub struct CdpBridgeHostReadback {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadAckReadback {
     pub ok: bool,
-    pub control_surface: String,
-    pub required_foreground: bool,
-    pub installer_path: String,
-    pub installer_sha256: String,
-    pub installer_exit_code: i32,
-    pub installer_stdout_sha256: String,
-    pub installer_stderr_sha256: String,
-    pub installer_duration_ms: u64,
     pub extension_id: String,
-    pub extension_dir: String,
-    pub extension_service_worker_sha256: String,
-    pub active_profile: String,
-    pub reason: String,
-    pub profile_before_installed: bool,
-    pub profile_before_ready: bool,
-    pub profile_after_installed: bool,
-    pub profile_after_ready: bool,
-    pub loaded_build_id: String,
-    pub deployed_build_id: String,
-    pub scheduled_at_unix_ms: u64,
+    pub version: String,
+    pub protocol_version: u32,
+    pub build_id: String,
+    pub build_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_build_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_byte_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_error: Option<String>,
+    pub debugger_api_available: bool,
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    pub reload_requested_at_unix_ms: u64,
     pub reload_delay_ms: u64,
-    pub foreground_api_calls: u64,
-    pub tab_mutations: u64,
-    pub synthetic_input_events: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1876,8 +1665,7 @@ pub struct CdpBridgeReloadResponse {
     pub session_id: String,
     pub required_foreground: bool,
     pub wait_timeout_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before: Option<CdpBridgeHostReadback>,
+    pub before: CdpBridgeHostReadback,
     pub command_ack: CdpBridgeReloadAckReadback,
     pub after: CdpBridgeHostReadback,
     pub reconnected: bool,
@@ -1983,14 +1771,6 @@ pub struct CdpNavigateTabResponse {
     pub navigation_error_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_download: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub navigation_claim_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub navigation_correlation_status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_document_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_document_id: Option<String>,
     /// #1344: when the navigate started a Chrome download instead of changing the
     /// tab URL, the structured outcome — `download_started` or `download_completed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2849,14 +2629,6 @@ pub struct BrowserWaitForFunctionResponse {
     pub value_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unserializable_value: Option<String>,
-    /// Exact Chrome main-frame document identity before polling began.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_document_id: Option<String>,
-    /// Exact Chrome main-frame document identity that owns the accepted result.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_document_id: Option<String>,
-    /// Number of independently observed main-frame document transitions.
-    pub navigation_count: u64,
     pub url: String,
     pub title: String,
     pub ready_state: String,
@@ -3720,9 +3492,6 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
             }
         }
     }
-    if params.transcribe_audio_seconds.is_some() {
-        include.audio = true;
-    }
     include.max_subtree_depth = observe_gather_depth(params);
     include.max_subtree_nodes = params.max_elements.unwrap_or(60).clamp(1, 500);
     include.element_offset = params.element_offset.unwrap_or(0).min(100_000);
@@ -3742,40 +3511,31 @@ pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
     params.depth.unwrap_or(default_depth).min(6)
 }
 
-fn attach_observation_snapshot_metadata(
-    input: &mut ObservationInput,
-    snapshot: &M1ObservationSnapshot,
-) {
-    input.capture_config = Some(snapshot.active_capture_config.clone());
-    input.capture_runtime = Some(snapshot.capture_runtime.clone());
-    if snapshot.perception_mode != PerceptionMode::Auto {
-        input.mode_override = Some(snapshot.perception_mode);
-    }
-}
-
-pub fn current_input_from_snapshot(
-    snapshot: &M1ObservationSnapshot,
-    depth: u32,
-) -> Result<ObservationInput, ErrorData> {
-    if snapshot.force_observe_internal {
+pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {
+    if state.force_observe_internal {
         return Err(mcp_error(
             error_codes::OBSERVE_INTERNAL,
             "forced observe internal error",
         ));
     }
-    if snapshot.force_no_perception {
+    if state.force_no_perception {
         return Err(mcp_error(
             error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             "no perception source is available",
         ));
     }
-    if let Some(input) = &snapshot.synthetic {
+    if let Some(input) = &state.synthetic {
         let mut input = input_limited_to_depth(input.clone(), depth);
-        attach_observation_snapshot_metadata(&mut input, snapshot);
+        if state.perception_mode != PerceptionMode::Auto {
+            input.mode_override = Some(state.perception_mode);
+        }
+        input.capture_config = Some(state.active_capture_config.clone());
+        input.capture_runtime = Some(state.capture_runtime_readback());
         return Ok(input);
     }
-    let mut input = platform_input(depth, snapshot.perception_mode)?;
-    attach_observation_snapshot_metadata(&mut input, snapshot);
+    let mut input = platform_input(depth, state.perception_mode)?;
+    input.capture_config = Some(state.active_capture_config.clone());
+    input.capture_runtime = Some(state.capture_runtime_readback());
     Ok(input)
 }
 
@@ -3788,7 +3548,7 @@ pub fn current_input_from_snapshot(
 /// that the window/foreground perception path refuses to downgrade (#1508). The
 /// caller populates the requested global slots (fs recent, clipboard, audio)
 /// onto the returned input.
-pub fn global_only_input_from_snapshot(snapshot: &M1ObservationSnapshot) -> ObservationInput {
+pub fn global_only_input(state: &M1State) -> ObservationInput {
     // An honest "no window was observed" foreground: hwnd 0, empty process and
     // title. A global-only observe deliberately reads no window, so the
     // foreground carries no borrowed/foreground identity.
@@ -3812,29 +3572,32 @@ pub fn global_only_input_from_snapshot(snapshot: &M1ObservationSnapshot) -> Obse
         is_dwm_composed: false,
     };
     let mut input = ObservationInput::new(foreground);
-    attach_observation_snapshot_metadata(&mut input, snapshot);
+    input.capture_config = Some(state.active_capture_config.clone());
+    input.capture_runtime = Some(state.capture_runtime_readback());
+    if state.perception_mode != PerceptionMode::Auto {
+        input.mode_override = Some(state.perception_mode);
+    }
     input
 }
 
-pub fn observe_input_from_snapshot(
-    snapshot: &M1ObservationSnapshot,
+pub fn observe_input(
+    state: &M1State,
     params: &ObserveParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     let depth = observe_gather_depth(params);
     if let Some(element_id) = &params.subtree_root {
-        let mut input = element_input_from_id(element_id, depth, snapshot.perception_mode)?;
-        attach_observation_snapshot_metadata(&mut input, snapshot);
-        return Ok(input);
+        return element_input_from_id(element_id, depth, state.perception_mode);
     }
     // Precedence: explicit per-call window_hwnd > session active target >
     // foreground. The target path snapshots the window without foregrounding it.
     if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        let mut input = window_input_from_hwnd(hwnd, depth, snapshot.perception_mode)?;
-        attach_observation_snapshot_metadata(&mut input, snapshot);
+        let mut input = window_input_from_hwnd(hwnd, depth, state.perception_mode)?;
+        input.capture_config = Some(state.active_capture_config.clone());
+        input.capture_runtime = Some(state.capture_runtime_readback());
         return Ok(input);
     }
-    current_input_from_snapshot(snapshot, depth)
+    current_input(state, depth)
 }
 
 /// Attaches CDP (when reachable) and folds the page's DOM/accessibility tree
@@ -4755,20 +4518,21 @@ const FIND_CDP_MAX_NODES: usize = 300;
 /// Builds the perception input a `find` query searches (foreground or a specific
 /// window), including detection entities. Split from matching so the async `find`
 /// handler can fold in CDP web nodes (#685) before matching.
-pub fn build_find_input_from_snapshot(
-    snapshot: &M1ObservationSnapshot,
+pub fn build_find_input(
+    state: &mut M1State,
     params: &FindParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     // Precedence matches observe: explicit window_hwnd > session target > foreground.
-    let input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        let mut input =
-            window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, snapshot.perception_mode)?;
-        attach_observation_snapshot_metadata(&mut input, snapshot);
+    let mut input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+        let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
+        input.capture_config = Some(state.active_capture_config.clone());
+        input.capture_runtime = Some(state.capture_runtime_readback());
         input
     } else {
-        current_input_from_snapshot(snapshot, FIND_SNAPSHOT_DEPTH)?
+        current_input(state, FIND_SNAPSHOT_DEPTH)?
     };
+    populate_detection_from_state(state, &mut input);
     Ok(input)
 }
 
@@ -4818,7 +4582,6 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
         results,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
-        similar: None,
     }
 }
 
@@ -4830,7 +4593,7 @@ pub fn set_capture_target_in_state(
     let mut config = state.capture_config.clone();
     config.target = capture_target_from_param(params.target)?;
     if let Some(interval) = params.min_update_interval_ms {
-        config.min_update_interval_ms = validate_capture_interval(interval)?;
+        config.min_update_interval_ms = clamp_capture_interval(interval);
     }
     if let Some(cursor_visible) = params.cursor_visible {
         config.cursor_visible = cursor_visible;
@@ -4867,32 +4630,15 @@ pub fn apply_profile_runtime_config_in_state(
     if state.manual_perception_mode.is_none() {
         state.perception_mode = profile.mode;
     }
-    let detection_config = detection_config_from_profile(&profile.detection);
-    if let Some(runtime) = state.detection_runtime.as_mut() {
-        runtime
-            .reconcile_config(&detection_config, state.perception_mode)
-            .map_err(|error| {
-                mcp_error_with_remediation(
-                    error_codes::DETECTION_MODEL_INFER_FAILED,
-                    format!(
-                        "profile {} could not reconcile its persistent detector: {error}",
-                        profile.id
-                    ),
-                    "inspect the named worker PID/process and GPU reservation source of truth, then re-apply the profile after the exact owned worker is absent",
-                )
-            })?;
-    }
-    if detection_config != state.detection_config
-        || state.detection_config_source == "daemon_default:no_profile_applied"
-    {
-        state.detection_config_applied_unix_ms = unix_ms_now();
-    }
-    state.detection_config_source = format!("profile:{}", profile.id);
-    state.detection_config = detection_config;
+    state.detection_config = detection_config_from_profile(&profile.detection);
 
     let mut config = state.capture_config.clone();
-    config.min_update_interval_ms =
-        validate_capture_interval(u64::from(profile.capture.min_update_interval_ms))?;
+    config.min_update_interval_ms = u64::from(
+        profile
+            .capture
+            .min_update_interval_ms
+            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
+    );
     config.cursor_visible = profile.capture.cursor_visible;
     if let Some(target) = capture_target_from_profile_target(&profile.capture.target) {
         config.target = target;
@@ -4938,50 +4684,12 @@ fn detection_config_from_profile(profile: &ProfileDetection) -> DetectionRuntime
     DetectionRuntimeConfig::from_profile(profile)
 }
 
-/// Wall-clock milliseconds since the Unix epoch, for stamping when a runtime
-/// configuration took effect. A host clock before the epoch is not a reason to
-/// fail perception, so it stamps 0 rather than panicking.
-fn unix_ms_now() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
-
 pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
     let message = message.into();
     ErrorData::new(
         rmcp::model::ErrorCode(-32099),
         message,
         Some(json!({ "code": code })),
-    )
-}
-
-/// Builds an MCP error that carries a structured failure's **own** remediation
-/// as a field (#1911).
-///
-/// [`mcp_error`] emits `{"code": ...}` only, so converting a substrate error
-/// through it left the remediation reachable solely as text inside the message.
-/// Anything downstream mapping that error onto its own envelope therefore had
-/// nothing to forward and substituted a generic sentence — which is how a
-/// failure came to advise a fix for a different fault.
-///
-/// Use this wherever a typed error with a catalog remediation crosses into the
-/// MCP surface; use [`mcp_error`] for failures raised here, whose remediation
-/// belongs to the reporting surface rather than to a substrate.
-pub fn mcp_error_with_remediation(
-    code: &str,
-    message: impl Into<String>,
-    remediation: &str,
-) -> ErrorData {
-    let message = message.into();
-    ErrorData::new(
-        rmcp::model::ErrorCode(-32099),
-        message,
-        Some(json!({ "code": code, "remediation": remediation })),
     )
 }
 
@@ -5050,7 +4758,9 @@ fn observation_capture_from_capture_config(
 ) -> ObservationCaptureConfig {
     ObservationCaptureConfig {
         target: observation_target_from_capture_target(&config.target),
-        min_update_interval_ms: u32::try_from(config.min_update_interval_ms).unwrap_or(u32::MAX),
+        min_update_interval_ms: u32::try_from(config.min_update_interval_ms)
+            .unwrap_or(u32::MAX)
+            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
         cursor_visible: config.cursor_visible,
         dirty_region_only: config.dirty_region_only,
         generation,
@@ -5066,7 +4776,9 @@ fn observation_capture_from_profile_capture(
 ) -> ObservationCaptureConfig {
     ObservationCaptureConfig {
         target: observation_target_from_profile_target(&capture.target),
-        min_update_interval_ms: capture.min_update_interval_ms,
+        min_update_interval_ms: capture
+            .min_update_interval_ms
+            .max(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32),
         cursor_visible: capture.cursor_visible,
         dirty_region_only,
         generation,
@@ -5121,16 +4833,12 @@ fn capture_config_without_generation_eq(
         && left.source == right.source
 }
 
-fn validate_capture_interval(interval_ms: u64) -> Result<u64, ErrorData> {
-    if !(MIN_CAPTURE_UPDATE_INTERVAL_MS..=MAX_CAPTURE_INTERVAL_MS).contains(&interval_ms) {
-        return Err(mcp_error(
-            error_codes::CAPTURE_UNSUPPORTED_SEMANTICS,
-            format!(
-                "min_update_interval_ms={interval_ms} is outside the CPU/GDI low-CPU policy range {MIN_CAPTURE_UPDATE_INTERVAL_MS}..={MAX_CAPTURE_INTERVAL_MS}"
-            ),
-        ));
+const fn clamp_capture_interval(interval_ms: u64) -> u64 {
+    if interval_ms < MIN_CAPTURE_UPDATE_INTERVAL_MS {
+        MIN_CAPTURE_UPDATE_INTERVAL_MS
+    } else {
+        interval_ms
     }
-    Ok(interval_ms)
 }
 
 fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget, ErrorData> {
@@ -5185,7 +4893,8 @@ const fn capture_target_wire(target: &CaptureTarget) -> CaptureTargetWire {
 
 const fn capture_backend_name(backend: CaptureBackend) -> &'static str {
     match backend {
-        CaptureBackend::GdiBitBlt => NO_EXPLICIT_GPU_API_CAPTURE_BACKEND,
+        CaptureBackend::GraphicsCaptureApi => "graphics_capture_api",
+        CaptureBackend::DxgiDuplication => "dxgi_duplication",
     }
 }
 
@@ -5204,5 +4913,1243 @@ const fn mode_rationale(mode: PerceptionMode) -> &'static str {
         PerceptionMode::A11yOnly => "manual_a11y_only",
         PerceptionMode::PixelOnly => "manual_pixel_only",
         PerceptionMode::Hybrid => "manual_hybrid",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use synapse_core::{
+        Backend, CdpDiagnostics, CdpStatus, ProfileBackends, ProfileDetection, ProfileMatch,
+        ProfileOcr, ProfileUseScope, SensorStatus, WebPerceptionPath,
+    };
+    use synapse_perception::TextRegion;
+
+    #[test]
+    fn window_hwnd_shape_enforces_canonical_windows_user_handle_range() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = validate_window_hwnd_shape("observe", hwnd)
+                .expect_err("noncanonical HWND must fail before target resolution");
+            let data = error.data.expect("structured HWND validation data");
+            assert_eq!(
+                data.get("code").and_then(Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+            assert_eq!(data.get("tool").and_then(Value::as_str), Some("observe"));
+            assert_eq!(
+                data.get("field").and_then(Value::as_str),
+                Some("window_hwnd")
+            );
+            assert_eq!(
+                data.get("accepted_range").and_then(Value::as_str),
+                Some("1..=u32::MAX")
+            );
+            assert_eq!(data.get("actual_value").and_then(Value::as_i64), Some(hwnd));
+            assert!(
+                data.get("remediation")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("canonical"))
+            );
+        }
+
+        assert_eq!(validate_window_hwnd_shape("observe", 1).unwrap(), 1);
+        assert_eq!(
+            validate_window_hwnd_shape("observe", i64::from(u32::MAX)).unwrap(),
+            i64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn capture_target_rejects_noncanonical_window_before_runtime_switch() {
+        for window_hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = capture_target_from_param(CaptureTargetParam::Window { window_hwnd })
+                .expect_err("noncanonical capture target must fail before controller mutation");
+            let data = error.data.expect("structured HWND validation data");
+            assert_eq!(
+                data.get("code").and_then(Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+            assert_eq!(
+                data.get("tool").and_then(Value::as_str),
+                Some("set_capture_target")
+            );
+            assert_eq!(
+                data.get("actual_value").and_then(Value::as_i64),
+                Some(window_hwnd)
+            );
+        }
+    }
+
+    #[test]
+    fn hwnd_request_schemas_advertise_canonical_user_handle_range() {
+        fn assert_range<T: JsonSchema + 'static>(name: &str) {
+            let schema = common::schema_for_type::<T>();
+            let schema = Value::Object((*schema).clone());
+            assert_eq!(
+                schema["properties"]["window_hwnd"]["minimum"],
+                json!(1),
+                "{name} window_hwnd schema must fail closed for nonpositive values"
+            );
+            assert_eq!(
+                schema["properties"]["window_hwnd"]["maximum"],
+                json!(u32::MAX),
+                "{name} window_hwnd schema must reject noncanonical high bits"
+            );
+        }
+
+        assert_range::<ObserveParams>("observe");
+        assert_range::<FindParams>("find");
+        assert_range::<ReadTextParams>("read_text");
+        assert_range::<CaptureScreenshotParams>("capture_screenshot");
+        assert_range::<ScreenshotParams>("screenshot");
+        assert_range::<CaptureGifParams>("capture_gif");
+        assert_range::<HiddenDesktopPipFrameParams>("hidden_desktop_pip_frame");
+
+        let set_target = Value::Object((*set_target_input_schema()).clone());
+        let variants = set_target["properties"]["target"]["oneOf"]
+            .as_array()
+            .expect("set_target target variants");
+        assert_eq!(variants.len(), 2);
+        for variant in variants {
+            assert_eq!(variant["properties"]["window_hwnd"]["minimum"], json!(1));
+            assert_eq!(
+                variant["properties"]["window_hwnd"]["maximum"],
+                json!(u32::MAX)
+            );
+        }
+    }
+
+    /// #882: `include:["interactable"]` implies elements, flips the semantic
+    /// filter on, and raises the default gather depth to the maximum; an
+    /// explicit `depth` always wins.
+    #[test]
+    fn interactable_slot_implies_elements_and_deep_gather() {
+        let params: ObserveParams = serde_json::from_value(json!({
+            "include": ["interactable"]
+        }))
+        .expect("interactable include slot must deserialize");
+        let include = observe_include(&params);
+        println!(
+            "readback=observe_include edge=interactable elements={} interactable_only={} depth={}",
+            include.elements, include.interactable_only, include.max_subtree_depth
+        );
+        assert!(include.elements);
+        assert!(include.interactable_only);
+        assert!(!include.diagnostics);
+        assert_eq!(include.max_subtree_depth, 6);
+        assert_eq!(observe_gather_depth(&params), 6);
+
+        let explicit_depth: ObserveParams = serde_json::from_value(json!({
+            "include": ["interactable"],
+            "depth": 3
+        }))
+        .expect("explicit depth with interactable must deserialize");
+        assert_eq!(observe_gather_depth(&explicit_depth), 3);
+
+        let default_params = ObserveParams::default();
+        let default_include = observe_include(&default_params);
+        println!(
+            "readback=observe_include edge=default interactable_only={} depth={}",
+            default_include.interactable_only, default_include.max_subtree_depth
+        );
+        assert!(!default_include.interactable_only);
+        assert!(default_include.diagnostics);
+        assert_eq!(observe_gather_depth(&default_params), 2);
+    }
+
+    #[test]
+    fn set_target_deserialize_names_canonical_shapes() {
+        let canonical: SetTargetParams = serde_json::from_value(json!({
+            "target": {
+                "kind": "window",
+                "window_hwnd": 1234
+            }
+        }))
+        .expect("canonical window target shape must deserialize");
+        match canonical.target {
+            SetTargetParam::Window { window_hwnd } => assert_eq!(window_hwnd, 1234),
+            SetTargetParam::Cdp { .. } => panic!("expected window target"),
+        }
+
+        let alias_error = serde_json::from_value::<SetTargetParams>(json!({
+            "target": {
+                "hwnd": 1234
+            }
+        }))
+        .expect_err("legacy hwnd alias must fail loudly")
+        .to_string();
+        assert!(alias_error.contains("does not accept legacy field `hwnd`"));
+        assert!(alias_error.contains("\"kind\":\"window\""));
+        assert!(alias_error.contains("window_hwnd"));
+
+        let missing_kind_error = serde_json::from_value::<SetTargetParams>(json!({
+            "target": {
+                "window_hwnd": 1234
+            }
+        }))
+        .expect_err("missing kind must name accepted target shapes")
+        .to_string();
+        assert!(missing_kind_error.contains("missing string field `kind`"));
+        assert!(missing_kind_error.contains("\"kind\":\"cdp\""));
+    }
+
+    /// Supporting real-window integration evidence for per-agent target
+    /// perception (#736/#737); manual FSV remains separate. Bind a BACKGROUND
+    /// window as the target and verify `observe`
+    /// returns that window's content WITHOUT stealing the foreground. Source of
+    /// truth = `synapse_a11y::current_foreground_context()` (the real OS
+    /// foreground) read separately before/after. Spawns real Notepad + mspaint,
+    /// so it is `#[ignore]` by default; run on an interactive desktop with
+    /// `cargo test -p synapse-mcp --bins observe_target_window -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[ignore = "spawns real Notepad + mspaint; run on an interactive desktop with --ignored"]
+    #[test]
+    fn observe_target_window_in_background_without_foreground_steal() -> anyhow::Result<()> {
+        use std::{
+            process::Command,
+            thread::sleep,
+            time::{Duration, Instant},
+        };
+
+        fn wait_for_foreground_process(name: &str) -> Option<synapse_core::ForegroundContext> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Ok(foreground) = synapse_a11y::current_foreground_context()
+                    && foreground.process_name.eq_ignore_ascii_case(name)
+                {
+                    return Some(foreground);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                sleep(Duration::from_millis(150));
+            }
+        }
+
+        // 1) Launch Notepad and capture its HWND while it is the foreground.
+        let mut notepad = Command::new("notepad.exe").spawn()?;
+        let notepad_fg = wait_for_foreground_process("notepad.exe")
+            .ok_or_else(|| anyhow::anyhow!("notepad did not reach the foreground"))?;
+        let notepad_hwnd = notepad_fg.hwnd;
+        println!(
+            "readback=launch app=notepad hwnd=0x{:x} title={:?}",
+            notepad_hwnd, notepad_fg.window_title
+        );
+
+        // 2) Launch mspaint to STEAL the foreground away from Notepad (stands in
+        //    for the human / another agent changing focus).
+        let mut paint = Command::new("mspaint.exe").spawn()?;
+        let _paint_fg = wait_for_foreground_process("mspaint.exe")
+            .ok_or_else(|| anyhow::anyhow!("mspaint did not reach the foreground"))?;
+        let before_fg = synapse_a11y::current_foreground_context()?;
+        assert_ne!(
+            before_fg.hwnd, notepad_hwnd,
+            "precondition: Notepad must NOT be the foreground window"
+        );
+        println!(
+            "readback=foreground_before_observe hwnd=0x{:x} process={}",
+            before_fg.hwnd, before_fg.process_name
+        );
+
+        // 3) Observe the BACKGROUND Notepad via the per-session target path.
+        let state = M1State::default();
+        let params = ObserveParams {
+            window_hwnd: Some(notepad_hwnd),
+            ..ObserveParams::default()
+        };
+        let observation = observe_input(&state, &params, None)?;
+        println!(
+            "readback=observation foreground_hwnd=0x{:x} process={} title={:?}",
+            observation.foreground.hwnd,
+            observation.foreground.process_name,
+            observation.foreground.window_title
+        );
+
+        // Source of truth: the observation describes the TARGET (Notepad), not
+        // the OS foreground (mspaint).
+        assert_eq!(
+            observation.foreground.hwnd, notepad_hwnd,
+            "observation must describe the target window, not the foreground"
+        );
+        assert!(
+            observation
+                .foreground
+                .process_name
+                .eq_ignore_ascii_case("notepad.exe"),
+            "observed process should be notepad.exe, got {}",
+            observation.foreground.process_name
+        );
+
+        // 4) observe did NOT steal the foreground (no SetForegroundWindow on the
+        //    perception path).
+        let after_fg = synapse_a11y::current_foreground_context()?;
+        println!(
+            "readback=foreground_after_observe hwnd=0x{:x} process={}",
+            after_fg.hwnd, after_fg.process_name
+        );
+        assert_eq!(
+            after_fg.hwnd, before_fg.hwnd,
+            "observe must NOT change the foreground window"
+        );
+
+        // 5) Edge case: close the target, then observing it must fail loud
+        //    instead of silently reverting to the foreground.
+        notepad.kill().ok();
+        sleep(Duration::from_millis(750));
+        let after_close = observe_input(&state, &params, None);
+        println!(
+            "readback=observe_after_target_closed is_err={}",
+            after_close.is_err()
+        );
+        assert!(
+            after_close.is_err(),
+            "observing a closed target window must error, not silently fall back to foreground"
+        );
+
+        paint.kill().ok();
+        Ok(())
+    }
+
+    #[test]
+    fn capture_interval_floor_applies_to_manual_and_profile_metadata() {
+        let config = CaptureConfig {
+            min_update_interval_ms: 1,
+            ..CaptureConfig::default()
+        };
+        let manual = observation_capture_from_capture_config(&config, 42, "manual-test".to_owned());
+        assert_eq!(
+            manual.min_update_interval_ms,
+            MIN_CAPTURE_UPDATE_INTERVAL_MS_U32
+        );
+
+        let profile = ProfileCapture {
+            target: ProfileCaptureTarget::PrimaryMonitor,
+            min_update_interval_ms: 1,
+            cursor_visible: true,
+        };
+        let from_profile =
+            observation_capture_from_profile_capture(&profile, true, 43, "profile:test".to_owned());
+        assert_eq!(
+            from_profile.min_update_interval_ms,
+            MIN_CAPTURE_UPDATE_INTERVAL_MS_U32
+        );
+    }
+
+    #[test]
+    fn inactive_capture_runtime_readback_reports_controller_state() {
+        let mut state = M1State::default();
+        state.capture_config.min_update_interval_ms = 1;
+
+        let readback = state.capture_runtime_readback();
+
+        assert_eq!(readback.status, "inactive");
+        assert!(readback.target.is_none());
+        assert!(readback.backend.is_none());
+        assert_eq!(readback.generation, 0);
+        assert_eq!(
+            readback.min_update_interval_ms,
+            Some(MIN_CAPTURE_UPDATE_INTERVAL_MS_U32)
+        );
+        assert_eq!(readback.frames_captured, 0);
+        assert_eq!(readback.frames_dropped, 0);
+        assert_eq!(readback.channel_len, 0);
+        assert_eq!(readback.channel_capacity, CAPTURE_CHANNEL_CAPACITY);
+        assert!(!readback.stop_requested);
+    }
+
+    #[test]
+    fn element_window_rect_validation_requires_non_empty_bounds() {
+        let element_id = ElementId::parse("0x1:00000001").expect("valid element id");
+        let positive = Rect {
+            x: 10,
+            y: 20,
+            w: 1,
+            h: 1,
+        };
+        assert!(validate_element_window_rect(&element_id, positive).is_ok());
+
+        for rect in [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 10,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 0,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: -1,
+                h: 10,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: -1,
+            },
+        ] {
+            let error = validate_element_window_rect(&element_id, rect)
+                .expect_err("empty element_window bounds must fail closed");
+            assert!(error.message.contains("non-empty UI rectangle"));
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&json!(error_codes::CAPTURE_TARGET_INVALID))
+            );
+        }
+    }
+
+    #[test]
+    fn manual_perception_mode_survives_profile_runtime_apply() {
+        let mut state = M1State::default();
+        set_perception_mode_in_state(
+            &mut state,
+            &SetPerceptionModeParams {
+                mode: "pixel_only".to_owned(),
+            },
+        )
+        .expect("manual mode parses");
+
+        apply_profile_runtime_config_in_state(
+            &mut state,
+            &profile_with_mode(PerceptionMode::Hybrid),
+        )
+        .expect("profile config applies");
+
+        assert_eq!(state.perception_mode, PerceptionMode::PixelOnly);
+        assert_eq!(
+            state.manual_perception_mode,
+            Some(PerceptionMode::PixelOnly)
+        );
+    }
+
+    #[test]
+    fn auto_perception_mode_releases_profile_runtime_apply() {
+        let mut state = M1State::default();
+        set_perception_mode_in_state(
+            &mut state,
+            &SetPerceptionModeParams {
+                mode: "pixel_only".to_owned(),
+            },
+        )
+        .expect("manual mode parses");
+        set_perception_mode_in_state(
+            &mut state,
+            &SetPerceptionModeParams {
+                mode: "auto".to_owned(),
+            },
+        )
+        .expect("auto mode parses");
+
+        apply_profile_runtime_config_in_state(
+            &mut state,
+            &profile_with_mode(PerceptionMode::Hybrid),
+        )
+        .expect("profile config applies");
+
+        assert_eq!(state.perception_mode, PerceptionMode::Hybrid);
+        assert_eq!(state.manual_perception_mode, None);
+    }
+
+    #[test]
+    fn read_text_resolves_focused_region_when_target_is_omitted() {
+        let state = M1State {
+            synthetic: Some(synthetic_notepad_input()),
+            ..Default::default()
+        };
+        let focused = state
+            .synthetic
+            .as_ref()
+            .and_then(|input| input.focused.as_ref())
+            .expect("synthetic fixture has focused element")
+            .bbox;
+
+        let request = resolve_read_text_request(
+            &state,
+            &ReadTextParams {
+                backend: OcrBackend::Auto,
+                lang_hint: Some(" en-US ".to_owned()),
+                ..ReadTextParams::default()
+            },
+            None,
+        )
+        .expect("focused fallback should resolve");
+
+        assert_eq!(request.region, focused);
+        assert_eq!(request.requested_backend, OcrBackend::Auto);
+        assert_eq!(request.effective_backend, OcrBackend::Winrt);
+        assert_eq!(request.lang(), "en-US");
+        assert!(request.synthetic);
+    }
+
+    #[test]
+    fn read_text_crnn_backend_fails_closed_until_provider_is_wired() {
+        let state = M1State {
+            synthetic: Some(synthetic_notepad_input()),
+            ..Default::default()
+        };
+
+        let error = resolve_read_text_request(
+            &state,
+            &ReadTextParams {
+                region: Some(Rect {
+                    x: 1,
+                    y: 2,
+                    w: 80,
+                    h: 24,
+                }),
+                backend: OcrBackend::Crnn,
+                ..ReadTextParams::default()
+            },
+            None,
+        )
+        .expect_err("unwired CRNN backend must not silently fall through");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(error_codes::OCR_BACKEND_UNAVAILABLE))
+        );
+        assert!(error.message.contains("CRNN OCR backend"));
+    }
+
+    #[test]
+    fn read_text_rejects_zero_sized_regions_before_ocr() {
+        let state = M1State {
+            synthetic: Some(synthetic_notepad_input()),
+            ..Default::default()
+        };
+
+        for region in [
+            Rect {
+                x: 1,
+                y: 2,
+                w: 0,
+                h: 24,
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                w: 80,
+                h: 0,
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                w: -1,
+                h: 24,
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                w: 80,
+                h: -1,
+            },
+        ] {
+            let error = resolve_read_text_request(
+                &state,
+                &ReadTextParams {
+                    region: Some(region),
+                    backend: OcrBackend::Winrt,
+                    ..ReadTextParams::default()
+                },
+                None,
+            )
+            .expect_err("empty OCR regions must fail closed");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&json!(error_codes::OCR_NO_TEXT))
+            );
+        }
+    }
+
+    #[test]
+    fn browser_ocr_words_upgrade_uia_only_to_queryable_ocr_nodes() {
+        let mut input = chromium_ocr_input();
+        let before_path = input.web_path;
+        let before_len = input.elements.len();
+
+        let added = apply_browser_ocr_words(
+            &mut input,
+            vec![
+                TextRegion {
+                    text: " Checkout ".to_owned(),
+                    bbox: Rect {
+                        x: 120,
+                        y: 180,
+                        w: 92,
+                        h: 24,
+                    },
+                    confidence: 0.95,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
+                },
+                TextRegion {
+                    text: "now".to_owned(),
+                    bbox: Rect {
+                        x: 218,
+                        y: 180,
+                        w: 44,
+                        h: 24,
+                    },
+                    confidence: 0.93,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
+                },
+            ],
+            8,
+        );
+
+        println!(
+            "readback=browser_ocr edge=happy before_path:{before_path:?} before_elements:{before_len} after_path:{:?} after_elements:{} added:{added}",
+            input.web_path,
+            input.elements.len()
+        );
+        assert_eq!(added, 2);
+        assert_eq!(input.web_path, Some(WebPerceptionPath::Ocr));
+        assert_eq!(input.elements[0].name, "Checkout");
+        assert_eq!(input.elements[0].role, "text");
+        assert_eq!(
+            input.elements[0].automation_id.as_deref(),
+            Some("ocr:word:0")
+        );
+        assert!(
+            input.elements[0]
+                .element_id
+                .parts()
+                .expect("OCR element id parses")
+                .runtime_id_hex
+                .starts_with("0c0c")
+        );
+        assert_eq!(
+            browser_ocr_rect_from_element_id(&input.elements[0].element_id),
+            Some(Rect {
+                x: 120,
+                y: 180,
+                w: 92,
+                h: 24,
+            })
+        );
+    }
+
+    #[test]
+    fn browser_ocr_words_keep_uia_only_when_ocr_has_no_usable_text() {
+        let mut input = chromium_ocr_input();
+
+        let added = apply_browser_ocr_words(
+            &mut input,
+            vec![
+                TextRegion {
+                    text: "   ".to_owned(),
+                    bbox: Rect {
+                        x: 1,
+                        y: 2,
+                        w: 30,
+                        h: 12,
+                    },
+                    confidence: 0.5,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
+                },
+                TextRegion {
+                    text: "Hidden".to_owned(),
+                    bbox: Rect {
+                        x: 1,
+                        y: 2,
+                        w: 0,
+                        h: 12,
+                    },
+                    confidence: 0.5,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
+                },
+            ],
+            8,
+        );
+
+        println!(
+            "readback=browser_ocr edge=empty after_path:{:?} after_elements:{} added:{added}",
+            input.web_path,
+            input.elements.len()
+        );
+        assert_eq!(added, 0);
+        assert_eq!(input.web_path, Some(WebPerceptionPath::UiaOnly));
+        assert!(input.elements.is_empty());
+    }
+
+    #[test]
+    fn browser_ocr_guard_only_allows_cdp_failures_on_uia_only_path() {
+        let mut input = chromium_ocr_input();
+        assert!(should_attempt_browser_ocr(&input));
+
+        input.cdp = Some(CdpDiagnostics {
+            process_name: "chrome.exe".to_owned(),
+            status: CdpStatus::Ok,
+            endpoint: Some("http://127.0.0.1:9222".to_owned()),
+            checked_ports: vec![9222],
+            checked_endpoints: vec!["http://127.0.0.1:9222".to_owned()],
+            reason_code: None,
+            detail: None,
+            capabilities: Vec::new(),
+            attached_node_count: None,
+            selected_target_id: None,
+            selected_session_id: None,
+            target_selection_reason: None,
+            target_candidate_count: None,
+            frame_tree_frame_count: None,
+            attached_frame_target_count: None,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
+        });
+        assert!(!should_attempt_browser_ocr(&input));
+
+        input.cdp = Some(CdpDiagnostics::unreachable(
+            "chrome.exe",
+            error_codes::A11Y_CDP_UNREACHABLE,
+        ));
+        input.web_path = Some(WebPerceptionPath::Cdp);
+        assert!(!should_attempt_browser_ocr(&input));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cdp_enrichment_skips_deprecated_chrome_debugger_extension_snapshot() {
+        let mut input = chromium_ocr_input();
+        let before_element_count = input.elements.len();
+
+        enrich_input_with_cdp_for_target(&mut input, 6, 160, Some("chrome-tab:test")).await;
+
+        let diagnostics = input.cdp.as_ref().expect("cdp diagnostics");
+        println!(
+            "readback=cdp_enrich edge=normal_chrome_no_raw_cdp status:{} reason:{:?} detail:{:?} before_elements:{} after_elements:{}",
+            diagnostics.status.as_str(),
+            diagnostics.reason_code,
+            diagnostics.detail,
+            before_element_count,
+            input.elements.len()
+        );
+        assert_eq!(diagnostics.status, CdpStatus::ExtensionUnavailable);
+        assert_eq!(
+            diagnostics.reason_code.as_deref(),
+            Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE)
+        );
+        assert!(
+            diagnostics
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("disabled"))
+        );
+        assert!(diagnostics.detail.as_deref().is_none_or(|detail| {
+            !detail.contains(error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED)
+        }));
+        assert_eq!(input.elements.len(), before_element_count);
+    }
+
+    #[test]
+    fn browser_ocr_skips_when_main_pane_uia_content_is_present() {
+        let mut input = chromium_ocr_input();
+        input.elements.push(chromium_uia_node(
+            "Force Renderer Complete Button",
+            "button",
+            Rect {
+                x: 420,
+                y: 180,
+                w: 320,
+                h: 34,
+            },
+            "0000002a00000042",
+        ));
+
+        println!(
+            "readback=browser_ocr edge=main_pane_uia after_has_content:{} after_should_full_ocr:{} after_should_overlay_ocr:{}",
+            has_chromium_main_pane_uia_content(&input),
+            should_attempt_browser_ocr(&input),
+            should_attempt_browser_overlay_ocr(&input)
+        );
+        assert!(has_chromium_main_pane_uia_content(&input));
+        assert!(!should_attempt_browser_ocr(&input));
+        assert!(should_attempt_browser_overlay_ocr(&input));
+    }
+
+    #[test]
+    fn browser_overlay_ocr_accepts_new_visible_text_missing_from_uia() {
+        let mut input = chromium_ocr_input();
+        input.elements.push(chromium_uia_node(
+            "Timeline item loaded",
+            "text",
+            Rect {
+                x: 440,
+                y: 280,
+                w: 360,
+                h: 36,
+            },
+            "0000002a00000044",
+        ));
+        let probe_region = browser_overlay_probe_region(
+            browser_content_region(input.foreground.window_bounds)
+                .expect("test browser content region exists"),
+        )
+        .expect("test overlay probe region exists");
+
+        let gap = browser_overlay_ocr_gap(
+            &input,
+            vec![
+                ocr_word("Compose", 520, 340),
+                ocr_word("hidden", 520, 388),
+                ocr_word("modal", 618, 388),
+                ocr_word("draft", 702, 388),
+                ocr_word("Post", 520, 454),
+                ocr_word("Cancel", 610, 454),
+            ],
+            probe_region,
+        );
+
+        println!(
+            "readback=browser_overlay_ocr edge=missing_modal before_path:{:?} probe:{probe_region:?} cluster:{:?} new_tokens:{} action_tokens:{} attach:{}",
+            input.web_path,
+            gap.cluster_region,
+            gap.new_token_count,
+            gap.new_action_token_count,
+            browser_overlay_ocr_gap_is_actionable(
+                gap.new_token_count,
+                gap.new_action_token_count,
+                gap.cluster_region,
+                probe_region
+            )
+        );
+        assert!(should_attempt_browser_overlay_ocr(&input));
+        assert_eq!(gap.new_token_count, 6);
+        assert_eq!(gap.new_action_token_count, 3);
+        assert_eq!(
+            gap.cluster_region,
+            Some(Rect {
+                x: 520,
+                y: 340,
+                w: 260,
+                h: 140,
+            })
+        );
+        assert!(browser_overlay_ocr_gap_is_actionable(
+            gap.new_token_count,
+            gap.new_action_token_count,
+            gap.cluster_region,
+            probe_region
+        ));
+
+        let added = apply_browser_ocr_words(&mut input, gap.words, 8);
+        assert_eq!(added, 6);
+        assert_eq!(input.web_path, Some(WebPerceptionPath::Ocr));
+        assert!(input.elements.iter().any(|node| node.name == "Post"));
+        assert!(input.elements.iter().any(|node| {
+            node.automation_id
+                .as_deref()
+                .is_some_and(|automation_id| automation_id.starts_with("ocr:word:"))
+        }));
+    }
+
+    #[test]
+    fn browser_overlay_ocr_rejects_text_already_exposed_by_uia() {
+        let input = {
+            let mut input = chromium_ocr_input();
+            input.elements.push(chromium_uia_node(
+                "Compose hidden modal draft Post Cancel",
+                "text",
+                Rect {
+                    x: 440,
+                    y: 280,
+                    w: 560,
+                    h: 160,
+                },
+                "0000002a00000045",
+            ));
+            input
+        };
+        let probe_region = browser_overlay_probe_region(
+            browser_content_region(input.foreground.window_bounds)
+                .expect("test browser content region exists"),
+        )
+        .expect("test overlay probe region exists");
+
+        let gap = browser_overlay_ocr_gap(
+            &input,
+            vec![
+                ocr_word("Compose", 520, 340),
+                ocr_word("hidden", 520, 388),
+                ocr_word("modal", 618, 388),
+                ocr_word("draft", 702, 388),
+                ocr_word("Post", 520, 454),
+                ocr_word("Cancel", 610, 454),
+            ],
+            probe_region,
+        );
+
+        println!(
+            "readback=browser_overlay_ocr edge=already_exposed probe:{probe_region:?} cluster:{:?} new_tokens:{} action_tokens:{} attach:{}",
+            gap.cluster_region,
+            gap.new_token_count,
+            gap.new_action_token_count,
+            browser_overlay_ocr_gap_is_actionable(
+                gap.new_token_count,
+                gap.new_action_token_count,
+                gap.cluster_region,
+                probe_region
+            )
+        );
+        assert!(should_attempt_browser_overlay_ocr(&input));
+        assert_eq!(gap.new_token_count, 0);
+        assert_eq!(gap.new_action_token_count, 0);
+        assert_eq!(gap.cluster_region, None);
+        assert!(gap.words.is_empty());
+        assert!(!browser_overlay_ocr_gap_is_actionable(
+            gap.new_token_count,
+            gap.new_action_token_count,
+            gap.cluster_region,
+            probe_region
+        ));
+    }
+
+    #[test]
+    fn browser_overlay_ocr_rejects_scattered_page_noise_without_modal_actions() {
+        let mut input = chromium_ocr_input();
+        input.elements.push(chromium_uia_node(
+            "Share Mode starts after workspace ready",
+            "text",
+            Rect {
+                x: 420,
+                y: 260,
+                w: 520,
+                h: 42,
+            },
+            "0000002a00000046",
+        ));
+        let probe_region = browser_overlay_probe_region(
+            browser_content_region(input.foreground.window_bounds)
+                .expect("test browser content region exists"),
+        )
+        .expect("test overlay probe region exists");
+
+        let gap = browser_overlay_ocr_gap(
+            &input,
+            vec![
+                ocr_word("Start", 910, 320),
+                ocr_word("Turn", 880, 460),
+                ocr_word("month", 930, 660),
+                ocr_word("queue", 540, 650),
+                ocr_word("private", 500, 330),
+            ],
+            probe_region,
+        );
+
+        println!(
+            "readback=browser_overlay_ocr edge=scattered_noise probe:{probe_region:?} cluster:{:?} new_tokens:{} action_tokens:{} attach:{}",
+            gap.cluster_region,
+            gap.new_token_count,
+            gap.new_action_token_count,
+            browser_overlay_ocr_gap_is_actionable(
+                gap.new_token_count,
+                gap.new_action_token_count,
+                gap.cluster_region,
+                probe_region
+            )
+        );
+        assert_eq!(gap.new_action_token_count, 0);
+        assert!(!browser_overlay_ocr_gap_is_actionable(
+            gap.new_token_count,
+            gap.new_action_token_count,
+            gap.cluster_region,
+            probe_region
+        ));
+    }
+
+    #[test]
+    fn browser_overlay_ocr_anchors_on_action_cluster_when_probe_includes_page_noise() {
+        let mut input = chromium_ocr_input();
+        input.foreground.window_bounds = Rect {
+            x: 1974,
+            y: 29,
+            w: 2976,
+            h: 1936,
+        };
+        input.elements.extend([
+            chromium_uia_node(
+                "Main timeline control surface",
+                "heading",
+                Rect {
+                    x: 2658,
+                    y: 421,
+                    w: 1294,
+                    h: 59,
+                },
+                "0000002a00000047",
+            ),
+            chromium_uia_node(
+                "Refresh timeline",
+                "button",
+                Rect {
+                    x: 2658,
+                    y: 609,
+                    w: 261,
+                    h: 66,
+                },
+                "0000002a00000048",
+            ),
+            chromium_uia_node(
+                "Underlying state ready for OCR overlay verification.",
+                "text",
+                Rect {
+                    x: 2680,
+                    y: 718,
+                    w: 684,
+                    h: 33,
+                },
+                "0000002a00000049",
+            ),
+            chromium_uia_node(
+                "Open settings",
+                "link",
+                Rect {
+                    x: 2658,
+                    y: 795,
+                    w: 230,
+                    h: 66,
+                },
+                "0000002a0000004a",
+            ),
+        ]);
+        let probe_region = browser_overlay_probe_region(
+            browser_content_region(input.foreground.window_bounds)
+                .expect("observed browser content region exists"),
+        )
+        .expect("observed overlay probe region exists");
+
+        let gap = browser_overlay_ocr_gap(
+            &input,
+            vec![
+                ocr_sized_word("fresh", 2719, 631, 64, 22),
+                ocr_sized_word("timeline", 2794, 631, 102, 22),
+                ocr_sized_word("derlying", 2719, 724, 103, 28),
+                ocr_sized_word("state", 2833, 725, 63, 21),
+                ocr_sized_word("ready", 2907, 724, 73, 28),
+                ocr_sized_word("for", 2989, 724, 35, 22),
+                ocr_sized_word("OCR", 3033, 724, 65, 22),
+                ocr_sized_word("overlay", 3108, 724, 95, 28),
+                ocr_sized_word("verification.", 3212, 724, 149, 22),
+                ocr_sized_word("en", 2718, 823, 34, 16),
+                ocr_sized_word("settings", 2763, 817, 102, 28),
+                ocr_sized_word("Compose", 3028, 856, 322, 67),
+                ocr_sized_word("Visible", 3025, 980, 147, 37),
+                ocr_sized_word("Modal", 3192, 980, 132, 37),
+                ocr_sized_word("Alpha", 3341, 980, 129, 47),
+                ocr_sized_word("Top", 3025, 1058, 80, 47),
+                ocr_sized_word("layer", 3124, 1058, 108, 47),
+                ocr_sized_word("pixels", 3249, 1058, 125, 47),
+                ocr_sized_word("only", 3392, 1058, 92, 47),
+                ocr_sized_word("Post", 3073, 1242, 107, 37),
+                ocr_sized_word("Cancel", 3425, 1241, 163, 38),
+            ],
+            probe_region,
+        );
+
+        println!(
+            "readback=browser_overlay_ocr edge=action_anchor_noise probe:{probe_region:?} cluster:{:?} new_tokens:{} action_tokens:{} attach:{}",
+            gap.cluster_region,
+            gap.new_token_count,
+            gap.new_action_token_count,
+            browser_overlay_ocr_gap_is_actionable(
+                gap.new_token_count,
+                gap.new_action_token_count,
+                gap.cluster_region,
+                probe_region
+            )
+        );
+        assert_eq!(
+            probe_region,
+            Rect {
+                x: 2718,
+                y: 585,
+                w: 1488,
+                h: 920,
+            }
+        );
+        assert_eq!(gap.new_action_token_count, 3);
+        assert!(gap.words.iter().any(|word| word.text == "Compose"));
+        assert!(gap.words.iter().any(|word| word.text == "Post"));
+        assert!(gap.words.iter().any(|word| word.text == "Cancel"));
+        assert!(!gap.words.iter().any(|word| word.text == "fresh"));
+        assert!(!gap.words.iter().any(|word| word.text == "derlying"));
+        assert!(browser_overlay_ocr_gap_is_actionable(
+            gap.new_token_count,
+            gap.new_action_token_count,
+            gap.cluster_region,
+            probe_region
+        ));
+    }
+
+    #[test]
+    fn browser_ocr_runs_when_only_sidebar_uia_content_is_present() {
+        let mut input = chromium_ocr_input();
+        input.elements.push(AccessibleNode {
+            element_id: synapse_core::element_id(0x2200, "0000002a00000043"),
+            parent: None,
+            name: "Navigation Item".to_owned(),
+            role: "link".to_owned(),
+            automation_id: Some("sidebar-link".to_owned()),
+            value: None,
+            bbox: Rect {
+                x: 40,
+                y: 180,
+                w: 220,
+                h: 34,
+            },
+            enabled: true,
+            focused: false,
+            patterns: vec![synapse_core::UiaPattern::Invoke],
+            children_count: 0,
+            depth: 2,
+        });
+
+        println!(
+            "readback=browser_ocr edge=sidebar_only after_has_content:{} after_should_ocr:{}",
+            has_chromium_main_pane_uia_content(&input),
+            should_attempt_browser_ocr(&input)
+        );
+        assert!(!has_chromium_main_pane_uia_content(&input));
+        assert!(should_attempt_browser_ocr(&input));
+    }
+
+    #[test]
+    fn browser_content_tiles_skip_chrome_band_and_bound_tile_count() {
+        let content = browser_content_region(Rect {
+            x: 10,
+            y: 20,
+            w: 1200,
+            h: 1600,
+        })
+        .expect("large browser window has content region");
+        let tiles = browser_ocr_tiles(content);
+
+        println!(
+            "readback=browser_ocr edge=tiles content:{content:?} tile_count:{} first:{:?} last:{:?}",
+            tiles.len(),
+            tiles.first(),
+            tiles.last()
+        );
+        assert_eq!(content.y, 116);
+        assert_eq!(content.h, 1504);
+        assert_eq!(tiles.len(), 3);
+        assert_eq!(tiles[0].h, BROWSER_OCR_TILE_HEIGHT_PX);
+        assert_eq!(tiles[2].h, 304);
+        assert!(
+            browser_content_region(Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 0,
+            })
+            .is_none()
+        );
+    }
+
+    fn chromium_ocr_input() -> ObservationInput {
+        let mut input = ObservationInput::new(ForegroundContext {
+            hwnd: 0x2200,
+            pid: 7777,
+            process_name: "chrome.exe".to_owned(),
+            process_path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".to_owned(),
+            window_title: "Example - Google Chrome".to_owned(),
+            window_bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 1280,
+                h: 900,
+            },
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: Some("chrome".to_owned()),
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        });
+        input.capture_status = SensorStatus::Healthy;
+        input.cdp = Some(CdpDiagnostics::unreachable(
+            "chrome.exe",
+            error_codes::A11Y_CDP_UNREACHABLE,
+        ));
+        input.web_path = Some(WebPerceptionPath::UiaOnly);
+        input
+    }
+
+    fn chromium_uia_node(name: &str, role: &str, bbox: Rect, runtime_id: &str) -> AccessibleNode {
+        AccessibleNode {
+            element_id: synapse_core::element_id(0x2200, runtime_id),
+            parent: None,
+            name: name.to_owned(),
+            role: role.to_owned(),
+            automation_id: Some(format!("test-{runtime_id}")),
+            value: None,
+            bbox,
+            enabled: true,
+            focused: false,
+            patterns: vec![synapse_core::UiaPattern::Invoke],
+            children_count: 0,
+            depth: 2,
+        }
+    }
+
+    fn ocr_word(text: &str, x: i32, y: i32) -> TextRegion {
+        ocr_sized_word(text, x, y, 78, 26)
+    }
+
+    fn ocr_sized_word(text: &str, x: i32, y: i32, w: i32, h: i32) -> TextRegion {
+        TextRegion {
+            text: text.to_owned(),
+            bbox: Rect { x, y, w, h },
+            confidence: 0.95,
+            confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
+        }
+    }
+
+    fn profile_with_mode(mode: PerceptionMode) -> Profile {
+        Profile {
+            id: "test-profile".to_owned(),
+            label: "Test Profile".to_owned(),
+            version: "2".to_owned(),
+            use_scope: ProfileUseScope::OperatorOwnedTest,
+            matches: vec![ProfileMatch {
+                exe: Some("test.exe".to_owned()),
+                title_regex: None,
+                steam_appid: None,
+                window_class: None,
+                process_args: Vec::new(),
+            }],
+            mode,
+            capture: ProfileCapture {
+                target: ProfileCaptureTarget::ForegroundWindow,
+                min_update_interval_ms: 50,
+                cursor_visible: true,
+            },
+            detection: ProfileDetection {
+                model_id: None,
+                classes_of_interest: Vec::new(),
+                confidence_threshold: 0.5,
+                max_detections: 32,
+            },
+            ocr: ProfileOcr {
+                default_backend: OcrBackend::Auto,
+                regions: Vec::new(),
+                parser_config: BTreeMap::new(),
+            },
+            hud: Vec::new(),
+            keymap: BTreeMap::new(),
+            backends: ProfileBackends {
+                default: Backend::Auto,
+                keyboard_default: Backend::Auto,
+                mouse_default: Backend::Auto,
+                pad_default: Backend::Auto,
+            },
+            metadata: BTreeMap::new(),
+            event_extensions: Vec::new(),
+        }
     }
 }

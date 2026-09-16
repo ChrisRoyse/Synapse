@@ -5,9 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
-# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
-# makes this crate `private` for `cargo deny check licenses` (#1930).
-publish.workspace = true
+
+[features]
+# Exposes `lease::isolate_for_test`, which installs a thread-local override of
+# the process-global input lease so downstream crates' parallel tests can run
+# hermetically (see issue #1574). Off in production; enabled via dev-dependency.
+test-support = []
 
 [dependencies]
 bit-set = "0.10.0"
@@ -21,7 +24,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-enigo = { version = "0.6.1", git = "https://github.com/enigo-rs/enigo", rev = "a9da6367f189d6d6ca95f1d3de34a5ff2f6c2a68", default-features = false }
+enigo.workspace = true
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 vigem-client = { workspace = true, features = ["unstable_ds4"] }
@@ -29,7 +32,36 @@ windows.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 arboard.workspace = true
-enigo = { version = "0.6.1", git = "https://github.com/enigo-rs/enigo", rev = "a9da6367f189d6d6ca95f1d3de34a5ff2f6c2a68", default-features = false, features = ["x11rb"] }
+enigo = { workspace = true, features = ["x11rb"] }
+
+[dev-dependencies]
+criterion.workspace = true
+insta.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "action_curve_step_calc_natural"
+harness = false
+
+[[bench]]
+name = "action_software_press"
+harness = false
+
+[[bench]]
+name = "action_software_click"
+harness = false
+
+[[bench]]
+name = "action_vigem_pad_report"
+harness = false
+
+[[bench]]
+name = "action_recording_round_trip"
+harness = false
 
 [lints.rust]
 unsafe_code = "allow"

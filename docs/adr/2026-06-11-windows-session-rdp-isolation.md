@@ -19,7 +19,7 @@ Parent: #721
   acceptable background-agent behavior.
 
 Some applications still require a real interactive Windows session: raw input
-DirectInput/Raw Input surfaces and legacy apps tied to the active
+games, DirectInput/Raw Input surfaces, legacy apps tied to the active
 interactive desktop, and vendor software that refuses background UIA or window
 messages. For those applications, the heavier isolation boundary is not a
 hidden desktop. It is a separate Windows user session, usually created through

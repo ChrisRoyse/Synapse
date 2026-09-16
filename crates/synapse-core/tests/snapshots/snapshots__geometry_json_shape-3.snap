@@ -1,0 +1,8 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "Size { w: 1920, h: 1080 }"
+---
+{
+  "w": 1920,
+  "h": 1080
+}

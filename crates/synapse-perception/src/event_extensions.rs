@@ -1,14 +1,8 @@
 use chrono::Utc;
 use serde_json::json;
-use synapse_core::{CompiledEventFilter, Event, EventExtension, EventRef, EventSource};
+use synapse_core::{Event, EventExtension, EventRef, EventSource};
 
 use crate::{PerceptionError, PerceptionResult};
-
-#[derive(Clone, Debug)]
-pub struct CompiledEventExtension {
-    extension: EventExtension,
-    filter: CompiledEventFilter,
-}
 
 /// Validates one profile event extension before it can emit derived events.
 ///
@@ -59,33 +53,6 @@ pub fn validate_event_extensions(extensions: &[EventExtension]) -> PerceptionRes
     Ok(())
 }
 
-/// Compiles every profile event extension at registration time.
-///
-/// # Errors
-///
-/// Returns [`PerceptionError::EventExtensionInvalid`] without a partial result
-/// when validation or regex compilation fails.
-pub fn compile_event_extensions(
-    extensions: &[EventExtension],
-) -> PerceptionResult<Vec<CompiledEventExtension>> {
-    extensions
-        .iter()
-        .map(|extension| {
-            validate_event_extension(extension)?;
-            let filter = CompiledEventFilter::compile(&extension.from_filter).map_err(|error| {
-                PerceptionError::EventExtensionInvalid {
-                    name: extension.name.clone(),
-                    detail: format!("filter compilation failed: {error}"),
-                }
-            })?;
-            Ok(CompiledEventExtension {
-                extension: extension.clone(),
-                filter,
-            })
-        })
-        .collect()
-}
-
 /// Evaluates profile event extensions against a real event and returns derived events.
 ///
 /// The returned events keep their source as [`EventSource::Perception`] and
@@ -96,14 +63,15 @@ pub fn compile_event_extensions(
 /// Returns [`PerceptionError::EventExtensionInvalid`] when an extension is
 /// invalid or when sequence assignment would overflow.
 pub fn evaluate_event_extensions(
-    extensions: &[CompiledEventExtension],
+    extensions: &[EventExtension],
     trigger: &Event,
     first_seq: u64,
 ) -> PerceptionResult<Vec<Event>> {
+    validate_event_extensions(extensions)?;
+
     let mut events = Vec::new();
-    for compiled in extensions {
-        let extension = &compiled.extension;
-        if !compiled.filter.matches(trigger) {
+    for extension in extensions {
+        if !extension.from_filter.matches(trigger) {
             continue;
         }
         let seq = first_seq

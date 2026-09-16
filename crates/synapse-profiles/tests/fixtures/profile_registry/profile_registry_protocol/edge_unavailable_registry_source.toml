@@ -1,0 +1,14 @@
+schema_version = 1
+kind = "registry_source"
+source_id = "registry.synthetic.unavailable"
+source_kind = "hosted_http"
+enabled = true
+auth_mode = "none"
+base_url = "https://registry.invalid.synapse.example/v0"
+protocol_version = "synapse-registry-v0"
+trust_policy_id = "trust.synthetic.local"
+last_health_status = "unavailable"
+last_error_code = "registry_source_unavailable"
+last_successful_sync_at = "2026-05-26T01:00:00Z"
+offline_cache_allowed = true
+expected_local_behavior = "keep_local_registry_usable_and_queue_outbound_contributions"

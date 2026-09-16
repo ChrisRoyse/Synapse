@@ -8,7 +8,11 @@
     "check": "bun run scripts/check-dashboard-charter.ts",
     "dev": "vite --host 127.0.0.1",
     "storybook": "storybook dev -p 6006 --host 127.0.0.1 --no-open",
-    "build:storybook": "storybook build --quiet -o storybook-static"
+    "build:storybook": "storybook build --quiet -o storybook-static",
+    "test:coverage": "bun run scripts/check-story-coverage.ts",
+    "test:visual": "playwright test --config playwright.visual.config.ts tests/storybook-visual.spec.ts",
+    "test:visual:update": "playwright test --config playwright.visual.config.ts tests/storybook-visual.spec.ts --update-snapshots",
+    "test:a11y": "playwright test --config playwright.visual.config.ts tests/storybook-a11y.spec.ts"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "^1.1.13",
@@ -32,14 +36,16 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
-    "@storybook/addon-a11y": "10.5.7",
-    "@storybook/react-vite": "10.5.7",
+    "@axe-core/playwright": "4.11.3",
+    "@playwright/test": "1.60.0",
+    "@storybook/addon-a11y": "9.1.20",
+    "@storybook/react-vite": "9.1.20",
     "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^25.9.3",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "5.2.0",
-    "storybook": "10.5.7",
+    "storybook": "9.1.20",
     "tailwindcss": "^4.3.1",
     "typescript": "^6.0.3",
     "vite": "7.3.5"

@@ -37,11 +37,3 @@
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
 rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "linker-flavor=lld-link"]
-
-# Cargo 1.88+ tracks last-use metadata for registry/git cache entries. Check on
-# every substantive Cargo invocation instead of allowing a developer machine's
-# global cache to grow until an unrelated manual cleanup. Built-in age policy
-# remains authoritative (downloaded artifacts three months, regenerable local
-# artifacts one month).
-[cache]
-auto-clean-frequency = "always"

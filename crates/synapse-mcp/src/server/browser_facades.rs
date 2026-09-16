@@ -10,7 +10,6 @@ use super::{
     BrowserExposeBindingResponse, BrowserPdfParams, BrowserPdfResponse, BrowserScreenshotParams,
     BrowserScreenshotResponse, CdpBridgeReloadParams, CdpBridgeReloadResponse, ErrorData, Json,
     Parameters, SynapseService,
-    browser_clock_events::{BrowserClockParams, BrowserClockResponse},
     browser_dialog::{BrowserHandleDialogParams, BrowserHandleDialogResponse},
     browser_dnd::{BrowserDndParams, BrowserDndResponse},
     browser_emulate::{BrowserEmulateParams, BrowserEmulateResponse},
@@ -90,7 +89,6 @@ pub enum BrowserDebuggerOperation {
     ExposeBinding,
     Drag,
     Drop,
-    Clock,
 }
 
 impl BrowserDebuggerOperation {
@@ -113,7 +111,6 @@ impl BrowserDebuggerOperation {
             Self::ExposeBinding => "expose_binding",
             Self::Drag => "drag",
             Self::Drop => "drop",
-            Self::Clock => "clock",
         }
     }
 }
@@ -155,7 +152,7 @@ pub struct BrowserDebuggerParams {
     #[serde(default)]
     pub network: Option<BrowserNetworkParams>,
     #[serde(default)]
-    pub network_har: Option<Box<BrowserNetworkHarParams>>,
+    pub network_har: Option<BrowserNetworkHarParams>,
     #[serde(default)]
     pub network_overrides: Option<BrowserNetworkOverridesParams>,
     #[serde(default)]
@@ -168,8 +165,6 @@ pub struct BrowserDebuggerParams {
     pub drag: Option<BrowserDndParams>,
     #[serde(default)]
     pub drop: Option<BrowserDndParams>,
-    #[serde(default)]
-    pub clock: Option<Box<BrowserClockParams>>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -183,7 +178,7 @@ pub struct BrowserDebuggerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_messages: Option<BrowserConsoleMessagesResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reload_bridge: Option<Box<CdpBridgeReloadResponse>>,
+    pub reload_bridge: Option<CdpBridgeReloadResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<BrowserPdfResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,7 +194,7 @@ pub struct BrowserDebuggerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<BrowserNetworkResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_har: Option<Box<BrowserNetworkHarResponse>>,
+    pub network_har: Option<BrowserNetworkHarResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_overrides: Option<BrowserNetworkOverridesResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,8 +207,6 @@ pub struct BrowserDebuggerResponse {
     pub drag: Option<BrowserDndResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop: Option<BrowserDndResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clock: Option<Box<BrowserClockResponse>>,
 }
 
 fn loose_object_schema(description: &'static str) -> Value {
@@ -249,8 +242,7 @@ fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
                     "emulate",
                     "expose_binding",
                     "drag",
-                    "drop",
-                    "clock"
+                    "drop"
                 ],
                 "description": "Debugger facade operation. Supply exactly the same-named spec object."
             },
@@ -280,8 +272,7 @@ fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
             "emulate": loose_object_schema("Spec for operation=emulate."),
             "expose_binding": loose_object_schema("Spec for operation=expose_binding."),
             "drag": loose_object_schema("Spec for operation=drag."),
-            "drop": loose_object_schema("Spec for operation=drop."),
-            "clock": loose_object_schema("Spec for operation=clock.")
+            "drop": loose_object_schema("Spec for operation=drop.")
         }
     });
     match schema {
@@ -430,18 +421,13 @@ impl SynapseService {
                 Ok(Json(browser_debugger_response(
                     BrowserDebuggerOperation::ReloadBridge,
                     format!(
-                        "bridge host-control reload before_host={} after_host={} reconnected={} waited_ms={} control_surface={} profile={}",
-                        response
-                            .before
-                            .as_ref()
-                            .map_or("<none>", |before| before.host_id.as_str()),
+                        "bridge reload before_host={} after_host={} reconnected={} waited_ms={}",
+                        response.before.host_id,
                         response.after.host_id,
                         response.reconnected,
-                        response.waited_ms,
-                        response.command_ack.control_surface,
-                        response.command_ack.active_profile
+                        response.waited_ms
                     ),
-                    |out| out.reload_bridge = Some(Box::new(response)),
+                    |out| out.reload_bridge = Some(response),
                 )))
             }
             BrowserDebuggerOperation::Pdf => {
@@ -572,7 +558,7 @@ impl SynapseService {
                     .network_har
                     .ok_or_else(|| missing_debugger_spec("network_har"))?;
                 let response = self
-                    .browser_network_har(Parameters(*delegate), request_context)
+                    .browser_network_har(Parameters(delegate), request_context)
                     .await?
                     .0;
                 Ok(Json(browser_debugger_response(
@@ -584,7 +570,7 @@ impl SynapseService {
                         response.har_bytes,
                         response.route_count
                     ),
-                    |out| out.network_har = Some(Box::new(response)),
+                    |out| out.network_har = Some(response),
                 )))
             }
             BrowserDebuggerOperation::NetworkOverrides => {
@@ -696,26 +682,6 @@ impl SynapseService {
                     |out| out.drop = Some(response),
                 )))
             }
-            BrowserDebuggerOperation::Clock => {
-                let delegate = params
-                    .0
-                    .clock
-                    .ok_or_else(|| missing_debugger_spec("clock"))?;
-                let response = Box::pin(self.browser_clock(Parameters(*delegate), request_context))
-                    .await?
-                    .0;
-                Ok(Json(browser_debugger_response(
-                    BrowserDebuggerOperation::Clock,
-                    format!(
-                        "clock target={} operation={:?} installed={} backend={}",
-                        response.cdp_target_id,
-                        response.operation,
-                        response.clock.installed,
-                        response.readback_backend
-                    ),
-                    |out| out.clock = Some(Box::new(response)),
-                )))
-            }
         }
     }
 }
@@ -773,7 +739,6 @@ fn merge_browser_debugger_top_level_target(
     fold!(params.expose_binding);
     fold!(params.drag);
     fold!(params.drop);
-    fold!(params.clock);
     Ok(())
 }
 
@@ -810,7 +775,6 @@ fn validate_browser_debugger_params(params: &BrowserDebuggerParams) -> Result<()
             ("expose_binding", params.expose_binding.is_some()),
             ("drag", params.drag.is_some()),
             ("drop", params.drop.is_some()),
-            ("clock", params.clock.is_some()),
         ],
     )
 }
@@ -1001,7 +965,6 @@ fn browser_debugger_response(
         expose_binding: None,
         drag: None,
         drop: None,
-        clock: None,
     };
     populate(&mut response);
     response
@@ -1089,5 +1052,104 @@ impl SynapseService {
             )),
         )?;
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod merge_top_level_target_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// #1551/#1593: a top-level `cdp_target_id`/`window_hwnd` on
+    /// `browser_debugger` (the telemetry payload that used to fail closed as
+    /// `unknown field`) now deserializes AND is folded into the selected
+    /// operation spec, so envelope addressing resolves the SAME target as the
+    /// nested-spec form. This exercises the real deserialize path end to end.
+    #[test]
+    fn browser_debugger_top_level_target_folds_into_operation_spec_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "cdp_target_id": "TARGET-1593-DBG",
+            "window_hwnd": 0x1234,
+            "evaluate": { "expression": "1 + 1" },
+        }))
+        .expect("top-level target now deserializes on browser_debugger");
+        println!(
+            "readback=before cdp_target_id={:?}",
+            params
+                .evaluate
+                .as_ref()
+                .and_then(|spec| spec.cdp_target_id.clone())
+        );
+        merge_browser_debugger_top_level_target(&mut params)
+            .expect("top-level target folds into the evaluate spec");
+        let spec = params.evaluate.expect("evaluate spec present");
+        println!(
+            "readback=after cdp_target_id={:?} window_hwnd={:?}",
+            spec.cdp_target_id, spec.window_hwnd
+        );
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1593-DBG"));
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    /// #1551/#1593: a top-level target that conflicts with the value already in
+    /// the operation spec must fail closed rather than silently pick one.
+    #[test]
+    fn browser_debugger_top_level_target_conflict_fails_closed_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "cdp_target_id": "TARGET-1593-DBG",
+            "evaluate": { "expression": "1 + 1", "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations deserialize");
+        let err = merge_browser_debugger_top_level_target(&mut params)
+            .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    /// #1593: `reload_bridge` reloads the whole CDP bridge, not a single target,
+    /// so a top-level target alias must fail closed.
+    #[test]
+    fn browser_debugger_reload_bridge_rejects_top_level_target_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "reload_bridge",
+            "cdp_target_id": "TARGET-1593-DBG",
+        }))
+        .expect("reload_bridge with top-level target deserializes");
+        let err = merge_browser_debugger_top_level_target(&mut params)
+            .expect_err("reload_bridge must reject a top-level target");
+        println!("readback=reload_bridge rejection message={}", err.message);
+        assert!(
+            err.message.contains("reload_bridge"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1593: no envelope target supplied is a no-op; the nested spec is
+    /// untouched so the happy path stays identical.
+    #[test]
+    fn browser_debugger_without_top_level_target_is_noop_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "evaluate": { "expression": "1 + 1", "cdp_target_id": "NESTED-ONLY" },
+        }))
+        .expect("nested-only target deserializes");
+        merge_browser_debugger_top_level_target(&mut params)
+            .expect("no envelope target is a no-op");
+        assert_eq!(
+            params
+                .evaluate
+                .expect("evaluate spec present")
+                .cdp_target_id
+                .as_deref(),
+            Some("NESTED-ONLY")
+        );
     }
 }

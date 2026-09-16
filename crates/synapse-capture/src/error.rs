@@ -12,8 +12,6 @@ pub enum CaptureError {
     TargetLost { detail: String },
     #[error("CAPTURE_TARGET_INVALID: {detail}")]
     TargetInvalid { detail: String },
-    #[error("CAPTURE_UNSUPPORTED_SEMANTICS: {detail}")]
-    UnsupportedSemantics { detail: String },
     #[error("CAPTURE_NO_DIRTY_REGIONS")]
     NoDirtyRegions,
     #[error("CAPTURE_THREAD_FAILED: {detail}")]
@@ -29,7 +27,6 @@ impl CaptureError {
             Self::PrintWindowBlack { .. } => error_codes::CAPTURE_PRINTWINDOW_BLACK,
             Self::TargetLost { .. } => error_codes::CAPTURE_TARGET_LOST,
             Self::TargetInvalid { .. } => error_codes::CAPTURE_TARGET_INVALID,
-            Self::UnsupportedSemantics { .. } => error_codes::CAPTURE_UNSUPPORTED_SEMANTICS,
             Self::NoDirtyRegions => error_codes::CAPTURE_NO_DIRTY_REGIONS,
             Self::ThreadFailed { .. } => "CAPTURE_THREAD_FAILED",
         }

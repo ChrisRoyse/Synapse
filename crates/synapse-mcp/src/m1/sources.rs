@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::mpsc,
     time::Instant,
 };
 
@@ -13,8 +13,8 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::{ClipboardFormat, read_clipboard_text};
 use synapse_core::{
     AccessibleNode, AudioContext, ClipboardSummary, DetectedEntity, FocusedElement,
-    ForegroundContext, FsEvent, FsEventKind, HudReadings, PerceptionMode, Rect, SensorStatus,
-    UiaPattern, element_id, entity_id,
+    ForegroundContext, FsEvent, FsEventKind, HudReading, HudReadings, HudValue, PerceptionMode,
+    Rect, SensorStatus, UiaPattern, element_id, entity_id,
 };
 use synapse_perception::ObservationInput;
 
@@ -250,91 +250,269 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_summary_hashes_text_without_raw_excerpt() {
+        let summary = clipboard_summary_from_text("issue544-known-input");
+
+        assert_eq!(
+            summary.formats,
+            vec!["text/plain".to_owned(), "text/unicode".to_owned()]
+        );
+        assert_eq!(summary.text_len, Some(20));
+        assert_eq!(summary.redacted, true);
+        let excerpt = summary.text_excerpt.as_deref().unwrap_or_default();
+        assert!(excerpt.starts_with("sha256:"));
+        assert!(!excerpt.contains("issue544-known-input"));
+    }
+
+    #[test]
+    fn clipboard_summary_empty_text_is_redacted_empty_metadata() {
+        let summary = clipboard_summary_from_text("");
+
+        assert!(summary.formats.is_empty());
+        assert_eq!(summary.text_len, None);
+        assert_eq!(summary.text_excerpt, None);
+        assert_eq!(summary.redacted, true);
+    }
+
+    #[test]
+    fn clipboard_timeline_sample_keeps_plaintext_snippet() {
+        let sample = clipboard_timeline_sample_from_text("issue839-known-clipboard").unwrap();
+
+        assert_eq!(sample.snippet, "issue839-known-clipboard");
+        assert_eq!(sample.text_len, 24);
+        assert!(sample.text_sha256.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn fs_path_token_hashes_without_raw_path() {
+        let root = PathBuf::from(r"C:\synapse-regression");
+        let path = root.join("nested").join("known.txt");
+
+        let token = redacted_fs_path_token(&root, &path);
+
+        assert!(token.starts_with("sha256:"));
+        assert!(!token.contains("known.txt"));
+        assert!(!token.contains("synapse-regression"));
+    }
+
+    #[test]
+    fn fs_timeline_path_text_strips_windows_verbatim_prefix() {
+        let path = PathBuf::from(r"\\?\C:\Users\hotra\Documents\issue839.txt");
+
+        assert_eq!(
+            fs_timeline_path_text(&path),
+            r"C:\Users\hotra\Documents\issue839.txt"
+        );
+    }
+
+    #[test]
+    fn fs_event_kind_maps_notify_kinds() {
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Create(notify::event::CreateKind::File)),
+            Some(FsEventKind::Created)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any
+            ))),
+            Some(FsEventKind::Modified)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both
+            ))),
+            Some(FsEventKind::Renamed)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Remove(notify::event::RemoveKind::File)),
+            Some(FsEventKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn fs_events_coalesce_by_redacted_path() {
+        let path = "sha256:path".to_owned();
+        let at = Utc::now();
+        let events = coalesce_fs_events(vec![
+            FsEvent {
+                at,
+                path: path.clone(),
+                kind: FsEventKind::Created,
+                size_bytes: Some(0),
+            },
+            FsEvent {
+                at,
+                path: path.clone(),
+                kind: FsEventKind::Modified,
+                size_bytes: Some(9),
+            },
+        ]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, FsEventKind::Created);
+        assert_eq!(events[0].size_bytes, Some(9));
+    }
+
+    #[test]
+    fn rebase_nodes_to_foreground_shifts_stale_uia_rects_when_root_size_matches() {
+        let mut nodes = vec![
+            accessible_node_with_bbox(
+                0,
+                None,
+                Rect {
+                    x: 100,
+                    y: 200,
+                    w: 800,
+                    h: 600,
+                },
+            ),
+            accessible_node_with_bbox(
+                1,
+                Some(element_id(0x1234, "0000002a00000000")),
+                Rect {
+                    x: 110,
+                    y: 240,
+                    w: 780,
+                    h: 520,
+                },
+            ),
+            accessible_node_with_bbox(
+                2,
+                Some(element_id(0x1234, "0000002a00000001")),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+            ),
+        ];
+        let foreground = foreground_with_bounds(Rect {
+            x: 300,
+            y: 450,
+            w: 800,
+            h: 600,
+        });
+
+        rebase_nodes_to_foreground(&mut nodes, &foreground);
+
+        assert_eq!(
+            nodes[0].bbox,
+            Rect {
+                x: 300,
+                y: 450,
+                w: 800,
+                h: 600,
+            }
+        );
+        assert_eq!(
+            nodes[1].bbox,
+            Rect {
+                x: 310,
+                y: 490,
+                w: 780,
+                h: 520,
+            }
+        );
+        assert_eq!(
+            nodes[2].bbox,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rebase_nodes_to_foreground_leaves_different_sized_roots_unchanged() {
+        let mut nodes = vec![accessible_node_with_bbox(
+            0,
+            None,
+            Rect {
+                x: 100,
+                y: 200,
+                w: 800,
+                h: 600,
+            },
+        )];
+        let foreground = foreground_with_bounds(Rect {
+            x: 300,
+            y: 450,
+            w: 801,
+            h: 600,
+        });
+
+        rebase_nodes_to_foreground(&mut nodes, &foreground);
+
+        assert_eq!(
+            nodes[0].bbox,
+            Rect {
+                x: 100,
+                y: 200,
+                w: 800,
+                h: 600,
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_focus_scope_does_not_fallback_to_root() {
+        let nodes = vec![
+            node(0, 0, "Target Window", "Window", false),
+            node(1, 1, "Editor", "Edit", false),
+        ];
+
+        assert!(focused_from_nodes(&nodes, FocusSupplementScope::TargetWindow(0x1234)).is_none());
+
+        let Some(global) = focused_from_nodes(&nodes, FocusSupplementScope::GlobalForeground)
+        else {
+            panic!("global foreground observations keep the legacy root fallback");
+        };
+        assert_eq!(global.name, "Target Window");
+        assert_eq!(global.role, "Window");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_focus_scope_preserves_focused_value_metadata() {
+        let root = node(0, 0, "Target Window", "Window", false);
+        let mut edit = node(1, 1, "Editor", "Edit", true);
+        edit.value = Some("known-background-value".to_owned());
+        edit.patterns = vec![UiaPattern::Value];
+
+        let Some(focused) =
+            focused_from_nodes(&[root, edit], FocusSupplementScope::TargetWindow(0x1234))
+        else {
+            panic!("focused target node should be selected");
+        };
+
+        assert_eq!(focused.name, "Editor");
+        assert_eq!(focused.role, "Edit");
+        assert_eq!(focused.value.as_deref(), Some("known-background-value"));
+        assert_eq!(focused.patterns, vec![UiaPattern::Value]);
+    }
+}
+
 pub struct FsRecentTracker {
     roots: Vec<PathBuf>,
-    queue: Option<Arc<Mutex<FsWatchQueue>>>,
+    rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
     _watcher: Option<RecommendedWatcher>,
     disabled_reason: Option<String>,
-}
-
-#[derive(Debug)]
-struct FsQueuedEvent {
-    at: DateTime<Utc>,
-    path: PathBuf,
-    kind: FsEventKind,
-}
-
-#[derive(Debug, Default)]
-struct FsWatchQueue {
-    events: VecDeque<FsQueuedEvent>,
-    received_paths: u64,
-    coalesced_paths: u64,
-    evicted_paths: u64,
-    watcher_errors: u64,
-    high_water_paths: usize,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct FsWatchReadback {
-    pub enabled: bool,
-    pub roots: Vec<String>,
-    pub queue_capacity_paths: usize,
-    pub queued_paths: usize,
-    pub high_water_paths: usize,
-    pub received_paths: u64,
-    pub coalesced_paths: u64,
-    pub evicted_paths: u64,
-    pub watcher_errors: u64,
-    pub disabled_reason: Option<String>,
-    pub queue_error: Option<String>,
-}
-
-impl FsWatchReadback {
-    /// Builds the health payload without a fallible serialization step. Health
-    /// is the diagnostic surface for watcher failure, so it must never replace
-    /// an encoding error with fabricated "disabled" state.
-    #[must_use]
-    pub fn into_health_value(self) -> serde_json::Value {
-        serde_json::Value::Object(serde_json::Map::from_iter([
-            ("enabled".to_owned(), self.enabled.into()),
-            (
-                "roots".to_owned(),
-                serde_json::Value::Array(
-                    self.roots
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            ),
-            (
-                "queue_capacity_paths".to_owned(),
-                self.queue_capacity_paths.into(),
-            ),
-            ("queued_paths".to_owned(), self.queued_paths.into()),
-            ("high_water_paths".to_owned(), self.high_water_paths.into()),
-            ("received_paths".to_owned(), self.received_paths.into()),
-            ("coalesced_paths".to_owned(), self.coalesced_paths.into()),
-            ("evicted_paths".to_owned(), self.evicted_paths.into()),
-            ("watcher_errors".to_owned(), self.watcher_errors.into()),
-            (
-                "disabled_reason".to_owned(),
-                self.disabled_reason
-                    .map_or(serde_json::Value::Null, serde_json::Value::String),
-            ),
-            (
-                "queue_error".to_owned(),
-                self.queue_error
-                    .map_or(serde_json::Value::Null, serde_json::Value::String),
-            ),
-        ]))
-    }
 }
 
 impl fmt::Debug for FsRecentTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FsRecentTracker")
             .field("roots", &self.roots)
-            .field("enabled", &self.queue.is_some())
+            .field("enabled", &self.rx.is_some())
             .field("disabled_reason", &self.disabled_reason)
             .finish_non_exhaustive()
     }
@@ -384,41 +562,16 @@ impl FsRecentTracker {
         if roots.is_empty() {
             anyhow::bail!("no configured filesystem summary roots are available");
         }
-        let queue = Arc::new(Mutex::new(FsWatchQueue::default()));
-        let callback_queue = Arc::clone(&queue);
+        let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
-            let mut queue = match callback_queue.lock() {
-                Ok(queue) => queue,
-                Err(error) => {
-                    tracing::error!(
-                        code = "OBSERVE_FS_WATCH_QUEUE_POISONED",
-                        error = %error,
-                        remediation = "restart the Synapse daemon and inspect the preceding panic; filesystem activity is not being accepted while the queue lock is poisoned",
-                        "filesystem watcher could not publish a native event"
-                    );
-                    return;
-                }
-            };
-            match event {
-                Ok(event) => queue.push_notify_event(event),
-                Err(error) => {
-                    queue.watcher_errors = queue.watcher_errors.saturating_add(1);
-                    tracing::error!(
-                        code = "OBSERVE_FS_WATCH_NATIVE_ERROR",
-                        watcher_errors = queue.watcher_errors,
-                        error = %error,
-                        remediation = "inspect the watched roots and native watcher resources; the failed event was not represented as a filesystem change",
-                        "native filesystem watcher reported an error"
-                    );
-                }
-            }
+            let _ = tx.send(event);
         })?;
         for root in &roots {
             watcher.watch(root, RecursiveMode::Recursive)?;
         }
         Ok(Self {
             roots,
-            queue: Some(queue),
+            rx: Some(rx),
             _watcher: Some(watcher),
             disabled_reason: None,
         })
@@ -431,7 +584,7 @@ impl FsRecentTracker {
     fn disabled(reason: Option<String>) -> Self {
         Self {
             roots: Vec::new(),
-            queue: None,
+            rx: None,
             _watcher: None,
             disabled_reason: reason,
         }
@@ -451,121 +604,25 @@ impl FsRecentTracker {
     }
 
     fn drain_events(&self) -> Vec<FsObservedEvent> {
-        let Some(queue) = self.queue.as_ref() else {
+        let Some(rx) = self.rx.as_ref() else {
             return Vec::new();
         };
-        let queued = match queue.lock() {
-            Ok(mut queue) => queue.events.drain(..).collect::<Vec<_>>(),
-            Err(error) => {
-                tracing::error!(
-                    code = "OBSERVE_FS_WATCH_QUEUE_POISONED",
+        let mut events = Vec::new();
+        while let Ok(result) = rx.try_recv() {
+            match result {
+                Ok(event) => events.extend(fs_events_from_notify(&self.roots, &event)),
+                Err(error) => tracing::debug!(
+                    code = "OBSERVE_FS_WATCH_EVENT_FAILED",
                     error = %error,
-                    remediation = "restart the Synapse daemon and inspect the preceding panic; filesystem activity cannot be read while the queue lock is poisoned",
-                    "filesystem watcher queue could not be drained"
-                );
-                return Vec::new();
+                    "filesystem watcher event failed"
+                ),
             }
-        };
-        queued
-            .into_iter()
-            .filter_map(|event| fs_observed_event_from_queued(&self.roots, event))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn readback(&self) -> FsWatchReadback {
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect();
-        let Some(queue) = self.queue.as_ref() else {
-            return FsWatchReadback {
-                enabled: false,
-                roots,
-                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
-                queued_paths: 0,
-                high_water_paths: 0,
-                received_paths: 0,
-                coalesced_paths: 0,
-                evicted_paths: 0,
-                watcher_errors: 0,
-                disabled_reason: self.disabled_reason.clone(),
-                queue_error: None,
-            };
-        };
-        match queue.lock() {
-            Ok(queue) => FsWatchReadback {
-                enabled: true,
-                roots,
-                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
-                queued_paths: queue.events.len(),
-                high_water_paths: queue.high_water_paths,
-                received_paths: queue.received_paths,
-                coalesced_paths: queue.coalesced_paths,
-                evicted_paths: queue.evicted_paths,
-                watcher_errors: queue.watcher_errors,
-                disabled_reason: None,
-                queue_error: None,
-            },
-            Err(error) => FsWatchReadback {
-                enabled: true,
-                roots,
-                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
-                queued_paths: 0,
-                high_water_paths: 0,
-                received_paths: 0,
-                coalesced_paths: 0,
-                evicted_paths: 0,
-                watcher_errors: 0,
-                disabled_reason: None,
-                queue_error: Some(format!("filesystem watcher queue lock poisoned: {error}")),
-            },
         }
-    }
-}
-
-impl FsWatchQueue {
-    fn push_notify_event(&mut self, event: notify::Event) {
-        let Some(kind) = fs_event_kind(event.kind) else {
-            return;
-        };
-        let at = Utc::now();
-        for path in event.paths {
-            self.received_paths = self.received_paths.saturating_add(1);
-            if let Some(position) = self.events.iter().position(|queued| queued.path == path) {
-                let Some(mut queued) = self.events.remove(position) else {
-                    tracing::error!(
-                        code = "OBSERVE_FS_WATCH_QUEUE_INDEX_DRIFT",
-                        position,
-                        queue_len = self.events.len(),
-                        remediation = "inspect FsWatchQueue::push_notify_event; a position returned by VecDeque::position must remain removable under the same exclusive lock",
-                        "filesystem watcher queue index changed inside one exclusive operation"
-                    );
-                    continue;
-                };
-                queued.at = at;
-                queued.kind = coalesced_fs_kind(queued.kind, kind);
-                self.events.push_back(queued);
-                self.coalesced_paths = self.coalesced_paths.saturating_add(1);
-                continue;
-            }
-            if self.events.len() == MAX_FS_RECENT_EVENTS {
-                let _superseded = self.events.pop_front();
-                self.evicted_paths = self.evicted_paths.saturating_add(1);
-                if self.evicted_paths.is_power_of_two() {
-                    tracing::warn!(
-                        code = "OBSERVE_FS_WATCH_RECENT_WINDOW_ADVANCED",
-                        queue_capacity_paths = MAX_FS_RECENT_EVENTS,
-                        evicted_paths = self.evicted_paths,
-                        received_paths = self.received_paths,
-                        "filesystem activity exceeded the public recent-path window; the oldest path was retired while the newest exact path state was retained"
-                    );
-                }
-            }
-            self.events.push_back(FsQueuedEvent { at, path, kind });
-            self.high_water_paths = self.high_water_paths.max(self.events.len());
+        let mut events = coalesce_fs_observed_events(events);
+        if events.len() > MAX_FS_RECENT_EVENTS {
+            events.drain(0..events.len() - MAX_FS_RECENT_EVENTS);
         }
+        events
     }
 }
 
@@ -582,28 +639,74 @@ struct FsObservedEvent {
     timeline: FsTimelineEvent,
 }
 
-fn fs_observed_event_from_queued(
-    roots: &[PathBuf],
-    event: FsQueuedEvent,
-) -> Option<FsObservedEvent> {
-    let root = event_root_for_path(roots, &event.path)?;
-    let full_path = fs_event_full_path(&event.path);
-    let full_path_text = fs_timeline_path_text(&full_path);
-    let size_bytes = fs_event_size(&full_path, event.kind);
-    Some(FsObservedEvent {
-        observation: FsEvent {
-            at: event.at,
-            path: redacted_fs_path_token(root, &full_path),
-            kind: event.kind,
-            size_bytes,
-        },
-        timeline: FsTimelineEvent {
-            at: event.at,
-            path: full_path_text,
-            kind: event.kind,
-            size_bytes,
-        },
-    })
+fn fs_events_from_notify(roots: &[PathBuf], event: &notify::Event) -> Vec<FsObservedEvent> {
+    let Some(kind) = fs_event_kind(event.kind) else {
+        return Vec::new();
+    };
+    let at = Utc::now();
+    event
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let root = event_root_for_path(roots, path)?;
+            let full_path = fs_event_full_path(path);
+            let full_path_text = fs_timeline_path_text(&full_path);
+            let size_bytes = fs_event_size(&full_path, kind);
+            Some(FsObservedEvent {
+                observation: FsEvent {
+                    at,
+                    path: redacted_fs_path_token(root, &full_path),
+                    kind,
+                    size_bytes,
+                },
+                timeline: FsTimelineEvent {
+                    at,
+                    path: full_path_text,
+                    kind,
+                    size_bytes,
+                },
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn coalesce_fs_events(events: Vec<FsEvent>) -> Vec<FsEvent> {
+    let mut by_path = BTreeMap::<String, FsEvent>::new();
+    for event in events {
+        by_path
+            .entry(event.path.clone())
+            .and_modify(|existing| {
+                existing.at = event.at;
+                existing.kind = coalesced_fs_kind(existing.kind, event.kind);
+                if event.size_bytes.is_some() || existing.kind == FsEventKind::Deleted {
+                    existing.size_bytes = event.size_bytes;
+                }
+            })
+            .or_insert(event);
+    }
+    by_path.into_values().collect()
+}
+
+fn coalesce_fs_observed_events(events: Vec<FsObservedEvent>) -> Vec<FsObservedEvent> {
+    let mut by_path = BTreeMap::<String, FsObservedEvent>::new();
+    for event in events {
+        by_path
+            .entry(event.timeline.path.clone())
+            .and_modify(|existing| {
+                existing.observation.at = event.observation.at;
+                existing.timeline.at = event.timeline.at;
+                let kind = coalesced_fs_kind(existing.timeline.kind, event.timeline.kind);
+                existing.observation.kind = kind;
+                existing.timeline.kind = kind;
+                if event.timeline.size_bytes.is_some() || kind == FsEventKind::Deleted {
+                    existing.observation.size_bytes = event.observation.size_bytes;
+                    existing.timeline.size_bytes = event.timeline.size_bytes;
+                }
+            })
+            .or_insert(event);
+    }
+    by_path.into_values().collect()
 }
 
 const fn coalesced_fs_kind(existing: FsEventKind, next: FsEventKind) -> FsEventKind {
@@ -715,6 +818,46 @@ fn node(sequence: u32, depth: u32, name: &str, role: &str, focused: bool) -> Acc
         patterns: Vec::new(),
         children_count: 0,
         depth,
+    }
+}
+
+#[cfg(test)]
+fn accessible_node_with_bbox(
+    sequence: u32,
+    parent: Option<synapse_core::ElementId>,
+    bbox: Rect,
+) -> AccessibleNode {
+    AccessibleNode {
+        element_id: element_id(0x1234, &format!("0000002a{sequence:08x}")),
+        parent,
+        name: format!("node-{sequence}"),
+        role: "pane".to_owned(),
+        automation_id: None,
+        value: None,
+        bbox,
+        enabled: true,
+        focused: false,
+        patterns: Vec::new(),
+        children_count: 0,
+        depth: sequence,
+    }
+}
+
+#[cfg(test)]
+fn foreground_with_bounds(window_bounds: Rect) -> ForegroundContext {
+    ForegroundContext {
+        hwnd: 0x1234,
+        pid: 44,
+        process_name: "notepad.exe".to_owned(),
+        process_path: "C:\\Windows\\System32\\notepad.exe".to_owned(),
+        window_title: "manual.txt - Notepad".to_owned(),
+        window_bounds,
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: true,
     }
 }
 
@@ -1512,8 +1655,9 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
     }
     let started = Instant::now();
     let pid = input.foreground.pid;
+    let ports = synapse_a11y::candidate_ports_for_pid(pid);
     let diagnostics =
-        synapse_a11y::probe_chromium_cdp_for_pid_blocking(&process_name, pid, CDP_PROBE_TIMEOUT);
+        synapse_a11y::probe_chromium_cdp_blocking(&process_name, &ports, CDP_PROBE_TIMEOUT);
     input
         .sensor_latency_ms
         .insert("cdp".to_owned(), started.elapsed().as_secs_f32() * 1000.0);
@@ -1525,14 +1669,10 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
 
     if diagnostics.status == CdpStatus::Unreachable {
         tracing::warn!(
-            code = diagnostics
-                .reason_code
-                .as_deref()
-                .unwrap_or("A11Y_CDP_UNREACHABLE"),
+            code = "A11Y_CDP_UNREACHABLE",
             process_name = %process_name,
             pid,
-            probed_ports = ?diagnostics.checked_ports,
-            detail = ?diagnostics.detail,
+            probed_ports = ?ports,
             "Chromium foreground has no reachable CDP HTTP endpoint; web DOM is not \
              exposed. Launch the browser via act_launch for a dedicated debug profile, \
              set SYNAPSE_CDP_PORTS to an already-running browser that was started with \
@@ -1560,6 +1700,9 @@ fn populate_window_capture_baseline(input: &mut ObservationInput) {
                 "capture".to_owned(),
                 started.elapsed().as_secs_f32() * 1000.0,
             );
+            if is_luanti_foreground(&input.foreground) {
+                populate_luanti_visible_baseline(input);
+            }
         }
         Err(error) => {
             tracing::debug!(
@@ -1575,6 +1718,88 @@ fn populate_window_capture_baseline(input: &mut ObservationInput) {
 }
 
 #[cfg(windows)]
+fn populate_luanti_visible_baseline(input: &mut ObservationInput) {
+    let Some(crosshair_region) = centered_region(input.foreground.window_bounds, 48, 48) else {
+        return;
+    };
+    if let Some(reading) = contrast_reading("luanti.crosshair_contrast", crosshair_region) {
+        let confidence = reading.confidence;
+        input
+            .hud
+            .by_name
+            .insert("luanti.crosshair_contrast".to_owned(), reading);
+        input.entities.push(DetectedEntity {
+            entity_id: entity_id(10_001),
+            track_id: 10_001,
+            class_label: "luanti_crosshair_region".to_owned(),
+            bbox: crosshair_region,
+            confidence,
+            first_seen_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            velocity_px_per_s: None,
+        });
+    }
+
+    let Some(hotbar_region) = hotbar_region(input.foreground.window_bounds) else {
+        return;
+    };
+    if let Some(reading) = contrast_reading("luanti.hotbar_contrast", hotbar_region) {
+        let confidence = reading.confidence;
+        input
+            .hud
+            .by_name
+            .insert("luanti.hotbar_contrast".to_owned(), reading);
+        input.entities.push(DetectedEntity {
+            entity_id: entity_id(10_002),
+            track_id: 10_002,
+            class_label: "luanti_hotbar_region".to_owned(),
+            bbox: hotbar_region,
+            confidence,
+            first_seen_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            velocity_px_per_s: None,
+        });
+    }
+}
+
+#[cfg(windows)]
+fn contrast_reading(name: &str, region: Rect) -> Option<HudReading> {
+    let captured = synapse_capture::screen_region_to_bgra_bitmap(region).ok()?;
+    let score = bgra_contrast_score(&captured.bytes);
+    Some(HudReading {
+        raw_text: format!(
+            "{name} contrast={score:.3} region={}x{}@{},{}",
+            captured.width, captured.height, captured.region.x, captured.region.y
+        ),
+        parsed: HudValue::Number(f64::from(score)),
+        confidence: score.clamp(0.0, 1.0),
+        stale_ms: 0,
+    })
+}
+
+#[cfg(windows)]
+fn bgra_contrast_score(bytes: &[u8]) -> f32 {
+    let mut count = 0.0_f32;
+    let mut sum = 0.0_f32;
+    let mut sum_sq = 0.0_f32;
+    for pixel in bytes.chunks_exact(4) {
+        let b = f32::from(pixel[0]);
+        let g = f32::from(pixel[1]);
+        let r = f32::from(pixel[2]);
+        let luma = 0.0722_f32.mul_add(b, 0.7152_f32.mul_add(g, 0.2126_f32 * r));
+        count += 1.0;
+        sum += luma;
+        sum_sq = luma.mul_add(luma, sum_sq);
+    }
+    if count <= 0.0 {
+        return 0.0;
+    }
+    let mean = sum / count;
+    let variance = mean.mul_add(-mean, sum_sq / count).max(0.0);
+    (variance.sqrt() / 128.0).clamp(0.0, 1.0)
+}
+
+#[cfg(windows)]
 fn one_pixel_region(bounds: Rect) -> Option<Rect> {
     (bounds.w > 0 && bounds.h > 0).then_some(Rect {
         x: bounds.x,
@@ -1582,6 +1807,48 @@ fn one_pixel_region(bounds: Rect) -> Option<Rect> {
         w: 1,
         h: 1,
     })
+}
+
+#[cfg(windows)]
+const fn centered_region(bounds: Rect, w: i32, h: i32) -> Option<Rect> {
+    if bounds.w < w || bounds.h < h || w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: bounds.x + ((bounds.w - w) / 2),
+        y: bounds.y + ((bounds.h - h) / 2),
+        w,
+        h,
+    })
+}
+
+#[cfg(windows)]
+fn hotbar_region(bounds: Rect) -> Option<Rect> {
+    if bounds.w <= 0 || bounds.h <= 0 {
+        return None;
+    }
+    let w = (bounds.w / 3).clamp(180, 520).min(bounds.w);
+    let h = (bounds.h / 12).clamp(48, 96).min(bounds.h);
+    centered_bottom_region(bounds, w, h, 28)
+}
+
+#[cfg(windows)]
+fn centered_bottom_region(bounds: Rect, w: i32, h: i32, y_offset: i32) -> Option<Rect> {
+    if bounds.w < w || bounds.h < h || w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: bounds.x + ((bounds.w - w) / 2),
+        y: bounds.y + bounds.h - h - y_offset.clamp(0, bounds.h - h),
+        w,
+        h,
+    })
+}
+
+#[cfg(windows)]
+fn is_luanti_foreground(foreground: &ForegroundContext) -> bool {
+    foreground.process_name.eq_ignore_ascii_case("luanti.exe")
+        && foreground.window_title.starts_with("Luanti ")
 }
 
 #[cfg(windows)]

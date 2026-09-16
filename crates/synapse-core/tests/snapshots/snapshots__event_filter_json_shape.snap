@@ -1,0 +1,29 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "EventFilter::And\n{\n    args:\n    vec![EventFilter::Kind { kind: \"hud-value-changed\".to_owned(), },\n    EventFilter::Data\n    {\n        path: \"/field\".to_owned(), predicate: DataPredicate::Eq\n        { value: serde_json::json!(\"hp\"), },\n    }, EventFilter::Data\n    {\n        path: \"/new\".to_owned(), predicate: DataPredicate::Lt\n        { value: serde_json::json!(20), },\n    },],\n}"
+---
+{
+  "op": "and",
+  "args": [
+    {
+      "op": "kind",
+      "kind": "hud-value-changed"
+    },
+    {
+      "op": "data",
+      "path": "/field",
+      "predicate": {
+        "op": "eq",
+        "value": "hp"
+      }
+    },
+    {
+      "op": "data",
+      "path": "/new",
+      "predicate": {
+        "op": "lt",
+        "value": 20
+      }
+    }
+  ]
+}

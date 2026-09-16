@@ -1,0 +1,9 @@
+---
+source: crates/synapse-action/tests/dynamics_natural_hello_world.rs
+expression: "snapshot_text(&ikis, total_wall_ms)"
+---
+text: "Hello world."
+seed: 42
+dynamics: Natural::FAST
+total_wall_ms: 308
+ikis_ms: [0, 24, 36, 24, 23, 49, 37, 21, 24, 14, 21, 35]

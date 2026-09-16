@@ -19,6 +19,8 @@
     clippy::unreadable_literal,
     reason = "synapse-a11y keeps pedantic/nursery style lint debt explicit while using clippy -D warnings for correctness and behavior regressions"
 )]
+#![cfg_attr(test, allow(clippy::float_cmp))]
+
 mod cdp;
 mod cdp_action;
 mod cdp_actionability;
@@ -65,3 +67,6 @@ pub use snapshot::*;
 pub use ui_element::*;
 pub use window::millis_since_last_input;
 pub use window::*;
+
+#[cfg(test)]
+mod tests;

@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -11,7 +11,6 @@ use std::{
 };
 
 use anyhow::Context;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::{
     ErrorData,
     model::ErrorCode,
@@ -49,15 +48,6 @@ const SW_HIDE: u16 = 0;
 #[cfg(windows)]
 const SW_SHOWNOACTIVATE: u16 = 4;
 const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 120_000;
-/// Decimal process-private ceiling promised by the lightweight Synapse
-/// runtime. The installed Windows job object is the kernel backstop; this
-/// pre-trigger check provides an actionable refusal before a child is spawned.
-const SYNAPSE_PROCESS_HARD_LIMIT_BYTES: u64 = synapse_core::SYNAPSE_PROCESS_HARD_LIMIT_BYTES;
-/// Largest integer exactly representable by the f64 ratios consumed by the
-/// frozen resource-headroom lens. The writer enforces the decoder's domain so
-/// a command cannot execute and only later discover that its prestate is
-/// unmeasurable.
-const SHELL_RESOURCE_MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 pub const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u64 = 60_000;
 const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
@@ -80,9 +70,6 @@ const RUN_SHELL_INLINE_AWAIT_LIMIT_ENV: &str = "SYNAPSE_RUN_SHELL_INLINE_AWAIT_L
 const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const SHELL_CLEANUP_CAPTURE_CAP_BYTES: u64 = 1024 * 1024;
-const DEFAULT_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES: u64 = 1024 * 1024;
-pub(crate) const MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const LAUNCH_OUTPUT_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const SHELL_JOB_DASHBOARD_TAIL_BYTES: u64 = 2 * 1024;
@@ -100,41 +87,28 @@ const SHELL_RESERVED_ENV_KEYS: [&str; 3] = [
     SHELL_WORKING_DIR_ENV,
 ];
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const SHELL_ENV_DAEMON_STALE: &str = "SYNAPSE_SHELL_ENV_DAEMON_STALE";
-const SHELL_ENV_DURABLE_MISSING: &str = "SYNAPSE_SHELL_ENV_DURABLE_MISSING";
-const SHELL_ENV_DURABLE_INVALID: &str = "SYNAPSE_SHELL_ENV_DURABLE_INVALID";
-/// `CUDA_PATH` is absent from durable Windows environment *and* NVML proved
-/// this host has no CUDA device, so the absence is the correct state rather
-/// than a broken install (#1881). Reported at INFO with the device evidence.
-const SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE: &str =
-    "SYNAPSE_SHELL_ENV_CUDA_PATH_ABSENT_NO_CUDA_DEVICE";
-/// The durable-`CUDA_PATH` precondition was not enforced for a CUDA-relevant
-/// command because NVML proved this host has no CUDA device, so the variable is
-/// correctly absent and the precondition is unsatisfiable and irrelevant
-/// (#1887).
-const SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE: &str =
-    "SYNAPSE_SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE";
-const WINDOWS_DURABLE_ENV_OVERRIDE_KEYS: [&str; 6] = [
-    "CUDA_PATH",
-    "CUDA_PATH_V13_3",
-    "FORGE_CUDA_CCBIN",
-    "NVCC_CCBIN",
-    "NVCC_APPEND_FLAGS",
-    "NVCC_PREPEND_FLAGS",
+const PROCESS_BASE_ENV_KEYS: [&str; 20] = [
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SystemDrive",
+    "SystemRoot",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
 ];
-#[cfg(windows)]
-const WINDOWS_MACHINE_ENVIRONMENT_SUBKEY: &str =
-    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
-#[cfg(windows)]
-const WINDOWS_USER_ENVIRONMENT_SUBKEY: &str = "Environment";
-#[cfg(windows)]
-const CHILD_ENV_INCOMPLETE_REMEDIATION: &str = concat!(
-    "The variable could not be found in the daemon's own environment, in ",
-    r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment, in HKCU\Environment, ",
-    "nor derived deterministically. Set it durably (setx / the relevant registry key) and restart ",
-    "the Synapse daemon so it inherits the repaired block, or pass it explicitly in the call's `env` map. ",
-    "Synapse refuses the spawn rather than handing the child an environment a normal Windows process would never have."
-);
 #[cfg(windows)]
 const WINDOWS_DEFAULT_PATHEXT: &str =
     ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
@@ -145,16 +119,6 @@ const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 const SHELL_REMOTE_TRANSPORT_LOCAL: &str = "local";
 const SHELL_REMOTE_TRANSPORT_SSH: &str = "ssh";
-/// A `wsl.exe` invocation. The payload runs inside the WSL2 utility VM, which is
-/// a *separate kernel* with its own PID namespace: the Linux child is not a
-/// Windows process, is not in the Windows process table, and is not contained by
-/// the job's Windows kill-on-close job object. Microsoft additionally documents
-/// that `wslhost.exe` takes over the Linux process lifetime when `wsl.exe`
-/// terminates first, and that a wrapper kill only delivers `SIGHUP` to the Linux
-/// child when its streams are redirected. So `wsl.exe` liveness is neither
-/// necessary nor sufficient evidence about the payload and must never be
-/// classified as `local`.
-const SHELL_REMOTE_TRANSPORT_WSL: &str = "wsl";
 const SHELL_REMOTE_CLEANUP_NOT_APPLICABLE: &str = "not_applicable";
 const SHELL_REMOTE_CLEANUP_NOT_TRACKED: &str = "remote_process_not_tracked";
 const SHELL_REMOTE_CLEANUP_TRACKING_PENDING: &str = "remote_process_tracking_pending";
@@ -168,15 +132,6 @@ const SHELL_JOB_STATUS_REMOTE_TRANSPORT_LOST: &str = "transport_lost_process_may
 const SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE: &str =
     "remote_process_exited_local_transport_stale";
 const SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED: &str = "spawn_cleanup_unverified";
-/// Terminal status published by startup reconciliation for a durable job whose
-/// owning supervisor incarnation is gone. It is deliberately NOT a success: no
-/// exit code was ever observed, so the record says "interrupted" and carries the
-/// attribution evidence instead of synthesizing an outcome.
-const SHELL_JOB_STATUS_INTERRUPTED: &str = "interrupted";
-/// The WSL payload's `(distro, linux boot_id, linux pid, /proc/<pid>/stat
-/// starttime)` identity was never captured, so the durable record cannot tell a
-/// live Linux child from a dead `wsl.exe` wrapper.
-const SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED: &str = "wsl_linux_child_identity_untracked";
 const SHELL_REMOTE_CLEANUP_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
 const SHELL_REMOTE_CLEANUP_ALREADY_GONE: &str = "remote_process_already_gone";
 const SHELL_REMOTE_PROCESS_MARKER: &str = "SYNAPSE_REMOTE_PROCESS_V1";
@@ -216,7 +171,6 @@ pub struct M4ServiceConfig {
     allow_shell_any: bool,
     allow_launch_any: bool,
     run_shell_inline_await_limit_ms: u64,
-    shell_search_tools: Arc<str>,
 }
 
 impl Default for M4ServiceConfig {
@@ -227,7 +181,6 @@ impl Default for M4ServiceConfig {
             allow_shell_any: false,
             allow_launch_any: false,
             run_shell_inline_await_limit_ms: DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
-            shell_search_tools: Arc::from(shell_search_tool_readback()),
         }
     }
 }
@@ -322,7 +275,6 @@ impl M4ServiceConfig {
             allow_shell_any,
             allow_launch_any,
             run_shell_inline_await_limit_ms,
-            shell_search_tools: Arc::from(shell_search_tool_readback()),
         })
     }
 
@@ -375,11 +327,6 @@ impl M4ServiceConfig {
     #[must_use]
     pub const fn run_shell_durable_max_timeout_ms(&self) -> Option<u64> {
         None
-    }
-
-    #[must_use]
-    pub fn shell_search_tool_readback(&self) -> &str {
-        &self.shell_search_tools
     }
 
     fn shell_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
@@ -707,26 +654,6 @@ pub struct ActRunShellTransferDiagnostics {
     pub suggested_next_steps: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ActRunShellEnvironmentDiagnostic {
-    pub variable: String,
-    pub diagnostic_code: String,
-    pub severity: String,
-    pub daemon_pid: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validation_path: Option<String>,
-    pub explicit_override: bool,
-    pub source_of_truth: String,
-    pub remediation: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellCancelResponse {
@@ -843,8 +770,6 @@ pub struct ActRunShellJobStatus {
     pub effective_working_dir: Option<String>,
     pub env_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub environment_diagnostics: Vec<ActRunShellEnvironmentDiagnostic>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_env_keys: Vec<String>,
     pub timeout_ms: Option<u64>,
     pub started_at: String,
@@ -872,93 +797,6 @@ pub struct ActRunShellJobStatus {
     /// while the daemon retains the exact owner for bounded retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_failure: Option<ActRunShellSpawnFailureReadback>,
-    /// The synapse-mcp process that owns this job's monitor task and its
-    /// Windows named Job Object. A child-owned keeper handle preserves the
-    /// object and its complete process membership across daemon restarts so a
-    /// later incarnation can reopen and monitor it (#1807/#1808).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor: Option<ActRunShellSupervisorIdentity>,
-    /// Startup/crash reconciliation evidence. Present only on records that a
-    /// supervisor restart transitioned to a terminal state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_reconciliation: Option<ActRunShellSupervisorReconciliation>,
-}
-
-/// Identity of the synapse-mcp supervisor process that owns a durable job.
-///
-/// Every durable child starts inside an armed Windows Job Object. Once its
-/// running row is durable, Synapse duplicates a keeper handle into that exact
-/// child and disarms kill-on-close. The child therefore survives a daemon exit
-/// while keeping the named object and its descendant membership alive. A later
-/// daemon reopens the object, verifies exact child membership, and adopts both
-/// the process and tree before changing this durable owner row.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ActRunShellSupervisorIdentity {
-    /// Random per-daemon-process incarnation id, regenerated on every start
-    /// (the systemd `InvocationID` model). Two records with different
-    /// incarnation ids were started by different daemon processes even when the
-    /// OS recycled the pid.
-    pub incarnation_id: String,
-    pub pid: u32,
-    /// Windows: `GetProcessTimes` creation FILETIME in 100 ns ticks. Other
-    /// platforms: the kernel start-time value exposed by sysinfo.
-    pub start_time: u64,
-    pub start_time_source: String,
-    /// Kernel boot identity for the host that created this supervisor. On
-    /// Windows this is `SystemBootEnvironmentInformation.BootIdentifier`; on
-    /// Linux it is `/proc/sys/kernel/random/boot_id`.
-    ///
-    /// Legacy records deserialize as `None`. Absence is uncertainty and must
-    /// never be used to attribute child loss to Windows Job Object close.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_boot_id: Option<String>,
-    /// How this supervisor contains the job's owned children.
-    pub child_containment: String,
-    pub started_at: String,
-}
-
-/// Why a durable `running` record was terminated by a later supervisor.
-///
-/// `cause` is deliberately separate from `exit_code`, and `exit_code_trustworthy`
-/// is explicit: a job reaped by job-object close never produced an observed exit
-/// status, so the record must say the code is unknown rather than synthesize one.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ActRunShellSupervisorReconciliation {
-    /// `supervisor_restart_children_reaped_by_job_object_close` |
-    /// `host_reboot_controller_loss` |
-    /// `supervisor_restart_child_absent_containment_unknown` |
-    /// `supervisor_restart_child_never_had_creation_identity`
-    pub cause: String,
-    /// `absent_no_clean_shutdown_marker` (crash, kill, or power loss) |
-    /// `absent_clean_shutdown_marker` (graceful stop) |
-    /// `absent_no_supervisor_recorded` (record predates supervisor identity).
-    pub prior_supervisor_state: String,
-    pub prior_supervisor_incarnation_id: Option<String>,
-    pub prior_supervisor_pid: Option<u32>,
-    pub prior_supervisor_identity_state: String,
-    pub reconciling_supervisor_incarnation_id: String,
-    pub reconciling_supervisor_pid: u32,
-    /// Persisted boot identity of the prior owner, when the record was new
-    /// enough to carry it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prior_host_boot_id: Option<String>,
-    /// Legacy reconciliation records predate host-boot tracking.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reconciling_host_boot_id: Option<String>,
-    /// `same_boot` | `boot_changed` | `same_boot_proven_by_surviving_exact_child`
-    /// | `prior_boot_identity_unrecorded`
-    /// | `prior_boot_identity_incomparable_encoding` (written before #1869, so
-    /// it proves neither a reboot nor its absence).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_boot_relation: Option<String>,
-    pub child_containment: String,
-    pub child_identity_state: String,
-    pub children_terminated_by: String,
-    pub exit_code_trustworthy: bool,
-    pub observation_source: String,
-    pub observed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1136,52 +974,6 @@ pub struct ActLaunchParams {
     #[serde(default)]
     #[schemars(default)]
     pub desktop: Option<String>,
-    /// Terminal/output ownership contract for the freshly-created process.
-    /// Omission preserves the historical fire-and-forget behavior and reports
-    /// terminal observation as `not_requested`; it is never interpreted as a
-    /// successful exit. `capture` retains the exact process handle, drains
-    /// stdout/stderr concurrently, and durably publishes a terminal row.
-    #[serde(default)]
-    #[schemars(default)]
-    pub output: Option<ActLaunchOutput>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ActLaunchOutput {
-    FireAndForget,
-    Capture {
-        #[serde(default = "default_launch_output_capture_max_bytes")]
-        #[schemars(
-            default = "default_launch_output_capture_max_bytes",
-            range(min = 1, max = 16_777_216)
-        )]
-        max_bytes_per_stream: u64,
-    },
-}
-
-impl ActLaunchOutput {
-    #[must_use]
-    pub const fn mode(&self) -> &'static str {
-        match self {
-            Self::FireAndForget => "fire_and_forget",
-            Self::Capture { .. } => "capture",
-        }
-    }
-
-    #[must_use]
-    pub const fn capture_max_bytes_per_stream(&self) -> Option<u64> {
-        match self {
-            Self::FireAndForget => None,
-            Self::Capture {
-                max_bytes_per_stream,
-            } => Some(*max_bytes_per_stream),
-        }
-    }
-}
-
-const fn default_launch_output_capture_max_bytes() -> u64 {
-    DEFAULT_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1436,11 +1228,6 @@ pub struct ActSpawnAgentResponse {
     pub spawn_id: String,
     pub cli: ActSpawnAgentCli,
     pub kind: ActSpawnAgentCli,
-    /// Exact model requested for this spawn. This mirrors the immutable spawn
-    /// manifest so downstream outcome records never have to join against a
-    /// mutable template to recover historical model identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_ref: Option<String>,
     pub launcher_process_id: u32,
@@ -1747,15 +1534,8 @@ fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActLaunchResponse {
-    /// Content-bound identity shared by the durable start and terminal rows.
-    pub launch_id: String,
     /// PID of the process act_launch freshly spawned.
     pub pid: u32,
-    /// Exact Windows process creation FILETIME read from the retained process
-    /// handle. Together with `pid`, this identifies the process generation and
-    /// prevents PID reuse from binding a terminal row to another process.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_creation_time_100ns: Option<u64>,
     pub hwnd: Option<i64>,
     /// PID that actually OWNS `hwnd`. Equals `pid` for a normal launch where the
     /// spawned process showed its own window. Differs from `pid` when act_launch
@@ -1791,43 +1571,9 @@ pub struct ActLaunchResponse {
     /// Title observed for the verified CDP target URL, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_verified_title: Option<String>,
-    /// Exact page target id independently read from `/json/list`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_verified_target_id: Option<String>,
-    /// Content-bound identity of the exact launched-endpoint registry row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_registration_id: Option<String>,
-    /// Browser UUID attested across DevToolsActivePort and /json/version.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_browser_id: Option<String>,
-    /// Exact browser WebSocket URL independently read from /json/version.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_browser_websocket_url: Option<String>,
-    /// Physical Windows PID that owns the loopback listening socket.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_listener_pid: Option<u32>,
-    /// Exact listener process generation read through GetProcessTimes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_listener_process_creation_time_100ns: Option<u64>,
-    /// `synapse_ephemeral` profiles are deleted on endpoint teardown;
-    /// `caller_managed_stable` profiles are never deleted by Synapse.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cdp_profile_ownership: Option<String>,
     /// Desktop routing readback when `desktop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<ActLaunchDesktopReadback>,
-    pub output: ActLaunchOutputLaunchReadback,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActLaunchOutputLaunchReadback {
-    pub mode: String,
-    pub terminal_observation: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bytes_per_stream: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_history_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1854,7 +1600,6 @@ pub fn launch_request_details(params: &ActLaunchParams) -> serde_json::Value {
         "force_renderer_accessibility": params.force_renderer_accessibility,
         "windows_console_window_state": params.windows_console_window_state,
         "desktop": params.desktop,
-        "output": params.output,
         "windows_new_console": launch_target_needs_new_console(&params.target),
         "request_sha256": launch_request_sha256(params).ok(),
     })
@@ -1869,80 +1614,15 @@ pub fn launch_process_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
     .into_bytes()
 }
 
-fn launch_process_terminal_history_row_key_parts(launched_at: &str, pid: u32) -> String {
-    format!(
-        "process_history/v1/act_launch/{}/{pid}/terminal",
-        launched_at.replace(':', "_")
-    )
-}
-
-pub fn launch_process_terminal_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
-    launch_process_terminal_history_row_key_parts(&response.launched_at, response.pid).into_bytes()
-}
-
-/// Build the `CF_PROCESS_HISTORY` row for one `act_launch`.
-///
-/// Parentage (#2089) is observed here rather than assumed. Before this, launch
-/// rows recorded the launched `pid` and nothing about who launched it, so the
-/// `syn-graphpos-process-v1` process lane had no source for a single
-/// parent/child edge. The row now carries:
-///
-/// * `parentage` — the full observation, always, including every state in which
-///   parentage could **not** be established, with the exact reason. Absence is
-///   never silent.
-/// * `parent_pid` — present only when the observation is edge-bearing (the
-///   kernel named a parent, that pid's current occupant was created at or before
-///   the child, and both creation times came from one snapshot). A recycled pid
-///   therefore cannot fabricate an edge, because the flat field the graph reads
-///   is simply not written.
 pub fn launch_process_history_row(
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
-    session_id: Option<&str>,
 ) -> Result<Vec<u8>, ErrorData> {
-    let launched_at_unix_ms = launched_at_unix_ms(&response.launched_at)?;
-    let parentage = synapse_action::capture_process_parentage(response.pid);
-    let parent_pid = parentage.edge_parent_pid();
-    if let (Some(handle_creation), Some(snapshot_creation)) = (
-        response.process_creation_time_100ns,
-        parentage.child_start_time_100ns,
-    ) && handle_creation != snapshot_creation
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "act_launch exact handle/snapshot process creation identity mismatch for pid {}: handle={} snapshot={}",
-                response.pid, handle_creation, snapshot_creation
-            ),
-        ));
-    }
-    if parent_pid.is_none() {
-        tracing::warn!(
-            code = "ACTION_LAUNCH_PARENTAGE_UNPROVEN",
-            pid = response.pid,
-            state = parentage.state.as_str(),
-            parent_pid_observed = parentage.parent_pid_observed,
-            reason = parentage.unavailable_reason.as_deref().unwrap_or("none"),
-            "act_launch recorded a process history row whose parentage could not be proven; the \
-             process graph will not derive a parent edge from it"
-        );
-    }
-    let parentage = serde_json::to_value(&parentage).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_launch process history parentage encode failed: {error}"),
-        )
-    })?;
-    let mut row = json!({
-        "parentage": parentage,
-        "schema_version": 2,
+    let row = json!({
+        "schema_version": 1,
         "row_kind": "process_start",
         "tool": "act_launch",
-        "status": if response.output.terminal_observation == "running" { "running" } else { "started" },
-        "launch_id": response.launch_id,
-        "start_history_key": String::from_utf8_lossy(&launch_process_history_row_key(response)),
-        "terminal_history_key": response.output.terminal_history_key,
-        "session_id": session_id,
+        "status": "started",
         "target": params.target,
         "args": params.args,
         "working_dir": params.working_dir,
@@ -1954,12 +1634,9 @@ pub fn launch_process_history_row(
         "request_sha256": launch_request_sha256(params).ok(),
         "command_line": launch_command_line(params).ok(),
         "pid": response.pid,
-        "process_creation_time_100ns": response.process_creation_time_100ns,
         "hwnd": response.hwnd,
         "matched_title": response.matched_title,
         "launched_at": response.launched_at,
-        "launched_at_unix_ms": launched_at_unix_ms,
-        "ts_ns": launched_at_unix_ms.saturating_mul(1_000_000),
         "reason": response.reason,
         "cdp_debug": params.cdp_debug,
         "force_renderer_accessibility": params.force_renderer_accessibility,
@@ -1971,125 +1648,11 @@ pub fn launch_process_history_row(
         "cdp_verified_title": response.cdp_verified_title,
         "desktop": params.desktop,
         "desktop_readback": response.desktop,
-        "output": response.output,
     });
-    let Some(object) = row.as_object_mut() else {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_launch process history row was not a JSON object",
-        ));
-    };
-    object.insert(
-        "cdp_verified_target_id".to_owned(),
-        json!(response.cdp_verified_target_id),
-    );
-    object.insert(
-        "cdp_registration_id".to_owned(),
-        json!(response.cdp_registration_id),
-    );
-    object.insert("cdp_browser_id".to_owned(), json!(response.cdp_browser_id));
-    object.insert(
-        "cdp_browser_websocket_url".to_owned(),
-        json!(response.cdp_browser_websocket_url),
-    );
-    object.insert(
-        "cdp_listener_pid".to_owned(),
-        json!(response.cdp_listener_pid),
-    );
-    object.insert(
-        "cdp_listener_process_creation_time_100ns".to_owned(),
-        json!(response.cdp_listener_process_creation_time_100ns),
-    );
-    object.insert(
-        "cdp_profile_ownership".to_owned(),
-        json!(response.cdp_profile_ownership),
-    );
-    // Written only when the observation is edge-bearing, and written as an
-    // integer when it is. The key is absent rather than `null` for an unproven
-    // parentage so the graph reader's "is this field present" question has one
-    // unambiguous answer.
-    if let Some(parent_pid) = parent_pid {
-        object.insert("parent_pid".to_owned(), json!(parent_pid));
-    }
     encode_json(&row).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_launch process history row encode failed: {error}"),
-        )
-    })
-}
-
-pub fn launch_process_terminal_history_row(
-    params: &ActLaunchParams,
-    response: &ActLaunchResponse,
-    session_id: Option<&str>,
-    exit: &LaunchProcessExitObservation,
-    status: &str,
-    stdout: Option<&ActLaunchOutputArtifactReadback>,
-    stderr: Option<&ActLaunchOutputArtifactReadback>,
-    termination_cause: Option<&str>,
-    error_message: Option<&str>,
-) -> Result<Vec<u8>, ErrorData> {
-    let observed_at = chrono::Utc::now();
-    let completed_at = exit.completed_at_unix_ms.and_then(|unix_ms| {
-        i64::try_from(unix_ms)
-            .ok()
-            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-            .map(|value| value.to_rfc3339())
-    });
-    let ts_ns = exit
-        .completed_at_unix_ms
-        .unwrap_or_else(|| u64::try_from(observed_at.timestamp_millis()).unwrap_or(u64::MAX))
-        .saturating_mul(1_000_000);
-    let row = json!({
-        "schema_version": 2,
-        "row_kind": "process_terminal",
-        "tool": "act_launch",
-        "status": status,
-        "launch_id": response.launch_id,
-        "start_history_key": String::from_utf8_lossy(&launch_process_history_row_key(response)),
-        "terminal_history_key": String::from_utf8_lossy(&launch_process_terminal_history_row_key(response)),
-        "session_id": session_id,
-        "target": params.target,
-        "args": params.args,
-        "working_dir": params.working_dir,
-        "command_line": launch_command_line(params).ok(),
-        "request_sha256": launch_request_sha256(params).ok(),
-        "pid": response.pid,
-        "process_creation_time_100ns": exit.process_creation_time_100ns,
-        "process_exit_time_100ns": exit.process_exit_time_100ns,
-        "launched_at": response.launched_at,
-        "completed_at": completed_at,
-        "completed_at_unix_ms": exit.completed_at_unix_ms,
-        "observed_at": observed_at.to_rfc3339(),
-        "exit_code": exit.exit_code,
-        "exit_observation_status": exit.status,
-        "output_contract": response.output,
-        "stdout": stdout,
-        "stderr": stderr,
-        "termination_cause": termination_cause,
-        "error_message": error_message,
-        "ts_ns": ts_ns,
-    });
-    encode_json(&row).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_launch terminal process history row encode failed: {error}"),
-        )
-    })
-}
-
-fn launched_at_unix_ms(launched_at: &str) -> Result<u64, ErrorData> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(launched_at).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_launch process history launched_at parse failed: {error}"),
-        )
-    })?;
-    u64::try_from(parsed.timestamp_millis()).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_launch process history launched_at before Unix epoch: {error}"),
         )
     })
 }
@@ -2375,9 +1938,17 @@ fn direct_shell_background_reason(
 }
 
 pub fn validate_run_shell_execution_plan(
-    _params: &ActRunShellParams,
-    _inline_await_limit_ms: u64,
+    params: &ActRunShellParams,
+    inline_await_limit_ms: u64,
 ) -> Result<(), ErrorData> {
+    if let Some(background_reason) = direct_shell_background_reason(params, inline_await_limit_ms) {
+        reject_new_durable_ssh_promotion(
+            &params.command,
+            &params.args,
+            Some(background_reason),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -2425,7 +1996,6 @@ fn act_run_shell_background_response(
 }
 
 pub fn run_shell_request_details(
-    config: &M4ServiceConfig,
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> serde_json::Value {
@@ -2468,110 +2038,8 @@ pub fn run_shell_request_details(
         } else {
             "inline_timeout_only"
         },
-        "admission_facts": shell_admission_facts(config, params),
         "idempotency_key_present": params.idempotency_key.is_some(),
         "request_sha256": run_shell_request_sha256(params).ok(),
-    })
-}
-
-/// Frozen non-secret facts consumed by the action panel's point-in-time
-/// admission lens.
-///
-/// This snapshot is written before authorization and before any child process
-/// can start. It deliberately records the independently measurable predicates
-/// the validator reads, not the validator's eventual return value or any
-/// terminal action field. A future validator predicate requires a new schema
-/// and action-panel generation; consumers never infer missing facts from an
-/// error response.
-fn shell_admission_facts(config: &M4ServiceConfig, params: &ActRunShellParams) -> Value {
-    let command = params.command.as_str();
-    let trimmed_command = command.trim();
-    let command_shape = if trimmed_command.is_empty() {
-        "empty"
-    } else if trimmed_command != command {
-        "outer_whitespace"
-    } else if is_wrapped_in_quotes(command) {
-        "wrapped_in_quotes"
-    } else if starts_with_unclosed_quote(command) {
-        "unclosed_quote"
-    } else if first_command_token(command).is_some_and(|first| first != command)
-        && !command_exists_verbatim(command, params.working_dir.as_deref())
-    {
-        "contains_arguments"
-    } else {
-        "executable_name_or_path"
-    };
-    let environment_state = if params
-        .env
-        .iter()
-        .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
-    {
-        "invalid_entry"
-    } else if params.env.keys().any(|key| {
-        SHELL_RESERVED_ENV_KEYS
-            .iter()
-            .any(|reserved| key.eq_ignore_ascii_case(reserved))
-    }) {
-        "reserved_session_key"
-    } else if params.env.is_empty() {
-        "empty"
-    } else {
-        "valid"
-    };
-    let idempotency_key_state = params.idempotency_key.as_deref().map_or("absent", |key| {
-        if key.trim().is_empty() {
-            "blank"
-        } else if key.len() <= MAX_SHELL_IDEMPOTENCY_KEY_BYTES {
-            "within_256_byte_bound"
-        } else {
-            "above_256_byte_bound"
-        }
-    });
-    let command_line = shell_command_line(params);
-    let allow_shell_policy_state = match config.shell_match(&command_line) {
-        Some(ANY_PERMITTED_SENTINEL) => "permissive_any",
-        Some(_) => "allowlist_match",
-        None if config.allow_shell_count() == 0 => "no_allowlist_policy",
-        None => "allowlist_miss",
-    };
-    json!({
-        "schema": "synapse.shell_admission_facts.v1",
-        "command_bytes": command.len(),
-        "command_trimmed_bytes": trimmed_command.len(),
-        "command_shape": command_shape,
-        "environment_entries": params.env.len(),
-        "environment_state": environment_state,
-        "chromium_debug_policy_state": if validate_run_shell_chromium_debug_policy(params).is_ok() {
-            "clear"
-        } else {
-            "violation"
-        },
-        "global_input_state": if detect_shell_global_input(&command_line).is_some() {
-            "detected"
-        } else {
-            "clear"
-        },
-        "reserved_variable_assignment_state": if detect_shell_reserved_variable_assignment(&command_line).is_some() {
-            "detected"
-        } else {
-            "clear"
-        },
-        "uncontained_recursive_delete_state": if detect_uncontained_recursive_delete(&command_line).is_some() {
-            "detected"
-        } else {
-            "clear"
-        },
-        "timeout_state": if params.timeout_ms == 0 { "zero" } else { "positive" },
-        "durable_timeout_state": match params.durable_timeout_ms {
-            None => "absent",
-            Some(0) => "zero",
-            Some(_) => "positive",
-        },
-        "execution_mode": params.execution_mode.as_str(),
-        "idempotency_key_bytes": params.idempotency_key.as_deref().map(str::len),
-        "idempotency_key_state": idempotency_key_state,
-        "allow_shell_patterns": config.allow_shell_count(),
-        "allow_shell_policy_state": allow_shell_policy_state,
     })
 }
 
@@ -2588,34 +2056,8 @@ pub fn authorize_run_shell_start(
     authorize_run_shell(config, &shell_params)
 }
 
-pub fn run_shell_start_request_details(
-    config: &M4ServiceConfig,
-    params: &ActRunShellStartParams,
-) -> serde_json::Value {
+pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde_json::Value {
     let command_metadata = shell_command_metadata(&params.command, &params.args);
-    let shell_params = run_shell_params_for_start_validation(params);
-    let mut admission_facts = shell_admission_facts(config, &shell_params);
-    if let Some(facts) = admission_facts.as_object_mut() {
-        let job_id_state = params.job_id.as_deref().map_or("absent", |job_id| {
-            if job_id.is_empty() {
-                "empty"
-            } else if job_id.len() > SHELL_JOB_ID_MAX_BYTES {
-                "above_128_byte_bound"
-            } else if job_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            {
-                "valid"
-            } else {
-                "invalid_characters"
-            }
-        });
-        facts.insert("job_id_state".to_owned(), json!(job_id_state));
-        facts.insert(
-            "job_id_bytes".to_owned(),
-            json!(params.job_id.as_deref().map(str::len)),
-        );
-    }
     json!({
         "command": params.command,
         "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
@@ -2636,7 +2078,6 @@ pub fn run_shell_start_request_details(
         } else {
             "unbounded_until_exit_or_cancel"
         },
-        "admission_facts": admission_facts,
         "job_id": params.job_id,
         "request_sha256": run_shell_start_request_sha256(params).ok(),
     })
@@ -2741,6 +2182,16 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActRunShellStartResponse, ErrorData> {
     let _ = unresolved_shell_child_owner_report();
+    // This gate deliberately precedes request hashing and job-directory
+    // creation. A refused SSH durable promotion must not spawn a local/remote
+    // process or leave a synthetic tracked-job artifact that recovery could
+    // later mistake for acquired ownership.
+    reject_new_durable_ssh_promotion(
+        &params.command,
+        &params.args,
+        Some("explicit_act_run_shell_start"),
+        params.job_id.as_deref(),
+    )?;
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let request_sha256 = run_shell_start_request_sha256(&params)?;
@@ -2782,7 +2233,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                 SHELL_REMOTE_CLEANUP_PRE_MARKER_TERMINAL.to_owned();
             status.remote_process_scope.remote_cleanup_error_code = None;
             status.remote_process_scope.remote_cleanup_message = Some(
-                "remote tracking preflight refused the prepared plan before any child process was created"
+                "SSH tracking preflight refused the prepared plan before any child process was created"
                     .to_owned(),
             );
             push_unique_evidence(
@@ -2806,7 +2257,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                             code = "M4_ACT_RUN_SHELL_PREFLIGHT_REFUSAL_PERSISTED",
                             job_id,
                             status_path = %paths.status_path.display(),
-                            "persisted and independently read back remote tracking preflight refusal"
+                            "persisted and independently read back SSH tracking preflight refusal"
                         );
                         None
                     }
@@ -2838,12 +2289,12 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                     durable_detail,
                     policy_error = %error.message,
                     status_path = %paths.status_path.display(),
-                    "remote tracking preflight refusal durable state could not be verified"
+                    "SSH tracking preflight refusal durable state could not be verified"
                 );
                 return Err(shell_tool_error(
                     durable_error_code,
                     format!(
-                        "act_run_shell_start refused unsafe remote tracking ({}) but could not verify its durable spawn_refused status: {durable_detail}",
+                        "act_run_shell_start refused unsafe SSH tracking ({}) but could not verify its durable spawn_refused status: {durable_detail}",
                         error.message
                     ),
                     json!({
@@ -2868,7 +2319,6 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
     let spawned = match spawn_shell_job_child(
         &params,
         &spawn_plan,
-        &job_id,
         stdout_file,
         stderr_file,
         context,
@@ -3181,27 +2631,6 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
         started,
     )?;
 
-    handoff_shell_job_to_restart_survivable_monitoring(
-        &paths,
-        &mut status,
-        &mut child,
-        &local_process_identity,
-        &mut process_job,
-        started,
-    )?;
-
-    // The child has not executed an instruction until this point (#1867), so
-    // every containment guarantee above is established against a process that
-    // could not have exited, escaped its job, or spawned descendants.
-    resume_restart_survivable_shell_child(
-        &paths,
-        &mut status,
-        &mut child,
-        &local_process_identity,
-        &mut process_job,
-        started,
-    )?;
-
     let monitor_paths = paths.clone();
     let monitor_status = status.clone();
     let monitor_original_args = params.args.clone();
@@ -3413,10 +2842,7 @@ fn shell_job_status_diagnostics(
 fn shell_job_remote_command_exit_status_hints(job: &ActRunShellJobStatus) -> Vec<String> {
     if job.status != "exit_nonzero"
         || job.exit_code != Some(1)
-        || !matches!(
-            job.remote_process_scope.transport.as_str(),
-            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-        )
+        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
     {
         return Vec::new();
     }
@@ -3984,17 +3410,6 @@ pub fn cleanup_shell_jobs_for_session(
     Ok(readback)
 }
 
-/// Schema version this binary writes into every durable `status.json`.
-///
-/// Reading is deliberately asymmetric to writing (#1858). Records at or below
-/// this version must decode: any field introduced after a version was first
-/// shipped therefore carries `#[serde(default)]` so an older record decodes as
-/// "that identity was never recorded" instead of "this file is corrupt".
-/// Records ABOVE this version were written by a newer daemon and are classified
-/// `job_status_future_schema` -- unreadable by this binary, but known-intact
-/// evidence that must never be quarantined, rewritten, or destroyed.
-const SHELL_JOB_STATUS_SCHEMA_VERSION: u32 = 4;
-
 const SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const SHELL_JOB_RECOVERY_ID_SAMPLE_CAP: usize = 64;
 
@@ -4017,9 +3432,6 @@ pub struct ShellJobCorruptRecoveryReadback {
     pub unexpected_job_root_entries: usize,
     pub skipped_concurrently_mutated: usize,
     pub recovery_failures: usize,
-    /// Records written by a newer daemon than this binary. Intact evidence that
-    /// this reader must not interpret, quarantine, rewrite, or delete (#1858).
-    pub retained_future_schema_jobs: usize,
     pub bytes_quarantined: u64,
     pub quarantined_job_ids_sample: Vec<String>,
     pub retained_job_ids_sample: Vec<String>,
@@ -4285,18 +3697,26 @@ fn run_corrupt_job_remote_liveness_probe(
     pgid: &str,
     operation: &str,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    run_remote_liveness_probe(invocation, pid, pgid, operation)
+    run_remote_liveness_probe(
+        &invocation.command,
+        &invocation.control_args,
+        pid,
+        pgid,
+        operation,
+    )
 }
 
 fn run_remote_liveness_probe(
-    invocation: &ShellRemoteCleanupInvocation,
+    command: &str,
+    invocation_args: &[String],
     pid: &str,
     pgid: &str,
     operation: &str,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    let args = remote_liveness_replay_args(invocation, pid, pgid)?;
+    let mut args = hardened_ssh_automatic_replay_args(invocation_args)?;
+    args.push(ssh_remote_liveness_command(pid, pgid));
     let readback = run_shell_cleanup_command_with_timeout(
-        &invocation.command,
+        command,
         &args,
         Duration::from_millis(SHELL_REMOTE_LIVENESS_TIMEOUT_MS),
     )?;
@@ -4638,7 +4058,8 @@ fn run_corrupt_job_identity_bound_remote_cleanup(
     pgid: &str,
     identity: &RemoteProcessOwnershipIdentity,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    let args = remote_cleanup_replay_args(invocation, pid, pgid, identity)?;
+    let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
+    args.push(ssh_remote_cleanup_command(pid, pgid, identity));
     let readback = run_shell_cleanup_command_with_timeout(
         &invocation.command,
         &args,
@@ -4664,9 +4085,9 @@ fn run_corrupt_job_identity_bound_remote_cleanup(
 
 /// Inspect the durable request only when corrupt-status recovery otherwise has
 /// no remote ownership evidence. A typed local request can positively exclude
-/// SSH/WSL intent; missing, malformed, or redacted shell metadata is uncertainty
+/// SSH intent; missing, malformed, or redacted shell metadata is uncertainty
 /// and therefore cannot authorize quarantine.
-fn corrupt_shell_job_request_remote_intent(
+fn corrupt_shell_job_request_ssh_intent(
     paths: &ShellJobPaths,
     job_id: &str,
 ) -> Result<Option<String>, String> {
@@ -4674,35 +4095,29 @@ fn corrupt_shell_job_request_remote_intent(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "request.json is absent for {job_id}; remote-process intent cannot be excluded without a sidecar or process marker"
+                "request.json is absent for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
             ));
         }
         Err(error) => {
             return Err(format!(
-                "could not read request.json while excluding remote-process intent for {job_id}: {error}"
+                "could not read request.json while excluding SSH intent for {job_id}: {error}"
             ));
         }
     };
     let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
-        format!("could not decode request.json while excluding remote-process intent for {job_id}: {error}")
+        format!("could not decode request.json while excluding SSH intent for {job_id}: {error}")
     })?;
     let command = request
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             format!(
-                "request.json has no typed command metadata for {job_id}; remote-process intent is unverifiable"
+                "request.json has no typed command metadata for {job_id}; SSH intent is unverifiable"
             )
         })?;
     if let Some(client) = ssh_family_client_for_executable(command) {
         return Ok(Some(format!(
             "request_direct_ssh_family:{client}:{}",
-            executable_leaf(command)
-        )));
-    }
-    if is_wsl_executable(command) {
-        return Ok(Some(format!(
-            "request_direct_wsl:{}",
             executable_leaf(command)
         )));
     }
@@ -4712,14 +4127,14 @@ fn corrupt_shell_job_request_remote_intent(
         Some(Value::Bool(redacted)) => *redacted,
         Some(_) => {
             return Err(format!(
-                "request.json args_redacted metadata is not boolean for {job_id}; remote-process intent is unverifiable"
+                "request.json args_redacted metadata is not boolean for {job_id}; SSH intent is unverifiable"
             ));
         }
     };
     let args = match request.get("args") {
         None => {
             return Err(format!(
-                "request.json has no typed args metadata for {job_id}; shell-wrapped remote-process intent is unverifiable"
+                "request.json has no typed args metadata for {job_id}; shell-wrapped SSH intent is unverifiable"
             ));
         }
         Some(Value::Array(values)) => values
@@ -4727,14 +4142,14 @@ fn corrupt_shell_job_request_remote_intent(
             .map(|value| {
                 value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
                     format!(
-                        "request.json args metadata contains a non-string value for {job_id}; remote-process intent is unverifiable"
+                        "request.json args metadata contains a non-string value for {job_id}; SSH intent is unverifiable"
                     )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(format!(
-                "request.json args metadata is not an array for {job_id}; remote-process intent is unverifiable"
+                "request.json args metadata is not an array for {job_id}; SSH intent is unverifiable"
             ));
         }
     };
@@ -4758,7 +4173,7 @@ fn corrupt_shell_job_request_remote_intent(
         )
     {
         return Err(format!(
-            "request.json shell arguments are redacted for {job_id}; remote-process intent cannot be excluded without a sidecar or process marker"
+            "request.json shell arguments are redacted for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
         ));
     }
     Ok(None)
@@ -4781,7 +4196,7 @@ fn verify_corrupt_shell_job_remote_state(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return Err(format!(
-                "could not read stderr while excluding a remote process marker for {job_id}: {error}"
+                "could not read stderr while excluding an SSH remote process marker for {job_id}: {error}"
             ));
         }
     };
@@ -4813,9 +4228,9 @@ fn verify_corrupt_shell_job_remote_state(
                 "stderr contains a raw SYNAPSE_REMOTE_PROCESS_ marker for {job_id}, but no valid process identity and no remote-cleanup.json sidecar; remote state is unverifiable"
             ));
         }
-        if let Some(request_evidence) = corrupt_shell_job_request_remote_intent(paths, job_id)? {
+        if let Some(request_evidence) = corrupt_shell_job_request_ssh_intent(paths, job_id)? {
             return Err(format!(
-                "request.json records remote-process intent for {job_id} ({request_evidence}), but no remote-cleanup.json sidecar or process marker proves remote ownership/state"
+                "request.json records SSH intent for {job_id} ({request_evidence}), but no remote-cleanup.json sidecar or process marker proves remote ownership/state"
             ));
         }
         return Ok(ShellJobQuarantineRemoteVerification {
@@ -6242,7 +5657,6 @@ fn recover_corrupt_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryRead
         unexpected_job_root_entries: 0,
         skipped_concurrently_mutated: 0,
         recovery_failures: 0,
-        retained_future_schema_jobs: 0,
         bytes_quarantined: 0,
         quarantined_job_ids_sample: Vec::new(),
         retained_job_ids_sample: Vec::new(),
@@ -6408,28 +5822,6 @@ fn recover_corrupt_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryRead
                     );
                     continue;
                 };
-                if reason == "job_status_future_schema" {
-                    // Written by a newer daemon. The bytes are intact; this
-                    // binary simply cannot interpret them. Retain untouched and
-                    // never route into corrupt-job quarantine, which would
-                    // let an older binary destroy a newer daemon's evidence.
-                    readback.retained_future_schema_jobs =
-                        readback.retained_future_schema_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_STARTUP_STATUS_FUTURE_SCHEMA",
-                        job_id,
-                        status_path = %path_string(&paths.status_path),
-                        reader_schema_version = SHELL_JOB_STATUS_SCHEMA_VERSION,
-                        detail = %error.message,
-                        data = ?error.data,
-                        "startup retained a durable shell-job record written by a newer daemon; this binary will not interpret, quarantine, or modify it"
-                    );
-                    continue;
-                }
                 if reason != "job_status_decode_failed" {
                     readback.recovery_failures = readback.recovery_failures.saturating_add(1);
                     push_shell_job_recovery_sample(
@@ -7099,1387 +6491,6 @@ fn reap_stale_shell_jobs_with_ttl(ttl: Duration) -> Result<ShellJobReapReadback,
     Ok(readback)
 }
 
-const SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT: &str = "windows_job_object_kill_on_job_close";
-/// The durable row has been committed while the daemon installs a named Job
-/// Object keeper handle into the exact suspended child. Before that keeper
-/// exists, daemon death closes the last armed handle and reaps the tree.
-const SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING: &str =
-    "windows_named_job_object_child_keeper_pending";
-/// The exact child owns a handle to its armed named Job Object. Daemon exit is
-/// therefore not the last close and the child survives. If the root exits while
-/// no daemon is present, its keeper becomes the last close and the still-armed
-/// object reaps every remaining descendant.
-const SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE: &str =
-    "windows_named_job_object_armed_child_keeper_restart_survivable";
-/// The exact child reached terminal state before a keeper handle could be
-/// installed. Restart survival only protects a child that is still running, so
-/// there is nothing to arm and nothing was lost: the still-armed daemon-lifetime
-/// Job Object remains correct containment and the monitor reconciles the job
-/// from its already-persisted stdout/stderr/exit status. Deliberately NOT in the
-/// restart-adoption set — a terminal child must never be adopted as surviving.
-const SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER: &str =
-    "windows_child_terminal_before_restart_survival_handoff";
-const SHELL_SUPERVISOR_CONTAINMENT_NONE: &str = "no_kill_on_close_containment";
-const SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX: &str = "unavailable:";
-const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
-
-static SHELL_JOB_SUPERVISOR_IDENTITY: OnceLock<ActRunShellSupervisorIdentity> = OnceLock::new();
-
-/// Prefix of the composite Windows host boot-instance identity.
-#[cfg(windows)]
-pub(crate) const WINDOWS_HOST_BOOT_IDENTITY_PREFIX: &str = "winboot";
-
-/// Registry witness that corroborates the kernel boot counter. It is written by
-/// the prefetcher during boot, so it is a *second* observation of the same
-/// kernel fact, never the authority.
-#[cfg(windows)]
-pub(crate) const WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters\BootId";
-
-/// Read the physical host **installation** identity from the kernel.
-///
-/// `SYSTEM_BOOT_ENVIRONMENT_INFORMATION.BootIdentifier` is a UUIDv1 minted when
-/// the operating system is installed. On the configured host its embedded v1
-/// timestamp is `2025-04-13T03:12:28Z`, which is the OS `InstallDate` — and it
-/// was byte-identical either side of the real `2026-07-28T04:26:55Z` reboot.
-/// It therefore identifies the *installation*, and is used here only to keep a
-/// reimaged or restored OS (whose boot counter restarts near zero) from
-/// colliding with boot records written by the previous installation.
-#[cfg(windows)]
-pub(crate) fn read_host_installation_identity() -> Result<String, ErrorData> {
-    use windows::{
-        Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
-        core::GUID,
-    };
-
-    // SYSTEM_BOOT_ENVIRONMENT_INFORMATION starts with a GUID and has grown
-    // additional fields over Windows releases. A bounded oversized buffer
-    // preserves ABI compatibility while only reading the documented invariant
-    // first field.
-    let mut buffer = [0_u8; 64];
-    let mut returned = 0_u32;
-    let status = unsafe {
-        NtQuerySystemInformation(
-            SYSTEM_INFORMATION_CLASS(90),
-            buffer.as_mut_ptr().cast(),
-            64,
-            &mut returned,
-        )
-    };
-    if status.is_err() {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "Windows kernel installation identity query failed with NTSTATUS 0x{:08x}",
-                status.0 as u32
-            ),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_installation_identity_query_failed",
-                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
-                "ntstatus": format!("0x{:08x}", status.0 as u32),
-                "remediation": "repair the Windows ntdll/system-information query failure and restart synapse-mcp; host transitions remain refused",
-            }),
-        ));
-    }
-    if returned < 16 {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "Windows kernel installation identity query returned {returned} bytes, fewer than the required 16-byte BootIdentifier"
-            ),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_installation_identity_response_truncated",
-                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
-                "returned_bytes": returned,
-                "required_bytes": std::mem::size_of::<GUID>(),
-                "remediation": "repair the Windows system-information API mismatch and restart synapse-mcp; host transitions remain refused",
-            }),
-        ));
-    }
-    let guid = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<GUID>()) };
-    if guid == GUID::zeroed() {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            "Windows kernel returned an all-zero BootIdentifier",
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_installation_identity_zero",
-                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
-                "remediation": "repair the Windows boot-environment identity Source of Truth and restart synapse-mcp; host transitions remain refused",
-            }),
-        ));
-    }
-    Ok(format!("{guid:?}").to_ascii_lowercase())
-}
-
-/// Read the monotonic per-boot counter the kernel publishes in the read-only
-/// `KUSER_SHARED_DATA` page mapped into every user-mode process at the
-/// architecturally fixed address `0x7FFE0000`.
-///
-/// `winload` initialises `BootId` from the Boot Status Data log on every boot,
-/// so it advances by exactly one per boot and is immune to wall-clock repair —
-/// unlike `SYSTEM_TIMEOFDAY_INFORMATION.BootTime`, which the kernel re-bases
-/// when the system time is set and which would therefore make a single boot
-/// look like two.
-#[cfg(windows)]
-pub(crate) fn read_host_boot_counter() -> Result<u32, ErrorData> {
-    use windows::Wdk::System::SystemServices::KUSER_SHARED_DATA;
-
-    // The field is read through Microsoft's own win32-metadata layout rather
-    // than a hand-written offset. This assertion is the fail-closed guard on
-    // that layout: if a future `windows` crate release moves `BootId`, the
-    // build stops here instead of silently reading a neighbouring field --
-    // which is exactly how the install-scoped GUID shipped as a boot identity.
-    const {
-        assert!(
-            core::mem::offset_of!(KUSER_SHARED_DATA, BootId) == 0x2C4,
-            "KUSER_SHARED_DATA.BootId is no longer at the documented x64 offset 0x2C4"
-        );
-    }
-
-    const KUSER_SHARED_DATA_USER_ADDRESS: usize = 0x7FFE_0000;
-    let boot_counter = unsafe {
-        std::ptr::read_volatile(std::ptr::addr_of!(
-            (*(KUSER_SHARED_DATA_USER_ADDRESS as *const KUSER_SHARED_DATA)).BootId
-        ))
-    };
-
-    if boot_counter == 0 {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            "Windows kernel published a zero KUSER_SHARED_DATA.BootId, which no booted system can report",
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_boot_counter_zero",
-                "source_of_truth": "KUSER_SHARED_DATA.BootId at 0x7FFE0000+0x2C4",
-                "registry_witness": WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
-                "remediation": "repair the Windows Boot Status Data log (C:\\Windows\\bootstat.dat) that winload uses to seed BootId, then restart synapse-mcp; durable shell ownership and host transitions remain refused",
-            }),
-        ));
-    }
-
-    Ok(boot_counter)
-}
-
-/// Read the physical host **boot-instance** identity from the kernel.
-///
-/// This is intentionally not derived from wall-clock uptime: clock repair,
-/// hibernation, and coarse timestamp resolution can make timestamps ambiguous.
-/// An unreadable kernel Source of Truth is an error, never a synthetic id.
-///
-/// The identity is the pair `(installation, boot counter)`, because neither
-/// component identifies a boot on its own: the boot-environment GUID never
-/// changes within an installation, and the boot counter restarts near zero
-/// after a reinstall. Equality of this string is what
-/// `classify_orphan_reconciliation` uses to separate "the daemon died inside
-/// one boot" from "the host rebooted", so it must contain no value that can
-/// move *within* a boot.
-#[cfg(windows)]
-pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
-    let installation = read_host_installation_identity()?;
-    let boot_counter = read_host_boot_counter()?;
-    Ok(format!(
-        "{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:{installation}:{boot_counter}"
-    ))
-}
-
-/// Relation between the boot identity a record was written under and the boot
-/// identity reconciling it now.
-///
-/// The fourth arm exists because #1869 changed the identity encoding. Records
-/// written before that fix carry a bare install-scoped GUID, which is *not
-/// comparable* to a `winboot:<installation>:<counter>` identity: it cannot
-/// prove a reboot happened and it cannot prove one did not. Treating an
-/// unparseable prior value as `boot_changed` would manufacture a host-reboot
-/// claim out of a mere encoding change — the same class of unfounded
-/// attribution as #1856 itself, pointing the opposite way. It is reported as
-/// its own state so the ambiguity is visible rather than laundered into a
-/// verdict.
-pub(crate) fn classify_host_boot_relation(
-    prior: Option<&str>,
-    current_host_boot_id: &str,
-) -> &'static str {
-    /// A comparable identity is one this build knows how to interpret.
-    fn comparable(value: &str) -> bool {
-        #[cfg(windows)]
-        {
-            value.starts_with(&format!("{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:"))
-        }
-        // On Linux the identity is the raw procfs boot_id and has always been
-        // written in that one encoding, so every recorded value is comparable.
-        #[cfg(not(windows))]
-        {
-            !value.is_empty()
-        }
-    }
-
-    match prior {
-        None => "prior_boot_identity_unrecorded",
-        Some(prior) if !comparable(prior) || !comparable(current_host_boot_id) => {
-            "prior_boot_identity_incomparable_encoding"
-        }
-        Some(prior) if prior == current_host_boot_id => "same_boot",
-        Some(_) => "boot_changed",
-    }
-}
-
-/// Every independent witness of the host boot-instance identity, published
-/// together so an operator can ground a `same_boot` / `boot_changed` verdict
-/// against physical evidence instead of trusting a single opaque string.
-///
-/// The witnesses are deliberately heterogeneous: the kernel shared page, the
-/// prefetcher's registry copy of the same counter, and the kernel boot instant
-/// that can be cross-read from Windows System event log `Microsoft-Windows-
-/// Kernel-General` id 12 and `Microsoft-Windows-Kernel-Boot` id 20
-/// (`LastBootId`). Agreement across them is the evidence; any one alone is not.
-#[cfg(windows)]
-#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
-pub struct HostBootIdentityEvidence {
-    /// The composite identity that reconciliation actually compares.
-    pub identity: String,
-    pub source_of_truth: &'static str,
-    /// Install-scoped UUIDv1; constant across reboots, so never a boot identity.
-    pub installation_identity: String,
-    pub installation_identity_source: &'static str,
-    pub installation_identity_scope: &'static str,
-    /// Monotonic per-boot counter: the only component that discriminates boots.
-    pub boot_counter: u32,
-    pub boot_counter_source: &'static str,
-    pub boot_counter_registry_witness: &'static str,
-    pub boot_counter_registry_value: Option<u32>,
-    /// `agree` | `disagree` | `absent`.
-    pub boot_counter_witness_agreement: &'static str,
-    /// Kernel boot instant. Corroboration only — the kernel re-bases it when
-    /// the system clock is set, so it must never enter the identity itself.
-    pub boot_time_filetime_utc: Option<i64>,
-    pub boot_time_utc: Option<String>,
-    pub boot_time_source: &'static str,
-    pub boot_time_excluded_from_identity_reason: &'static str,
-}
-
-#[cfg(windows)]
-fn read_boot_counter_registry_witness() -> Option<u32> {
-    use windows::{
-        Win32::{
-            Foundation::ERROR_SUCCESS,
-            System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
-        },
-        core::PCWSTR,
-    };
-
-    let subkey = wide_null(
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
-    );
-    let value_name = wide_null("BootId");
-    let mut value = 0_u32;
-    let mut size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(4);
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey.as_ptr()),
-            PCWSTR(value_name.as_ptr()),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(std::ptr::addr_of_mut!(value).cast()),
-            Some(&raw mut size),
-        )
-    };
-    if status == ERROR_SUCCESS {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
-fn read_host_boot_time_filetime() -> Option<i64> {
-    use windows::Wdk::System::SystemInformation::{
-        NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
-    };
-
-    // SYSTEM_TIMEOFDAY_INFORMATION: BootTime is the leading LARGE_INTEGER.
-    let mut buffer = [0_u8; 64];
-    let mut returned = 0_u32;
-    let status = unsafe {
-        NtQuerySystemInformation(
-            SYSTEM_INFORMATION_CLASS(3),
-            buffer.as_mut_ptr().cast(),
-            48,
-            &mut returned,
-        )
-    };
-    if status.is_err() || returned < 8 {
-        return None;
-    }
-    let boot_time = i64::from_le_bytes(buffer[..8].try_into().ok()?);
-    (boot_time > 0).then_some(boot_time)
-}
-
-/// Collect every witness of the boot identity, logging loudly when the
-/// registry witness contradicts the kernel shared page. Disagreement does not
-/// substitute a different value — the kernel page stays authoritative — but it
-/// is a real anomaly and is surfaced rather than absorbed.
-#[cfg(windows)]
-pub fn host_boot_identity_evidence() -> Result<HostBootIdentityEvidence, ErrorData> {
-    let installation_identity = read_host_installation_identity()?;
-    let boot_counter = read_host_boot_counter()?;
-    let registry_value = read_boot_counter_registry_witness();
-    let agreement = match registry_value {
-        Some(value) if value == boot_counter => "agree",
-        Some(value) => {
-            tracing::error!(
-                code = "M4_HOST_BOOT_COUNTER_WITNESS_DISAGREEMENT",
-                kernel_boot_counter = boot_counter,
-                registry_boot_counter = value,
-                registry_witness = WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
-                "the prefetcher's registry copy of the kernel boot counter disagrees with \
-                 KUSER_SHARED_DATA.BootId. The kernel shared page remains authoritative and no \
-                 substitute value is used, but investigate: this is either an early-boot write \
-                 race before the prefetcher republished the counter, or registry tampering."
-            );
-            "disagree"
-        }
-        None => "absent",
-    };
-    let boot_time = read_host_boot_time_filetime();
-    Ok(HostBootIdentityEvidence {
-        identity: format!(
-            "{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:{installation_identity}:{boot_counter}"
-        ),
-        source_of_truth: "KUSER_SHARED_DATA.BootId + NtQuerySystemInformation(SystemBootEnvironmentInformation)",
-        installation_identity,
-        installation_identity_source: "NtQuerySystemInformation(SystemBootEnvironmentInformation).BootIdentifier",
-        installation_identity_scope: "constant for the lifetime of this OS installation; verified byte-identical either side of a real reboot, so it is NOT a boot identity",
-        boot_counter,
-        boot_counter_source: "KUSER_SHARED_DATA.BootId at 0x7FFE0000+0x2C4, seeded by winload from the Boot Status Data log",
-        boot_counter_registry_witness: WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
-        boot_counter_registry_value: registry_value,
-        boot_counter_witness_agreement: agreement,
-        boot_time_filetime_utc: boot_time,
-        boot_time_utc: boot_time.and_then(|filetime| {
-            chrono::DateTime::from_timestamp(
-                filetime / 10_000_000 - 11_644_473_600,
-                u32::try_from((filetime % 10_000_000) * 100).unwrap_or(0),
-            )
-            .map(|time| time.to_rfc3339())
-        }),
-        boot_time_source: "NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime; cross-readable from System event log Microsoft-Windows-Kernel-General id 12",
-        boot_time_excluded_from_identity_reason: "the kernel re-bases KeBootTime when the system clock is set, so a single boot could otherwise present two identities",
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
-    const PATH: &str = "/proc/sys/kernel/random/boot_id";
-    let value = fs::read_to_string(PATH).map_err(|error| {
-        shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!("Linux kernel boot identity {PATH} could not be read: {error}"),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "linux_boot_identity_read_failed",
-                "source_of_truth": PATH,
-                "remediation": "restore readable procfs boot_id state and restart synapse-mcp; host transitions remain refused",
-            }),
-        )
-    })?;
-    let value = value.trim();
-    let valid = value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
-                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
-        });
-    if !valid || value.bytes().all(|byte| matches!(byte, b'0' | b'-')) {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!("Linux kernel boot identity {PATH} is structurally invalid"),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "linux_boot_identity_invalid",
-                "source_of_truth": PATH,
-                "observed_length": value.len(),
-                "remediation": "repair the procfs boot_id Source of Truth and restart synapse-mcp; host transitions remain refused",
-            }),
-        ));
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
-    Err(shell_tool_error(
-        error_codes::STORAGE_READ_FAILED,
-        "this platform has no implemented kernel boot-identity Source of Truth",
-        json!({
-            "code": error_codes::STORAGE_READ_FAILED,
-            "reason": "host_boot_identity_platform_unsupported",
-            "remediation": "implement a kernel-backed boot identity for this platform before enabling durable shell ownership or host transitions",
-        }),
-    ))
-}
-
-/// This daemon process's durable-shell-job supervisor identity, computed once.
-///
-/// If the process cannot read its own kernel creation identity the record is
-/// still written, but with an `unavailable:` source so that
-/// [`shell_supervisor_identity_is_provable`] refuses to use it as absence proof
-/// later. Degrading silently to a bare pid would let a *recycled* pid look like
-/// a live supervisor (or a live supervisor look dead), so it fails closed.
-fn shell_job_supervisor_identity() -> &'static ActRunShellSupervisorIdentity {
-    SHELL_JOB_SUPERVISOR_IDENTITY.get_or_init(|| {
-        let pid = std::process::id();
-        let (start_time, start_time_source) = match capture_local_process_identity(pid) {
-            Ok(identity) => (identity.start_time, identity.start_time_source),
-            Err(detail) => {
-                tracing::error!(
-                    code = "M4_SHELL_JOB_SUPERVISOR_IDENTITY_UNAVAILABLE",
-                    pid,
-                    detail = %detail,
-                    "durable shell-job supervisor could not read its own kernel process creation identity; \
-                     after a restart, orphan reconciliation will REFUSE to publish terminal records for this \
-                     incarnation's jobs because it cannot prove this supervisor is gone. Fix the process query \
-                     failure named in `detail` (usually a denied OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) \
-                     or a failing GetProcessTimes) and restart the daemon."
-                );
-                (
-                    0,
-                    format!("{SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX}{detail}"),
-                )
-            }
-        };
-        ActRunShellSupervisorIdentity {
-            incarnation_id: uuid::Uuid::new_v4().simple().to_string(),
-            pid,
-            start_time,
-            start_time_source,
-            host_boot_id: match read_host_boot_identity() {
-                Ok(boot_id) => Some(boot_id),
-                Err(error) => {
-                    tracing::error!(
-                        code = "M4_HOST_BOOT_IDENTITY_UNAVAILABLE",
-                        detail = %error.message,
-                        data = ?error.data,
-                        "durable shell-job supervisor could not read the kernel host boot identity; daemon startup and host-transition authorization will fail closed"
-                    );
-                    None
-                }
-            },
-            child_containment: if cfg!(windows) {
-                SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT
-            } else {
-                SHELL_SUPERVISOR_CONTAINMENT_NONE
-            }
-            .to_owned(),
-            started_at: chrono::Utc::now().to_rfc3339(),
-        }
-    })
-}
-
-/// Whether a recorded supervisor identity is strong enough to prove absence.
-/// A zero/unavailable creation time cannot be compared against a live process.
-fn shell_supervisor_identity_is_provable(identity: &ActRunShellSupervisorIdentity) -> bool {
-    identity.start_time != 0
-        && !identity
-            .start_time_source
-            .starts_with(SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX)
-}
-
-fn shell_supervisor_process_identity(
-    identity: &ActRunShellSupervisorIdentity,
-) -> ActRunShellLocalProcessIdentity {
-    ActRunShellLocalProcessIdentity {
-        pid: identity.pid,
-        start_time: identity.start_time,
-        start_time_source: identity.start_time_source.clone(),
-    }
-}
-
-fn local_process_identity_state_label(state: &LocalProcessIdentityState) -> String {
-    match state {
-        LocalProcessIdentityState::Match => "match".to_owned(),
-        LocalProcessIdentityState::Exited => "exited".to_owned(),
-        LocalProcessIdentityState::Absent => "absent".to_owned(),
-        LocalProcessIdentityState::Mismatch(actual) => format!(
-            "mismatch:actual_start_time={}:source={}",
-            actual.start_time, actual.start_time_source
-        ),
-        LocalProcessIdentityState::Unreadable(detail) => format!("unreadable:{detail}"),
-    }
-}
-
-/// On-disk record of the daemon incarnation that currently owns the durable
-/// shell-job store.
-///
-/// This is the crash-vs-clean-shutdown discriminator (PostgreSQL `pg_control`
-/// `DB_SHUTDOWNED`, Kafka `.kafka_cleanshutdown`, systemd `InvocationID`): the
-/// running daemon writes it with `clean_shutdown_at: null` at startup and
-/// rewrites it with a timestamp when it releases the shell-job store lifetime
-/// lock. A successor that finds `clean_shutdown_at: null` knows the previous
-/// incarnation never got to shut down.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct ShellJobSupervisorMarker {
-    schema_version: u32,
-    incarnation_id: String,
-    pid: u32,
-    start_time: u64,
-    start_time_source: String,
-    #[serde(default)]
-    host_boot_id: Option<String>,
-    child_containment: String,
-    started_at: String,
-    clean_shutdown_at: Option<String>,
-}
-
-fn shell_job_supervisor_marker_path() -> Result<PathBuf, ErrorData> {
-    Ok(shell_job_root_dir()?.join(SHELL_SUPERVISOR_MARKER_FILE))
-}
-
-fn shell_job_supervisor_marker_for(
-    identity: &ActRunShellSupervisorIdentity,
-    clean_shutdown_at: Option<String>,
-) -> ShellJobSupervisorMarker {
-    ShellJobSupervisorMarker {
-        schema_version: 2,
-        incarnation_id: identity.incarnation_id.clone(),
-        pid: identity.pid,
-        start_time: identity.start_time,
-        start_time_source: identity.start_time_source.clone(),
-        host_boot_id: identity.host_boot_id.clone(),
-        child_containment: identity.child_containment.clone(),
-        started_at: identity.started_at.clone(),
-        clean_shutdown_at,
-    }
-}
-
-/// Read the predecessor's marker, if any. A marker that exists but cannot be
-/// decoded is reported as an error rather than treated as absent: silently
-/// downgrading it would attribute a graceful shutdown as a crash.
-fn read_shell_job_supervisor_marker(
-    path: &Path,
-) -> Result<Option<ShellJobSupervisorMarker>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "failed to read durable shell-job supervisor marker {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    serde_json::from_slice::<ShellJobSupervisorMarker>(&bytes)
-        .map(Some)
-        .map_err(|error| {
-            format!(
-                "durable shell-job supervisor marker {} did not decode: {error}",
-                path.display()
-            )
-        })
-}
-
-/// Record that this daemon released the durable shell-job store gracefully.
-///
-/// Called from the single graceful lifetime-lock close path shared by the stdio
-/// and HTTP daemons. Its absence at the next startup is what distinguishes a
-/// crash/kill/power-loss from an orderly stop.
-pub fn mark_shell_job_supervisor_clean_shutdown() {
-    let identity = shell_job_supervisor_identity();
-    let path = match shell_job_supervisor_marker_path() {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_PATH_FAILED",
-                incarnation_id = %identity.incarnation_id,
-                detail = %error.message,
-                "could not resolve the durable shell-job supervisor marker path at shutdown; the next \
-                 daemon start will attribute this exit as `absent_no_clean_shutdown_marker`"
-            );
-            return;
-        }
-    };
-    let marker = shell_job_supervisor_marker_for(identity, Some(chrono::Utc::now().to_rfc3339()));
-    if let Err(error) = write_pretty_json_file(&path, &marker, "supervisor_marker") {
-        tracing::error!(
-            code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_WRITE_FAILED",
-            incarnation_id = %identity.incarnation_id,
-            path = %path_string(&path),
-            detail = %error.message,
-            "could not persist the durable shell-job clean-shutdown marker; the next daemon start will \
-             attribute this exit as `absent_no_clean_shutdown_marker` (crash) even though it was graceful"
-        );
-    } else {
-        tracing::info!(
-            code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_RECORDED",
-            incarnation_id = %identity.incarnation_id,
-            path = %path_string(&path),
-            "readback=shell_job_supervisor_marker after=clean_shutdown_recorded"
-        );
-    }
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct ShellJobSupervisorRestartReadback {
-    pub incarnation_id: String,
-    pub supervisor_pid: u32,
-    pub supervisor_identity_provable: bool,
-    pub host_boot_id: String,
-    pub prior_supervisor_state: String,
-    pub prior_incarnation_id: Option<String>,
-    pub prior_host_boot_id: Option<String>,
-    pub marker_host_boot_relation: String,
-    pub job_root: Option<String>,
-    pub scanned_job_dirs: usize,
-    pub live_status_jobs: usize,
-    pub interrupted_jobs: usize,
-    pub adopted_jobs: usize,
-    pub retained_live_child_jobs: usize,
-    pub retained_unprovable_jobs: usize,
-    pub retained_foreign_supervisor_jobs: usize,
-    pub write_failures: usize,
-    pub interrupted_job_ids_sample: Vec<String>,
-    pub adopted_job_ids_sample: Vec<String>,
-    pub retained_job_ids_sample: Vec<String>,
-}
-
-/// Reconcile durable `running`/`cancel_requested` records left behind by a
-/// previous daemon incarnation (#1808).
-///
-/// Before this pass existed, the only reconciliation of a dead-pid `running`
-/// record happened on an explicit `act_run_shell_status` read or on cleanup of
-/// the *owning* session. A crash destroys the session, so nothing ever read
-/// those records again and they stayed `"status": "running"` forever while their
-/// process trees had already been reaped by the job object closing with the
-/// dying daemon. An agent polling the store would believe an expensive job was
-/// still protected.
-///
-/// The pass is strictly evidence-driven and fails closed in every uncertain
-/// case: it only publishes a terminal record when it can prove BOTH that the
-/// owning supervisor incarnation is gone AND that the child's exact creation
-/// identity is gone.
-fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
--> Result<ShellJobSupervisorRestartReadback, ErrorData> {
-    let identity = shell_job_supervisor_identity();
-    let current_host_boot_id = identity.host_boot_id.as_deref().ok_or_else(|| {
-        shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            "daemon startup refused because the durable shell-job supervisor has no kernel host boot identity",
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "startup_host_boot_identity_unavailable",
-                "remediation": "repair the kernel boot-identity query named in the preceding M4_HOST_BOOT_IDENTITY_UNAVAILABLE log and restart synapse-mcp",
-            }),
-        )
-    })?;
-    let physical_host_boot_id = read_host_boot_identity()?;
-    if physical_host_boot_id != current_host_boot_id {
-        return Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            "daemon startup host boot identity changed during initialization",
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "startup_host_boot_identity_changed_during_initialization",
-                "supervisor_host_boot_id": current_host_boot_id,
-                "physical_host_boot_id": physical_host_boot_id,
-                "remediation": "inspect kernel boot state and restart synapse-mcp; durable ownership reconciliation remains refused",
-            }),
-        ));
-    }
-    let marker_path = shell_job_supervisor_marker_path()?;
-    let prior_marker = match read_shell_job_supervisor_marker(&marker_path) {
-        Ok(marker) => marker,
-        Err(detail) => {
-            return Err(shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "daemon startup could not read the durable shell-job supervisor marker: {detail}. \
-                     Refusing to guess whether the previous daemon shut down cleanly. Inspect {} and \
-                     delete it only if you accept that the previous exit will be attributed as a crash.",
-                    marker_path.display()
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "path": marker_path,
-                    "reason": "shell_job_supervisor_marker_unreadable",
-                    "detail": detail,
-                }),
-            ));
-        }
-    };
-    let prior_supervisor_state = match prior_marker.as_ref() {
-        Some(marker) if marker.clean_shutdown_at.is_some() => "absent_clean_shutdown_marker",
-        Some(_) => "absent_no_clean_shutdown_marker",
-        None => "absent_no_supervisor_recorded",
-    };
-    let prior_marker_host_boot_id = prior_marker
-        .as_ref()
-        .and_then(|marker| marker.host_boot_id.clone());
-    let marker_host_boot_relation =
-        classify_host_boot_relation(prior_marker_host_boot_id.as_deref(), current_host_boot_id);
-    let root = shell_durable_job_root_dir()?;
-    let mut readback = ShellJobSupervisorRestartReadback {
-        incarnation_id: identity.incarnation_id.clone(),
-        supervisor_pid: identity.pid,
-        supervisor_identity_provable: shell_supervisor_identity_is_provable(identity),
-        host_boot_id: current_host_boot_id.to_owned(),
-        prior_supervisor_state: prior_supervisor_state.to_owned(),
-        prior_incarnation_id: prior_marker
-            .as_ref()
-            .map(|marker| marker.incarnation_id.clone()),
-        prior_host_boot_id: prior_marker_host_boot_id,
-        marker_host_boot_relation: marker_host_boot_relation.to_owned(),
-        job_root: Some(path_string(&root)),
-        scanned_job_dirs: 0,
-        live_status_jobs: 0,
-        interrupted_jobs: 0,
-        adopted_jobs: 0,
-        retained_live_child_jobs: 0,
-        retained_unprovable_jobs: 0,
-        retained_foreign_supervisor_jobs: 0,
-        write_failures: 0,
-        interrupted_job_ids_sample: Vec::new(),
-        adopted_job_ids_sample: Vec::new(),
-        retained_job_ids_sample: Vec::new(),
-    };
-    if root.exists() {
-        let entries = fs::read_dir(&root).map_err(|error| {
-            shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "daemon startup supervisor-restart reconciliation could not read the durable shell-job root {}: {error}",
-                    root.display()
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "path": root,
-                    "reason": "supervisor_restart_job_root_read_failed",
-                }),
-            )
-        })?;
-        for entry in entries {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let job_dir = entry.path();
-            if !job_dir.is_dir() {
-                continue;
-            }
-            let Some(job_id) = job_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-            if validate_shell_job_id(&job_id).is_err() {
-                continue;
-            }
-            readback.scanned_job_dirs = readback.scanned_job_dirs.saturating_add(1);
-            let paths = shell_job_paths_from_root(&root, &job_id);
-            // A record this pass cannot read is handled by the corrupt-job
-            // recovery gate that runs immediately after; never guess here.
-            let Ok(job) = read_shell_job_status(&paths.status_path, &job_id) else {
-                continue;
-            };
-            if !shell_job_live_status(&job.status) {
-                continue;
-            }
-            readback.live_status_jobs = readback.live_status_jobs.saturating_add(1);
-            reconcile_one_orphaned_shell_job(
-                job,
-                &paths,
-                identity,
-                prior_supervisor_state,
-                prior_marker.as_ref(),
-                current_host_boot_id,
-                &mut readback,
-            );
-        }
-    }
-    // Claim the store for this incarnation only after the predecessor's marker
-    // has been consumed, so a crash *during* this pass leaves the predecessor's
-    // evidence intact for the next attempt.
-    let marker = shell_job_supervisor_marker_for(identity, None);
-    write_pretty_json_file(&marker_path, &marker, "supervisor_marker")?;
-    tracing::info!(
-        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILED",
-        incarnation_id = %readback.incarnation_id,
-        supervisor_pid = readback.supervisor_pid,
-        supervisor_identity_provable = readback.supervisor_identity_provable,
-        prior_supervisor_state = %readback.prior_supervisor_state,
-        prior_incarnation_id = ?readback.prior_incarnation_id,
-        host_boot_id = %readback.host_boot_id,
-        prior_host_boot_id = ?readback.prior_host_boot_id,
-        marker_host_boot_relation = %readback.marker_host_boot_relation,
-        scanned_job_dirs = readback.scanned_job_dirs,
-        live_status_jobs = readback.live_status_jobs,
-        interrupted_jobs = readback.interrupted_jobs,
-        adopted_jobs = readback.adopted_jobs,
-        retained_live_child_jobs = readback.retained_live_child_jobs,
-        retained_unprovable_jobs = readback.retained_unprovable_jobs,
-        retained_foreign_supervisor_jobs = readback.retained_foreign_supervisor_jobs,
-        write_failures = readback.write_failures,
-        interrupted_job_ids_sample = ?readback.interrupted_job_ids_sample,
-        adopted_job_ids_sample = ?readback.adopted_job_ids_sample,
-        retained_job_ids_sample = ?readback.retained_job_ids_sample,
-        "readback=shell_job_supervisor_restart after=durable_job_root_scan"
-    );
-    Ok(readback)
-}
-
-/// Classify and, when provable, terminalize one orphaned durable record.
-fn reconcile_one_orphaned_shell_job(
-    mut job: ActRunShellJobStatus,
-    paths: &ShellJobPaths,
-    identity: &ActRunShellSupervisorIdentity,
-    prior_supervisor_state: &str,
-    prior_marker: Option<&ShellJobSupervisorMarker>,
-    current_host_boot_id: &str,
-    readback: &mut ShellJobSupervisorRestartReadback,
-) {
-    let job_id = job.job_id.clone();
-    let owner_boot_id = job.supervisor.as_ref().and_then(|owner| {
-        owner.host_boot_id.clone().or_else(|| {
-            prior_marker
-                .filter(|marker| marker.incarnation_id == owner.incarnation_id)
-                .and_then(|marker| marker.host_boot_id.clone())
-        })
-    });
-    let mut host_boot_relation =
-        classify_host_boot_relation(owner_boot_id.as_deref(), current_host_boot_id).to_owned();
-    // 1. Is the supervisor that owned this record actually gone?
-    let (prior_state_label, prior_incarnation, prior_pid, prior_containment) = match job
-        .supervisor
-        .as_ref()
-    {
-        Some(owner) if owner.incarnation_id == identity.incarnation_id => {
-            // This incarnation owns it; a live monitor task is authoritative.
-            return;
-        }
-        Some(owner) if host_boot_relation == "boot_changed" => (
-            "host_boot_changed:prior_supervisor_cannot_survive".to_owned(),
-            Some(owner.incarnation_id.clone()),
-            Some(owner.pid),
-            Some(owner.child_containment.clone()),
-        ),
-        Some(owner) if !shell_supervisor_identity_is_provable(owner) => {
-            readback.retained_unprovable_jobs = readback.retained_unprovable_jobs.saturating_add(1);
-            push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
-            tracing::error!(
-                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_UNPROVABLE",
-                job_id = %job_id,
-                owner_incarnation_id = %owner.incarnation_id,
-                owner_pid = owner.pid,
-                owner_start_time_source = %owner.start_time_source,
-                "durable shell job retained as live: the owning supervisor incarnation has no provable \
-                 kernel creation identity, so its absence cannot be proven and the record must not be \
-                 declared interrupted"
-            );
-            return;
-        }
-        Some(owner) => {
-            let state = local_process_identity_state(&shell_supervisor_process_identity(owner));
-            match state {
-                LocalProcessIdentityState::Match => {
-                    readback.retained_foreign_supervisor_jobs =
-                        readback.retained_foreign_supervisor_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_STILL_LIVE",
-                        job_id = %job_id,
-                        owner_incarnation_id = %owner.incarnation_id,
-                        owner_pid = owner.pid,
-                        this_incarnation_id = %identity.incarnation_id,
-                        this_pid = identity.pid,
-                        "durable shell job retained as live: another synapse-mcp process with the recorded \
-                         supervisor creation identity is still running, so this daemon must not reconcile \
-                         its jobs. Two daemons are sharing one shell-job store — stop the extra instance."
-                    );
-                    return;
-                }
-                LocalProcessIdentityState::Unreadable(detail) => {
-                    readback.retained_unprovable_jobs =
-                        readback.retained_unprovable_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_UNREADABLE",
-                        job_id = %job_id,
-                        owner_incarnation_id = %owner.incarnation_id,
-                        owner_pid = owner.pid,
-                        detail = %detail,
-                        "durable shell job retained as live: the owning supervisor process could not be \
-                         queried, which is uncertainty and never absence proof"
-                    );
-                    return;
-                }
-                other => (
-                    local_process_identity_state_label(&other),
-                    Some(owner.incarnation_id.clone()),
-                    Some(owner.pid),
-                    Some(owner.child_containment.clone()),
-                ),
-            }
-        }
-        None => ("no_supervisor_recorded".to_owned(), None, None, None),
-    };
-
-    // 2. Is the child gone? Absence of the *exact creation identity* is the only
-    //    proof accepted here; a bare pid can have been recycled.
-    let child_identity_snapshot = job.local_process_identity.clone();
-    let child_state_label = match child_identity_snapshot.as_ref() {
-        Some(child_identity) => {
-            let state = local_process_identity_state(child_identity);
-            match state {
-                LocalProcessIdentityState::Match => {
-                    if host_boot_relation == "boot_changed" {
-                        readback.write_failures = readback.write_failures.saturating_add(1);
-                        push_shell_job_recovery_sample(
-                            &mut readback.retained_job_ids_sample,
-                            job_id.clone(),
-                        );
-                        tracing::error!(
-                            code = "M4_SHELL_JOB_BOOT_IDENTITY_CONTRADICTION",
-                            job_id = %job_id,
-                            prior_host_boot_id = ?owner_boot_id,
-                            current_host_boot_id,
-                            pid = child_identity.pid,
-                            start_time = child_identity.start_time,
-                            "durable shell job retained as live and daemon startup will fail closed: the record says the host boot changed but the exact prior child creation identity is present"
-                        );
-                        return;
-                    }
-                    if matches!(
-                        prior_containment.as_deref(),
-                        Some(
-                            SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING
-                                | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
-                        )
-                    ) {
-                        // A surviving exact child creation identity is itself
-                        // proof the host never rebooted, so it resolves both
-                        // "no prior identity recorded" and the #1869
-                        // "recorded, but in an encoding this build cannot
-                        // compare" case.
-                        if matches!(
-                            host_boot_relation.as_str(),
-                            "prior_boot_identity_unrecorded"
-                                | "prior_boot_identity_incomparable_encoding"
-                        ) {
-                            host_boot_relation =
-                                "same_boot_proven_by_surviving_exact_child".to_owned();
-                        }
-                        match adopt_surviving_shell_job_after_supervisor_restart(
-                            job,
-                            paths,
-                            identity,
-                            prior_supervisor_state,
-                            prior_state_label,
-                            prior_incarnation,
-                            prior_pid,
-                            prior_containment,
-                            owner_boot_id,
-                            host_boot_relation,
-                            current_host_boot_id,
-                            child_identity.clone(),
-                        ) {
-                            Ok(()) => {
-                                readback.adopted_jobs = readback.adopted_jobs.saturating_add(1);
-                                push_shell_job_recovery_sample(
-                                    &mut readback.adopted_job_ids_sample,
-                                    job_id,
-                                );
-                            }
-                            Err(error) => {
-                                readback.write_failures = readback.write_failures.saturating_add(1);
-                                push_shell_job_recovery_sample(
-                                    &mut readback.retained_job_ids_sample,
-                                    job_id.clone(),
-                                );
-                                tracing::error!(
-                                    code = "M4_SHELL_JOB_SUPERVISOR_RESTART_ADOPTION_FAILED",
-                                    job_id = %job_id,
-                                    pid = child_identity.pid,
-                                    detail = %error.message,
-                                    data = ?error.data,
-                                    "restart-survivable durable child could not be adopted; startup will fail closed"
-                                );
-                            }
-                        }
-                        return;
-                    }
-                    readback.retained_live_child_jobs =
-                        readback.retained_live_child_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_SURVIVED",
-                        job_id = %job_id,
-                        pid = child_identity.pid,
-                        child_containment = ?prior_containment,
-                        "durable shell job retained as live: its exact child creation identity is STILL \
-                         RUNNING after the owning supervisor exited. On Windows that should be impossible \
-                         under JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — the child either broke away from the \
-                         job object or was created outside it. No monitor owns it now; cancel it with \
-                         act_run_shell_cancel or terminate the pid manually."
-                    );
-                    return;
-                }
-                LocalProcessIdentityState::Unreadable(detail) => {
-                    readback.retained_unprovable_jobs =
-                        readback.retained_unprovable_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_UNREADABLE",
-                        job_id = %job_id,
-                        pid = child_identity.pid,
-                        detail = %detail,
-                        "durable shell job retained as live: its child process identity could not be read, \
-                         which is uncertainty and never absence proof"
-                    );
-                    return;
-                }
-                other => local_process_identity_state_label(&other),
-            }
-        }
-        None => {
-            // Legacy record with no creation identity. A pid alone can be
-            // recycled, so a *present* pid is not proof of life and an absent
-            // one is not proof of death — but the owning supervisor is proven
-            // gone, and with it the monitor that could ever finish this record.
-            match job.pid {
-                Some(pid) if shell_job_live_process_ids(&[pid]).contains(&pid) => {
-                    readback.retained_unprovable_jobs =
-                        readback.retained_unprovable_jobs.saturating_add(1);
-                    push_shell_job_recovery_sample(
-                        &mut readback.retained_job_ids_sample,
-                        job_id.clone(),
-                    );
-                    tracing::error!(
-                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_LEGACY_PID_PRESENT",
-                        job_id = %job_id,
-                        pid,
-                        "durable shell job retained as live: the record predates immutable process creation \
-                         identity and its numeric pid is still present in the process table, which may be a \
-                         recycled pid. Verify manually and cancel the job if the pid is not the original child."
-                    );
-                    return;
-                }
-                Some(pid) => format!("legacy_no_creation_identity:pid_absent:{pid}"),
-                None => "legacy_no_creation_identity:no_pid".to_owned(),
-            }
-        }
-    };
-
-    // 3. Both proven gone: publish the honest terminal record.
-    let prior_containment_label = prior_containment
-        .as_deref()
-        .unwrap_or("unrecorded_child_containment");
-    let prior_job_object_contained = matches!(
-        prior_containment_label,
-        SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT
-            | SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING
-            | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
-    );
-    let children_terminated_by = if host_boot_relation == "boot_changed" {
-        "host_reboot_or_power_transition_not_job_object_attributed".to_owned()
-    } else if host_boot_relation == "same_boot" && prior_job_object_contained {
-        "windows_job_object_kill_on_last_handle_close".to_owned()
-    } else {
-        "unknown_without_same_boot_job_object_evidence".to_owned()
-    };
-    let cause = if host_boot_relation == "boot_changed" {
-        "host_reboot_controller_loss"
-    } else if job.local_process_identity.is_none() {
-        "supervisor_restart_child_never_had_creation_identity"
-    } else if host_boot_relation == "same_boot" && prior_job_object_contained {
-        "supervisor_restart_children_reaped_by_job_object_close"
-    } else {
-        "supervisor_restart_child_absent_containment_unknown"
-    };
-    let observed_at = chrono::Utc::now().to_rfc3339();
-    let reconciliation = ActRunShellSupervisorReconciliation {
-        cause: cause.to_owned(),
-        prior_supervisor_state: prior_supervisor_state.to_owned(),
-        prior_supervisor_incarnation_id: prior_incarnation.clone(),
-        prior_supervisor_pid: prior_pid,
-        prior_supervisor_identity_state: prior_state_label.clone(),
-        reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
-        reconciling_supervisor_pid: identity.pid,
-        prior_host_boot_id: owner_boot_id.clone(),
-        reconciling_host_boot_id: Some(current_host_boot_id.to_owned()),
-        host_boot_relation: Some(host_boot_relation.clone()),
-        child_containment: prior_containment_label.to_owned(),
-        child_identity_state: child_state_label.clone(),
-        children_terminated_by: children_terminated_by.clone(),
-        // No exit status was ever observed for this child. Kubelet's rule: when
-        // the cause cannot be proven, say so — never synthesize `exit 0`.
-        exit_code_trustworthy: false,
-        observation_source: "daemon_startup_supervisor_restart_reconciliation".to_owned(),
-        observed_at: observed_at.clone(),
-    };
-    let prior_shutdown_sentence = match prior_supervisor_state {
-        "absent_clean_shutdown_marker" => {
-            "the previous daemon recorded a clean shutdown of the durable shell-job store"
-        }
-        "absent_no_clean_shutdown_marker" => {
-            "the previous daemon never recorded a clean shutdown of the durable shell-job store, so it \
-             crashed, was killed, or lost power"
-        }
-        _ => {
-            "no previous supervisor marker existed, so this store predates supervisor identity tracking \
-             and the previous exit mode is unknown"
-        }
-    };
-    job.status = SHELL_JOB_STATUS_INTERRUPTED.to_owned();
-    job.completed_at.get_or_insert_with(|| observed_at.clone());
-    job.duration_ms
-        .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
-    job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-    job.error_message = Some(format!(
-        "durable shell job lost its controller and never produced an exit status. \
-         Owning supervisor incarnation {owner_incarnation} (pid {owner_pid}) is {prior_state}; {prior_shutdown_sentence}. \
-         Host boot relation is {host_boot_relation} (prior={prior_host_boot_id}, current={current_host_boot_id}). \
-         This daemon is incarnation {this_incarnation} (pid {this_pid}). Child containment was {containment}; \
-         owned children were terminated by {children_terminated_by}. Child process identity readback: {child_state}. \
-         exit_code is unknown and MUST NOT be read as success.",
-        owner_incarnation = prior_incarnation.as_deref().unwrap_or("<unrecorded>"),
-        owner_pid = prior_pid.map_or_else(|| "<unrecorded>".to_owned(), |pid| pid.to_string()),
-        prior_state = prior_state_label,
-        host_boot_relation = host_boot_relation,
-        prior_host_boot_id = owner_boot_id.as_deref().unwrap_or("<unrecorded>"),
-        current_host_boot_id = identity.host_boot_id.as_deref().unwrap_or("<unreadable>"),
-        this_incarnation = identity.incarnation_id,
-        this_pid = identity.pid,
-        containment = prior_containment_label,
-        child_state = child_state_label,
-    ));
-    job.supervisor_reconciliation = Some(reconciliation);
-    push_unique_evidence(
-        &mut job.remote_process_scope.detection_evidence,
-        format!(
-            "supervisor_restart_reconciliation:cause={cause}:prior_state={prior_supervisor_state}:host_boot_relation={host_boot_relation}"
-        ),
-    );
-    // The local transport may have died before its monitor persisted a marker.
-    // Re-read the capture files, honor an exact remote exit marker, otherwise
-    // run the same identity-bound liveness/cleanup path used by explicit cancel.
-    if job.remote_process_scope.remote_cleanup_required
-        && !job.remote_process_scope.remote_cleanup_verified
-    {
-        if let Err(error) = refresh_shell_job_remote_metadata_from_outputs(&mut job, paths) {
-            mark_shell_job_remote_cleanup_failed(
-                &mut job,
-                "daemon_startup_supervisor_restart_reconciliation",
-                "remote_metadata_read_failed",
-                &format!("{error:?}"),
-            );
-        } else {
-            let remote_exit_reconciled = reconcile_shell_job_remote_exit_marker(
-                &mut job,
-                paths,
-                false,
-                "daemon_startup_supervisor_restart_remote_exit_readback",
-            )
-            .unwrap_or_else(|error| {
-                mark_shell_job_remote_cleanup_failed(
-                    &mut job,
-                    "daemon_startup_supervisor_restart_remote_exit_readback",
-                    "remote_exit_marker_read_failed",
-                    &format!("{error:?}"),
-                );
-                false
-            });
-            if !remote_exit_reconciled
-                && job.remote_process_scope.remote_process_id.is_some()
-                && job.remote_process_scope.remote_process_group_id.is_some()
-            {
-                let _ = attempt_shell_job_remote_cleanup(
-                    &mut job,
-                    paths,
-                    "daemon_startup_supervisor_restart_reconciliation",
-                    None,
-                );
-            } else if !remote_exit_reconciled
-                && job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
-                && job.remote_process_scope.remote_cleanup_status
-                    == SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
-            {
-                mark_shell_job_wsl_child_unverified(
-                    &mut job,
-                    "daemon_startup_supervisor_restart_reconciliation",
-                );
-            } else if !remote_exit_reconciled && !job.remote_process_scope.remote_cleanup_verified {
-                mark_shell_job_remote_cleanup_unverified(
-                    &mut job,
-                    "daemon_startup_supervisor_restart_reconciliation",
-                    "supervisor_restart_terminated_local_transport_before_remote_cleanup",
-                );
-            }
-        }
-    }
-    match write_shell_job_reconciliation_status(paths, job) {
-        Ok(persisted) => {
-            readback.interrupted_jobs = readback.interrupted_jobs.saturating_add(1);
-            push_shell_job_recovery_sample(
-                &mut readback.interrupted_job_ids_sample,
-                job_id.clone(),
-            );
-            tracing::error!(
-                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_INTERRUPTED",
-                job_id = %job_id,
-                status = %persisted.status,
-                cause,
-                prior_supervisor_state,
-                prior_supervisor_incarnation_id = ?prior_incarnation,
-                child_identity_state = %child_state_label,
-                children_terminated_by = %children_terminated_by,
-                "published an honest terminal record for a durable shell job orphaned by a supervisor restart"
-            );
-        }
-        Err(error) => {
-            readback.write_failures = readback.write_failures.saturating_add(1);
-            push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
-            tracing::error!(
-                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_WRITE_FAILED",
-                job_id = %job_id,
-                detail = %error.message,
-                data = ?error.data,
-                "could not persist the terminal record for a durable shell job orphaned by a supervisor \
-                 restart; the record still claims to be running. Fix the storage failure named in `detail` \
-                 and restart the daemon, or read the job with act_run_shell_status to force reconciliation."
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
-fn adopt_surviving_shell_job_after_supervisor_restart(
-    mut job: ActRunShellJobStatus,
-    paths: &ShellJobPaths,
-    identity: &ActRunShellSupervisorIdentity,
-    prior_supervisor_state: &str,
-    prior_state_label: String,
-    prior_incarnation: Option<String>,
-    prior_pid: Option<u32>,
-    prior_containment: Option<String>,
-    prior_host_boot_id: Option<String>,
-    host_boot_relation: String,
-    current_host_boot_id: &str,
-    child_identity: ActRunShellLocalProcessIdentity,
-) -> Result<(), ErrorData> {
-    // Bind the kernel handle before changing the durable owner row. A failure
-    // leaves the predecessor row authoritative and makes startup fail closed.
-    let child_handle = AdoptedShellChildHandle::open(&child_identity).map_err(|detail| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "daemon startup could not bind a monitor to restart-surviving shell child pid {}: {detail}",
-                child_identity.pid
-            ),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "job_id": job.job_id,
-                "pid": child_identity.pid,
-                "start_time": child_identity.start_time,
-                "reason": "restart_surviving_child_handle_open_failed",
-                "detail": detail,
-            }),
-        )
-    })?;
-    let prior_containment_label = prior_containment
-        .as_deref()
-        .unwrap_or(SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE);
-    let process_job = OwnedProcessJob::open_for_restart_adoption(
-        &job.job_id,
-        &child_handle,
-        prior_containment_label,
-    )?;
-    let observed_at = chrono::Utc::now().to_rfc3339();
-    job.supervisor_reconciliation = Some(ActRunShellSupervisorReconciliation {
-        cause: "supervisor_restart_child_survived_and_adopted".to_owned(),
-        prior_supervisor_state: prior_supervisor_state.to_owned(),
-        prior_supervisor_incarnation_id: prior_incarnation,
-        prior_supervisor_pid: prior_pid,
-        prior_supervisor_identity_state: prior_state_label,
-        reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
-        reconciling_supervisor_pid: identity.pid,
-        prior_host_boot_id,
-        reconciling_host_boot_id: Some(current_host_boot_id.to_owned()),
-        host_boot_relation: Some(host_boot_relation),
-        child_containment: prior_containment
-            .unwrap_or_else(|| SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned()),
-        child_identity_state: "match_running".to_owned(),
-        children_terminated_by: "not_terminated_restart_survival_handoff".to_owned(),
-        exit_code_trustworthy: true,
-        observation_source: "daemon_startup_exact_process_handle_adoption".to_owned(),
-        observed_at: observed_at.clone(),
-    });
-    let mut new_owner = identity.clone();
-    new_owner.child_containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned();
-    job.supervisor = Some(new_owner);
-    push_unique_evidence(
-        &mut job.remote_process_scope.detection_evidence,
-        format!(
-            "supervisor_restart_adopted:pid={}:start_time={}:at={observed_at}",
-            child_identity.pid, child_identity.start_time
-        ),
-    );
-    let persisted = write_shell_job_reconciliation_status(paths, job)?;
-    let monitor_paths = paths.clone();
-    let monitor_job_id = persisted.job_id.clone();
-    tokio::spawn(async move {
-        monitor_adopted_shell_job(child_handle, process_job, persisted, monitor_paths).await;
-    });
-    tracing::info!(
-        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_ADOPTED",
-        job_id = %monitor_job_id,
-        pid = child_identity.pid,
-        child_start_time = child_identity.start_time,
-        supervisor_incarnation_id = %identity.incarnation_id,
-        supervisor_pid = identity.pid,
-        "restart-surviving durable shell child was rebound to an exact process handle and monitor"
-    );
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn adopt_surviving_shell_job_after_supervisor_restart(
-    _job: ActRunShellJobStatus,
-    _paths: &ShellJobPaths,
-    _identity: &ActRunShellSupervisorIdentity,
-    _prior_supervisor_state: &str,
-    _prior_state_label: String,
-    _prior_incarnation: Option<String>,
-    _prior_pid: Option<u32>,
-    _prior_containment: Option<String>,
-    _prior_host_boot_id: Option<String>,
-    _host_boot_relation: String,
-    _current_host_boot_id: &str,
-    child_identity: ActRunShellLocalProcessIdentity,
-) -> Result<(), ErrorData> {
-    Err(shell_tool_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        "restart-surviving shell-child adoption is unavailable on this platform",
-        json!({
-            "code": error_codes::TOOL_INTERNAL_ERROR,
-            "pid": child_identity.pid,
-            "reason": "restart_surviving_child_adoption_unsupported_platform",
-        }),
-    ))
-}
-
 /// Required corrupt-job recovery gate plus best-effort stale-job retention for
 /// daemon startup. A corrupt directory whose evidence disposition or remote
 /// state cannot be proved prevents the daemon from accepting requests. Once
@@ -8500,51 +6511,37 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
             return Err(error);
         }
     };
-    let outstanding = corrupt_readback.retained_unverifiable_remote_jobs
-        + corrupt_readback.unexpected_job_root_entries
-        + corrupt_readback.skipped_concurrently_mutated
-        + corrupt_readback.recovery_failures
-        + corrupt_readback.retained_future_schema_jobs;
-    if outstanding > 0 {
-        // These are per-record obligations, not a statement that the store is
-        // unreadable. Refusing to start on them was a P0 availability failure
-        // that bought no safety (#1858): the conditions are not self-healing --
-        // a remote host that is gone can never become verifiable, and a record
-        // written by a newer daemon never becomes older -- so every subsequent
-        // start re-failed identically and the supervisor restart-looped
-        // forever. Nothing about being down terminates an orphaned remote
-        // process; it only guarantees no daemon is ever alive to observe it,
-        // retry verification, or tell anyone.
-        //
-        // The fail-closed boundary that actually protects evidence is
-        // DESTRUCTIVE ACTION, and that is enforced separately and unchanged:
-        // this pass still refuses to delete, quarantine, or signal anything
-        // whose remote ownership it could not prove. What changes here is only
-        // that an unproven disposition is carried as a durable, retried,
-        // health-surfaced obligation instead of a permanently locked door.
-        //
-        // A whole-store failure (unreadable job root, unverifiable quarantine
-        // store) still returns Err above and still refuses startup, because
-        // there the daemon genuinely cannot know what it owns.
-        let obligations = record_shell_job_recovery_obligations(&corrupt_readback);
+    if corrupt_readback.retained_unverifiable_remote_jobs > 0
+        || corrupt_readback.unexpected_job_root_entries > 0
+        || corrupt_readback.skipped_concurrently_mutated > 0
+        || corrupt_readback.recovery_failures > 0
+    {
         tracing::error!(
-            code = "M4_SHELL_JOB_STARTUP_RECOVERY_OBLIGATIONS_OUTSTANDING",
+            code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_INCOMPLETE",
             corrupt_status_jobs = corrupt_readback.corrupt_status_jobs,
             quarantined_jobs = corrupt_readback.quarantined_jobs,
             retained_unverifiable_remote_jobs = corrupt_readback.retained_unverifiable_remote_jobs,
-            retained_future_schema_jobs = corrupt_readback.retained_future_schema_jobs,
             unexpected_job_root_entries = corrupt_readback.unexpected_job_root_entries,
             skipped_concurrently_mutated = corrupt_readback.skipped_concurrently_mutated,
             recovery_failures = corrupt_readback.recovery_failures,
-            outstanding_obligations = outstanding,
-            obligations_path = ?obligations,
-            job_root = ?corrupt_readback.job_root,
             retained_job_ids_sample = ?corrupt_readback.retained_job_ids_sample,
             unexpected_job_root_entries_sample = ?corrupt_readback.unexpected_job_root_entries_sample,
-            "durable shell-job evidence dispositions remain unproven; retained untouched, recorded as outstanding obligations, and retried on every start"
+            "refusing daemon startup because one or more durable shell-job evidence dispositions could not be verified"
         );
-    } else {
-        clear_shell_job_recovery_obligations();
+        let code = if corrupt_readback.retained_unverifiable_remote_jobs > 0 {
+            error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED
+        } else {
+            error_codes::STORAGE_WRITE_FAILED
+        };
+        return Err(shell_tool_error(
+            code,
+            "daemon startup refused: corrupt durable shell-job recovery is incomplete",
+            json!({
+                "code": code,
+                "reason": "startup_corrupt_shell_job_recovery_incomplete",
+                "readback": corrupt_readback,
+            }),
+        ));
     }
     tracing::info!(
         code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_COMPLETE",
@@ -8555,41 +6552,6 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
         bytes_quarantined = corrupt_readback.bytes_quarantined,
         "daemon startup completed corrupt durable shell-job recovery"
     );
-    // Orphan reconciliation runs after the corrupt-record gate (so every record
-    // it reads is structurally valid) and before the TTL reaper (so a record it
-    // terminalizes can be reaped in the same pass once aged).
-    let restart_readback = match reconcile_orphaned_shell_jobs_after_supervisor_restart() {
-        Ok(readback) => readback,
-        Err(error) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILE_FAILED",
-                detail = %error.message,
-                data = ?error.data,
-                "daemon startup could not reconcile durable shell jobs orphaned by a previous supervisor; \
-                 refusing startup rather than serving records that still claim to be running"
-            );
-            return Err(error);
-        }
-    };
-    if restart_readback.write_failures > 0 {
-        tracing::error!(
-            code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILE_INCOMPLETE",
-            write_failures = restart_readback.write_failures,
-            live_status_jobs = restart_readback.live_status_jobs,
-            interrupted_jobs = restart_readback.interrupted_jobs,
-            "refusing daemon startup because one or more orphaned durable shell-job records could not be \
-             transitioned out of `running` after a supervisor restart"
-        );
-        return Err(shell_tool_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            "daemon startup refused: durable shell jobs orphaned by a supervisor restart still claim to be running",
-            json!({
-                "code": error_codes::STORAGE_WRITE_FAILED,
-                "reason": "startup_supervisor_restart_reconciliation_incomplete",
-                "readback": restart_readback,
-            }),
-        ));
-    }
     match reap_stale_shell_jobs() {
         Ok(readback) => tracing::info!(
             code = "M4_SHELL_JOB_REAP_STARTUP",
@@ -8607,359 +6569,6 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
         ),
     }
     Ok(corrupt_readback)
-}
-
-/// Durable ledger of durable shell-job recovery obligations this daemon could
-/// not discharge at startup (#1858).
-///
-/// Startup no longer refuses to run on these, so this file plus the
-/// `M4_SHELL_JOB_STARTUP_RECOVERY_OBLIGATIONS_OUTSTANDING` event plus the
-/// health surface are what make them impossible to lose track of. It lives
-/// beside the job root rather than inside it, because every entry inside the
-/// job root must be a job directory.
-fn shell_job_recovery_obligations_path() -> Result<PathBuf, ErrorData> {
-    Ok(shell_job_root_dir()?.join("recovery-obligations.json"))
-}
-
-/// Writes the outstanding-obligation ledger, preserving `first_observed_at`
-/// from any prior generation so a long-lived obligation reports its true age
-/// rather than resetting on every restart.
-fn record_shell_job_recovery_obligations(
-    readback: &ShellJobCorruptRecoveryReadback,
-) -> Option<String> {
-    let path = match shell_job_recovery_obligations_path() {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_PATH_FAILED",
-                detail = %error.message,
-                "could not resolve the durable shell-job recovery obligations ledger path"
-            );
-            return None;
-        }
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    let first_observed_at = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("first_observed_at")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| now.clone());
-    let payload = json!({
-        "schema_version": 1,
-        "first_observed_at": first_observed_at,
-        "last_observed_at": now,
-        "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
-        "outstanding": {
-            "retained_unverifiable_remote_jobs": readback.retained_unverifiable_remote_jobs,
-            "retained_future_schema_jobs": readback.retained_future_schema_jobs,
-            "unexpected_job_root_entries": readback.unexpected_job_root_entries,
-            "skipped_concurrently_mutated": readback.skipped_concurrently_mutated,
-            "recovery_failures": readback.recovery_failures,
-        },
-        "readback": readback,
-        "remediation": "each obligation is retried on every daemon start. Inspect the M4_SHELL_JOB_STARTUP_* events for the exact job ids and paths. Evidence is retained untouched: nothing here is deleted, quarantined, or signalled without proven remote ownership.",
-    });
-    let bytes = match serde_json::to_vec_pretty(&payload) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_ENCODE_FAILED",
-                detail = %error,
-                "could not encode the durable shell-job recovery obligations ledger"
-            );
-            return None;
-        }
-    };
-    if let Some(parent) = path.parent()
-        && let Err(error) = fs::create_dir_all(parent)
-    {
-        tracing::error!(
-            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_WRITE_FAILED",
-            path = %path_string(&path),
-            detail = %error,
-            "could not create the directory for the shell-job recovery obligations ledger"
-        );
-        return None;
-    }
-    if let Err(error) = fs::write(&path, &bytes) {
-        tracing::error!(
-            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_WRITE_FAILED",
-            path = %path_string(&path),
-            detail = %error,
-            "could not write the shell-job recovery obligations ledger"
-        );
-        return None;
-    }
-    // Independent readback: the ledger is only reported as written once its
-    // bytes have been reread from the filesystem and matched.
-    match fs::read(&path) {
-        Ok(readback_bytes) if readback_bytes == bytes => Some(path_string(&path)),
-        Ok(readback_bytes) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_READBACK_MISMATCH",
-                path = %path_string(&path),
-                wrote_bytes = bytes.len(),
-                read_bytes = readback_bytes.len(),
-                "the shell-job recovery obligations ledger did not read back the bytes just written"
-            );
-            None
-        }
-        Err(error) => {
-            tracing::error!(
-                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_READBACK_FAILED",
-                path = %path_string(&path),
-                detail = %error,
-                "could not reread the shell-job recovery obligations ledger after writing it"
-            );
-            None
-        }
-    }
-}
-
-/// Removes the ledger once a startup pass proved every disposition. Absence of
-/// the file is the assertion "nothing outstanding".
-fn clear_shell_job_recovery_obligations() {
-    let Ok(path) = shell_job_recovery_obligations_path() else {
-        return;
-    };
-    match fs::remove_file(&path) {
-        Ok(()) => tracing::info!(
-            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_CLEARED",
-            path = %path_string(&path),
-            "every durable shell-job recovery obligation was discharged; cleared the outstanding ledger"
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => tracing::error!(
-            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_CLEAR_FAILED",
-            path = %path_string(&path),
-            detail = %error,
-            "could not clear the discharged shell-job recovery obligations ledger"
-        ),
-    }
-}
-
-/// Health-surface read of the outstanding-obligation ledger. `Ok(None)` means
-/// the ledger is absent, i.e. nothing outstanding. An unreadable or malformed
-/// ledger is an error, never silently treated as "nothing outstanding".
-pub fn read_shell_job_recovery_obligations() -> Result<Option<Value>, ErrorData> {
-    let path = shell_job_recovery_obligations_path()?;
-    match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
-            .map(Some)
-            .map_err(|error| {
-                shell_tool_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "durable shell-job recovery obligations ledger is not valid JSON: {error}"
-                    ),
-                    json!({
-                        "code": error_codes::STORAGE_READ_FAILED,
-                        "path": path,
-                        "reason": "shell_job_recovery_obligations_decode_failed",
-                    }),
-                )
-            }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!("durable shell-job recovery obligations ledger could not be read: {error}"),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "path": path,
-                "reason": "shell_job_recovery_obligations_read_failed",
-            }),
-        )),
-    }
-}
-
-/// Fail-closed inventory consumed by the planned host-transition authorization
-/// boundary. Unlike dashboard/retention scans, this inventory never skips a
-/// malformed or unreadable entry: one unknown durable record is enough to
-/// refuse a destructive host transition.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ShellJobHostTransitionSnapshot {
-    pub source_of_truth: String,
-    pub job_root: String,
-    pub scanned_job_dirs: usize,
-    pub live_jobs: Vec<ShellJobHostTransitionLiveJob>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ShellJobHostTransitionLiveJob {
-    pub job_id: String,
-    pub status: String,
-    pub status_path: String,
-    pub pid: Option<u32>,
-    pub local_process_start_time: Option<u64>,
-    pub started_at: String,
-    pub supervisor_incarnation_id: Option<String>,
-    pub supervisor_host_boot_id: Option<String>,
-    pub remote_transport: String,
-    pub remote_identity: Option<String>,
-    pub remote_process_id: Option<String>,
-    pub remote_process_group_id: Option<String>,
-    pub remote_boot_id: Option<String>,
-    pub remote_process_start_time: Option<String>,
-}
-
-pub(crate) fn shell_job_host_transition_snapshot()
--> Result<ShellJobHostTransitionSnapshot, ErrorData> {
-    let root = shell_durable_job_root_dir()?;
-    let source_of_truth = format!(
-        "every durable shell status.json under {}",
-        path_string(&root)
-    );
-    if !root.exists() {
-        return Ok(ShellJobHostTransitionSnapshot {
-            source_of_truth,
-            job_root: path_string(&root),
-            scanned_job_dirs: 0,
-            live_jobs: Vec::new(),
-        });
-    }
-    let entries = fs::read_dir(&root).map_err(|error| {
-        shell_tool_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "host-transition preflight could not enumerate durable shell-job root {}: {error}",
-                root.display()
-            ),
-            json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "host_transition_shell_job_root_read_failed",
-                "path": root,
-                "remediation": "repair the exact durable shell-job root permissions or filesystem error and retry; host transition remains refused",
-            }),
-        )
-    })?;
-    let mut scanned_job_dirs = 0_usize;
-    let mut live_jobs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "host-transition preflight could not read a durable shell-job directory entry under {}: {error}",
-                    root.display()
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "reason": "host_transition_shell_job_entry_read_failed",
-                    "path": root,
-                    "remediation": "repair the exact directory entry/filesystem failure and retry; host transition remains refused",
-                }),
-            )
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|error| {
-            shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "host-transition preflight could not classify durable shell-job entry {}: {error}",
-                    path.display()
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "reason": "host_transition_shell_job_entry_type_failed",
-                    "path": path,
-                    "remediation": "repair the exact filesystem metadata failure and retry; host transition remains refused",
-                }),
-            )
-        })?;
-        if !file_type.is_dir() {
-            return Err(shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "host-transition preflight found an unexpected non-directory entry in the durable shell-job root: {}",
-                    path.display()
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "reason": "host_transition_unexpected_shell_job_root_entry",
-                    "path": path,
-                    "remediation": "inspect and explicitly disposition the unexpected entry; host transition remains refused",
-                }),
-            ));
-        }
-        let job_id = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| {
-                shell_tool_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    "host-transition preflight found a non-Unicode durable shell-job directory name",
-                    json!({
-                        "code": error_codes::STORAGE_READ_FAILED,
-                        "reason": "host_transition_non_unicode_shell_job_id",
-                        "path": path,
-                        "remediation": "inspect and explicitly disposition the invalid durable job directory; host transition remains refused",
-                    }),
-                )
-            })?;
-        validate_shell_job_id(&job_id).map_err(|error| {
-            shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "host-transition preflight found invalid durable shell-job directory {job_id}: {}",
-                    error.message
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "reason": "host_transition_invalid_shell_job_id",
-                    "job_id": job_id,
-                    "path": path,
-                    "detail": error.message,
-                    "remediation": "inspect and explicitly disposition the invalid durable job directory; host transition remains refused",
-                }),
-            )
-        })?;
-        scanned_job_dirs = scanned_job_dirs.saturating_add(1);
-        let paths = shell_job_paths_from_root(&root, &job_id);
-        let job = read_shell_job_status(&paths.status_path, &job_id)?;
-        let job = reconcile_shell_job_process_state(job, &paths)?;
-        if !shell_job_live_status(&job.status) {
-            continue;
-        }
-        live_jobs.push(ShellJobHostTransitionLiveJob {
-            job_id: job.job_id,
-            status: job.status,
-            status_path: path_string(&paths.status_path),
-            pid: job.pid,
-            local_process_start_time: job
-                .local_process_identity
-                .as_ref()
-                .map(|identity| identity.start_time),
-            started_at: job.started_at,
-            supervisor_incarnation_id: job
-                .supervisor
-                .as_ref()
-                .map(|identity| identity.incarnation_id.clone()),
-            supervisor_host_boot_id: job
-                .supervisor
-                .as_ref()
-                .and_then(|identity| identity.host_boot_id.clone()),
-            remote_transport: job.remote_process_scope.transport,
-            remote_identity: job.remote_process_scope.remote_identity,
-            remote_process_id: job.remote_process_scope.remote_process_id,
-            remote_process_group_id: job.remote_process_scope.remote_process_group_id,
-            remote_boot_id: job.remote_process_scope.remote_boot_id,
-            remote_process_start_time: job.remote_process_scope.remote_process_start_time,
-        });
-    }
-    live_jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
-    Ok(ShellJobHostTransitionSnapshot {
-        source_of_truth,
-        job_root: path_string(&root),
-        scanned_job_dirs,
-        live_jobs,
-    })
 }
 
 pub fn shell_jobs_dashboard_snapshot(
@@ -9302,25 +6911,10 @@ pub(crate) fn validate_launch_authorized(
     config: &M4ServiceConfig,
     params: &ActLaunchParams,
 ) -> Result<String, ErrorData> {
-    Ok(validate_launch_authorized_plan(config, params)?.matched_pattern)
-}
-
-struct ValidatedLaunchAuthorization {
-    matched_pattern: String,
-    wait_regex: Option<regex::Regex>,
-}
-
-fn validate_launch_authorized_plan(
-    config: &M4ServiceConfig,
-    params: &ActLaunchParams,
-) -> Result<ValidatedLaunchAuthorization, ErrorData> {
-    let wait_regex = validate_launch_params(params)?;
+    validate_launch_params(params)?;
     let command_line = launch_command_line(params)?;
     if let Some(matched_pattern) = config.launch_match(&command_line) {
-        return Ok(ValidatedLaunchAuthorization {
-            matched_pattern: matched_pattern.to_owned(),
-            wait_regex,
-        });
+        return Ok(matched_pattern.to_owned());
     }
     let reason = if config.allow_launch_count() == 0 {
         "no_allow_launch_policy"
@@ -9353,35 +6947,9 @@ pub(crate) async fn launch_for_session(
     launch_for_session_with_boundary(config, params, session_id, &allow_physical_mutation).await
 }
 
-fn cleanup_unspawned_cdp_after_error(
-    error: ErrorData,
-    launch: Option<&ChromiumCdpLaunch>,
-) -> ErrorData {
-    let cdp_cleanup = launch.map(cleanup_cdp_launch_plan);
-    let cleanup_verified = cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
-    if !cleanup_verified {
-        synapse_action::record_operator_panic_safety_incident();
-    }
-    physical_mutation_boundary_error(
-        error,
-        "act_launch_pre_spawn_cdp_cleanup",
-        json!({
-            "source_of_truth": "Synapse-owned CDP profile path + exact durable ownership marker + independent filesystem absence readback",
-            "cdp_cleanup": cdp_cleanup,
-            "cleanup_verified": cleanup_verified,
-        }),
-    )
-}
-
-fn cleanup_launched_process_after_boundary(
-    error: ErrorData,
-    pid: u32,
-    launch: Option<&ChromiumCdpLaunch>,
-) -> ErrorData {
+fn cleanup_launched_process_after_boundary(error: ErrorData, pid: u32) -> ErrorData {
     let cleanup = terminate_owned_process_tree(pid);
-    let cdp_cleanup = launch.map(cleanup_cdp_launch_plan);
-    let cleanup_verified = cleanup.remaining_process_ids.is_empty()
-        && cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
+    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
     if !cleanup_verified {
         synapse_action::record_operator_panic_safety_incident();
     }
@@ -9389,10 +6957,9 @@ fn cleanup_launched_process_after_boundary(
         error,
         "act_launch_operator_panic_cleanup",
         json!({
-            "source_of_truth": "exact launched process tree + separate process-table readback + exact CDP registry/profile filesystem readback",
+            "source_of_truth": "exact launched process tree + separate process-table readback",
             "pid": pid,
             "termination": cleanup,
-            "cdp_cleanup": cdp_cleanup,
             "cleanup_verified": cleanup_verified,
         }),
     )
@@ -9402,9 +6969,8 @@ fn ensure_launched_process_mutation_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
     stage: &'static str,
     pid: u32,
-    cdp_launch: Option<&ChromiumCdpLaunch>,
 ) -> Result<(), ErrorData> {
-    boundary(stage).map_err(|error| cleanup_launched_process_after_boundary(error, pid, cdp_launch))
+    boundary(stage).map_err(|error| cleanup_launched_process_after_boundary(error, pid))
 }
 
 pub(crate) async fn launch_for_session_with_boundary(
@@ -9413,48 +6979,24 @@ pub(crate) async fn launch_for_session_with_boundary(
     session_id: Option<&str>,
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActLaunchOutcome, ErrorData> {
-    let authorization = validate_launch_authorized_plan(config, &params)?;
-    let matched_pattern = authorization.matched_pattern;
-    let wait_regex = authorization.wait_regex;
-    if matches!(params.output, Some(ActLaunchOutput::Capture { .. })) && session_id.is_none() {
-        return Err(launch_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "act_launch output capture requires an HTTP MCP session so the complete inherited process tree remains owned until every output writer closes",
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "reason": "launch_output_capture_requires_session",
-                "remediation": "initialize Streamable HTTP MCP, then call act_launch/process launch with that Mcp-Session-Id; use fire_and_forget only when terminal/output observation is deliberately not required",
-            }),
-        ));
-    }
-    #[cfg(not(windows))]
-    if matches!(params.output, Some(ActLaunchOutput::Capture { .. })) {
-        return Err(launch_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "act_launch output capture is unavailable on this non-Windows build",
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "reason": "launch_output_capture_windows_only",
-                "remediation": "run the Windows Synapse daemon whose retained process HANDLE and creation FILETIME provide the required exact-generation terminal authority",
-            }),
-        ));
-    }
+    let matched_pattern = validate_launch_authorized(config, &params)?;
     let command_line = launch_command_line(&params)?;
+    let wait_regex = params
+        .wait_for_window_title_regex
+        .as_ref()
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("act_launch wait_for_window_title_regex is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     // #684: make a CDP debug port reachable for Synapse-launched Chromium so
     // observe/find can read the page DOM without manual flags. Augment the spawn
     // command only (policy already matched the original command above).
-    let cdp_launch = chromium_cdp_launch(&params)?;
-    if cdp_launch.is_some() && session_id.is_none() {
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            "act_launch CDP endpoint ownership requires an HTTP MCP session",
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "cdp_launch_requires_session_lifecycle",
-                "remediation": "initialize Streamable HTTP MCP and call act_launch with its Mcp-Session-Id so process, endpoint registry, and profile cleanup share one lifetime",
-            }),
-        ));
-    }
+    let cdp_launch = chromium_cdp_launch(&params);
     let force_renderer_accessibility = chromium_renderer_accessibility_arg(&params);
     let spawn_params = params_with_chromium_launch_args(
         &params,
@@ -9468,44 +7010,24 @@ pub(crate) async fn launch_for_session_with_boundary(
     let desktop_readback = launch_desktop
         .as_ref()
         .map(PreparedLaunchDesktop::to_response);
-    if let Some(launch) = cdp_launch.as_ref() {
-        prepare_cdp_profile_for_spawn(launch)?;
-    }
-    boundary("act_launch_immediately_before_create_process")
-        .map_err(|error| cleanup_unspawned_cdp_after_error(error, cdp_launch.as_ref()))?;
-    let mut spawned = spawn_launch_child(&spawn_params, launch_desktop, session_id.is_some())
-        .map_err(|error| cleanup_unspawned_cdp_after_error(error, cdp_launch.as_ref()))?;
+    boundary("act_launch_immediately_before_create_process")?;
+    let spawned = spawn_launch_child(&spawn_params, launch_desktop)?;
     let pid = spawned.pid;
     ensure_launched_process_mutation_boundary(
         boundary,
         "act_launch_immediately_after_create_process",
         pid,
-        cdp_launch.as_ref(),
     )?;
-    let mut cdp = if let Some(launch) = &cdp_launch {
+    let cdp = if let Some(launch) = &cdp_launch {
         let cdp = await_physical_mutation_boundary(
             boundary,
             "act_launch_while_resolving_cdp",
-            resolve_launched_cdp_port(
-                pid,
-                spawned.process_creation_time_100ns,
-                launch,
-                params.timeout_ms,
-            ),
+            resolve_launched_cdp_port(pid, launch),
         )
         .await
-        .map_err(|error| {
-            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-        })?;
-        ensure_launched_process_mutation_boundary(
-            boundary,
-            "act_launch_after_resolving_cdp",
-            pid,
-            cdp_launch.as_ref(),
-        )?;
-        cdp.map_err(|error| {
-            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-        })?
+        .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+        ensure_launched_process_mutation_boundary(boundary, "act_launch_after_resolving_cdp", pid)?;
+        cdp
     } else {
         LaunchedCdp::default()
     };
@@ -9515,16 +7037,14 @@ pub(crate) async fn launch_for_session_with_boundary(
         verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms),
     )
     .await
-    .map_err(|error| cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref()))?;
+    .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
     ensure_launched_process_mutation_boundary(
         boundary,
         "act_launch_after_verifying_chromium_url",
         pid,
-        cdp_launch.as_ref(),
     )?;
-    let cdp_target = cdp_target.map_err(|error| {
-        cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-    })?;
+    let cdp_target =
+        cdp_target.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
     let window = if let Some(regex) = wait_regex {
         if let Some(desktop_lease) = spawned.desktop_lease.as_ref() {
             let window = await_physical_mutation_boundary(
@@ -9542,18 +7062,13 @@ pub(crate) async fn launch_for_session_with_boundary(
                 ),
             )
             .await
-            .map_err(|error| {
-                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-            })?;
+            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
             ensure_launched_process_mutation_boundary(
                 boundary,
                 "act_launch_after_waiting_for_desktop_window",
                 pid,
-                cdp_launch.as_ref(),
             )?;
-            window.map_err(|error| {
-                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-            })?
+            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
         } else {
             let window = await_physical_mutation_boundary(
                 boundary,
@@ -9568,46 +7083,18 @@ pub(crate) async fn launch_for_session_with_boundary(
                 ),
             )
             .await
-            .map_err(|error| {
-                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-            })?;
+            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
             ensure_launched_process_mutation_boundary(
                 boundary,
                 "act_launch_after_waiting_for_window",
                 pid,
-                cdp_launch.as_ref(),
             )?;
-            window.map_err(|error| {
-                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-            })?
+            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
         }
     } else {
         WindowWaitResult::not_requested()
     };
     let launched_at = chrono::Utc::now().to_rfc3339();
-    let request_sha256 = launch_request_sha256(&params)?;
-    let launch_id = sha256_hex(
-        format!(
-            "act_launch/v2\0{}\0{}\0{}\0{}",
-            pid,
-            spawned
-                .process_creation_time_100ns
-                .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
-            launched_at,
-            request_sha256
-        )
-        .as_bytes(),
-    );
-    let output_mode = params
-        .output
-        .as_ref()
-        .map_or("fire_and_forget", ActLaunchOutput::mode);
-    let output_max_bytes = params
-        .output
-        .as_ref()
-        .and_then(ActLaunchOutput::capture_max_bytes_per_stream);
-    let terminal_history_key =
-        output_max_bytes.map(|_| launch_process_terminal_history_row_key_parts(&launched_at, pid));
     tracing::info!(
         code = "M4_ACT_LAUNCH_EXECUTED",
         command_line = %command_line,
@@ -9637,23 +7124,10 @@ pub(crate) async fn launch_for_session_with_boundary(
             "act_launch matched a pre-existing/foreign window not owned by the spawned pid (#1358)"
         );
     }
-    ensure_launched_process_mutation_boundary(
-        boundary,
-        "act_launch_before_response",
-        pid,
-        cdp_launch.as_ref(),
-    )?;
-    if let Some(launch) = cdp_launch.as_ref() {
-        publish_launched_cdp(launch, &mut cdp).map_err(|error| {
-            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
-        })?;
-    }
-    let cdp_registration = cdp.registration.as_ref();
+    ensure_launched_process_mutation_boundary(boundary, "act_launch_before_response", pid)?;
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
-            launch_id,
             pid,
-            process_creation_time_100ns: spawned.process_creation_time_100ns,
             window_owner_pid,
             reused_existing_window,
             hwnd: window.hwnd,
@@ -9664,42 +7138,17 @@ pub(crate) async fn launch_for_session_with_boundary(
             cdp_endpoint: cdp.endpoint,
             cdp_user_data_dir: cdp.user_data_dir,
             cdp_verified_url: cdp_target.as_ref().map(|target| target.url.clone()),
-            cdp_verified_title: cdp_target.as_ref().and_then(|target| target.title.clone()),
-            cdp_verified_target_id: cdp_target.map(|target| target.id),
-            cdp_registration_id: cdp_registration.map(|row| row.registration_id.clone()),
-            cdp_browser_id: cdp_registration.map(|row| row.browser_id.clone()),
-            cdp_browser_websocket_url: cdp_registration
-                .map(|row| row.browser_websocket_url.clone()),
-            cdp_listener_pid: cdp_registration.map(|row| row.listener_pid),
-            cdp_listener_process_creation_time_100ns: cdp_registration
-                .and_then(|row| row.listener_process_creation_time_100ns),
-            cdp_profile_ownership: cdp.profile_ownership.map(|value| value.as_str().to_owned()),
+            cdp_verified_title: cdp_target.and_then(|target| target.title),
             desktop: desktop_readback,
-            output: ActLaunchOutputLaunchReadback {
-                mode: output_mode.to_owned(),
-                terminal_observation: if output_max_bytes.is_some() {
-                    "running".to_owned()
-                } else {
-                    "not_requested".to_owned()
-                },
-                max_bytes_per_stream: output_max_bytes,
-                terminal_history_key,
-            },
         },
-        process_job: spawned.process_job.take(),
-        desktop_lease: spawned.desktop_lease.take(),
-        terminal_capture: spawned.terminal_capture.take(),
-        cdp_resource: cdp.resource.take(),
+        desktop_lease: spawned.desktop_lease,
     })
 }
 
 #[derive(Debug)]
 pub(crate) struct ActLaunchOutcome {
     pub response: ActLaunchResponse,
-    pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<LaunchDesktopLease>,
-    pub terminal_capture: Option<LaunchTerminalCapture>,
-    pub cdp_resource: Option<CdpLaunchResource>,
 }
 
 /// Planned CDP-debug augmentation for a Chromium-family launch (#684).
@@ -9709,38 +7158,6 @@ struct ChromiumCdpLaunch {
     user_data_dir: std::path::PathBuf,
     /// Args injected ahead of the caller's args.
     injected_args: Vec<String>,
-    requested_port: CdpRequestedPort,
-    profile_ownership: CdpProfileOwnership,
-    profile_ownership_token: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CdpRequestedPort {
-    Ephemeral,
-    Fixed(u16),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CdpProfileOwnership {
-    SynapseEphemeral,
-    CallerManagedStable,
-}
-
-impl CdpProfileOwnership {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::SynapseEphemeral => "synapse_ephemeral",
-            Self::CallerManagedStable => "caller_managed_stable",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CdpLaunchResource {
-    registration: synapse_a11y::LaunchedCdpRegistration,
-    user_data_dir: PathBuf,
-    profile_ownership: CdpProfileOwnership,
-    profile_ownership_token: Option<String>,
 }
 
 /// Optional Chromium renderer accessibility launch flag (#689).
@@ -9805,242 +7222,46 @@ struct LaunchedCdp {
     port: Option<u16>,
     endpoint: Option<String>,
     user_data_dir: Option<String>,
-    registration: Option<synapse_a11y::LaunchedCdpRegistration>,
-    profile_ownership: Option<CdpProfileOwnership>,
-    resource: Option<CdpLaunchResource>,
 }
 
-/// Builds one complete CDP endpoint transaction. Caller-supplied port/profile
-/// switches are accepted only as a coherent, uniquely specified pair. Partial,
-/// duplicate, malformed, or pipe-based configuration fails before process
-/// creation instead of silently disabling endpoint ownership (#2166).
-fn chromium_cdp_launch(params: &ActLaunchParams) -> Result<Option<ChromiumCdpLaunch>, ErrorData> {
+/// Decides whether to inject CDP debug flags for this launch. Returns `None` for
+/// non-Chromium targets, when the caller opted out (`cdp_debug = Some(false)`),
+/// or when the caller already specified a debug port / user-data-dir (respect
+/// their intent). Otherwise plans an ephemeral port + dedicated profile.
+fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
+    if params.cdp_debug == Some(false) {
+        return None;
+    }
     let is_chromium =
         synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
-    let has_remote_debugging_switch = params.args.iter().any(|arg| {
-        is_switch_arg(arg, "--remote-debugging-port")
-            || is_switch_arg(arg, "--remote-debugging-pipe")
+    if !is_chromium && params.cdp_debug != Some(true) {
+        return None;
+    }
+    let already_configured = params.args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower.starts_with("--remote-debugging-port") || lower.starts_with("--user-data-dir")
     });
-    let has_profile_switch = params
-        .args
-        .iter()
-        .any(|arg| is_switch_arg(arg, "--user-data-dir"));
-    let has_cdp_switch = has_remote_debugging_switch || has_profile_switch;
-    if validate_explicit_cdp_disabled_args(params)? {
-        return Ok(None);
+    if already_configured {
+        tracing::info!(
+            code = "M4_ACT_LAUNCH_CDP_SKIPPED",
+            reason = "caller_supplied_debug_or_profile_flags",
+            "act_launch leaving caller-specified CDP/profile flags untouched"
+        );
+        return None;
     }
-    if !is_chromium && params.cdp_debug != Some(true) && !has_cdp_switch {
-        return Ok(None);
-    }
-    if params
-        .args
-        .iter()
-        .any(|arg| is_switch_arg(arg, "--remote-debugging-pipe"))
-    {
-        return Err(cdp_config_error(
-            "remote_debugging_pipe_has_no_owned_loopback_endpoint",
-            params,
-            "use --remote-debugging-port with one dedicated --user-data-dir; pipe transport cannot satisfy the loopback listener ownership contract",
-        ));
-    }
-
-    let port_value = unique_switch_value(&params.args, "--remote-debugging-port")?;
-    let profile_value = unique_switch_value(&params.args, "--user-data-dir")?;
-    match (port_value, profile_value) {
-        (None, None) => {
-            let (user_data_dir, profile_ownership, profile_ownership_token) =
-                cdp_automation_profile_dir()?;
-            Ok(Some(ChromiumCdpLaunch {
-                injected_args: vec![
-                    "--remote-debugging-port=0".to_owned(),
-                    format!("--user-data-dir={}", user_data_dir.display()),
-                    "--silent-debugger-extension-api".to_owned(),
-                    "--disable-extensions".to_owned(),
-                    "--no-first-run".to_owned(),
-                    "--no-default-browser-check".to_owned(),
-                ],
-                user_data_dir,
-                requested_port: CdpRequestedPort::Ephemeral,
-                profile_ownership,
-                profile_ownership_token,
-            }))
-        }
-        (Some(port), Some(profile)) => {
-            let parsed_port = port.parse::<u16>().map_err(|error| {
-                cdp_config_error_with_detail(
-                    "remote_debugging_port_invalid",
-                    params,
-                    "set --remote-debugging-port to 0 for an ephemeral port or to an integer from 1 through 65535",
-                    format!("value={port:?} parse_error={error}"),
-                )
-            })?;
-            if profile.trim().is_empty() {
-                return Err(cdp_config_error(
-                    "user_data_dir_empty",
-                    params,
-                    "set --user-data-dir to one explicit non-default automation profile directory",
-                ));
-            }
-            Ok(Some(ChromiumCdpLaunch {
-                user_data_dir: PathBuf::from(profile),
-                injected_args: Vec::new(),
-                requested_port: if parsed_port == 0 {
-                    CdpRequestedPort::Ephemeral
-                } else {
-                    CdpRequestedPort::Fixed(parsed_port)
-                },
-                profile_ownership: CdpProfileOwnership::CallerManagedStable,
-                profile_ownership_token: None,
-            }))
-        }
-        (Some(_), None) => Err(cdp_config_error(
-            "remote_debugging_port_without_user_data_dir",
-            params,
-            "pair the single --remote-debugging-port switch with one non-default --user-data-dir",
-        )),
-        (None, Some(_)) => Err(cdp_config_error(
-            "user_data_dir_without_remote_debugging_port",
-            params,
-            "pair the single --user-data-dir switch with one --remote-debugging-port switch",
-        )),
-    }
-}
-
-/// Validate the explicit debugger-free Chromium lane at the public parameter
-/// boundary as well as at launch construction. This keeps malformed mode/switch
-/// combinations from being reclassified by the later popup-safety policy and
-/// guarantees their causal diagnostic is emitted before permissions, process
-/// history, profile ownership, or OS process creation can be touched.
-fn validate_explicit_cdp_disabled_args(params: &ActLaunchParams) -> Result<bool, ErrorData> {
-    if params.cdp_debug != Some(false) {
-        return Ok(false);
-    }
-
-    let has_remote_debugging_switch = params.args.iter().any(|arg| {
-        is_switch_arg(arg, "--remote-debugging-port")
-            || is_switch_arg(arg, "--remote-debugging-pipe")
-    });
-    if has_remote_debugging_switch {
-        return Err(cdp_config_error(
-            "cdp_disabled_with_debug_switches",
-            params,
-            "remove Chromium remote-debugging switches or set cdp_debug=true; an explicit --user-data-dir remains valid for a debugger-free normal-extension launch",
-        ));
-    }
-
-    if params
-        .args
-        .iter()
-        .any(|arg| is_switch_arg(arg, "--user-data-dir"))
-    {
-        // `--user-data-dir` is a general Chromium isolation switch, not a
-        // debugger switch. Validate its cardinality/value even on the
-        // explicitly debugger-free lane so malformed launches fail before any
-        // authority or resource admission, then leave it intact for the normal
-        // extension bridge.
-        let _ = unique_switch_value(&params.args, "--user-data-dir")?;
-    }
-
-    Ok(true)
-}
-
-fn unique_switch_value(args: &[String], switch: &str) -> Result<Option<String>, ErrorData> {
-    let mut value = None;
-    for (index, arg) in args.iter().enumerate() {
-        if !is_switch_arg(arg, switch) {
-            continue;
-        }
-        if value.is_some() {
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                format!("act_launch requires exactly one {switch} switch"),
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "duplicate_cdp_switch",
-                    "switch": switch,
-                    "args": args,
-                    "remediation": format!("remove duplicate {switch} switches and provide exactly one unambiguous value"),
-                }),
-            ));
-        }
-        let candidate = if let Some((_name, raw)) = arg.split_once('=') {
-            trim_arg_quotes(raw)
-        } else {
-            let Some(next) = args.get(index + 1) else {
-                return Err(launch_tool_error(
-                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    format!("act_launch {switch} switch has no value"),
-                    json!({
-                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                        "reason": "cdp_switch_value_missing",
-                        "switch": switch,
-                        "args": args,
-                        "remediation": format!("provide {switch}=<value> or {switch} <value>"),
-                    }),
-                ));
-            };
-            if next.starts_with("--") {
-                return Err(launch_tool_error(
-                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    format!(
-                        "act_launch {switch} switch is followed by another switch, not a value"
-                    ),
-                    json!({
-                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                        "reason": "cdp_switch_value_missing",
-                        "switch": switch,
-                        "next_arg": next,
-                        "args": args,
-                        "remediation": format!("provide {switch}=<value> or {switch} <value>"),
-                    }),
-                ));
-            }
-            trim_arg_quotes(next)
-        };
-        if candidate.is_empty() {
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                format!("act_launch {switch} value must not be empty"),
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "cdp_switch_value_empty",
-                    "switch": switch,
-                    "args": args,
-                    "remediation": format!("provide one non-empty value for {switch}"),
-                }),
-            ));
-        }
-        value = Some(candidate.to_owned());
-    }
-    Ok(value)
-}
-
-fn cdp_config_error(
-    reason: &'static str,
-    params: &ActLaunchParams,
-    remediation: &'static str,
-) -> ErrorData {
-    cdp_config_error_with_detail(reason, params, remediation, "none".to_owned())
-}
-
-fn cdp_config_error_with_detail(
-    reason: &'static str,
-    params: &ActLaunchParams,
-    remediation: &'static str,
-    detail: String,
-) -> ErrorData {
-    launch_tool_error(
-        error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-        format!("act_launch refused invalid Chromium CDP configuration ({reason})"),
-        json!({
-            "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            "reason": reason,
-            "target": params.target,
-            "args": params.args,
-            "detail": detail,
-            "remediation": remediation,
-        }),
-    )
+    let user_data_dir = cdp_automation_profile_dir();
+    let injected_args = vec![
+        "--remote-debugging-port=0".to_owned(),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        "--silent-debugger-extension-api".to_owned(),
+        "--disable-extensions".to_owned(),
+        "--no-first-run".to_owned(),
+        "--no-default-browser-check".to_owned(),
+    ];
+    Some(ChromiumCdpLaunch {
+        user_data_dir,
+        injected_args,
+    })
 }
 
 /// A fresh ActLaunchParams whose injected browser args precede the caller's
@@ -10066,37 +7287,12 @@ fn params_with_chromium_launch_args(
 /// `SYNAPSE_CDP_USER_DATA_DIR` for a stable (login-persisting) profile; otherwise
 /// a unique per-launch dir under the OS temp so concurrent browsers never share
 /// a profile (Chrome refuses a second debug port on the same profile).
-fn cdp_automation_profile_dir() -> Result<(PathBuf, CdpProfileOwnership, Option<String>), ErrorData>
-{
+fn cdp_automation_profile_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("SYNAPSE_CDP_USER_DATA_DIR") {
         let dir = std::path::PathBuf::from(dir);
-        if dir.as_os_str().is_empty() {
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "SYNAPSE_CDP_USER_DATA_DIR is present but empty",
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "stable_cdp_profile_env_empty",
-                    "remediation": "unset SYNAPSE_CDP_USER_DATA_DIR for a Synapse-owned ephemeral profile, or set it to one non-default stable automation profile directory",
-                }),
-            ));
+        if !dir.as_os_str().is_empty() {
+            return dir;
         }
-        if !matches!(
-            chromium_user_data_dir_safety(dir.to_string_lossy().as_ref()),
-            ChromiumUserDataDirSafety::Dedicated
-        ) {
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "SYNAPSE_CDP_USER_DATA_DIR resolves to the default Chromium profile",
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "stable_cdp_profile_is_default_profile",
-                    "user_data_dir": dir,
-                    "remediation": "set SYNAPSE_CDP_USER_DATA_DIR to a dedicated automation profile that is not the user's normal browser profile",
-                }),
-            ));
-        }
-        return Ok((dir, CdpProfileOwnership::CallerManagedStable, None));
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -10106,2633 +7302,61 @@ fn cdp_automation_profile_dir() -> Result<(PathBuf, CdpProfileOwnership, Option<
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let token = format!("{}-{seq}-{nanos:x}", std::process::id());
-    Ok((
-        std::env::temp_dir()
-            .join("synapse-cdp-profiles")
-            .join(&token),
-        CdpProfileOwnership::SynapseEphemeral,
-        Some(token),
-    ))
+    std::env::temp_dir()
+        .join("synapse-cdp-profiles")
+        .join(token)
 }
 
-/// Polls the browser's physical port file/listener and builds an unpublished
-/// registration candidate. Publication happens only after `/json/list` also
-/// proves a page target, so no partial endpoint can escape this transaction.
-async fn resolve_launched_cdp_port(
-    pid: u32,
-    launch_process_creation_time_100ns: Option<u64>,
-    launch: &ChromiumCdpLaunch,
-    timeout_ms: u64,
-) -> Result<LaunchedCdp, ErrorData> {
+/// Polls the launched browser's `DevToolsActivePort` file (Chrome writes the
+/// chosen ephemeral port there) and registers it so observe/find can attach.
+/// Fail-loud: logs an error if the port never appears, but does not orphan the
+/// already-spawned browser.
+async fn resolve_launched_cdp_port(pid: u32, launch: &ChromiumCdpLaunch) -> LaunchedCdp {
     let port_file = launch.user_data_dir.join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let user_data_dir = Some(launch.user_data_dir.display().to_string());
-    let mut last_error = None;
     loop {
-        let port_evidence = match launch.requested_port {
-            CdpRequestedPort::Ephemeral => match read_devtools_active_port(&port_file) {
-                Ok(evidence) => Some(evidence),
-                Err(error) => {
-                    last_error = Some(error);
-                    None
-                }
-            },
-            CdpRequestedPort::Fixed(port) => Some(DevToolsActivePortEvidence {
-                port,
-                browser_path: None,
-                file_sha256: None,
-            }),
-        };
-        if let Some(port_evidence) = port_evidence {
-            match attest_cdp_listener(
+        if let Some(port) = read_devtools_active_port(&port_file) {
+            synapse_a11y::register_launched_port(pid, port);
+            tracing::info!(
+                code = "M4_ACT_LAUNCH_CDP_PORT_OPENED",
                 pid,
-                launch_process_creation_time_100ns,
-                launch,
-                &port_evidence,
-            ) {
-                Ok(registration) => {
-                    tracing::info!(
-                        code = "M4_ACT_LAUNCH_CDP_ENDPOINT_ATTESTED",
-                        pid,
-                        port = port_evidence.port,
-                        listener_pid = registration.listener_pid,
-                        browser_id = %registration.browser_id,
-                        registration_id = %registration.registration_id,
-                        devtools_active_port_sha256 = ?port_evidence.file_sha256,
-                        user_data_dir = ?launch.user_data_dir,
-                        "act_launch attested an unpublished CDP endpoint candidate"
-                    );
-                    return Ok(LaunchedCdp {
-                        port: Some(port_evidence.port),
-                        endpoint: Some(format!("http://127.0.0.1:{}", port_evidence.port)),
-                        user_data_dir,
-                        registration: Some(registration),
-                        profile_ownership: Some(launch.profile_ownership),
-                        resource: None,
-                    });
-                }
-                Err(error) => last_error = Some(error),
-            }
+                port,
+                user_data_dir = ?launch.user_data_dir,
+                "act_launch opened a CDP debug port for the launched browser"
+            );
+            return LaunchedCdp {
+                port: Some(port),
+                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                user_data_dir,
+            };
         }
         if Instant::now() >= deadline {
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-                "act_launch could not attest the launched Chromium CDP endpoint before the deadline",
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-                    "reason": "cdp_endpoint_attestation_timeout",
-                    "pid": pid,
-                    "process_creation_time_100ns": launch_process_creation_time_100ns,
-                    "requested_port": match launch.requested_port { CdpRequestedPort::Ephemeral => json!("ephemeral"), CdpRequestedPort::Fixed(port) => json!(port) },
-                    "user_data_dir": launch.user_data_dir,
-                    "devtools_active_port_path": port_file,
-                    "last_error": last_error,
-                    "timeout_ms": timeout_ms,
-                    "remediation": "inspect the exact launch arguments, DevToolsActivePort bytes, Windows listener owner table, process generations, and Chromium startup logs; the process tree and any Synapse-owned profile are terminated on this failure",
-                }),
-            ));
+            tracing::error!(
+                code = error_codes::A11Y_CDP_ATTACH_FAILED,
+                pid,
+                user_data_dir = ?launch.user_data_dir,
+                "act_launch injected CDP flags but DevToolsActivePort never appeared; \
+                 the browser launched but its DOM will not be observable via CDP"
+            );
+            return LaunchedCdp {
+                port: None,
+                endpoint: None,
+                user_data_dir,
+            };
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
-#[derive(Clone, Debug)]
-struct DevToolsActivePortEvidence {
-    port: u16,
-    browser_path: Option<String>,
-    file_sha256: Option<String>,
-}
-
-fn read_devtools_active_port(path: &Path) -> Result<DevToolsActivePortEvidence, String> {
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    if bytes.len() > 4096 {
-        return Err(format!(
-            "{} exceeds the 4096-byte DevToolsActivePort limit: {} bytes",
-            path.display(),
-            bytes.len()
-        ));
-    }
-    let contents = std::str::from_utf8(&bytes)
-        .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
-    let lines = contents.lines().map(str::trim).collect::<Vec<_>>();
-    let [port_raw, browser_path] = lines.as_slice() else {
-        return Err(format!(
-            "{} must contain exactly two lines (port and browser WebSocket path); actual_line_count={}",
-            path.display(),
-            lines.len()
-        ));
-    };
-    let port = port_raw
-        .parse::<u16>()
-        .map_err(|error| format!("{} has invalid port {port_raw:?}: {error}", path.display()))?;
-    if port == 0 {
-        return Err(format!("{} contains invalid port 0", path.display()));
-    }
-    parse_browser_path(browser_path)?;
-    Ok(DevToolsActivePortEvidence {
-        port,
-        browser_path: Some((*browser_path).to_owned()),
-        file_sha256: Some(sha256_hex(&bytes)),
-    })
-}
-
-fn parse_browser_path(path: &str) -> Result<&str, String> {
-    let Some(browser_id) = path.strip_prefix("/devtools/browser/") else {
-        return Err(format!(
-            "browser WebSocket path must start with /devtools/browser/: {path:?}"
-        ));
-    };
-    if browser_id.is_empty()
-        || browser_id.contains('/')
-        || browser_id.chars().any(char::is_whitespace)
-    {
-        return Err(format!(
-            "browser WebSocket path has invalid browser id: {path:?}"
-        ));
-    }
-    Ok(browser_id)
-}
-
-fn browser_identity_from_websocket(
-    url: &str,
-    expected_port: u16,
-) -> Result<(String, String), String> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|error| format!("parse browser WebSocket URL {url:?}: {error}"))?;
-    if parsed.scheme() != "ws"
-        || parsed.host_str() != Some("127.0.0.1")
-        || parsed.port() != Some(expected_port)
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(format!(
-            "browser WebSocket URL must be ws://127.0.0.1:{expected_port}/devtools/browser/<id> with no query/fragment: {url:?}"
-        ));
-    }
-    let browser_path = parsed.path().to_owned();
-    let browser_id = parse_browser_path(&browser_path)?.to_owned();
-    Ok((browser_id, browser_path))
-}
-
-fn attest_cdp_listener(
-    launch_pid: u32,
-    launch_process_creation_time_100ns: Option<u64>,
-    launch: &ChromiumCdpLaunch,
-    port_evidence: &DevToolsActivePortEvidence,
-) -> Result<synapse_a11y::LaunchedCdpRegistration, String> {
-    #[cfg(windows)]
-    {
-        let actual_launch_creation = synapse_a11y::inspect_process_creation_time_100ns(launch_pid)?;
-        if actual_launch_creation != launch_process_creation_time_100ns
-            || actual_launch_creation.is_none()
-        {
-            return Err(format!(
-                "launch process generation mismatch pid={launch_pid} retained_handle={launch_process_creation_time_100ns:?} process_table={actual_launch_creation:?}"
-            ));
-        }
-    }
-    let listener =
-        synapse_a11y::inspect_local_cdp_listener(port_evidence.port, Duration::from_millis(750))?;
-    #[cfg(windows)]
-    {
-        let owned_process_ids = owned_process_tree_ids(launch_pid);
-        if !owned_process_ids.contains(&listener.listener_pid) {
-            return Err(format!(
-                "CDP listener pid {} is not in launched process tree root={} tree={owned_process_ids:?}",
-                listener.listener_pid, launch_pid
-            ));
-        }
-        if listener.listener_process_creation_time_100ns.is_none() {
-            return Err(format!(
-                "CDP listener pid {} has no process creation identity",
-                listener.listener_pid
-            ));
-        }
-    }
-    let (browser_id, browser_path) =
-        browser_identity_from_websocket(&listener.browser_websocket_url, port_evidence.port)?;
-    if let Some(expected_path) = port_evidence.browser_path.as_deref()
-        && expected_path != browser_path
-    {
-        return Err(format!(
-            "DevToolsActivePort browser path disagrees with /json/version: file={expected_path:?} http={browser_path:?}"
-        ));
-    }
-    let canonical_profile = fs::canonicalize(&launch.user_data_dir).map_err(|error| {
-        format!(
-            "canonicalize launched CDP profile {}: {error}",
-            launch.user_data_dir.display()
-        )
-    })?;
-    let user_data_dir_sha256 = sha256_hex(canonical_profile.to_string_lossy().as_bytes());
-    let registration_material = format!(
-        "synapse-launched-cdp/v1\0{launch_pid}\0{launch_process_creation_time_100ns:?}\0{}\0{:?}\0{}\0{}\0{}",
-        listener.listener_pid,
-        listener.listener_process_creation_time_100ns,
-        port_evidence.port,
-        browser_id,
-        user_data_dir_sha256
-    );
-    Ok(synapse_a11y::LaunchedCdpRegistration {
-        registration_id: sha256_hex(registration_material.as_bytes()),
-        launch_pid,
-        launch_process_creation_time_100ns,
-        listener_pid: listener.listener_pid,
-        listener_process_creation_time_100ns: listener.listener_process_creation_time_100ns,
-        port: port_evidence.port,
-        browser_id,
-        browser_websocket_url: listener.browser_websocket_url,
-        user_data_dir_sha256,
-    })
-}
-
-const CDP_PROFILE_OWNERSHIP_MARKER: &str = ".synapse-cdp-profile-owner.json";
-const CDP_PROFILE_OWNERSHIP_RECORD_DIR: &str = ".ownership";
-const CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA: &str = "synapse-cdp-profile-owner/v2";
-const CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES: u64 = 4096;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum CdpProfileOwnershipRecordPhase {
-    Pending,
-    Active,
-}
-
-impl CdpProfileOwnershipRecordPhase {
-    const fn suffix(self) -> &'static str {
-        match self {
-            Self::Pending => "pending.json",
-            Self::Active => "active.json",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CdpProfileDirectoryIdentity {
-    pub platform: String,
-    pub volume_id: u64,
-    pub file_id_hex: String,
-    pub created_100ns: u64,
-    pub canonical_path_sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CdpProfileOwnershipRecord {
-    schema: String,
-    phase: CdpProfileOwnershipRecordPhase,
-    ownership_token: String,
-    user_data_dir: String,
-    launcher_pid: u32,
-    launcher_process_creation_time_100ns: u64,
-    created_at: String,
-    directory_identity: Option<CdpProfileDirectoryIdentity>,
-}
-
-fn cdp_profile_root() -> PathBuf {
-    std::env::temp_dir().join("synapse-cdp-profiles")
-}
-
-fn cdp_profile_ownership_record_root() -> PathBuf {
-    cdp_profile_root().join(CDP_PROFILE_OWNERSHIP_RECORD_DIR)
-}
-
-fn cdp_profile_ownership_record_path(
-    token: &str,
-    phase: CdpProfileOwnershipRecordPhase,
-) -> PathBuf {
-    cdp_profile_ownership_record_root().join(format!("{token}.{}", phase.suffix()))
-}
-
-fn parse_cdp_profile_token(token: &str) -> Result<(u32, u64, u128), String> {
-    if token.is_empty()
-        || token.len() > 160
-        || token.contains(['/', '\\'])
-        || token == "."
-        || token == ".."
-    {
-        return Err(format!("invalid CDP profile ownership token {token:?}"));
-    }
-    let mut parts = token.split('-');
-    let pid = parts
-        .next()
-        .ok_or_else(|| format!("CDP profile token {token:?} has no launcher pid"))?
-        .parse::<u32>()
-        .map_err(|error| {
-            format!("CDP profile token {token:?} has invalid launcher pid: {error}")
-        })?;
-    let sequence = parts
-        .next()
-        .ok_or_else(|| format!("CDP profile token {token:?} has no sequence"))?
-        .parse::<u64>()
-        .map_err(|error| format!("CDP profile token {token:?} has invalid sequence: {error}"))?;
-    let created_nanos = u128::from_str_radix(
-        parts
-            .next()
-            .ok_or_else(|| format!("CDP profile token {token:?} has no creation time"))?,
-        16,
-    )
-    .map_err(|error| format!("CDP profile token {token:?} has invalid creation time: {error}"))?;
-    if parts.next().is_some() || pid == 0 || created_nanos == 0 {
-        return Err(format!(
-            "CDP profile token {token:?} does not have the exact pid-sequence-unix_nanos shape"
-        ));
-    }
-    Ok((pid, sequence, created_nanos))
-}
-
-fn validate_cdp_profile_record_root(create: bool) -> Result<PathBuf, String> {
-    let profile_root = cdp_profile_root();
-    let record_root = cdp_profile_ownership_record_root();
-    if create {
-        fs::create_dir_all(&record_root).map_err(|error| {
-            format!(
-                "create durable CDP profile owner root {} failed: {error}",
-                record_root.display()
-            )
-        })?;
-    }
-    for path in [&profile_root, &record_root] {
-        match fs::symlink_metadata(path) {
-            Ok(metadata)
-                if metadata.is_dir()
-                    && !metadata.file_type().is_symlink()
-                    && !metadata_is_windows_reparse_point(&metadata) => {}
-            Ok(_) => {
-                return Err(format!(
-                    "durable CDP profile ownership path {} is not a real directory",
-                    path.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect durable CDP profile ownership path {} failed: {error}",
-                    path.display()
-                ));
-            }
-        }
-    }
-    Ok(record_root)
-}
-
-#[cfg(windows)]
-fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    metadata.file_attributes() & 0x0000_0400 != 0
-}
-
-#[cfg(not(windows))]
-fn metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
-    use std::{
-        os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _},
-        time::UNIX_EPOCH,
-    };
-    use windows::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-            GetFileInformationByHandleEx,
-        },
-    };
-
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "open CDP profile directory {} failed: {error}",
-                path.display()
-            )
-        })?;
-    let metadata = file.metadata().map_err(|error| {
-        format!(
-            "inspect CDP profile directory {} failed: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata_is_windows_reparse_point(&metadata)
-    {
-        return Err(format!(
-            "CDP profile path {} is not a real non-reparse directory",
-            path.display()
-        ));
-    }
-    let mut file_id = FILE_ID_INFO::default();
-    let buffer_size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
-        .map_err(|_| "FILE_ID_INFO size does not fit u32".to_owned())?;
-    // SAFETY: `file` retains a valid directory handle for the call and the
-    // output buffer is initialized writable storage of the declared size.
-    unsafe {
-        GetFileInformationByHandleEx(
-            HANDLE(file.as_raw_handle()),
-            FileIdInfo,
-            std::ptr::from_mut(&mut file_id).cast(),
-            buffer_size,
-        )
-    }
-    .map_err(|error| format!("read FILE_ID_INFO for {} failed: {error}", path.display()))?;
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        format!(
-            "canonicalize CDP profile {} failed: {error}",
-            path.display()
-        )
-    })?;
-    let created_100ns = metadata
-        .created()
-        .map_err(|error| {
-            format!(
-                "read CDP profile creation time {} failed: {error}",
-                path.display()
-            )
-        })?
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("CDP profile creation time predates UNIX epoch: {error}"))?
-        .as_nanos()
-        / 100;
-    Ok(CdpProfileDirectoryIdentity {
-        platform: "windows_file_id_128".to_owned(),
-        volume_id: file_id.VolumeSerialNumber,
-        file_id_hex: hex_encode_lower(&file_id.FileId.Identifier),
-        created_100ns: u64::try_from(created_100ns).unwrap_or(u64::MAX),
-        canonical_path_sha256: sha256_hex(canonical.to_string_lossy().as_bytes()),
-    })
-}
-
-#[cfg(unix)]
-fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "inspect CDP profile directory {} failed: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "CDP profile path {} is not a real directory",
-            path.display()
-        ));
-    }
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        format!(
-            "canonicalize CDP profile {} failed: {error}",
-            path.display()
-        )
-    })?;
-    let created_100ns = metadata
-        .ctime()
-        .saturating_mul(10_000_000)
-        .saturating_add(metadata.ctime_nsec().div_euclid(100));
-    Ok(CdpProfileDirectoryIdentity {
-        platform: "unix_device_inode".to_owned(),
-        volume_id: metadata.dev(),
-        file_id_hex: format!("{:032x}", metadata.ino()),
-        created_100ns: u64::try_from(created_100ns).unwrap_or(0),
-        canonical_path_sha256: sha256_hex(canonical.to_string_lossy().as_bytes()),
-    })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
-    Err(format!(
-        "CDP profile directory identity is unsupported on this platform for {}",
-        path.display()
-    ))
-}
-
-fn validate_cdp_profile_ownership_record(
-    record: &CdpProfileOwnershipRecord,
-    expected_phase: CdpProfileOwnershipRecordPhase,
-) -> Result<(), String> {
-    if record.schema != CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA
-        || record.phase != expected_phase
-        || record.ownership_token.is_empty()
-    {
-        return Err(format!(
-            "CDP profile owner record header mismatch schema={:?} phase={:?} token={:?}",
-            record.schema, record.phase, record.ownership_token
-        ));
-    }
-    let (token_pid, _sequence, _created_nanos) = parse_cdp_profile_token(&record.ownership_token)?;
-    if token_pid != record.launcher_pid || record.launcher_process_creation_time_100ns == 0 {
-        return Err(format!(
-            "CDP profile owner record process identity mismatch token_pid={token_pid} launcher_pid={} launcher_creation={}",
-            record.launcher_pid, record.launcher_process_creation_time_100ns
-        ));
-    }
-    let expected_path = cdp_profile_root().join(&record.ownership_token);
-    if Path::new(&record.user_data_dir) != expected_path {
-        return Err(format!(
-            "CDP profile owner record path mismatch actual={} expected={}",
-            record.user_data_dir,
-            expected_path.display()
-        ));
-    }
-    if chrono::DateTime::parse_from_rfc3339(&record.created_at).is_err() {
-        return Err(format!(
-            "CDP profile owner record created_at is not RFC3339: {:?}",
-            record.created_at
-        ));
-    }
-    match (expected_phase, record.directory_identity.as_ref()) {
-        (CdpProfileOwnershipRecordPhase::Pending, None)
-        | (CdpProfileOwnershipRecordPhase::Active, Some(_)) => Ok(()),
-        _ => Err(format!(
-            "CDP profile owner record phase={expected_phase:?} has contradictory directory_identity presence={} ",
-            record.directory_identity.is_some()
-        )),
-    }
-}
-
-fn read_cdp_profile_ownership_record(
-    token: &str,
-    phase: CdpProfileOwnershipRecordPhase,
-) -> Result<Option<(CdpProfileOwnershipRecord, Vec<u8>)>, String> {
-    let path = cdp_profile_ownership_record_path(token, phase);
-    let path_metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "inspect CDP profile ownership record path {} failed: {error}",
-                path.display()
-            ));
-        }
-    };
-    if !path_metadata.is_file()
-        || path_metadata.file_type().is_symlink()
-        || metadata_is_windows_reparse_point(&path_metadata)
-    {
-        return Err(format!(
-            "CDP profile ownership record path {} is not a real file",
-            path.display()
-        ));
-    }
-    #[cfg(windows)]
-    let file = {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(&path)
-    };
-    #[cfg(not(windows))]
-    let mut file = match OpenOptions::new().read(true).open(&path) {
-        Ok(file) => Ok(file),
-        Err(error) => Err(error),
-    };
-    let mut file = file.map_err(|error| {
-        format!(
-            "open CDP profile ownership record {} failed: {error}",
-            path.display()
-        )
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        format!(
-            "inspect CDP profile ownership record {} failed: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata_is_windows_reparse_point(&metadata)
-        || metadata.len() > CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES
-    {
-        return Err(format!(
-            "CDP profile ownership record {} is not a real bounded file (bytes={})",
-            path.display(),
-            metadata.len()
-        ));
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows::Win32::{
-            Foundation::HANDLE,
-            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
-        };
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `file` owns a valid immutable-record handle for the call and
-        // the output buffer is initialized writable storage.
-        unsafe {
-            GetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
-                std::ptr::from_mut(&mut information),
-            )
-        }
-        .map_err(|error| {
-            format!(
-                "read CDP profile ownership record link count {} failed: {error}",
-                path.display()
-            )
-        })?;
-        if information.nNumberOfLinks != 1 {
-            return Err(format!(
-                "CDP profile ownership record {} has {} hard links; immutable authority requires one",
-                path.display(),
-                information.nNumberOfLinks
-            ));
-        }
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut bytes).map_err(|error| {
-        format!(
-            "read CDP profile ownership record {} failed: {error}",
-            path.display()
-        )
-    })?;
-    let record: CdpProfileOwnershipRecord = serde_json::from_slice(&bytes).map_err(|error| {
-        format!(
-            "decode CDP profile ownership record {} failed: {error}",
-            path.display()
-        )
-    })?;
-    validate_cdp_profile_ownership_record(&record, phase)?;
-    if record.ownership_token != token {
-        return Err(format!(
-            "CDP profile ownership record {} token {:?} does not match filename token {token:?}",
-            path.display(),
-            record.ownership_token
-        ));
-    }
-    Ok(Some((record, bytes)))
-}
-
-#[cfg(windows)]
-fn commit_new_cdp_profile_owner_file(staging: &Path, final_path: &Path) -> io::Result<()> {
-    use windows::{
-        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
-        core::PCWSTR,
-    };
-    let staging_wide = path_to_nul_terminated_wide(staging);
-    let final_wide = path_to_nul_terminated_wide(final_path);
-    // SAFETY: both path buffers are NUL-terminated and remain live for the call.
-    unsafe {
-        MoveFileExW(
-            PCWSTR(staging_wide.as_ptr()),
-            PCWSTR(final_wide.as_ptr()),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .map_err(|error| io::Error::from_raw_os_error(win32_error_low_code(&error) as i32))
-}
-
-#[cfg(not(windows))]
-fn commit_new_cdp_profile_owner_file(staging: &Path, final_path: &Path) -> io::Result<()> {
-    fs::hard_link(staging, final_path)?;
-    fs::remove_file(staging)?;
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| io::Error::other("CDP profile owner path has no parent"))?;
-    sync_directory_entry_parent(parent)
-}
-
-fn persist_cdp_profile_ownership_record(
-    record: &CdpProfileOwnershipRecord,
-) -> Result<Vec<u8>, String> {
-    validate_cdp_profile_ownership_record(record, record.phase)?;
-    let record_root = validate_cdp_profile_record_root(true)?;
-    let final_path = cdp_profile_ownership_record_path(&record.ownership_token, record.phase);
-    let staging_path = record_root.join(format!(
-        ".{}.{}.tmp.{}",
-        record.ownership_token,
-        record.phase.suffix(),
-        std::process::id()
-    ));
-    let bytes = serde_json::to_vec_pretty(record)
-        .map_err(|error| format!("encode CDP profile ownership record failed: {error}"))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES {
-        return Err(format!(
-            "encoded CDP profile ownership record exceeds {CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES} bytes"
-        ));
-    }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&staging_path)
-        .map_err(|error| {
-            format!(
-                "create CDP profile owner staging file {} failed: {error}",
-                staging_path.display()
-            )
-        })?;
-    file.write_all(&bytes).map_err(|error| {
-        format!(
-            "write CDP profile owner staging file {} failed: {error}",
-            staging_path.display()
-        )
-    })?;
-    file.sync_all().map_err(|error| {
-        format!(
-            "flush CDP profile owner staging file {} failed: {error}",
-            staging_path.display()
-        )
-    })?;
-    drop(file);
-    commit_new_cdp_profile_owner_file(&staging_path, &final_path).map_err(|error| {
-        format!(
-            "commit immutable CDP profile ownership record {} failed: {error}",
-            final_path.display()
-        )
-    })?;
-    let Some((readback, readback_bytes)) =
-        read_cdp_profile_ownership_record(&record.ownership_token, record.phase)?
-    else {
-        return Err(format!(
-            "CDP profile ownership record disappeared after commit: {}",
-            final_path.display()
-        ));
-    };
-    if readback != *record || readback_bytes != bytes {
-        return Err(format!(
-            "CDP profile ownership record readback mismatch at {}",
-            final_path.display()
-        ));
-    }
-    Ok(readback_bytes)
-}
-
-fn cdp_profile_prepare_lock() -> &'static Mutex<()> {
-    static PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    PREPARE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CdpProfileTreeMeasurement {
-    pub directory_count: u64,
-    pub file_count: u64,
-    pub total_file_bytes: u64,
-    pub metadata_sha256: String,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CdpProfileStatusEntry {
-    pub ownership_token: String,
-    pub user_data_dir: String,
-    pub state: String,
-    pub revision: String,
-    pub directory_present: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directory_identity: Option<CdpProfileDirectoryIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree: Option<CdpProfileTreeMeasurement>,
-    pub external_owner_present: bool,
-    pub pending_owner_present: bool,
-    pub legacy_marker_present: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launcher_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launcher_expected_creation_time_100ns: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launcher_actual_creation_time_100ns: Option<u64>,
-    pub live_user_pids: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CdpProfileStatusResponse {
-    pub source_of_truth: String,
-    pub profile_root: String,
-    pub ownership_record_root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ownership_token_filter: Option<String>,
-    pub entry_count: usize,
-    pub entries: Vec<CdpProfileStatusEntry>,
-    pub failures: Vec<String>,
-    pub revision: String,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CdpProfileRepairResponse {
-    pub source_of_truth: String,
-    pub ownership_token: String,
-    pub accepted_revision: String,
-    pub before: CdpProfileStatusEntry,
-    pub directory_present_after: bool,
-    pub external_owner_present_after: bool,
-    pub pending_owner_present_after: bool,
-    pub legacy_marker_present_after: bool,
-    pub status_after_revision: String,
-}
-
-fn cdp_profile_paths_equivalent(left: &Path, right: &Path) -> bool {
-    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .replace('/', "\\")
-            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
-}
-
-fn cdp_profile_live_user_pids(user_data_dir: &Path) -> Vec<u32> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let mut pids = BTreeSet::new();
-    for (pid, process) in system.processes() {
-        let args = process.cmd();
-        let mut index = 0usize;
-        while index < args.len() {
-            let arg = args[index].to_string_lossy();
-            let matches_profile = if let Some(value) = arg.strip_prefix("--user-data-dir=") {
-                cdp_profile_paths_equivalent(Path::new(value), user_data_dir)
-            } else if arg == "--user-data-dir" {
-                args.get(index + 1).is_some_and(|value| {
-                    cdp_profile_paths_equivalent(
-                        Path::new(value.to_string_lossy().as_ref()),
-                        user_data_dir,
-                    )
-                })
-            } else {
-                false
-            };
-            if matches_profile {
-                pids.insert(pid.as_u32());
-                break;
-            }
-            index = index.saturating_add(1);
-        }
-    }
-    pids.into_iter().collect()
-}
-
-fn cdp_profile_tree_measurement(path: &Path) -> Result<CdpProfileTreeMeasurement, String> {
-    let mut stack = vec![path.to_path_buf()];
-    let mut rows = Vec::new();
-    let mut directory_count = 0u64;
-    let mut file_count = 0u64;
-    let mut total_file_bytes = 0u64;
-    while let Some(directory) = stack.pop() {
-        directory_count = directory_count.saturating_add(1);
-        let entries = fs::read_dir(&directory).map_err(|error| {
-            format!(
-                "enumerate CDP profile tree directory {} failed: {error}",
-                directory.display()
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!(
-                    "read CDP profile tree entry beneath {} failed: {error}",
-                    directory.display()
-                )
-            })?;
-            let entry_path = entry.path();
-            let metadata = fs::symlink_metadata(&entry_path).map_err(|error| {
-                format!(
-                    "inspect CDP profile tree entry {} failed: {error}",
-                    entry_path.display()
-                )
-            })?;
-            if metadata.file_type().is_symlink() || metadata_is_windows_reparse_point(&metadata) {
-                return Err(format!(
-                    "CDP profile tree contains a symlink/reparse entry: {}",
-                    entry_path.display()
-                ));
-            }
-            let relative = entry_path.strip_prefix(path).map_err(|error| {
-                format!(
-                    "CDP profile tree path {} escaped root {}: {error}",
-                    entry_path.display(),
-                    path.display()
-                )
-            })?;
-            let modified_100ns = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|value| value.as_nanos() / 100)
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or(0);
-            if metadata.is_dir() {
-                rows.push(format!(
-                    "d\0{}\0{modified_100ns}",
-                    relative.to_string_lossy()
-                ));
-                stack.push(entry_path);
-            } else if metadata.is_file() {
-                file_count = file_count.saturating_add(1);
-                total_file_bytes = total_file_bytes.saturating_add(metadata.len());
-                rows.push(format!(
-                    "f\0{}\0{}\0{modified_100ns}",
-                    relative.to_string_lossy(),
-                    metadata.len()
-                ));
-            } else {
-                return Err(format!(
-                    "CDP profile tree contains an unsupported filesystem entry: {}",
-                    entry_path.display()
-                ));
-            }
-        }
-    }
-    rows.sort_unstable();
-    let metadata_sha256 = sha256_hex(rows.join("\n").as_bytes());
-    Ok(CdpProfileTreeMeasurement {
-        directory_count,
-        file_count,
-        total_file_bytes,
-        metadata_sha256,
-    })
-}
-
-fn cdp_profile_record_tokens() -> Result<BTreeSet<String>, Vec<String>> {
-    let root = cdp_profile_ownership_record_root();
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => {
-            return Err(vec![format!(
-                "enumerate CDP profile ownership records {} failed: {error}",
-                root.display()
-            )]);
-        }
-    };
-    let mut tokens = BTreeSet::new();
-    let mut failures = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                failures.push(format!(
-                    "read CDP profile owner directory entry failed: {error}"
-                ));
-                continue;
-            }
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            failures.push(format!(
-                "CDP profile owner filename is not Unicode: {}",
-                entry.path().display()
-            ));
-            continue;
-        };
-        let token = name
-            .strip_suffix(".active.json")
-            .or_else(|| name.strip_suffix(".pending.json"));
-        let Some(token) = token else {
-            failures.push(format!(
-                "unexpected CDP profile ownership ledger entry: {}",
-                entry.path().display()
-            ));
-            continue;
-        };
-        match parse_cdp_profile_token(token) {
-            Ok((_pid, _sequence, _created_nanos)) => {
-                tokens.insert(token.to_owned());
-            }
-            Err(error) => failures.push(error),
-        }
-    }
-    if failures.is_empty() {
-        Ok(tokens)
-    } else {
-        Err(failures)
-    }
-}
-
-fn cdp_profile_status_internal(ownership_token_filter: Option<&str>) -> CdpProfileStatusResponse {
-    let profile_root = cdp_profile_root();
-    let ownership_record_root = cdp_profile_ownership_record_root();
-    let mut failures = Vec::new();
-    let mut tokens = BTreeSet::new();
-    if let Some(token) = ownership_token_filter {
-        match parse_cdp_profile_token(token) {
-            Ok((_pid, _sequence, _created_nanos)) => {
-                tokens.insert(token.to_owned());
-            }
-            Err(error) => failures.push(error),
-        }
-    } else {
-        match fs::read_dir(&profile_root) {
-            Ok(entries) => {
-                for entry in entries {
-                    match entry {
-                        Ok(entry) if entry.file_name() == CDP_PROFILE_OWNERSHIP_RECORD_DIR => {}
-                        Ok(entry) => match entry.file_name().to_str() {
-                            Some(token) => {
-                                tokens.insert(token.to_owned());
-                            }
-                            None => failures.push(format!(
-                                "CDP profile directory token is not Unicode: {}",
-                                entry.path().display()
-                            )),
-                        },
-                        Err(error) => failures.push(format!(
-                            "read CDP profile root directory entry failed: {error}"
-                        )),
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(format!(
-                "enumerate CDP profile root {} failed: {error}",
-                profile_root.display()
-            )),
-        }
-        match cdp_profile_record_tokens() {
-            Ok(record_tokens) => tokens.extend(record_tokens),
-            Err(record_failures) => failures.extend(record_failures),
-        }
-    }
-    let mut status_entries = Vec::new();
-    for token in tokens {
-        let path = profile_root.join(&token);
-        let directory_present = path.exists();
-        let active =
-            match read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    failures.push(error);
-                    None
-                }
-            };
-        let pending = match read_cdp_profile_ownership_record(
-            &token,
-            CdpProfileOwnershipRecordPhase::Pending,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                failures.push(error);
-                None
-            }
-        };
-        if !directory_present && active.is_none() && pending.is_none() {
-            continue;
-        }
-        let directory_identity = if directory_present {
-            match cdp_profile_directory_identity(&path) {
-                Ok(identity) => Some(identity),
-                Err(error) => {
-                    failures.push(error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        // A filter selects entries; it must never change the representation
-        // whose revision authorizes deletion. Repair re-reads an exact token,
-        // so omitting the tree from an unfiltered status made the advertised
-        // revision impossible for repair to accept even when reality had not
-        // changed. Measure the same physical state in both modes and hash that
-        // one canonical representation below.
-        let tree = if directory_present {
-            match cdp_profile_tree_measurement(&path) {
-                Ok(tree) => Some(tree),
-                Err(error) => {
-                    failures.push(error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
-        let marker_bytes = if directory_present {
-            match fs::read(&marker_path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    failures.push(format!(
-                        "read legacy marker {} failed: {error}",
-                        marker_path.display()
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let live_user_pids = if directory_present {
-            cdp_profile_live_user_pids(&path)
-        } else {
-            Vec::new()
-        };
-        let mut launcher_pid = None;
-        let mut expected_creation = None;
-        let mut actual_creation = None;
-        let mut detail = None;
-        let state = if let Some((record, _bytes)) = active.as_ref() {
-            launcher_pid = Some(record.launcher_pid);
-            expected_creation = Some(record.launcher_process_creation_time_100ns);
-            actual_creation = synapse_a11y::inspect_process_creation_time_100ns(record.launcher_pid)
-                .ok()
-                .flatten();
-            if !directory_present {
-                "external_owner_without_profile"
-            } else if record.directory_identity.as_ref() != directory_identity.as_ref() {
-                detail = Some("external owner directory identity does not match physical path".to_owned());
-                "external_identity_mismatch"
-            } else {
-                match cdp_launcher_generation_state(
-                    record.launcher_pid,
-                    record.launcher_process_creation_time_100ns,
-                ) {
-                    CdpLauncherGenerationState::Live => "external_owned_live",
-                    CdpLauncherGenerationState::Absent => "external_owned_stale",
-                    CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
-                        actual_creation = Some(actual);
-                        "external_owner_pid_reused"
-                    }
-                    CdpLauncherGenerationState::Unreadable(error) => {
-                        detail = Some(error);
-                        "external_owner_unreadable"
-                    }
-                }
-            }
-        } else if let Some((record, _bytes)) = pending.as_ref() {
-            launcher_pid = Some(record.launcher_pid);
-            expected_creation = Some(record.launcher_process_creation_time_100ns);
-            actual_creation = synapse_a11y::inspect_process_creation_time_100ns(record.launcher_pid)
-                .ok()
-                .flatten();
-            if directory_present {
-                match cdp_launcher_generation_state(
-                    record.launcher_pid,
-                    record.launcher_process_creation_time_100ns,
-                ) {
-                    CdpLauncherGenerationState::Live => "pending_owner_live",
-                    CdpLauncherGenerationState::Absent if tree.as_ref().is_some_and(|tree| tree.file_count == 0 && tree.directory_count == 1) => "pending_owner_stale_empty",
-                    CdpLauncherGenerationState::Absent => "pending_owner_stale_nonempty",
-                    CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
-                        actual_creation = Some(actual);
-                        "pending_owner_pid_reused"
-                    }
-                    CdpLauncherGenerationState::Unreadable(error) => {
-                        detail = Some(error);
-                        "pending_owner_unreadable"
-                    }
-                }
-            } else {
-                "pending_owner_without_profile"
-            }
-        } else if let Some(bytes) = marker_bytes.as_ref() {
-            match serde_json::from_slice::<Value>(bytes) {
-                Ok(marker) => {
-                    let schema = marker.get("schema").and_then(Value::as_str);
-                    let marker_token = marker.get("ownership_token").and_then(Value::as_str);
-                    launcher_pid = marker
-                        .get("launcher_pid")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok());
-                    expected_creation = marker
-                        .get("launcher_process_creation_time_100ns")
-                        .and_then(Value::as_u64);
-                    if schema != Some("synapse-cdp-profile-owner/v1")
-                        || marker_token != Some(token.as_str())
-                        || launcher_pid.is_none()
-                        || expected_creation.is_none()
-                    {
-                        detail = Some(format!(
-                            "legacy marker mismatch schema={schema:?} token={marker_token:?} pid={launcher_pid:?} creation={expected_creation:?}"
-                        ));
-                        "legacy_marker_invalid"
-                    } else {
-                        let pid = launcher_pid.unwrap_or_default();
-                        let expected = expected_creation.unwrap_or_default();
-                        actual_creation = synapse_a11y::inspect_process_creation_time_100ns(pid)
-                            .ok()
-                            .flatten();
-                        match cdp_launcher_generation_state(pid, expected) {
-                            CdpLauncherGenerationState::Live => "legacy_owned_live",
-                            CdpLauncherGenerationState::Absent => "legacy_owned_stale",
-                            CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
-                                actual_creation = Some(actual);
-                                "legacy_owner_pid_reused"
-                            }
-                            CdpLauncherGenerationState::Unreadable(error) => {
-                                detail = Some(error);
-                                "legacy_owner_unreadable"
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    detail = Some(format!("decode legacy ownership marker failed: {error}"));
-                    "legacy_marker_invalid"
-                }
-            }
-        } else {
-            match parse_cdp_profile_token(&token) {
-                Ok((token_pid, _sequence, _created_nanos)) => {
-                    launcher_pid = Some(token_pid);
-                    actual_creation = synapse_a11y::inspect_process_creation_time_100ns(token_pid)
-                        .ok()
-                        .flatten();
-                    if !live_user_pids.is_empty() {
-                        "unowned_profile_in_use"
-                    } else if process_exists(token_pid) {
-                        "unowned_creator_pid_live"
-                    } else {
-                        "unowned_orphan"
-                    }
-                }
-                Err(error) => {
-                    detail = Some(error);
-                    "unowned_token_invalid"
-                }
-            }
-        }
-        .to_owned();
-        let revision_material = json!({
-            "ownership_token": token,
-            "user_data_dir": path,
-            "state": state,
-            "directory_present": directory_present,
-            "directory_identity": directory_identity,
-            "tree": tree,
-            "active_owner_sha256": active.as_ref().map(|(_record, bytes)| sha256_hex(bytes)),
-            "pending_owner_sha256": pending.as_ref().map(|(_record, bytes)| sha256_hex(bytes)),
-            "legacy_marker_sha256": marker_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
-            "launcher_pid": launcher_pid,
-            "launcher_expected_creation_time_100ns": expected_creation,
-            "launcher_actual_creation_time_100ns": actual_creation,
-            "live_user_pids": live_user_pids,
-            "detail": detail,
-        });
-        let revision = serde_json::to_vec(&revision_material)
-            .map(|bytes| sha256_hex(&bytes))
-            .unwrap_or_else(|error| format!("revision_encode_failed:{error}"));
-        status_entries.push(CdpProfileStatusEntry {
-            ownership_token: token,
-            user_data_dir: path.display().to_string(),
-            state,
-            revision,
-            directory_present,
-            directory_identity,
-            tree,
-            external_owner_present: active.is_some(),
-            pending_owner_present: pending.is_some(),
-            legacy_marker_present: marker_bytes.is_some(),
-            launcher_pid,
-            launcher_expected_creation_time_100ns: expected_creation,
-            launcher_actual_creation_time_100ns: actual_creation,
-            live_user_pids,
-            detail,
-        });
-    }
-    status_entries.sort_by(|left, right| left.ownership_token.cmp(&right.ownership_token));
-    failures.sort();
-    let root_revision_material = json!({
-        "entries": status_entries.iter().map(|entry| (&entry.ownership_token, &entry.revision)).collect::<Vec<_>>(),
-        "failures": failures,
-    });
-    let revision = serde_json::to_vec(&root_revision_material)
-        .map(|bytes| sha256_hex(&bytes))
-        .unwrap_or_else(|error| format!("root_revision_encode_failed:{error}"));
-    CdpProfileStatusResponse {
-        source_of_truth: "physical %TEMP%\\synapse-cdp-profiles tree + sibling .ownership ledger + live OS process table".to_owned(),
-        profile_root: profile_root.display().to_string(),
-        ownership_record_root: ownership_record_root.display().to_string(),
-        ownership_token_filter: ownership_token_filter.map(str::to_owned),
-        entry_count: status_entries.len(),
-        entries: status_entries,
-        failures,
-        revision,
-    }
-}
-
-#[must_use]
-pub fn cdp_profile_status(ownership_token_filter: Option<&str>) -> CdpProfileStatusResponse {
-    let _guard = match cdp_profile_prepare_lock().lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return CdpProfileStatusResponse {
-                source_of_truth: "physical %TEMP%\\synapse-cdp-profiles tree + sibling .ownership ledger + live OS process table".to_owned(),
-                profile_root: cdp_profile_root().display().to_string(),
-                ownership_record_root: cdp_profile_ownership_record_root().display().to_string(),
-                ownership_token_filter: ownership_token_filter.map(str::to_owned),
-                entry_count: 0,
-                entries: Vec::new(),
-                failures: vec!["CDP profile ownership lock is poisoned".to_owned()],
-                revision: sha256_hex(b"cdp_profile_ownership_lock_poisoned"),
-            };
-        }
-    };
-    cdp_profile_status_internal(ownership_token_filter)
-}
-
-pub fn repair_unowned_cdp_profile(
-    ownership_token: &str,
-    expected_revision: &str,
-) -> Result<CdpProfileRepairResponse, ErrorData> {
-    parse_cdp_profile_token(ownership_token).map_err(|error| {
-        cdp_reconciliation_error(
-            "cdp_profile_repair_token_invalid",
-            &cdp_profile_root().join(ownership_token),
-            error,
-        )
-    })?;
-    if expected_revision.len() != 64
-        || !expected_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_revision_invalid",
-            &cdp_profile_root().join(ownership_token),
-            "expected_revision must be one 64-character SHA-256 hex value".to_owned(),
-        ));
-    }
-    let _guard = cdp_profile_prepare_lock().lock().map_err(|_error| {
-        cdp_reconciliation_error(
-            "cdp_profile_repair_lock_poisoned",
-            &cdp_profile_root().join(ownership_token),
-            "CDP profile ownership lock is poisoned".to_owned(),
-        )
-    })?;
-    let status_before = cdp_profile_status_internal(Some(ownership_token));
-    if !status_before.failures.is_empty() {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_status_failed",
-            &cdp_profile_root().join(ownership_token),
-            serde_json::to_string(&status_before.failures)
-                .unwrap_or_else(|error| format!("failure render failed: {error}")),
-        ));
-    }
-    let Some(before) = status_before.entries.into_iter().next() else {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_target_absent",
-            &cdp_profile_root().join(ownership_token),
-            "the exact CDP profile token is absent; no mutation was attempted".to_owned(),
-        ));
-    };
-    if before.revision != expected_revision {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_revision_mismatch",
-            Path::new(&before.user_data_dir),
-            format!(
-                "expected_revision={expected_revision} actual_revision={}",
-                before.revision
-            ),
-        ));
-    }
-    if before.state != "unowned_orphan"
-        || before.external_owner_present
-        || before.pending_owner_present
-        || before.legacy_marker_present
-        || !before.live_user_pids.is_empty()
-    {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_target_not_unowned_orphan",
-            Path::new(&before.user_data_dir),
-            format!(
-                "state={} external_owner={} pending_owner={} legacy_marker={} live_user_pids={:?}",
-                before.state,
-                before.external_owner_present,
-                before.pending_owner_present,
-                before.legacy_marker_present,
-                before.live_user_pids
-            ),
-        ));
-    }
-    let target = cdp_profile_root().join(ownership_token);
-    let identity_now = cdp_profile_directory_identity(&target).map_err(|error| {
-        cdp_reconciliation_error("cdp_profile_repair_identity_unreadable", &target, error)
-    })?;
-    if before.directory_identity.as_ref() != Some(&identity_now) {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_identity_changed",
-            &target,
-            format!(
-                "status_identity={:?} trigger_identity={identity_now:?}",
-                before.directory_identity
-            ),
-        ));
-    }
-    let boundary_status = cdp_profile_status_internal(Some(ownership_token));
-    let boundary_entry = boundary_status.entries.first();
-    if !boundary_status.failures.is_empty()
-        || boundary_entry.map(|entry| entry.revision.as_str()) != Some(expected_revision)
-        || boundary_entry.map(|entry| entry.state.as_str()) != Some("unowned_orphan")
-    {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_mutation_boundary_drift",
-            &target,
-            format!(
-                "expected_revision={expected_revision} boundary_revision={:?} boundary_state={:?} failures={:?}",
-                boundary_entry.map(|entry| entry.revision.as_str()),
-                boundary_entry.map(|entry| entry.state.as_str()),
-                boundary_status.failures
-            ),
-        ));
-    }
-    let (token_pid, _sequence, _created_nanos) =
-        parse_cdp_profile_token(ownership_token).map_err(|error| {
-            cdp_reconciliation_error("cdp_profile_repair_token_invalid", &target, error)
-        })?;
-    let live_user_pids = cdp_profile_live_user_pids(&target);
-    if process_exists(token_pid) || !live_user_pids.is_empty() {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_live_owner_at_mutation_boundary",
-            &target,
-            format!(
-                "token_pid={token_pid} token_pid_live={} live_user_pids={live_user_pids:?}",
-                process_exists(token_pid)
-            ),
-        ));
-    }
-    fs::remove_dir_all(&target).map_err(|error| {
-        cdp_reconciliation_error(
-            "cdp_profile_repair_delete_failed",
-            &target,
-            error.to_string(),
-        )
-    })?;
-    let status_after = cdp_profile_status_internal(Some(ownership_token));
-    let directory_present_after = target.exists();
-    let external_owner_present_after =
-        cdp_profile_ownership_record_path(ownership_token, CdpProfileOwnershipRecordPhase::Active)
-            .exists();
-    let pending_owner_present_after =
-        cdp_profile_ownership_record_path(ownership_token, CdpProfileOwnershipRecordPhase::Pending)
-            .exists();
-    let legacy_marker_present_after = target.join(CDP_PROFILE_OWNERSHIP_MARKER).exists();
-    if directory_present_after
-        || external_owner_present_after
-        || pending_owner_present_after
-        || legacy_marker_present_after
-        || !status_after.failures.is_empty()
-        || !status_after.entries.is_empty()
-    {
-        return Err(cdp_reconciliation_error(
-            "cdp_profile_repair_readback_failed",
-            &target,
-            format!(
-                "directory_present={directory_present_after} external_owner_present={external_owner_present_after} pending_owner_present={pending_owner_present_after} legacy_marker_present={legacy_marker_present_after} status_entries={} status_failures={:?}",
-                status_after.entries.len(),
-                status_after.failures
-            ),
-        ));
-    }
-    tracing::info!(
-        code = "M4_ACT_LAUNCH_CDP_ORPHAN_REPAIRED",
-        ownership_token,
-        expected_revision,
-        user_data_dir = %target.display(),
-        before_files = before.tree.as_ref().map_or(0, |tree| tree.file_count),
-        before_bytes = before.tree.as_ref().map_or(0, |tree| tree.total_file_bytes),
-        "readback=profile_filesystem+external_owner_ledger after=exact_unowned_orphan_absent"
-    );
-    Ok(CdpProfileRepairResponse {
-        source_of_truth: status_after.source_of_truth,
-        ownership_token: ownership_token.to_owned(),
-        accepted_revision: expected_revision.to_owned(),
-        before,
-        directory_present_after,
-        external_owner_present_after,
-        pending_owner_present_after,
-        legacy_marker_present_after,
-        status_after_revision: status_after.revision,
-    })
-}
-
-fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
-    let profile_root = cdp_profile_root();
-    validate_cdp_profile_record_root(false).map_err(|error| {
-        cdp_reconciliation_error(
-            "cdp_profile_reconciliation_owner_root_invalid",
-            &profile_root,
-            error,
-        )
-    })?;
-    let entries = match fs::read_dir(&profile_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_enumeration_failed",
-                &profile_root,
-                error.to_string(),
-            ));
-        }
-    };
-    let owner_tokens = cdp_profile_record_tokens().map_err(|failures| {
-        cdp_reconciliation_error(
-            "cdp_profile_reconciliation_owner_ledger_invalid",
-            &cdp_profile_ownership_record_root(),
-            serde_json::to_string(&failures)
-                .unwrap_or_else(|error| format!("failure render failed: {error}")),
-        )
-    })?;
-    for token in owner_tokens {
-        let profile_path = profile_root.join(&token);
-        if profile_path.exists() {
-            continue;
-        }
-        let active =
-            read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_owner_without_profile_invalid",
-                        &profile_path,
-                        error,
-                    )
-                })?;
-        let pending =
-            read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Pending)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_pending_without_profile_invalid",
-                        &profile_path,
-                        error,
-                    )
-                })?;
-        if active.is_some() {
-            remove_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_owner_without_profile_delete_failed",
-                        &profile_path,
-                        error,
-                    )
-                })?;
-        }
-        if pending.is_some() {
-            remove_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Pending)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_pending_without_profile_delete_failed",
-                        &profile_path,
-                        error,
-                    )
-                })?;
-        }
-        tracing::info!(
-            code = "M4_ACT_LAUNCH_CDP_OWNER_WITHOUT_PROFILE_RECLAIMED",
-            ownership_token = token,
-            user_data_dir = %profile_path.display(),
-            "readback=external_owner_ledger+profile_filesystem after=owner_rows_absent_profile_absent"
-        );
-    }
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            cdp_reconciliation_error(
-                "cdp_profile_reconciliation_entry_failed",
-                &profile_root,
-                error.to_string(),
-            )
-        })?;
-        let path = entry.path();
-        if entry.file_name() == CDP_PROFILE_OWNERSHIP_RECORD_DIR {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            cdp_reconciliation_error(
-                "cdp_profile_reconciliation_metadata_failed",
-                &path,
-                error.to_string(),
-            )
-        })?;
-        if metadata.file_type().is_symlink()
-            || metadata_is_windows_reparse_point(&metadata)
-            || !metadata.is_dir()
-        {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_unsafe_entry",
-                &path,
-                "entry must be a real directory, not a file or symlink".to_owned(),
-            ));
-        }
-        let Some(token) = path.file_name().and_then(|value| value.to_str()) else {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_token_unreadable",
-                &path,
-                "directory name is not valid Unicode".to_owned(),
-            ));
-        };
-        parse_cdp_profile_token(token).map_err(|error| {
-            cdp_reconciliation_error("cdp_profile_reconciliation_token_invalid", &path, error)
-        })?;
-        let active_record =
-            read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_external_owner_invalid",
-                        &path,
-                        error,
-                    )
-                })?;
-        if let Some((record, _bytes)) = active_record {
-            let expected_identity = record.directory_identity.as_ref().ok_or_else(|| {
-                cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_external_identity_missing",
-                    &path,
-                    "active owner record has no directory identity".to_owned(),
-                )
-            })?;
-            let actual_identity = cdp_profile_directory_identity(&path).map_err(|error| {
-                cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_directory_identity_unreadable",
-                    &path,
-                    error,
-                )
-            })?;
-            if &actual_identity != expected_identity {
-                return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_directory_identity_mismatch",
-                    &path,
-                    format!("expected={expected_identity:?} actual={actual_identity:?}"),
-                ));
-            }
-            match cdp_launcher_generation_state(
-                record.launcher_pid,
-                record.launcher_process_creation_time_100ns,
-            ) {
-                CdpLauncherGenerationState::Live => continue,
-                CdpLauncherGenerationState::Absent => {
-                    let readback = cleanup_cdp_profile(
-                        &path,
-                        CdpProfileOwnership::SynapseEphemeral,
-                        Some(token),
-                    );
-                    if readback.failed {
-                        return Err(cdp_reconciliation_error(
-                            "cdp_profile_reconciliation_delete_failed",
-                            &path,
-                            serde_json::to_string(&readback).unwrap_or_else(|error| {
-                                format!("readback serialization failed: {error}")
-                            }),
-                        ));
-                    }
-                    tracing::info!(
-                        code = "M4_ACT_LAUNCH_CDP_STALE_PROFILE_RECLAIMED",
-                        user_data_dir = %path.display(),
-                        launcher_pid = record.launcher_pid,
-                        launcher_creation = record.launcher_process_creation_time_100ns,
-                        authority = "external_owner_v2",
-                        "readback=profile_filesystem+external_owner after=stale_owned_profile_absent"
-                    );
-                    continue;
-                }
-                CdpLauncherGenerationState::PidReused { actual_creation } => {
-                    return Err(cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_launcher_pid_reused",
-                        &path,
-                        format!(
-                            "launcher pid={} expected_creation={} actual_creation={actual_creation}",
-                            record.launcher_pid, record.launcher_process_creation_time_100ns
-                        ),
-                    ));
-                }
-                CdpLauncherGenerationState::Unreadable(error) => {
-                    return Err(cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_generation_unreadable",
-                        &path,
-                        error,
-                    ));
-                }
-            }
-        }
-        let pending_record =
-            read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
-                .map_err(|error| {
-                    cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_pending_owner_invalid",
-                        &path,
-                        error,
-                    )
-                })?;
-        if let Some((record, _bytes)) = pending_record {
-            match cdp_launcher_generation_state(
-                record.launcher_pid,
-                record.launcher_process_creation_time_100ns,
-            ) {
-                CdpLauncherGenerationState::Live => continue,
-                CdpLauncherGenerationState::Absent => {
-                    let mut contents = fs::read_dir(&path).map_err(|error| {
-                        cdp_reconciliation_error(
-                            "cdp_profile_reconciliation_pending_directory_unreadable",
-                            &path,
-                            error.to_string(),
-                        )
-                    })?;
-                    if contents.next().is_some() {
-                        return Err(cdp_reconciliation_error(
-                            "cdp_profile_reconciliation_pending_directory_not_empty",
-                            &path,
-                            "a pending owner may be reclaimed only before browser mutation; the directory contains bytes".to_owned(),
-                        ));
-                    }
-                    let readback = cleanup_cdp_profile(
-                        &path,
-                        CdpProfileOwnership::SynapseEphemeral,
-                        Some(token),
-                    );
-                    if readback.failed {
-                        return Err(cdp_reconciliation_error(
-                            "cdp_profile_reconciliation_pending_delete_failed",
-                            &path,
-                            serde_json::to_string(&readback).unwrap_or_else(|error| {
-                                format!("readback serialization failed: {error}")
-                            }),
-                        ));
-                    }
-                    continue;
-                }
-                CdpLauncherGenerationState::PidReused { actual_creation } => {
-                    return Err(cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_pending_launcher_pid_reused",
-                        &path,
-                        format!(
-                            "launcher pid={} expected_creation={} actual_creation={actual_creation}",
-                            record.launcher_pid, record.launcher_process_creation_time_100ns
-                        ),
-                    ));
-                }
-                CdpLauncherGenerationState::Unreadable(error) => {
-                    return Err(cdp_reconciliation_error(
-                        "cdp_profile_reconciliation_pending_generation_unreadable",
-                        &path,
-                        error,
-                    ));
-                }
-            }
-        }
-        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
-        let bytes = match fs::read(&marker_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                tracing::error!(
-                    code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-                    reason = "cdp_profile_unowned_orphan_retained",
-                    user_data_dir = %path.display(),
-                    ownership_token = token,
-                    remediation = "call process operation=cdp_profile_status, acquire the maintenance profile, then call process operation=cdp_profile_repair with this exact token and revision",
-                    "unowned legacy CDP profile is outside the durable ownership ledger; retained without blocking unrelated launch"
-                );
-                continue;
-            }
-            Err(error) => {
-                return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_marker_unreadable",
-                    &path,
-                    format!("read {}: {error}", marker_path.display()),
-                ));
-            }
-        };
-        if bytes.len() > 4096 {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_marker_oversize",
-                &path,
-                format!("marker has {} bytes; maximum is 4096", bytes.len()),
-            ));
-        }
-        let marker: Value = serde_json::from_slice(&bytes).map_err(|error| {
-            cdp_reconciliation_error(
-                "cdp_profile_reconciliation_marker_invalid",
-                &path,
-                error.to_string(),
-            )
-        })?;
-        let schema = marker.get("schema").and_then(Value::as_str);
-        let marker_token = marker.get("ownership_token").and_then(Value::as_str);
-        let launcher_pid = marker
-            .get("launcher_pid")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        let launcher_creation = marker
-            .get("launcher_process_creation_time_100ns")
-            .and_then(Value::as_u64);
-        if schema != Some("synapse-cdp-profile-owner/v1")
-            || marker_token != Some(token)
-            || launcher_pid.is_none()
-            || launcher_creation.is_none()
-        {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_marker_identity_mismatch",
-                &path,
-                format!(
-                    "schema={schema:?} marker_token={marker_token:?} directory_token={token:?} launcher_pid={launcher_pid:?} launcher_creation={launcher_creation:?}"
-                ),
-            ));
-        }
-        let launcher_pid = launcher_pid.unwrap_or_default();
-        let launcher_creation = launcher_creation.unwrap_or_default();
-        match cdp_launcher_generation_state(launcher_pid, launcher_creation) {
-            CdpLauncherGenerationState::Live => continue,
-            CdpLauncherGenerationState::Absent => {}
-            CdpLauncherGenerationState::PidReused { actual_creation } => {
-                return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_launcher_pid_reused",
-                    &path,
-                    format!(
-                        "legacy launcher pid={launcher_pid} expected_creation={launcher_creation} actual_creation={actual_creation}"
-                    ),
-                ));
-            }
-            CdpLauncherGenerationState::Unreadable(error) => {
-                return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_generation_unreadable",
-                    &path,
-                    error,
-                ));
-            }
-        }
-        let readback =
-            cleanup_cdp_profile(&path, CdpProfileOwnership::SynapseEphemeral, Some(token));
-        if readback.failed {
-            return Err(cdp_reconciliation_error(
-                "cdp_profile_reconciliation_delete_failed",
-                &path,
-                serde_json::to_string(&readback)
-                    .unwrap_or_else(|error| format!("readback serialization failed: {error}")),
-            ));
-        }
-        tracing::info!(
-            code = "M4_ACT_LAUNCH_CDP_STALE_PROFILE_RECLAIMED",
-            user_data_dir = %path.display(),
-            launcher_pid,
-            launcher_creation,
-            "readback=profile_filesystem after=stale_owned_profile_absent"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-enum CdpLauncherGenerationState {
-    Live,
-    Absent,
-    PidReused { actual_creation: u64 },
-    Unreadable(String),
-}
-
-fn cdp_launcher_generation_state(
-    launcher_pid: u32,
-    expected_creation: u64,
-) -> CdpLauncherGenerationState {
-    match synapse_a11y::inspect_process_creation_time_100ns(launcher_pid) {
-        Ok(Some(actual)) if actual == expected_creation => CdpLauncherGenerationState::Live,
-        Ok(Some(actual_creation)) => CdpLauncherGenerationState::PidReused { actual_creation },
-        Ok(None) if !process_exists(launcher_pid) => CdpLauncherGenerationState::Absent,
-        Ok(None) => CdpLauncherGenerationState::Unreadable(format!(
-            "launcher pid={launcher_pid} remains live but returned no process generation"
-        )),
-        Err(_error) if !process_exists(launcher_pid) => CdpLauncherGenerationState::Absent,
-        Err(error) => CdpLauncherGenerationState::Unreadable(format!(
-            "launcher pid={launcher_pid} remains live but identity read failed: {error}"
-        )),
-    }
-}
-
-fn cdp_reconciliation_error(reason: &'static str, path: &Path, detail: String) -> ErrorData {
-    launch_tool_error(
-        error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-        format!("act_launch refused to continue with unproven stale CDP profile state ({reason})"),
-        json!({
-            "code": error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-            "reason": reason,
-            "path": path,
-            "detail": detail,
-            "remediation": "inspect the exact ownership marker and process generation; repair or explicitly remove only the proven stale entry, then retry",
-        }),
-    )
-}
-
-fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), ErrorData> {
-    if launch.profile_ownership == CdpProfileOwnership::CallerManagedStable {
-        return Ok(());
-    }
-    let _prepare_guard = cdp_profile_prepare_lock()
-        .lock()
-        .map_err(|_error| {
-            launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "CDP profile preparation lock is poisoned",
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "cdp_profile_prepare_lock_poisoned",
-                    "remediation": "restart the Synapse daemon and inspect the preceding panic; profile reconciliation cannot run without exclusive ownership",
-                }),
-            )
-        })?;
-    reconcile_stale_cdp_profiles()?;
-    let Some(token) = launch.profile_ownership_token.as_deref() else {
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            "Synapse-owned CDP profile plan has no ownership token",
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_token_missing",
-                "user_data_dir": launch.user_data_dir,
-                "remediation": "inspect CDP launch planning; a Synapse-owned profile must always carry a unique ownership token",
-            }),
-        ));
-    };
-    let launcher_process_creation_time_100ns =
-        synapse_a11y::inspect_process_creation_time_100ns(std::process::id())
-            .map_err(|error| {
-                launch_tool_error(
-                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    format!(
-                        "act_launch could not read its daemon process generation for the CDP ownership marker: {error}"
-                    ),
-                    json!({
-                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                        "reason": "ephemeral_profile_launcher_generation_unreadable",
-                        "launcher_pid": std::process::id(),
-                        "source_error": error,
-                        "remediation": "repair Windows process-query permissions; Synapse will not create an ownership marker without a PID-generation identity",
-                    }),
-                )
-            })?
-            .ok_or_else(|| {
-                launch_tool_error(
-                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "act_launch daemon process generation read returned no identity",
-                    json!({
-                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                        "reason": "ephemeral_profile_launcher_generation_missing",
-                        "launcher_pid": std::process::id(),
-                        "remediation": "run the Windows Synapse daemon with process-query access; no browser was spawned",
-                    }),
-                )
-            })?;
-    let expected_parent = cdp_profile_root();
-    if launch.user_data_dir.parent() != Some(expected_parent.as_path())
-        || launch
-            .user_data_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            != Some(token)
-    {
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            "Synapse-owned CDP profile path does not match its exact temp-root token",
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_path_identity_mismatch",
-                "user_data_dir": launch.user_data_dir,
-                "expected_parent": expected_parent,
-                "ownership_token": token,
-                "remediation": "inspect CDP launch planning; never weaken the exact owned-profile path invariant",
-            }),
-        ));
-    }
-    validate_cdp_profile_record_root(true).map_err(|error| {
-        launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not create CDP profile root: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_root_create_failed",
-                "profile_root": expected_parent,
-                "source_error": error,
-                "remediation": "repair permissions or filesystem state for the OS temp synapse-cdp-profiles directory",
-            }),
-        )
-    })?;
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let pending_record = CdpProfileOwnershipRecord {
-        schema: CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA.to_owned(),
-        phase: CdpProfileOwnershipRecordPhase::Pending,
-        ownership_token: token.to_owned(),
-        user_data_dir: launch.user_data_dir.display().to_string(),
-        launcher_pid: std::process::id(),
-        launcher_process_creation_time_100ns,
-        created_at: created_at.clone(),
-        directory_identity: None,
-    };
-    persist_cdp_profile_ownership_record(&pending_record).map_err(|error| {
-        launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not durably reserve CDP profile ownership: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_pending_owner_write_failed",
-                "ownership_token": token,
-                "user_data_dir": launch.user_data_dir,
-                "source_error": error,
-                "remediation": "repair the durable ownership ledger beneath the OS temp synapse-cdp-profiles root; no profile directory or browser was created",
-            }),
-        )
-    })?;
-    if let Err(error) = fs::create_dir(&launch.user_data_dir) {
-        let pending_cleanup =
-            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not exclusively create its CDP profile: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_create_new_failed",
-                "user_data_dir": launch.user_data_dir,
-                "source_error": error.to_string(),
-                "pending_owner_cleanup": pending_cleanup,
-                "remediation": "inspect the exact path for a collision or filesystem failure; Synapse never reuses an ephemeral profile directory",
-            }),
-        ));
-    }
-    let directory_identity = match cdp_profile_directory_identity(&launch.user_data_dir) {
-        Ok(identity) => identity,
-        Err(error) => {
-            let empty_directory_cleanup = fs::remove_dir(&launch.user_data_dir)
-                .map(|()| "removed".to_owned())
-                .map_err(|cleanup_error| cleanup_error.to_string());
-            let pending_owner_cleanup =
-                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
-            return Err(launch_tool_error(
-                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                format!("act_launch could not bind its CDP profile directory identity: {error}"),
-                json!({
-                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                    "reason": "ephemeral_profile_directory_identity_unreadable",
-                    "user_data_dir": launch.user_data_dir,
-                    "source_error": error,
-                    "empty_directory_cleanup": empty_directory_cleanup,
-                    "pending_owner_cleanup": pending_owner_cleanup,
-                    "remediation": "repair filesystem identity-query access; no browser was spawned and exact empty-profile cleanup was attempted",
-                }),
-            ));
-        }
-    };
-    let active_record = CdpProfileOwnershipRecord {
-        schema: CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA.to_owned(),
-        phase: CdpProfileOwnershipRecordPhase::Active,
-        ownership_token: token.to_owned(),
-        user_data_dir: launch.user_data_dir.display().to_string(),
-        launcher_pid: std::process::id(),
-        launcher_process_creation_time_100ns,
-        created_at,
-        directory_identity: Some(directory_identity),
-    };
-    if let Err(error) = persist_cdp_profile_ownership_record(&active_record) {
-        let empty_directory_cleanup = fs::remove_dir(&launch.user_data_dir)
-            .map(|()| "removed".to_owned())
-            .map_err(|cleanup_error| cleanup_error.to_string());
-        let pending_owner_cleanup =
-            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
-        let active_owner_cleanup =
-            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active);
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not activate durable CDP profile ownership: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_active_owner_write_failed",
-                "user_data_dir": launch.user_data_dir,
-                "source_error": error,
-                "empty_directory_cleanup": empty_directory_cleanup,
-                "pending_owner_cleanup": pending_owner_cleanup,
-                "active_owner_cleanup": active_owner_cleanup,
-                "remediation": "repair the durable ownership ledger; no browser was spawned and exact empty-profile cleanup was attempted",
-            }),
-        ));
-    }
-    if let Err(error) =
-        remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
-    {
-        let cleanup = cleanup_cdp_profile(
-            &launch.user_data_dir,
-            CdpProfileOwnership::SynapseEphemeral,
-            Some(token),
-        );
-        return Err(launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not resolve its pending CDP ownership record: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_pending_owner_resolve_failed",
-                "user_data_dir": launch.user_data_dir,
-                "active_owner_path": cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active),
-                "pending_owner_path": cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending),
-                "source_error": error,
-                "exact_resource_cleanup": cleanup,
-                "remediation": "inspect the exact active/pending immutable owner rows and cleanup readback; no browser was spawned",
-            }),
-        ));
-    }
-    Ok(())
-}
-
-fn remove_cdp_profile_ownership_record(
-    token: &str,
-    phase: CdpProfileOwnershipRecordPhase,
-) -> Result<String, String> {
-    let path = cdp_profile_ownership_record_path(token, phase);
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok("already_absent".to_owned());
-        }
-        Err(error) => {
-            return Err(format!(
-                "remove CDP profile ownership record {} failed: {error}",
-                path.display()
-            ));
-        }
-    }
-    if path.exists() {
-        return Err(format!(
-            "CDP profile ownership record still exists after removal: {}",
-            path.display()
-        ));
-    }
-    Ok("removed".to_owned())
-}
-
-// The v1 in-profile marker writer intentionally no longer exists. Chrome owns
-// every byte below --user-data-dir, so no byte there can be the sole durable
-// deletion authority. New launches publish immutable pending+active records in
-// the sibling .ownership ledger before Chrome is spawned. The legacy marker is
-// read only for safe migration/reconciliation of profiles created by old builds.
-
-fn publish_launched_cdp(
-    launch: &ChromiumCdpLaunch,
-    cdp: &mut LaunchedCdp,
-) -> Result<(), ErrorData> {
-    let registration = cdp.registration.clone().ok_or_else(|| {
-        launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-            "act_launch reached CDP publication without an attested registration",
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-                "reason": "cdp_registration_candidate_missing",
-                "remediation": "inspect the endpoint attestation transaction; publication is forbidden until all physical identity fields exist",
-            }),
-        )
-    })?;
-    synapse_a11y::register_launched_endpoint(registration.clone()).map_err(|error| {
-        launch_tool_error(
-            error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-            format!("act_launch could not publish its attested CDP endpoint: {error}"),
-            json!({
-                "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
-                "reason": "cdp_registry_publish_failed",
-                "registration_id": registration.registration_id,
-                "pid": registration.launch_pid,
-                "source_error": error,
-                "remediation": "inspect the launched-endpoint registry for a poisoned lock or contradictory exact-PID generation row",
-            }),
-        )
-    })?;
-    cdp.resource = Some(CdpLaunchResource {
-        registration,
-        user_data_dir: launch.user_data_dir.clone(),
-        profile_ownership: launch.profile_ownership,
-        profile_ownership_token: launch.profile_ownership_token.clone(),
-    });
-    Ok(())
-}
-
-#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CdpLaunchCleanupReadback {
-    pub registration_id: Option<String>,
-    pub registration_present_before: bool,
-    pub registry_eviction_attempted: bool,
-    pub registry_evicted: bool,
-    pub registration_present_after: bool,
-    pub profile_ownership: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_source: Option<String>,
-    pub user_data_dir: String,
-    pub external_owner_present_before: bool,
-    pub pending_owner_present_before: bool,
-    pub external_owner_present_after: bool,
-    pub pending_owner_present_after: bool,
-    pub profile_existed_before: bool,
-    pub profile_deletion_attempted: bool,
-    pub profile_exists_after: bool,
-    pub failed: bool,
-    pub errors: Vec<String>,
-}
-
-pub(crate) fn cleanup_launched_cdp_resource(
-    resource: CdpLaunchResource,
-) -> CdpLaunchCleanupReadback {
-    let mut errors = Vec::new();
-    let registration_before =
-        match synapse_a11y::launched_endpoint_for_pid(resource.registration.launch_pid) {
-            Ok(value) => value,
-            Err(error) => {
-                errors.push(format!("read CDP registry before cleanup: {error}"));
-                None
-            }
-        };
-    let registration_present_before = registration_before
-        .as_ref()
-        .is_some_and(|row| row.registration_id == resource.registration.registration_id);
-    let registry_eviction_attempted = registration_present_before;
-    let registry_evicted = if registration_present_before {
-        match synapse_a11y::forget_launched_endpoint(
-            resource.registration.launch_pid,
-            &resource.registration.registration_id,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                errors.push(format!("exact CDP registry eviction failed: {error}"));
-                false
-            }
-        }
-    } else if let Some(row) = registration_before {
-        errors.push(format!(
-            "refused CDP registry cleanup because pid {} now holds contradictory registration_id={} expected={}",
-            resource.registration.launch_pid,
-            row.registration_id,
-            resource.registration.registration_id
-        ));
-        false
-    } else {
-        false
-    };
-    let registration_present_after =
-        match synapse_a11y::launched_endpoint_for_pid(resource.registration.launch_pid) {
-            Ok(row) => {
-                row.is_some_and(|row| row.registration_id == resource.registration.registration_id)
-            }
-            Err(error) => {
-                errors.push(format!("read CDP registry after cleanup: {error}"));
-                false
-            }
-        };
-    if registration_present_after {
-        errors.push("exact CDP registry row still exists after cleanup".to_owned());
-    }
-    let mut readback = cleanup_cdp_profile(
-        &resource.user_data_dir,
-        resource.profile_ownership,
-        resource.profile_ownership_token.as_deref(),
-    );
-    readback.registration_id = Some(resource.registration.registration_id);
-    readback.registration_present_before = registration_present_before;
-    readback.registry_eviction_attempted = registry_eviction_attempted;
-    readback.registry_evicted = registry_evicted;
-    readback.registration_present_after = registration_present_after;
-    readback.errors.splice(0..0, errors);
-    readback.failed = !readback.errors.is_empty();
-    tracing::info!(
-        code = "M4_ACT_LAUNCH_CDP_RESOURCE_CLEANUP",
-        readback = %serde_json::to_string(&readback).unwrap_or_else(|error| format!("serialization_failed:{error}")),
-        "readback=launched_cdp_registry+profile after=exact_resource_cleanup"
-    );
-    readback
-}
-
-pub(crate) fn spawn_launched_cdp_exit_monitor(resource: CdpLaunchResource) {
-    tokio::spawn(async move {
-        let mut unreadable_polls = 0_u64;
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let launch_live = exact_process_generation_is_live(
-                resource.registration.launch_pid,
-                resource.registration.launch_process_creation_time_100ns,
-            );
-            let listener_live = exact_process_generation_is_live(
-                resource.registration.listener_pid,
-                resource.registration.listener_process_creation_time_100ns,
-            );
-            match (launch_live, listener_live) {
-                (Ok(false), Ok(false)) => {
-                    let readback = cleanup_launched_cdp_resource(resource);
-                    if readback.failed {
-                        synapse_action::record_operator_panic_safety_incident();
-                        tracing::error!(
-                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-                            readback = %serde_json::to_string(&readback).unwrap_or_else(|error| format!("serialization_failed:{error}")),
-                            "natural CDP endpoint exit cleanup failed"
-                        );
-                    }
-                    return;
-                }
-                (Err(launch_error), Err(listener_error)) => {
-                    unreadable_polls = unreadable_polls.saturating_add(1);
-                    if unreadable_polls == 1 || unreadable_polls.is_multiple_of(120) {
-                        tracing::error!(
-                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-                            launch_pid = resource.registration.launch_pid,
-                            listener_pid = resource.registration.listener_pid,
-                            launch_error,
-                            listener_error,
-                            unreadable_polls,
-                            "CDP exit monitor cannot read either exact process generation; retaining registry/profile ownership and retrying"
-                        );
-                    }
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    unreadable_polls = unreadable_polls.saturating_add(1);
-                    if unreadable_polls == 1 || unreadable_polls.is_multiple_of(120) {
-                        tracing::error!(
-                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
-                            launch_pid = resource.registration.launch_pid,
-                            listener_pid = resource.registration.listener_pid,
-                            detail = %error,
-                            unreadable_polls,
-                            "CDP exit monitor cannot read one exact process generation; retaining registry/profile ownership and retrying"
-                        );
-                    }
-                }
-                _ => unreadable_polls = 0,
-            }
-        }
-    });
-}
-
-fn exact_process_generation_is_live(
-    pid: u32,
-    expected_creation_time_100ns: Option<u64>,
-) -> Result<bool, String> {
-    let Some(expected) = expected_creation_time_100ns else {
-        return Err(format!(
-            "process pid={pid} has no recorded creation identity"
-        ));
-    };
-    match synapse_a11y::inspect_process_creation_time_100ns(pid) {
-        Ok(Some(actual)) => Ok(actual == expected),
-        Ok(None) => Err(format!(
-            "process pid={pid} creation identity read returned no value"
-        )),
-        Err(_error) if !process_exists(pid) => Ok(false),
-        Err(error) => Err(format!(
-            "process pid={pid} remains live but its creation identity is unreadable: {error}"
-        )),
-    }
-}
-
-fn cleanup_cdp_launch_plan(launch: &ChromiumCdpLaunch) -> CdpLaunchCleanupReadback {
-    cleanup_cdp_profile(
-        &launch.user_data_dir,
-        launch.profile_ownership,
-        launch.profile_ownership_token.as_deref(),
-    )
-}
-
-fn cleanup_cdp_profile(
-    user_data_dir: &Path,
-    profile_ownership: CdpProfileOwnership,
-    ownership_token: Option<&str>,
-) -> CdpLaunchCleanupReadback {
-    let profile_existed_before = user_data_dir.exists();
-    let mut readback = CdpLaunchCleanupReadback {
-        profile_ownership: profile_ownership.as_str().to_owned(),
-        user_data_dir: user_data_dir.display().to_string(),
-        profile_existed_before,
-        profile_exists_after: profile_existed_before,
-        ..CdpLaunchCleanupReadback::default()
-    };
-    if profile_ownership == CdpProfileOwnership::CallerManagedStable {
-        return readback;
-    }
-    let Some(token) = ownership_token else {
-        readback
-            .errors
-            .push("Synapse-owned CDP profile cleanup has no ownership token".to_owned());
-        readback.failed = true;
-        return readback;
-    };
-    let expected_parent = cdp_profile_root();
-    if user_data_dir.parent() != Some(expected_parent.as_path())
-        || user_data_dir.file_name().and_then(|value| value.to_str()) != Some(token)
-    {
-        readback.errors.push(format!(
-            "refused recursive profile deletion: path {} is not exact token {token:?} beneath {}",
-            user_data_dir.display(),
-            expected_parent.display()
-        ));
-        readback.failed = true;
-        return readback;
-    }
-    let active_record =
-        match read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active) {
-            Ok(value) => value,
-            Err(error) => {
-                readback.errors.push(error);
-                readback.failed = true;
-                return readback;
-            }
-        };
-    let pending_record =
-        match read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending) {
-            Ok(value) => value,
-            Err(error) => {
-                readback.errors.push(error);
-                readback.failed = true;
-                return readback;
-            }
-        };
-    readback.external_owner_present_before = active_record.is_some();
-    readback.pending_owner_present_before = pending_record.is_some();
-    if !profile_existed_before {
-        if active_record.is_some()
-            && let Err(error) =
-                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
-        {
-            readback.errors.push(error);
-        }
-        if pending_record.is_some()
-            && let Err(error) =
-                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
-        {
-            readback.errors.push(error);
-        }
-        readback.external_owner_present_after =
-            cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active)
-                .exists();
-        readback.pending_owner_present_after =
-            cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending)
-                .exists();
-        readback.failed = !readback.errors.is_empty()
-            || readback.external_owner_present_after
-            || readback.pending_owner_present_after;
-        return readback;
-    }
-    let external_authority = if let Some((record, _bytes)) = active_record.as_ref() {
-        let Some(expected_identity) = record.directory_identity.as_ref() else {
-            readback
-                .errors
-                .push("active CDP profile owner record has no directory identity".to_owned());
-            readback.failed = true;
-            return readback;
-        };
-        match cdp_profile_directory_identity(user_data_dir) {
-            Ok(actual_identity) if &actual_identity == expected_identity => {
-                readback.authority_source = Some("external_owner_v2".to_owned());
-                true
-            }
-            Ok(actual_identity) => {
-                readback.errors.push(format!(
-                    "refused recursive profile deletion: external owner directory identity mismatch expected={expected_identity:?} actual={actual_identity:?}"
-                ));
-                readback.failed = true;
-                return readback;
-            }
-            Err(error) => {
-                readback.errors.push(format!(
-                    "refused recursive profile deletion: read external owner directory identity: {error}"
-                ));
-                readback.failed = true;
-                return readback;
-            }
-        }
-    } else if pending_record.is_some() {
-        match fs::read_dir(user_data_dir) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    readback.errors.push(
-                        "refused recursive profile deletion: pending owner directory is not empty"
-                            .to_owned(),
-                    );
-                    readback.failed = true;
-                    return readback;
-                }
-                readback.authority_source = Some("external_pending_owner_v2_empty".to_owned());
-                true
-            }
-            Err(error) => {
-                readback.errors.push(format!(
-                    "refused recursive profile deletion: inspect pending owner directory: {error}"
-                ));
-                readback.failed = true;
-                return readback;
-            }
-        }
-    } else {
-        false
-    };
-    readback.profile_deletion_attempted = true;
-    match fs::symlink_metadata(user_data_dir) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || metadata_is_windows_reparse_point(&metadata) =>
-        {
-            readback.errors.push(format!(
-                "refused recursive profile deletion: {} is a symlink or reparse point",
-                user_data_dir.display()
-            ));
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            readback.errors.push(format!(
-                "refused recursive profile deletion: {} is not a directory",
-                user_data_dir.display()
-            ));
-        }
-        Ok(_) if external_authority => {
-            if let Err(error) = fs::remove_dir_all(user_data_dir)
-                && error.kind() != io::ErrorKind::NotFound
-            {
-                readback.errors.push(format!(
-                    "remove exact externally-owned CDP profile {}: {error}",
-                    user_data_dir.display()
-                ));
-            }
-        }
-        Ok(_) => {
-            let marker_path = user_data_dir.join(CDP_PROFILE_OWNERSHIP_MARKER);
-            let marker_result = fs::read(&marker_path)
-                .map_err(|error| format!("read ownership marker {}: {error}", marker_path.display()))
-                .and_then(|bytes| {
-                    if bytes.len() > 4096 {
-                        return Err(format!(
-                            "ownership marker {} exceeds 4096 bytes",
-                            marker_path.display()
-                        ));
-                    }
-                    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-                        format!("decode ownership marker {}: {error}", marker_path.display())
-                    })?;
-                    let actual_schema = value.get("schema").and_then(Value::as_str);
-                    let actual_token = value.get("ownership_token").and_then(Value::as_str);
-                    if actual_schema != Some("synapse-cdp-profile-owner/v1")
-                        || actual_token != Some(token)
-                    {
-                        return Err(format!(
-                            "ownership marker mismatch path={} schema={actual_schema:?} token={actual_token:?} expected_token={token:?}",
-                            marker_path.display()
-                        ));
-                    }
-                    readback.authority_source = Some("legacy_in_profile_marker_v1".to_owned());
-                    Ok(())
-                });
-            match marker_result {
-                Ok(()) => {
-                    if let Err(error) = fs::remove_dir_all(user_data_dir)
-                        && error.kind() != io::ErrorKind::NotFound
-                    {
-                        readback.errors.push(format!(
-                            "remove exact owned CDP profile {}: {error}",
-                            user_data_dir.display()
-                        ));
-                    }
-                }
-                Err(_error) if !user_data_dir.exists() => {}
-                Err(error) => readback.errors.push(error),
-            }
-        }
-        Err(error) => readback.errors.push(format!(
-            "read profile metadata {}: {error}",
-            user_data_dir.display()
-        )),
-    }
-    readback.profile_exists_after = user_data_dir.exists();
-    if readback.profile_exists_after {
-        readback.errors.push(format!(
-            "CDP profile still exists after cleanup: {}",
-            user_data_dir.display()
-        ));
-    } else {
-        if active_record.is_some()
-            && let Err(error) =
-                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
-        {
-            readback.errors.push(error);
-        }
-        if pending_record.is_some()
-            && let Err(error) =
-                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
-        {
-            readback.errors.push(error);
-        }
-    }
-    readback.external_owner_present_after =
-        cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active).exists();
-    readback.pending_owner_present_after =
-        cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending).exists();
-    if readback.external_owner_present_after || readback.pending_owner_present_after {
-        readback.errors.push(format!(
-            "CDP profile ownership records remain after cleanup: active={} pending={}",
-            readback.external_owner_present_after, readback.pending_owner_present_after
-        ));
-    }
-    readback.failed = !readback.errors.is_empty();
-    readback
+/// Reads the first line of a `DevToolsActivePort` file as a port number.
+fn read_devtools_active_port(path: &Path) -> Option<u16> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().next()?.trim().parse::<u16>().ok()
 }
 
 #[derive(Clone, Debug)]
 struct VerifiedCdpTarget {
-    id: String,
     url: String,
     title: Option<String>,
 }
@@ -12740,15 +7364,11 @@ struct VerifiedCdpTarget {
 #[derive(Clone, Debug, Deserialize)]
 struct CdpTargetListEntry {
     #[serde(default)]
-    id: String,
-    #[serde(default)]
     url: String,
     #[serde(default)]
     title: Option<String>,
     #[serde(default, rename = "type")]
     target_type: Option<String>,
-    #[serde(default, rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: String,
 }
 
 async fn verify_launched_chromium_url(
@@ -12757,15 +7377,16 @@ async fn verify_launched_chromium_url(
     cdp: &LaunchedCdp,
     timeout_ms: u64,
 ) -> Result<Option<VerifiedCdpTarget>, ErrorData> {
+    let Some(expected_url) = launch_requested_url(&params.args) else {
+        return Ok(None);
+    };
     if cdp_launch.is_none() {
         return Ok(None);
     }
-    let expected_url = launch_requested_url(&params.args);
-    let expected_description = expected_url.as_deref().unwrap_or("<any page target>");
     let Some(endpoint) = cdp.endpoint.as_deref() else {
         return Err(launch_url_verification_error(
             "cdp_endpoint_missing",
-            expected_description,
+            &expected_url,
             None,
             timeout_ms,
             None,
@@ -12797,24 +7418,21 @@ async fn verify_launched_chromium_url(
             Ok(targets) => {
                 last_targets = target_summaries(&targets);
                 if let Some(target) = targets.iter().find(|target| {
-                    target.target_type.as_deref() == Some("page")
-                        && !target.id.is_empty()
-                        && cdp_page_websocket_matches(target, cdp.port)
-                        && expected_url
-                            .as_deref()
-                            .is_none_or(|expected| url_matches(expected, &target.url))
+                    target
+                        .target_type
+                        .as_deref()
+                        .is_none_or(|kind| kind == "page")
+                        && url_matches(&expected_url, &target.url)
                 }) {
                     tracing::info!(
                         code = "M4_ACT_LAUNCH_CDP_URL_VERIFIED",
                         endpoint,
-                        expected_url = ?expected_url,
+                        expected_url,
                         actual_url = %target.url,
-                        target_id = %target.id,
                         title = ?target.title,
                         "act_launch verified requested browser URL in CDP target list"
                     );
                     return Ok(Some(VerifiedCdpTarget {
-                        id: target.id.clone(),
                         url: target.url.clone(),
                         title: target.title.clone().filter(|title| !title.is_empty()),
                     }));
@@ -12829,7 +7447,7 @@ async fn verify_launched_chromium_url(
         if started.elapsed() >= timeout {
             return Err(launch_url_verification_error(
                 "url_not_observed_within_timeout",
-                expected_description,
+                &expected_url,
                 Some(endpoint),
                 timeout_ms,
                 last_error,
@@ -12854,33 +7472,10 @@ async fn fetch_cdp_target_list(
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
     }
-    let bytes = response
-        .bytes()
+    response
+        .json::<Vec<CdpTargetListEntry>>()
         .await
-        .map_err(|error| format!("read {url}: {error}"))?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(format!(
-            "GET {url}: response exceeds 1048576-byte limit ({} bytes)",
-            bytes.len()
-        ));
-    }
-    serde_json::from_slice::<Vec<CdpTargetListEntry>>(&bytes)
         .map_err(|error| format!("decode {url}: {error}"))
-}
-
-fn cdp_page_websocket_matches(target: &CdpTargetListEntry, port: Option<u16>) -> bool {
-    let Some(port) = port else {
-        return false;
-    };
-    let Ok(url) = reqwest::Url::parse(&target.web_socket_debugger_url) else {
-        return false;
-    };
-    url.scheme() == "ws"
-        && url.host_str() == Some("127.0.0.1")
-        && url.port() == Some(port)
-        && url.path() == format!("/devtools/page/{}", target.id)
-        && url.query().is_none()
-        && url.fragment().is_none()
 }
 
 fn launch_requested_url(args: &[String]) -> Option<String> {
@@ -13364,7 +7959,7 @@ fn validate_run_shell_idempotency_key(key: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn validate_launch_params(params: &ActLaunchParams) -> Result<Option<regex::Regex>, ErrorData> {
+fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
     if params.target.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -13377,43 +7972,19 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<Option<regex::Rege
             "act_launch timeout_ms must be >= 1",
         ));
     }
-    let wait_regex = params
-        .wait_for_window_title_regex
-        .as_ref()
-        .map(|pattern| {
-            regex::Regex::new(pattern).map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    format!("act_launch wait_for_window_title_regex is invalid: {error}"),
-                )
-            })
-        })
-        .transpose()?;
-    if let Some(ActLaunchOutput::Capture {
-        max_bytes_per_stream,
-    }) = &params.output
-        && (*max_bytes_per_stream == 0
-            || *max_bytes_per_stream > MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES)
-    {
-        return Err(launch_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_launch output capture max_bytes_per_stream must be between 1 and {MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES}"
-            ),
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "reason": "launch_output_capture_limit_invalid",
-                "max_bytes_per_stream": max_bytes_per_stream,
-                "maximum": MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES,
-                "remediation": "set output.mode=capture with max_bytes_per_stream in the documented range, or use output.mode=fire_and_forget when terminal/output observation is not required",
-            }),
-        ));
+    if let Some(pattern) = &params.wait_for_window_title_regex {
+        regex::Regex::new(pattern).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("act_launch wait_for_window_title_regex is invalid: {error}"),
+            )
+        })?;
     }
     validate_console_launch_visibility(params)?;
     validate_launch_desktop_option(params)?;
     validate_shared_tabbed_desktop_launch_target(params)?;
     validate_chromium_debug_launch_policy(params)?;
-    Ok(wait_regex)
+    Ok(())
 }
 
 fn validate_launch_desktop_option(params: &ActLaunchParams) -> Result<(), ErrorData> {
@@ -13545,9 +8116,6 @@ fn launch_desktop_params_error(
 }
 
 fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(), ErrorData> {
-    if validate_explicit_cdp_disabled_args(params)? {
-        return Ok(());
-    }
     let is_chromium =
         synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
     if !is_chromium && params.cdp_debug != Some(true) {
@@ -13573,8 +8141,6 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
             "has_silent_debugger_extension_api": violation.silent_debugger,
             "has_disable_extensions": violation.disable_extensions,
             "has_extension_loading_flags": violation.loads_extensions,
-            "popup_free_synapse_bridge_attested": violation.popup_free_synapse_bridge_attested,
-            "popup_free_synapse_bridge_attestation_error": violation.popup_free_synapse_bridge_attestation_error,
             "has_layout_shifting_infobar_flags": !violation.layout_infobar_flags.is_empty(),
             "layout_shifting_infobar_flags": violation.layout_infobar_flags,
             "required_invariant": CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT,
@@ -13583,7 +8149,7 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
     ))
 }
 
-const CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT: &str = "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, and no known layout-shifting Chrome warning flags; they must either disable all extensions or load only the byte-attested debugger-free Synapse bridge from its canonical active directory";
+const CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT: &str = "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, --disable-extensions, no extension-loading flags, and no known layout-shifting Chrome warning flags such as --disable-blink-features=AutomationControlled";
 
 #[derive(Debug)]
 struct ChromiumDebugPolicyViolation {
@@ -13593,8 +8159,6 @@ struct ChromiumDebugPolicyViolation {
     silent_debugger: bool,
     disable_extensions: bool,
     loads_extensions: bool,
-    popup_free_synapse_bridge_attested: bool,
-    popup_free_synapse_bridge_attestation_error: Option<String>,
     layout_infobar_flags: Vec<String>,
 }
 
@@ -13620,19 +8184,11 @@ fn chromium_debug_args_policy_violation(
     let loads_extensions = args.iter().any(|arg| {
         is_switch_arg(arg, "--load-extension") || is_switch_arg(arg, "--disable-extensions-except")
     });
-    let (popup_free_synapse_bridge_attested, popup_free_synapse_bridge_attestation_error) =
-        if loads_extensions {
-            match attest_popup_free_synapse_bridge_launch_args(args) {
-                Ok(()) => (true, None),
-                Err(error) => (false, Some(error)),
-            }
-        } else {
-            (false, None)
-        };
     let layout_infobar_flags = chromium_layout_infobar_flags(args);
 
     if silent_debugger
-        && ((disable_extensions && !loads_extensions) || popup_free_synapse_bridge_attested)
+        && disable_extensions
+        && !loads_extensions
         && layout_infobar_flags.is_empty()
         && matches!(user_data_dir_state, ChromiumUserDataDirSafety::Dedicated)
     {
@@ -13646,85 +8202,8 @@ fn chromium_debug_args_policy_violation(
         silent_debugger,
         disable_extensions,
         loads_extensions,
-        popup_free_synapse_bridge_attested,
-        popup_free_synapse_bridge_attestation_error,
         layout_infobar_flags,
     })
-}
-
-fn attest_popup_free_synapse_bridge_launch_args(args: &[String]) -> Result<(), String> {
-    let loaded = chromium_switch_path_values(args, "--load-extension")?;
-    let except = chromium_switch_path_values(args, "--disable-extensions-except")?;
-    if loaded.len() != 1 || except.len() != 1 {
-        return Err(format!(
-            "popup-free bridge launch requires exactly one --load-extension path and one matching --disable-extensions-except path; load_count={} except_count={}",
-            loaded.len(),
-            except.len()
-        ));
-    }
-    let loaded_path = PathBuf::from(&loaded[0]);
-    let except_path = PathBuf::from(&except[0]);
-    let loaded_canonical = loaded_path.canonicalize().map_err(|error| {
-        format!(
-            "--load-extension path is unreadable path={} error={error}",
-            loaded_path.display()
-        )
-    })?;
-    let except_canonical = except_path.canonicalize().map_err(|error| {
-        format!(
-            "--disable-extensions-except path is unreadable path={} error={error}",
-            except_path.display()
-        )
-    })?;
-    if !paths_equal_for_launch_policy(&loaded_canonical, &except_canonical) {
-        return Err(format!(
-            "extension-loading paths do not identify one exact directory load={} except={}",
-            loaded_canonical.display(),
-            except_canonical.display()
-        ));
-    }
-    synapse_chrome_bridge::attest_popup_free_bridge_launch_dir(&loaded_canonical).map(|_| ())
-}
-
-fn chromium_switch_path_values(args: &[String], switch: &str) -> Result<Vec<String>, String> {
-    let prefix = format!("{switch}=");
-    let mut values = Vec::new();
-    for arg in args {
-        let Some(raw) = arg.strip_prefix(&prefix) else {
-            if arg.eq_ignore_ascii_case(switch) {
-                return Err(format!(
-                    "{switch} must use the explicit {switch}=<absolute-path> form"
-                ));
-            }
-            continue;
-        };
-        for value in raw.split(',') {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(format!("{switch} contains an empty extension path"));
-            }
-            let path = Path::new(value);
-            if !path.is_absolute() {
-                return Err(format!(
-                    "{switch} extension path must be absolute path={value}"
-                ));
-            }
-            values.push(value.to_owned());
-        }
-    }
-    Ok(values)
-}
-
-fn paths_equal_for_launch_policy(left: &Path, right: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
 }
 
 fn validate_run_shell_chromium_debug_policy(params: &ActRunShellParams) -> Result<(), ErrorData> {
@@ -13934,8 +8413,6 @@ fn run_shell_chromium_debug_error(
         silent_debugger,
         disable_extensions,
         loads_extensions,
-        popup_free_synapse_bridge_attested,
-        popup_free_synapse_bridge_attestation_error,
         layout_infobar_flags,
     ) = if let Some(violation) = direct_violation {
         (
@@ -13944,16 +8421,12 @@ fn run_shell_chromium_debug_error(
             Some(violation.silent_debugger),
             Some(violation.disable_extensions),
             Some(violation.loads_extensions),
-            Some(violation.popup_free_synapse_bridge_attested),
-            violation.popup_free_synapse_bridge_attestation_error,
             violation.layout_infobar_flags,
         )
     } else {
         (
             None,
             "unknown_shell_wrapped".to_owned(),
-            None,
-            None,
             None,
             None,
             None,
@@ -13985,8 +8458,6 @@ fn run_shell_chromium_debug_error(
             "has_silent_debugger_extension_api": silent_debugger,
             "has_disable_extensions": disable_extensions,
             "has_extension_loading_flags": loads_extensions,
-            "popup_free_synapse_bridge_attested": popup_free_synapse_bridge_attested,
-            "popup_free_synapse_bridge_attestation_error": popup_free_synapse_bridge_attestation_error,
             "has_layout_shifting_infobar_flags": !layout_infobar_flags.is_empty(),
             "layout_shifting_infobar_flags": layout_infobar_flags,
             "required_invariant": CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT,
@@ -14134,84 +8605,16 @@ fn validate_console_launch_visibility(params: &ActLaunchParams) -> Result<(), Er
 
 struct SpawnedLaunchChild {
     pid: u32,
-    process_creation_time_100ns: Option<u64>,
-    process_job: Option<OwnedProcessJob>,
     desktop_lease: Option<LaunchDesktopLease>,
-    terminal_capture: Option<LaunchTerminalCapture>,
-}
-
-#[derive(Debug)]
-pub(crate) struct LaunchTerminalCapture {
-    pub control: LaunchTerminalCaptureControl,
-    pub process_wait: tokio::task::JoinHandle<LaunchProcessExitObservation>,
-    pub stdout: tokio::task::JoinHandle<ActLaunchOutputArtifactReadback>,
-    pub stderr: tokio::task::JoinHandle<ActLaunchOutputArtifactReadback>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct LaunchTerminalCaptureControl {
-    termination_cause: Arc<Mutex<Option<String>>>,
-}
-
-impl LaunchTerminalCaptureControl {
-    pub(crate) fn mark_termination_cause(&self, cause: &str) -> Result<(), String> {
-        let mut guard = self
-            .termination_cause
-            .lock()
-            .map_err(|_error| "launch terminal capture control lock poisoned".to_owned())?;
-        if guard.is_none() {
-            *guard = Some(cause.to_owned());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn termination_cause(&self) -> Result<Option<String>, String> {
-        self.termination_cause
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_error| "launch terminal capture control lock poisoned".to_owned())
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LaunchProcessExitObservation {
-    pub status: String,
-    pub exit_code: Option<u32>,
-    pub process_creation_time_100ns: u64,
-    pub process_exit_time_100ns: Option<u64>,
-    pub completed_at_unix_ms: Option<u64>,
-    pub error_message: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActLaunchOutputArtifactReadback {
-    pub state: String,
-    pub observed_bytes: u64,
-    pub observed_sha256: String,
-    pub captured_bytes: u64,
-    pub captured_sha256: String,
-    pub truncated: bool,
-    pub preview_bytes: u64,
-    pub preview_base64: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub utf8_preview: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_path: Option<String>,
-    pub artifact_verified: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
 }
 
 fn spawn_launch_child(
     params: &ActLaunchParams,
     desktop: Option<PreparedLaunchDesktop>,
-    session_owned: bool,
 ) -> Result<SpawnedLaunchChild, ErrorData> {
     #[cfg(windows)]
     {
-        return spawn_windows_child(params, desktop, session_owned);
+        return spawn_windows_child(params, desktop);
     }
 
     #[cfg(not(windows))]
@@ -14257,17 +8660,9 @@ fn spawn_launch_child(
                 }),
             )
         })?;
-        let process_job = if session_owned {
-            Some(assign_owned_process_job(child.id(), "act_launch", None)?)
-        } else {
-            None
-        };
         Ok(SpawnedLaunchChild {
             pid: child.id(),
-            process_creation_time_100ns: None,
-            process_job,
             desktop_lease: None,
-            terminal_capture: None,
         })
     }
 }
@@ -14321,83 +8716,15 @@ fn launch_target_is_absolute_windows_path(target: &str) -> bool {
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-struct OwnedLaunchWindowsHandle {
-    handle: Option<windows::Win32::Foundation::HANDLE>,
-    role: &'static str,
-}
-
-#[cfg(windows)]
-unsafe impl Send for OwnedLaunchWindowsHandle {}
-
-#[cfg(windows)]
-impl OwnedLaunchWindowsHandle {
-    const fn new(handle: windows::Win32::Foundation::HANDLE, role: &'static str) -> Self {
-        Self {
-            handle: Some(handle),
-            role,
-        }
-    }
-
-    fn raw(&self) -> windows::Win32::Foundation::HANDLE {
-        self.handle.unwrap_or_default()
-    }
-
-    fn take(&mut self) -> windows::Win32::Foundation::HANDLE {
-        self.handle.take().unwrap_or_default()
-    }
-
-    fn close_checked(&mut self) -> Result<(), String> {
-        let Some(handle) = self.handle else {
-            return Ok(());
-        };
-        unsafe { windows::Win32::Foundation::CloseHandle(handle) }
-            .map_err(|error| format!("CloseHandle({}) failed: {error}", self.role))?;
-        self.handle = None;
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for OwnedLaunchWindowsHandle {
-    fn drop(&mut self) {
-        if let Err(error) = self.close_checked() {
-            synapse_action::record_operator_panic_safety_incident();
-            tracing::error!(
-                code = "M4_ACT_LAUNCH_HANDLE_CLOSE_FAILED",
-                role = self.role,
-                detail = %error,
-                "act_launch could not close an owned Windows handle"
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
 fn spawn_windows_child(
     params: &ActLaunchParams,
     desktop: Option<PreparedLaunchDesktop>,
-    session_owned: bool,
 ) -> Result<SpawnedLaunchChild, ErrorData> {
     use windows::{
         Win32::{
-            Foundation::{
-                GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
-            },
-            Security::SECURITY_ATTRIBUTES,
-            Storage::FileSystem::{
-                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-                OPEN_EXISTING,
-            },
-            System::{
-                Pipes::CreatePipe,
-                Threading::{
-                    CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
-                    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-                    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                    PROCESS_INFORMATION, ResumeThread, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES,
-                    STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
-                },
+            Foundation::CloseHandle,
+            System::Threading::{
+                CreateProcessW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
             },
         },
         core::{PCWSTR, PWSTR},
@@ -14410,16 +8737,7 @@ fn spawn_windows_child(
         .as_ref()
         .map(|desktop| wide_null(desktop.startup_desktop()));
     let environment = launch_environment_block(params)?;
-    let capture_limit = params
-        .output
-        .as_ref()
-        .and_then(ActLaunchOutput::capture_max_bytes_per_stream);
-    let startup_info_cb = u32::try_from(if capture_limit.is_some() {
-        std::mem::size_of::<STARTUPINFOEXW>()
-    } else {
-        std::mem::size_of::<STARTUPINFOW>()
-    })
-    .map_err(|error| {
+    let startup_info_cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).map_err(|error| {
         launch_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_launch failed to prepare console startup info: {error}"),
@@ -14431,7 +8749,7 @@ fn spawn_windows_child(
         )
     })?;
 
-    let mut startup_info = STARTUPINFOW {
+    let startup_info = STARTUPINFOW {
         cb: startup_info_cb,
         lpDesktop: desktop_wide
             .as_ref()
@@ -14441,322 +8759,34 @@ fn spawn_windows_child(
         ..Default::default()
     };
 
-    let inheritable_security = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(|error| {
-            launch_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("act_launch failed to size inherited-handle security attributes: {error}"),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "reason": "launch_security_attributes_size_overflow",
-                }),
-            )
-        })?,
-        lpSecurityDescriptor: core::ptr::null_mut(),
-        bInheritHandle: true.into(),
-    };
-
-    let mut stdout_read = None;
-    let mut stdout_write = None;
-    let mut stderr_read = None;
-    let mut stderr_write = None;
-    let mut stdin_null = None;
-    let mut attribute_storage = Vec::<usize>::new();
-    let mut attribute_list = None;
-    let mut startup_info_ex = STARTUPINFOEXW::default();
-    let mut inherited_handles = None;
-
-    if capture_limit.is_some() {
-        let mut read = HANDLE::default();
-        let mut write = HANDLE::default();
-        unsafe {
-            CreatePipe(
-                &raw mut read,
-                &raw mut write,
-                Some(&raw const inheritable_security),
-                0,
-            )
-        }
-        .map_err(|error| {
-            launch_capture_prepare_error(params, "stdout_pipe_create_failed", error)
-        })?;
-        let read_handle = OwnedLaunchWindowsHandle::new(read, "stdout_read");
-        let write_handle = OwnedLaunchWindowsHandle::new(write, "stdout_write");
-        unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.map_err(
-            |error| {
-                launch_capture_prepare_error(params, "stdout_read_inheritance_clear_failed", error)
-            },
-        )?;
-        stdout_read = Some(read_handle);
-        stdout_write = Some(write_handle);
-
-        read = HANDLE::default();
-        write = HANDLE::default();
-        unsafe {
-            CreatePipe(
-                &raw mut read,
-                &raw mut write,
-                Some(&raw const inheritable_security),
-                0,
-            )
-        }
-        .map_err(|error| {
-            launch_capture_prepare_error(params, "stderr_pipe_create_failed", error)
-        })?;
-        let read_handle = OwnedLaunchWindowsHandle::new(read, "stderr_read");
-        let write_handle = OwnedLaunchWindowsHandle::new(write, "stderr_write");
-        unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.map_err(
-            |error| {
-                launch_capture_prepare_error(params, "stderr_read_inheritance_clear_failed", error)
-            },
-        )?;
-        stderr_read = Some(read_handle);
-        stderr_write = Some(write_handle);
-
-        let nul = unsafe {
-            CreateFileW(
-                windows::core::w!("NUL"),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                Some(&raw const inheritable_security),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        }
-        .map_err(|error| launch_capture_prepare_error(params, "stdin_null_open_failed", error))?;
-        stdin_null = Some(OwnedLaunchWindowsHandle::new(nul, "stdin_null"));
-
-        let inherited_handles = inherited_handles.insert([
-            stdin_null
-                .as_ref()
-                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
-            stdout_write
-                .as_ref()
-                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
-            stderr_write
-                .as_ref()
-                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
-        ]);
-        startup_info.dwFlags |= STARTF_USESTDHANDLES;
-        startup_info.hStdInput = inherited_handles[0];
-        startup_info.hStdOutput = inherited_handles[1];
-        startup_info.hStdError = inherited_handles[2];
-
-        let mut attribute_bytes = 0_usize;
-        let _ = unsafe {
-            InitializeProcThreadAttributeList(None, 1, Some(0), &raw mut attribute_bytes)
-        };
-        if attribute_bytes == 0 {
-            return Err(launch_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "act_launch could not size the strict inherited-handle allowlist",
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "reason": "launch_handle_allowlist_size_unavailable",
-                    "target": params.target,
-                }),
-            ));
-        }
-        let word_size = std::mem::size_of::<usize>();
-        attribute_storage.resize(attribute_bytes.div_ceil(word_size), 0);
-        let list = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_storage.as_mut_ptr().cast());
-        unsafe {
-            InitializeProcThreadAttributeList(Some(list), 1, Some(0), &raw mut attribute_bytes)
-        }
-        .map_err(|error| {
-            launch_capture_prepare_error(params, "launch_handle_allowlist_initialize_failed", error)
-        })?;
-        attribute_list = Some(list);
-        unsafe {
-            UpdateProcThreadAttribute(
-                list,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(inherited_handles.as_ptr().cast()),
-                std::mem::size_of_val(inherited_handles),
-                None,
-                None,
-            )
-        }
-        .map_err(|error| {
-            launch_capture_prepare_error(params, "launch_handle_allowlist_update_failed", error)
-        })?;
-        startup_info_ex.StartupInfo = startup_info;
-        startup_info_ex.lpAttributeList = list;
-    }
-
     let mut process_info = PROCESS_INFORMATION::default();
-    debug_assert_eq!(inherited_handles.is_some(), capture_limit.is_some());
     let current_dir = current_dir_wide
         .as_ref()
         .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
 
-    let mut creation_flags = windows_launch_creation_flags(params);
-    if session_owned {
-        creation_flags |= CREATE_SUSPENDED;
-    }
-    if capture_limit.is_some() {
-        creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
-    }
-    let startup_info_pointer = if capture_limit.is_some() {
-        (&raw const startup_info_ex).cast::<STARTUPINFOW>()
-    } else {
-        &raw const startup_info
-    };
     let result = unsafe {
         CreateProcessW(
             PCWSTR::null(),
             Some(PWSTR(command_line_wide.as_mut_ptr())),
             None,
             None,
-            capture_limit.is_some(),
-            creation_flags,
+            false,
+            windows_launch_creation_flags(params),
             Some(environment.as_ptr().cast()),
             current_dir,
-            startup_info_pointer,
+            &raw const startup_info,
             &raw mut process_info,
         )
     };
 
-    if let Some(list) = attribute_list.take() {
-        unsafe { DeleteProcThreadAttributeList(list) };
-    }
-
     match result {
         Ok(()) => {
             let pid = process_info.dwProcessId;
-            let mut process_handle =
-                OwnedLaunchWindowsHandle::new(process_info.hProcess, "process");
-            let mut thread_handle =
-                OwnedLaunchWindowsHandle::new(process_info.hThread, "primary_thread");
-            stdout_write.take();
-            stderr_write.take();
-            stdin_null.take();
-
-            let process_creation_time_100ns = match windows_process_times(process_handle.raw()) {
-                Ok(times) => times.0,
-                Err(error) => {
-                    let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
-                    return Err(launch_tool_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "act_launch could not read exact process creation identity for pid {pid}: {error}"
-                        ),
-                        json!({
-                            "code": error_codes::TOOL_INTERNAL_ERROR,
-                            "reason": "launch_process_identity_unavailable",
-                            "pid": pid,
-                            "detail": error,
-                            "cleanup": cleanup,
-                        }),
-                    ));
-                }
-            };
-            let process_job = if session_owned {
-                match assign_owned_process_job(pid, "act_launch", None) {
-                    Ok(job) => Some(job),
-                    Err(error) => {
-                        let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
-                        return Err(launch_tool_error(
-                            error_codes::TOOL_INTERNAL_ERROR,
-                            format!(
-                                "act_launch could not assign suspended pid {pid} to its session Job Object: {}",
-                                error.message
-                            ),
-                            json!({
-                                "code": error_codes::TOOL_INTERNAL_ERROR,
-                                "reason": "launch_suspended_job_assignment_failed",
-                                "pid": pid,
-                                "source_error": error.data,
-                                "cleanup": cleanup,
-                            }),
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            if session_owned && unsafe { ResumeThread(thread_handle.raw()) } == u32::MAX {
-                let error = windows::core::Error::from_thread();
-                let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
-                return Err(launch_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("act_launch could not resume contained pid {pid}: {error}"),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "launch_contained_process_resume_failed",
-                        "pid": pid,
-                        "cleanup": cleanup,
-                    }),
-                ));
-            }
-            if let Err(error) = thread_handle.close_checked() {
-                let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
-                return Err(launch_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "act_launch could not close the primary thread handle for pid {pid}: {error}"
-                    ),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "launch_primary_thread_handle_close_failed",
-                        "pid": pid,
-                        "cleanup": cleanup,
-                    }),
-                ));
-            }
-
-            let terminal_capture = capture_limit.map(|max_bytes| {
-                let process =
-                    OwnedLaunchWindowsHandle::new(process_handle.take(), "captured_process_wait");
-                let stdout = OwnedLaunchWindowsHandle::new(
-                    stdout_read
-                        .as_mut()
-                        .map(OwnedLaunchWindowsHandle::take)
-                        .unwrap_or_default(),
-                    "stdout_read",
-                );
-                let stderr = OwnedLaunchWindowsHandle::new(
-                    stderr_read
-                        .as_mut()
-                        .map(OwnedLaunchWindowsHandle::take)
-                        .unwrap_or_default(),
-                    "stderr_read",
-                );
-                let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-                LaunchTerminalCapture {
-                    control: LaunchTerminalCaptureControl::default(),
-                    process_wait: tokio::task::spawn_blocking(move || {
-                        wait_windows_launch_process(process, process_creation_time_100ns)
-                    }),
-                    stdout: tokio::task::spawn_blocking(move || {
-                        read_and_publish_launch_output(stdout, max_bytes, "stdout")
-                    }),
-                    stderr: tokio::task::spawn_blocking(move || {
-                        read_and_publish_launch_output(stderr, max_bytes, "stderr")
-                    }),
-                }
-            });
-            if terminal_capture.is_none() {
-                process_handle.close_checked().map_err(|error| {
-                    launch_tool_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("act_launch could not close fire-and-forget process handle for pid {pid}: {error}"),
-                        json!({
-                            "code": error_codes::TOOL_INTERNAL_ERROR,
-                            "reason": "launch_fire_and_forget_process_handle_close_failed",
-                            "pid": pid,
-                        }),
-                    )
-                })?;
-            }
+            let _ = unsafe { CloseHandle(process_info.hThread) };
+            let _ = unsafe { CloseHandle(process_info.hProcess) };
             Ok(SpawnedLaunchChild {
                 pid,
-                process_creation_time_100ns: Some(process_creation_time_100ns),
-                process_job,
                 desktop_lease: desktop.map(|desktop| desktop.lease),
-                terminal_capture,
             })
         }
         Err(error) => Err(launch_tool_error(
@@ -14773,314 +8803,6 @@ fn spawn_windows_child(
             }),
         )),
     }
-}
-
-#[cfg(windows)]
-fn launch_capture_prepare_error(
-    params: &ActLaunchParams,
-    reason: &'static str,
-    error: windows::core::Error,
-) -> ErrorData {
-    launch_tool_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        format!("act_launch could not prepare exact terminal/output capture: {error}"),
-        json!({
-            "code": error_codes::TOOL_INTERNAL_ERROR,
-            "reason": reason,
-            "target": params.target,
-            "detail": error.to_string(),
-            "remediation": "inspect the named Win32 pipe/handle-list failure and daemon logs; the process was not launched",
-        }),
-    )
-}
-
-#[cfg(windows)]
-fn windows_filetime_100ns(filetime: windows::Win32::Foundation::FILETIME) -> u64 {
-    (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
-}
-
-#[cfg(windows)]
-fn windows_filetime_unix_ms(filetime_100ns: u64) -> Result<u64, String> {
-    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
-    filetime_100ns
-        .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
-        .map(|ticks| ticks / 10_000)
-        .ok_or_else(|| {
-            format!(
-                "Windows FILETIME {filetime_100ns} precedes the Unix epoch {WINDOWS_TO_UNIX_EPOCH_100NS}"
-            )
-        })
-}
-
-#[cfg(windows)]
-fn windows_process_times(
-    process: windows::Win32::Foundation::HANDLE,
-) -> Result<(u64, u64), String> {
-    use windows::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
-
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    unsafe {
-        GetProcessTimes(
-            process,
-            &raw mut creation,
-            &raw mut exit,
-            &raw mut kernel,
-            &raw mut user,
-        )
-    }
-    .map_err(|error| format!("GetProcessTimes failed: {error}"))?;
-    Ok((
-        windows_filetime_100ns(creation),
-        windows_filetime_100ns(exit),
-    ))
-}
-
-#[cfg(windows)]
-fn terminate_wait_windows_launch_process(process: windows::Win32::Foundation::HANDLE) -> Value {
-    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-
-    let termination = unsafe { TerminateProcess(process, 1) }
-        .map(|()| "terminated".to_owned())
-        .unwrap_or_else(|error| format!("TerminateProcess failed: {error}"));
-    let wait = unsafe { WaitForSingleObject(process, 5_000) };
-    json!({
-        "termination": termination,
-        "wait_result": format!("0x{:08x}", wait.0),
-        "wait_object_0": wait == windows::Win32::Foundation::WAIT_OBJECT_0,
-    })
-}
-
-#[cfg(windows)]
-fn wait_windows_launch_process(
-    mut owned: OwnedLaunchWindowsHandle,
-    expected_creation_time_100ns: u64,
-) -> LaunchProcessExitObservation {
-    use windows::Win32::{
-        Foundation::{WAIT_FAILED, WAIT_OBJECT_0},
-        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-    };
-
-    let process = owned.raw();
-    let wait = unsafe { WaitForSingleObject(process, u32::MAX) };
-    let mut errors = Vec::new();
-    let mut exit_code = None;
-    let mut exit_time_100ns = None;
-    let mut completed_at_unix_ms = None;
-    if wait == WAIT_OBJECT_0 {
-        let mut observed_exit_code = 0_u32;
-        match unsafe { GetExitCodeProcess(process, &raw mut observed_exit_code) } {
-            Ok(()) => exit_code = Some(observed_exit_code),
-            Err(error) => errors.push(format!(
-                "GetExitCodeProcess after signaled wait failed: {error}"
-            )),
-        }
-        match windows_process_times(process) {
-            Ok((actual_creation, actual_exit)) => {
-                if actual_creation != expected_creation_time_100ns {
-                    errors.push(format!(
-                        "retained process HANDLE creation identity changed: expected={expected_creation_time_100ns} actual={actual_creation}"
-                    ));
-                }
-                exit_time_100ns = Some(actual_exit);
-                match windows_filetime_unix_ms(actual_exit) {
-                    Ok(value) => completed_at_unix_ms = Some(value),
-                    Err(error) => errors.push(error),
-                }
-            }
-            Err(error) => errors.push(error),
-        }
-    } else if wait == WAIT_FAILED {
-        errors.push(format!(
-            "WaitForSingleObject(process) failed: {}",
-            windows::core::Error::from_thread()
-        ));
-    } else {
-        errors.push(format!(
-            "WaitForSingleObject(process) returned unexpected wait code 0x{:08x}",
-            wait.0
-        ));
-    }
-    if let Err(error) = owned.close_checked() {
-        errors.push(error);
-    }
-    LaunchProcessExitObservation {
-        status: if errors.is_empty() {
-            "observed".to_owned()
-        } else {
-            "unevaluable".to_owned()
-        },
-        exit_code,
-        process_creation_time_100ns: expected_creation_time_100ns,
-        process_exit_time_100ns: exit_time_100ns,
-        completed_at_unix_ms,
-        error_message: (!errors.is_empty()).then(|| errors.join("; ")),
-    }
-}
-
-#[cfg(windows)]
-fn read_and_publish_launch_output(
-    mut owned: OwnedLaunchWindowsHandle,
-    max_bytes: usize,
-    stream: &'static str,
-) -> ActLaunchOutputArtifactReadback {
-    use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
-
-    let handle = owned.take();
-    let mut file = unsafe { fs::File::from_raw_handle(handle.0.cast() as RawHandle) };
-    let mut observed_hasher = Sha256::new();
-    let mut captured = Vec::with_capacity(max_bytes.min(64 * 1024));
-    let mut observed_bytes = 0_u64;
-    let mut read_error = None;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                observed_hasher.update(&buffer[..read]);
-                observed_bytes =
-                    observed_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-                let remaining = max_bytes.saturating_sub(captured.len());
-                let keep = read.min(remaining);
-                captured.extend_from_slice(&buffer[..keep]);
-            }
-            Err(error) => {
-                read_error = Some(format!(
-                    "ReadFile({stream}) failed after {observed_bytes} bytes: {error}"
-                ));
-                break;
-            }
-        }
-    }
-    let raw_handle = file.into_raw_handle();
-    let close_error = unsafe {
-        windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
-            raw_handle.cast(),
-        ))
-    }
-    .err()
-    .map(|error| format!("CloseHandle({stream}_read) failed: {error}"));
-    let observed_sha256 = hex_encode_lower(&observed_hasher.finalize());
-    let captured_sha256 = sha256_hex(&captured);
-    let captured_bytes = u64::try_from(captured.len()).unwrap_or(u64::MAX);
-    let preview = &captured[..captured.len().min(LAUNCH_OUTPUT_PREVIEW_MAX_BYTES)];
-    let publish = publish_launch_output_artifact(&captured, &captured_sha256);
-    let (artifact_path, artifact_verified, publish_error) = match publish {
-        Ok(path) => (Some(path.display().to_string()), true, None),
-        Err(error) => (None, false, Some(error)),
-    };
-    let mut errors = Vec::new();
-    if let Some(error) = read_error {
-        errors.push(error);
-    }
-    if let Some(error) = close_error {
-        errors.push(error);
-    }
-    if let Some(error) = publish_error {
-        errors.push(error);
-    }
-    let state = if errors.is_empty() {
-        "complete"
-    } else if !artifact_verified {
-        "artifact_publish_failed"
-    } else {
-        "read_failed"
-    };
-    ActLaunchOutputArtifactReadback {
-        state: state.to_owned(),
-        observed_bytes,
-        observed_sha256,
-        captured_bytes,
-        captured_sha256,
-        truncated: observed_bytes > captured_bytes || !errors.is_empty(),
-        preview_bytes: u64::try_from(preview.len()).unwrap_or(u64::MAX),
-        preview_base64: BASE64_STANDARD.encode(preview),
-        utf8_preview: std::str::from_utf8(preview).ok().map(ToOwned::to_owned),
-        artifact_path,
-        artifact_verified,
-        error_message: (!errors.is_empty()).then(|| errors.join("; ")),
-    }
-}
-
-#[cfg(windows)]
-fn launch_output_artifact_root_dir() -> Result<PathBuf, String> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "LOCALAPPDATA is missing/empty; cannot publish captured process output".to_owned()
-        })?;
-    let root = PathBuf::from(local_app_data)
-        .join("Synapse")
-        .join("process-output")
-        .join("sha256");
-    if !root.is_absolute() {
-        return Err(format!(
-            "captured process output root is not absolute: {}",
-            root.display()
-        ));
-    }
-    Ok(root)
-}
-
-#[cfg(windows)]
-fn publish_launch_output_artifact(bytes: &[u8], sha256: &str) -> Result<PathBuf, String> {
-    let directory = launch_output_artifact_root_dir()?.join(&sha256[..2]);
-    fs::create_dir_all(&directory).map_err(|error| {
-        format!(
-            "create captured process output artifact directory {} failed: {error}",
-            directory.display()
-        )
-    })?;
-    let path = directory.join(format!("{sha256}.bin"));
-    if !path.exists() {
-        let temporary = directory.join(format!(".{sha256}.{}.tmp", uuid::Uuid::new_v4().simple()));
-        let write_result = (|| -> Result<(), String> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|error| format!("create {} failed: {error}", temporary.display()))?;
-            file.write_all(bytes)
-                .map_err(|error| format!("write {} failed: {error}", temporary.display()))?;
-            file.sync_all()
-                .map_err(|error| format!("fsync {} failed: {error}", temporary.display()))?;
-            drop(file);
-            fs::rename(&temporary, &path).map_err(|error| {
-                format!(
-                    "atomic publish {} -> {} failed: {error}",
-                    temporary.display(),
-                    path.display()
-                )
-            })?;
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary);
-            if !path.exists() {
-                return Err(error);
-            }
-        }
-    }
-    let readback = fs::read(&path).map_err(|error| {
-        format!(
-            "independent artifact readback {} failed: {error}",
-            path.display()
-        )
-    })?;
-    let readback_sha256 = sha256_hex(&readback);
-    if readback != bytes || readback_sha256 != sha256 {
-        return Err(format!(
-            "content-addressed process output readback mismatch path={} expected_bytes={} actual_bytes={} expected_sha256={} actual_sha256={}",
-            path.display(),
-            bytes.len(),
-            readback.len(),
-            sha256,
-            readback_sha256
-        ));
-    }
-    Ok(path)
 }
 
 #[derive(Debug)]
@@ -15770,1244 +9492,52 @@ pub(crate) fn launch_child_environment(
     Ok(env.into_values().collect())
 }
 
-/// Builds the base environment every Synapse-spawned child receives.
-///
-/// # Why this is full inheritance and not an allow-list (#768)
-///
-/// `CreateProcess` with `lpEnvironment = NULL` gives a child a verbatim copy of
-/// the parent block, so *faithful inheritance* is what "a normal Windows
-/// process" means. `act_run_shell`/`act_launch` deliberately call `env_clear()`
-/// so the block is deterministic and auditable, which means this function has to
-/// reproduce that baseline explicitly.
-///
-/// It used to copy a hand-maintained 26-key allow-list out of the daemon
-/// environment. Every standard variable outside that list was silently dropped
-/// even when the daemon itself had it — `OS`, `PROCESSOR_ARCHITECTURE`,
-/// `NUMBER_OF_PROCESSORS`, `COMPUTERNAME`, `HOMEDRIVE`, `HOMEPATH`, `PUBLIC`,
-/// `ALLUSERSPROFILE`, `SESSIONNAME`, `LOGONSERVER`, `PSModulePath`, `DriverData`
-/// and every user tool/credential variable. That is the #768 class defect and
-/// the cause of its 2026-07-23 recurrence: a launcher guarded by
-/// `if ($env:OS -ne "Windows_NT")` refused inside a Synapse shell job because
-/// `OS` was never on the list, while `env: {"OS":"Windows_NT"}` per call worked.
-///
-/// The layering mirrors what winlogon + `CreateEnvironmentBlock` do at logon:
-///
-/// 1. every variable of the daemon process (faithful inheritance),
-/// 2. every value under `HKLM\...\Session Manager\Environment` then
-///    `HKCU\Environment` — this repairs a daemon whose own block is stale or
-///    impoverished (e.g. a Scheduled-Task launch, or persisted variables added
-///    after the daemon started), which inheritance alone cannot fix,
-/// 3. deterministic Windows standard/profile derivations.
-///
-/// Callers then run [`validate_child_base_environment`], which fails the spawn
-/// closed and names any required variable that still could not be resolved.
 fn child_base_environment() -> BTreeMap<String, (String, String)> {
     let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for (raw_key, raw_value) in std::env::vars_os() {
-        let (Some(key), Some(value)) = (raw_key.to_str(), raw_value.to_str()) else {
-            tracing::error!(
-                code = "M4_CHILD_ENV_INHERIT_NON_UTF8",
-                key = %raw_key.to_string_lossy(),
-                "daemon environment variable is not valid UTF-8 and cannot be forwarded to child processes; re-set it with a UTF-8 value via setx or HKCU\\Environment"
+    for key in PROCESS_BASE_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(
+                key.to_ascii_uppercase(),
+                (key.to_owned(), value.to_string_lossy().into_owned()),
             );
-            continue;
-        };
-        // Windows keeps hidden per-drive cwd entries (`=C:=C:\dir`) and an
-        // `=ExitCode` slot in the block. They are not inheritable variables and
-        // an `=` in a name would corrupt the child's environment block.
-        if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
-            continue;
         }
-        env.insert(key.to_ascii_uppercase(), (key.to_owned(), value.to_owned()));
     }
-    let inherited = env.len();
     add_windows_registry_environment(&mut env);
-    let after_registry = env.len();
     add_windows_standard_environment(&mut env);
-    let after_standard = env.len();
     add_windows_profile_environment(&mut env);
-    // #768 stayed open because every existing signal was consistent with a
-    // *complete* map (validation passed, the registry merge logged) while the
-    // spawned child provably had 28 variables. Per-layer counts plus the exact
-    // key list make the construction side directly readable, so the next
-    // measurement can say whether the map or the delivery is short.
-    tracing::info!(
-        code = "M4_CHILD_ENV_LAYERS",
-        inherited,
-        after_registry,
-        after_standard,
-        total = env.len(),
-        keys = %env.keys().cloned().collect::<Vec<_>>().join(","),
-        "constructed child process environment layer by layer"
-    );
     env
 }
 
-/// Every variable a normally-launched Windows process is guaranteed to have and
-/// that real tooling reads. `OS`, `PROCESSOR_ARCHITECTURE` and
-/// `NUMBER_OF_PROCESSORS` come from HKLM Session Manager; the identity and home
-/// variables come from the logon block or the derivations in
-/// `add_windows_standard_environment`. None of them may be quietly absent: a
-/// child missing them is the #768 failure mode (a launcher gated on
-/// `$env:OS -eq 'Windows_NT'` refusing to run). Checked twice — on the
-/// constructed map and again on the map actually delivered to `CreateProcess`.
-const REQUIRED_CHILD_ENVIRONMENT_KEYS: [&str; 22] = [
-    "PATH",
-    "PATHEXT",
-    "ComSpec",
-    "SystemDrive",
-    "SystemRoot",
-    "windir",
-    "OS",
-    "USERNAME",
-    "USERPROFILE",
-    "COMPUTERNAME",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "TEMP",
-    "TMP",
-    "ALLUSERSPROFILE",
-    "ProgramData",
-    "ProgramFiles",
-    "PUBLIC",
-    "PROCESSOR_ARCHITECTURE",
-    "NUMBER_OF_PROCESSORS",
-];
-
-fn shell_child_environment(
-    command_name: &str,
-    args: &[String],
-    requested_env: &BTreeMap<String, String>,
-    effective_working_dir: Option<&str>,
-    context: Option<&ShellExecutionContext>,
-) -> Result<BTreeMap<String, String>, ErrorData> {
-    let mut env = child_base_environment();
-    ensure_child_temp_environment(&mut env);
-    validate_child_base_environment(&env, "act_run_shell")?;
-    validate_configured_host_build_environment(&env, requested_env, command_name, args)?;
-    apply_requested_shell_environment(&mut env, requested_env);
-    apply_shell_session_environment(&mut env, effective_working_dir, context);
-    let delivered: BTreeMap<String, String> = env.into_values().collect();
-    validate_delivered_child_environment(&delivered, "act_run_shell")?;
-    Ok(delivered)
-}
-
-/// Re-checks the required variables on the exact map handed to `Command::env`.
-///
-/// `validate_child_base_environment` runs on the intermediate
-/// `UPPERCASE -> (original_key, value)` map, several transforms before the
-/// flattened map the spawn actually delivers. #768 stayed open through a state
-/// where that first validation *passed* while the spawned child provably had
-/// 28 of ~85 variables — construction and delivery disagreed, and nothing
-/// checked the side that matters. Validating the delivered map closes that
-/// gap: any future divergence fails the spawn by name instead of shipping a
-/// child that a normally-launched Windows process would never see.
-fn validate_delivered_child_environment(
-    delivered: &BTreeMap<String, String>,
-    surface: &'static str,
-) -> Result<(), ErrorData> {
-    if !cfg!(windows) {
-        return Ok(());
-    }
-    let missing: Vec<&str> = REQUIRED_CHILD_ENVIRONMENT_KEYS
-        .into_iter()
-        .filter(|key| {
-            !delivered
-                .iter()
-                .any(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
-        })
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    tracing::error!(
-        code = "M4_CHILD_ENV_DELIVERY_INCOMPLETE",
-        surface,
-        missing = ?missing,
-        delivered = delivered.len(),
-        daemon_pid = std::process::id(),
-        "constructed child environment passed validation but the delivered map is missing required Windows variables"
-    );
-    let message = format!(
-        "{surface} refused the spawn because the delivered child environment lost required Windows variables between construction and CreateProcess: missing=[{}] delivered_count={}. {CHILD_ENV_INCOMPLETE_REMEDIATION}",
-        missing.join(", "),
-        delivered.len()
-    );
-    let data = json!({
-        "code": error_codes::ACTION_TARGET_INVALID,
-        "reason": "child_environment_delivery_incomplete",
-        "surface": surface,
-        "missing": missing,
-        "delivered_count": delivered.len(),
-        "daemon_pid": std::process::id(),
-        "remediation": CHILD_ENV_INCOMPLETE_REMEDIATION,
-    });
-    if surface == "act_run_shell" {
-        return Err(shell_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            message,
-            data,
-        ));
-    }
-    Err(launch_tool_error(
-        error_codes::ACTION_TARGET_INVALID,
-        message,
-        data,
-    ))
-}
-
-fn apply_requested_shell_environment(
-    env: &mut BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-) {
-    for (key, value) in requested_env {
-        env.insert(key.to_ascii_uppercase(), (key.clone(), value.clone()));
-    }
-}
-
-fn shell_job_environment_diagnostics(
-    params: &ActRunShellStartParams,
-    context: Option<&ShellExecutionContext>,
-) -> Vec<ActRunShellEnvironmentDiagnostic> {
-    let mut env = child_base_environment();
-    ensure_child_temp_environment(&mut env);
-    apply_requested_shell_environment(&mut env, &params.env);
-    apply_shell_session_environment(&mut env, params.working_dir.as_deref(), context);
-    let mut diagnostics = configured_host_environment_diagnostics(&env, &params.env);
-    if let Some(skip) = cuda_precondition_skip_diagnostic(&env, &params.env, params) {
-        diagnostics.push(skip);
-    }
-    log_shell_environment_diagnostics(&diagnostics);
-    diagnostics
-}
-
-/// Captures only non-secret, point-in-time shell preconditions for the command
-/// audit `before` state. The snapshot is derived from the same child-environment
-/// construction and configured-host diagnostics used by execution; values are
-/// deliberately omitted so causal measurement cannot become credential
-/// storage.
-pub fn run_shell_precondition_snapshot(
-    params: &ActRunShellParams,
-    context: Option<&ShellExecutionContext>,
-) -> Result<Value, ErrorData> {
-    shell_precondition_snapshot(
-        &params.env,
-        params.working_dir.as_deref(),
-        context,
-        &params.command,
-        &params.args,
-    )
-}
-
-/// Durable-shell counterpart to [`run_shell_precondition_snapshot`].
-pub fn run_shell_start_precondition_snapshot(
-    params: &ActRunShellStartParams,
-    context: Option<&ShellExecutionContext>,
-) -> Result<Value, ErrorData> {
-    shell_precondition_snapshot(
-        &params.env,
-        params.working_dir.as_deref(),
-        context,
-        &params.command,
-        &params.args,
-    )
-}
-
-fn shell_precondition_snapshot(
-    requested_env: &BTreeMap<String, String>,
-    effective_working_dir: Option<&str>,
-    context: Option<&ShellExecutionContext>,
-    command: &str,
-    args: &[String],
-) -> Result<Value, ErrorData> {
-    let resource_prestate = shell_resource_prestate(effective_working_dir)?;
-    let mut env = child_base_environment();
-    ensure_child_temp_environment(&mut env);
-    apply_requested_shell_environment(&mut env, requested_env);
-    apply_shell_session_environment(&mut env, effective_working_dir, context);
-    let delivered: BTreeMap<String, String> = env.clone().into_values().collect();
-    let executable = shell_executable_preflight(command, effective_working_dir, &delivered)?;
-    let required_missing: Vec<&str> = if cfg!(windows) {
-        REQUIRED_CHILD_ENVIRONMENT_KEYS
-            .into_iter()
-            .filter(|key| {
-                !delivered
-                    .iter()
-                    .any(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut diagnostics = configured_host_environment_diagnostics(&env, requested_env);
-    let start_params = ActRunShellStartParams {
-        command: command.to_owned(),
-        args: args.to_vec(),
-        working_dir: effective_working_dir.map(ToOwned::to_owned),
-        env: requested_env.clone(),
-        timeout_ms: None,
-        job_id: None,
-    };
-    if let Some(skip) = cuda_precondition_skip_diagnostic(&env, requested_env, &start_params) {
-        diagnostics.push(skip);
-    }
-    let diagnostic_facts: Vec<Value> = diagnostics
-        .into_iter()
-        .map(|diagnostic| {
-            json!({
-                "variable": diagnostic.variable,
-                "diagnostic_code": diagnostic.diagnostic_code,
-                "severity": diagnostic.severity,
-                "explicit_override": diagnostic.explicit_override,
-                "source_of_truth": diagnostic.source_of_truth,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "schema_version": 3,
-        "source_of_truth": "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata + queried immediate Windows Job aggregate committed memory + OS process-private commit/working-set telemetry/system-memory/target-volume counters",
-        "platform": if cfg!(windows) { "windows" } else { "non_windows" },
-        "delivered_environment_count": delivered.len(),
-        "required_environment_count": if cfg!(windows) { REQUIRED_CHILD_ENVIRONMENT_KEYS.len() } else { 0 },
-        "required_environment_missing": required_missing,
-        "requested_environment_key_count": requested_env.len(),
-        "working_directory_present": effective_working_dir.is_some(),
-        "working_directory_exists": effective_working_dir.is_some_and(|path| Path::new(path).is_dir()),
-        "configured_host_diagnostics": diagnostic_facts,
-        "requested_command_path_class": shell_command_path_class(command),
-        "spawn_command_path_class": executable.spawn_command_path_class,
-        "executable_resolution": executable.state,
-        "executable_resolution_source": executable.source,
-        "resolved_path_sha256": executable.resolved_path_sha256,
-        "resource_prestate": resource_prestate,
-        "secret_values_persisted": false,
-    }))
-}
-
-fn shell_resource_prestate(effective_working_dir: Option<&str>) -> Result<Value, ErrorData> {
-    let job_memory = shell_job_memory_snapshot()?;
-    let private_bytes = synapse_calyx::process_private_bytes().map_err(|error| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell resource precondition could not read process private commit: {error}"),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "process_private_commit_probe_failed",
-                "remediation": "Repair the host process-memory counter before retrying; Synapse refuses to execute without an authoritative private-commit reading.",
-            }),
-        )
-    })?;
-    let working_set_bytes = synapse_calyx::process_working_set_bytes().map_err(|error| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell resource precondition could not read process working set: {error}"),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "process_working_set_probe_failed",
-                "remediation": "Repair the host process-memory counter before retrying; Synapse refuses to persist a partial resource snapshot.",
-            }),
-        )
-    })?;
-    let system = sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing()
-            .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
-    );
-    let system_total_memory_bytes = system.total_memory();
-    let system_available_memory_bytes = system.available_memory();
-    if system_total_memory_bytes == 0 || system_available_memory_bytes > system_total_memory_bytes {
-        return Err(shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell resource precondition received an invalid system-memory snapshot",
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "system_memory_probe_invalid",
-                "total_bytes": system_total_memory_bytes,
-                "available_bytes": system_available_memory_bytes,
-                "remediation": "Repair the OS memory-status provider; Synapse refuses to execute with missing or contradictory system-memory state.",
-            }),
-        ));
-    }
-
-    let (volume_probe_path, target_volume_probe_class) = match effective_working_dir {
-        Some(path) => (PathBuf::from(path), "effective_working_directory"),
-        None => (
-            std::env::current_dir().map_err(|error| {
-                shell_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("act_run_shell resource precondition could not read the daemon current directory: {error}"),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "resource_volume_current_directory_failed",
-                        "os_error": error.raw_os_error(),
-                        "remediation": "Restore an accessible daemon current directory before retrying.",
-                    }),
-                )
-            })?,
-            "daemon_current_directory",
-        ),
-    };
-    let target_volume_total_bytes = fs2::total_space(&volume_probe_path).map_err(|error| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell resource precondition could not read target-volume capacity: {error}"),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "target_volume_total_probe_failed",
-                "probe_path_class": target_volume_probe_class,
-                "os_error": error.raw_os_error(),
-                "remediation": "Restore the requested working directory and its volume, then retry.",
-            }),
-        )
-    })?;
-    let target_volume_available_bytes =
-        fs2::available_space(&volume_probe_path).map_err(|error| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("act_run_shell resource precondition could not read target-volume free space: {error}"),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "reason": "target_volume_available_probe_failed",
-                    "probe_path_class": target_volume_probe_class,
-                    "os_error": error.raw_os_error(),
-                    "remediation": "Restore the requested working directory and its volume, then retry.",
-                }),
-            )
-        })?;
-    if target_volume_total_bytes == 0 || target_volume_available_bytes > target_volume_total_bytes {
-        return Err(shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell resource precondition received an invalid target-volume snapshot",
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "target_volume_probe_invalid",
-                "probe_path_class": target_volume_probe_class,
-                "total_bytes": target_volume_total_bytes,
-                "available_bytes": target_volume_available_bytes,
-                "remediation": "Repair the target volume or filesystem capacity provider before retrying.",
-            }),
-        ));
-    }
-    let exact_resource_counters = [
-        job_memory.current_bytes,
-        job_memory.limit_bytes,
-        job_memory.headroom_bytes,
-        job_memory.peak_bytes,
-        private_bytes,
-        working_set_bytes,
-        SYNAPSE_PROCESS_HARD_LIMIT_BYTES.saturating_sub(private_bytes),
-        system_total_memory_bytes,
-        system_available_memory_bytes,
-        target_volume_total_bytes,
-        target_volume_available_bytes,
-    ];
-    if exact_resource_counters
-        .into_iter()
-        .any(|value| value > SHELL_RESOURCE_MAX_EXACT_F64_INT)
-    {
-        return Err(shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell resource precondition exceeds the frozen exact-f64 integer domain",
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "resource_counter_exact_f64_bound_exceeded",
-                "max_exact_integer": SHELL_RESOURCE_MAX_EXACT_F64_INT,
-                "job_memory_bytes": job_memory.current_bytes,
-                "job_memory_limit_bytes": job_memory.limit_bytes,
-                "job_memory_headroom_bytes": job_memory.headroom_bytes,
-                "job_peak_memory_bytes": job_memory.peak_bytes,
-                "process_private_bytes": private_bytes,
-                "process_working_set_bytes": working_set_bytes,
-                "system_total_memory_bytes": system_total_memory_bytes,
-                "system_available_memory_bytes": system_available_memory_bytes,
-                "target_volume_total_bytes": target_volume_total_bytes,
-                "target_volume_available_bytes": target_volume_available_bytes,
-                "remediation": "Version the resource lens with a bounded logarithmic integer encoding before executing on a host whose authoritative counter exceeds 2^53-1; the current lens refuses lossy conversion.",
-            }),
-        ));
-    }
-
-    Ok(json!({
-        "schema_version": 1,
-        "source_of_truth": "queried immediate Windows Job class-28 current/peak committed memory + exact kill-on-close/process-memory/job-memory extended-limit contract + OS process-private commit and working-set telemetry counters + OS system-memory counter + target-volume filesystem capacity counter",
-        "job_memory_bytes": job_memory.current_bytes,
-        "job_memory_limit_bytes": job_memory.limit_bytes,
-        "job_memory_headroom_bytes": job_memory.headroom_bytes,
-        "job_peak_memory_bytes": job_memory.peak_bytes,
-        "job_limit_flags": job_memory.limit_flags,
-        "process_private_bytes": private_bytes,
-        "process_working_set_bytes": working_set_bytes,
-        "process_private_limit_bytes": SYNAPSE_PROCESS_HARD_LIMIT_BYTES,
-        "process_private_headroom_bytes": SYNAPSE_PROCESS_HARD_LIMIT_BYTES.saturating_sub(private_bytes),
-        "system_total_memory_bytes": system_total_memory_bytes,
-        "system_available_memory_bytes": system_available_memory_bytes,
-        "target_volume_total_bytes": target_volume_total_bytes,
-        "target_volume_available_bytes": target_volume_available_bytes,
-        "target_volume_probe_class": target_volume_probe_class,
-        "gpu_measurement_required": false,
-    }))
-}
-
-#[derive(Clone, Copy)]
-struct ShellJobMemorySnapshot {
-    current_bytes: u64,
-    limit_bytes: u64,
-    headroom_bytes: u64,
-    peak_bytes: u64,
-    limit_flags: u32,
-}
-
+/// Resolves a bare executable name (`rg`, `findstr`, …) against a semicolon
+/// PATH plus PATHEXT, returning the first matching file. Mirrors how Windows
+/// resolves a bare command name so the readback matches what a shell job's own
+/// executable resolution would find.
 #[cfg(windows)]
-fn shell_job_memory_snapshot() -> Result<ShellJobMemorySnapshot, ErrorData> {
-    use windows::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, JobObjectReserved11Information,
-        QueryInformationJobObject,
-    };
-
-    // Windows exposes information class 28 as reserved in the public SDK, but
-    // the kernel ABI (also consumed by Microsoft's hcsshim) is exactly these
-    // two u64 counters: current and peak committed memory for the Job.  Do not
-    // substitute the similarly named violation-information class: its memory
-    // field is only defined for a notification event and is not a live value.
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(non_snake_case)]
-    struct JobObjectMemoryUsageInformation {
-        JobMemory: u64,
-        PeakJobMemoryUsed: u64,
-    }
-
-    let internal_error = |reason: &'static str, detail: String| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "act_run_shell could not verify its aggregate Windows Job memory contract: {detail}"
-            ),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": reason,
-                "detail": detail,
-                "remediation": "Reinstall the repo-built daemon so the setup-owned supervisor assigns it to the bounded Windows Job before resume; Synapse refuses process execution without kernel Job readback.",
-            }),
-        )
-    };
-    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-        .map_err(|error| internal_error("job_limit_size_conversion_failed", error.to_string()))?;
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    let mut returned_limit_bytes = 0_u32;
-    unsafe {
-        QueryInformationJobObject(
-            None,
-            JobObjectExtendedLimitInformation,
-            (&raw mut limits).cast(),
-            limit_size,
-            Some(&raw mut returned_limit_bytes),
-        )
-    }
-    .map_err(|error| internal_error("current_process_job_limit_query_failed", error.to_string()))?;
-    if returned_limit_bytes != limit_size {
-        return Err(internal_error(
-            "current_process_job_limit_readback_size_mismatch",
-            format!("returned={returned_limit_bytes} expected={limit_size}"),
-        ));
-    }
-    let expected_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_JOB_MEMORY;
-    let limit_flags = limits.BasicLimitInformation.LimitFlags;
-    if limit_flags != expected_flags {
-        return Err(internal_error(
-            "current_process_job_limit_flags_mismatch",
-            format!(
-                "actual=0x{:x} expected_exact=0x{:x}",
-                limit_flags.0, expected_flags.0
-            ),
-        ));
-    }
-    let limit_bytes = u64::try_from(limits.JobMemoryLimit)
-        .map_err(|error| internal_error("job_memory_limit_conversion_failed", error.to_string()))?;
-    let process_limit_bytes = u64::try_from(limits.ProcessMemoryLimit).map_err(|error| {
-        internal_error("process_memory_limit_conversion_failed", error.to_string())
-    })?;
-    let extended_peak_bytes = u64::try_from(limits.PeakJobMemoryUsed)
-        .map_err(|error| internal_error("job_peak_memory_conversion_failed", error.to_string()))?;
-    if limit_bytes != SYNAPSE_PROCESS_HARD_LIMIT_BYTES
-        || process_limit_bytes != SYNAPSE_PROCESS_HARD_LIMIT_BYTES
-    {
-        return Err(internal_error(
-            "job_committed_memory_limits_mismatch",
-            format!(
-                "job_memory={limit_bytes} process_memory={process_limit_bytes} expected_job_process_committed_private_max={SYNAPSE_PROCESS_HARD_LIMIT_BYTES}"
-            ),
-        ));
-    }
-
-    let usage_size = u32::try_from(std::mem::size_of::<JobObjectMemoryUsageInformation>())
-        .map_err(|error| {
-            internal_error("job_memory_usage_size_conversion_failed", error.to_string())
-        })?;
-    let mut usage = JobObjectMemoryUsageInformation::default();
-    let mut returned_usage_bytes = 0_u32;
-    unsafe {
-        QueryInformationJobObject(
-            None,
-            JobObjectReserved11Information,
-            (&raw mut usage).cast(),
-            usage_size,
-            Some(&raw mut returned_usage_bytes),
-        )
-    }
-    .map_err(|error| {
-        internal_error("current_process_job_memory_query_failed", error.to_string())
-    })?;
-    if returned_usage_bytes != usage_size {
-        return Err(internal_error(
-            "current_process_job_memory_readback_size_mismatch",
-            format!("returned={returned_usage_bytes} expected={usage_size}"),
-        ));
-    }
-    if usage.PeakJobMemoryUsed < extended_peak_bytes {
-        return Err(internal_error(
-            "current_process_job_memory_peak_regressed",
-            format!(
-                "memory_usage_information_peak={} extended_limit_information_earlier_peak={extended_peak_bytes}",
-                usage.PeakJobMemoryUsed
-            ),
-        ));
-    }
-    let current_bytes = usage.JobMemory;
-    let peak_bytes = usage.PeakJobMemoryUsed;
-    if peak_bytes < current_bytes {
-        return Err(internal_error(
-            "current_process_job_memory_bounds_invalid",
-            format!("current={current_bytes} peak={peak_bytes} limit={limit_bytes}"),
-        ));
-    }
-    let headroom_bytes = limit_bytes.saturating_sub(current_bytes);
-    Ok(ShellJobMemorySnapshot {
-        current_bytes,
-        limit_bytes,
-        headroom_bytes,
-        peak_bytes,
-        limit_flags: limit_flags.0,
-    })
-}
-
-#[cfg(not(windows))]
-fn shell_job_memory_snapshot() -> Result<ShellJobMemorySnapshot, ErrorData> {
-    Err(shell_tool_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        "act_run_shell cannot verify the required aggregate Job memory limit on this platform",
-        json!({
-            "code": error_codes::TOOL_INTERNAL_ERROR,
-            "reason": "aggregate_job_memory_unsupported_platform",
-            "remediation": "Add and physically verify an equivalent cgroup/resource-controller aggregate memory contract before enabling shell execution; process-only accounting is not accepted as a fallback.",
-        }),
-    ))
-}
-
-/// Returns the fail-closed execution refusal implied by an already captured
-/// resource snapshot. The snapshot is deliberately constructed first so a
-/// resource-caused outcome can be durably associated with its exact
-/// point-in-time cause instead of disappearing into a generic denied audit.
-///
-/// Probe failures never reach this function: they remain typed measurement
-/// errors, and no missing counter is replaced by zero or another sentinel.
-pub fn shell_precondition_resource_refusal(
-    preconditions: &Value,
-) -> Result<Option<ErrorData>, ErrorData> {
-    let invalid = |field: &'static str| {
-        shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "act_run_shell resource precondition snapshot is missing or invalid at {field}"
-            ),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "resource_snapshot_internal_contract_invalid",
-                "field": field,
-                "remediation": "Preserve the action-log evidence and repair the versioned resource snapshot writer before allowing process execution.",
-            }),
-        )
-    };
-    let resource = preconditions
-        .get("resource_prestate")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid("resource_prestate"))?;
-    let private_bytes = resource
-        .get("process_private_bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid("resource_prestate.process_private_bytes"))?;
-    let working_set_bytes = resource
-        .get("process_working_set_bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid("resource_prestate.process_working_set_bytes"))?;
-    let private_limit_bytes = resource
-        .get("process_private_limit_bytes")
-        .and_then(Value::as_u64)
-        .filter(|value| *value == SYNAPSE_PROCESS_HARD_LIMIT_BYTES)
-        .ok_or_else(|| invalid("resource_prestate.process_private_limit_bytes"))?;
-    let job_memory_bytes = resource
-        .get("job_memory_bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid("resource_prestate.job_memory_bytes"))?;
-    let job_memory_limit_bytes = resource
-        .get("job_memory_limit_bytes")
-        .and_then(Value::as_u64)
-        .filter(|value| *value == private_limit_bytes)
-        .ok_or_else(|| invalid("resource_prestate.job_memory_limit_bytes"))?;
-    if private_bytes < private_limit_bytes && job_memory_bytes < job_memory_limit_bytes {
-        return Ok(None);
-    }
-    let reason = match (
-        private_bytes >= private_limit_bytes,
-        job_memory_bytes >= job_memory_limit_bytes,
-    ) {
-        (_, true) => "aggregate_job_memory_limit_reached",
-        (true, false) => "process_private_commit_limit_reached",
-        (false, false) => return Ok(None),
-    };
-    Ok(Some(shell_tool_error(
-        error_codes::ACTION_RESOURCE_BUDGET_EXCEEDED,
-        format!(
-            "act_run_shell refused before execution because committed/private resource use reached the hard {private_limit_bytes}-byte limit (job={job_memory_bytes}, private={private_bytes}; working_set_telemetry={working_set_bytes})"
-        ),
-        json!({
-            "code": error_codes::ACTION_RESOURCE_BUDGET_EXCEEDED,
-            "reason": reason,
-            "process_private_bytes": private_bytes,
-            "process_working_set_bytes": working_set_bytes,
-            "job_memory_bytes": job_memory_bytes,
-            "job_memory_limit_bytes": job_memory_limit_bytes,
-            "max_bytes": private_limit_bytes,
-            "requested_bytes": 0,
-            "resource_snapshot_persisted_before_refusal": true,
-            "remediation": "Inspect health resource accounting, release the retained owner, and retry only after process private commit and aggregate Job commit are below their hard limits. Working set is telemetry, not a Job-enforced limit.",
-        }),
-    )))
-}
-
-struct ShellExecutablePreflight {
-    state: &'static str,
-    source: Option<&'static str>,
-    spawn_command_path_class: &'static str,
-    resolved_path_sha256: Option<String>,
-}
-
-fn shell_command_path_class(command: &str) -> &'static str {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        "empty"
-    } else if Path::new(trimmed).is_absolute() {
-        "absolute"
-    } else if trimmed.len() >= 2
-        && trimmed.as_bytes()[1] == b':'
-        && trimmed.as_bytes()[0].is_ascii_alphabetic()
-    {
-        "drive_relative"
-    } else if trimmed.contains(['/', '\\']) {
-        "relative_path"
-    } else {
-        "bare_name"
-    }
-}
-
-fn delivered_environment_value<'a>(
-    delivered: &'a BTreeMap<String, String>,
-    wanted: &str,
-) -> Option<&'a str> {
-    delivered
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
-        .map(|(_, value)| value.as_str())
-}
-
-fn executable_candidate_paths(path: PathBuf) -> Vec<PathBuf> {
-    let mut candidates = vec![path.clone()];
-    #[cfg(windows)]
-    if path.extension().is_none() {
-        let mut with_exe = path;
-        with_exe.set_extension("exe");
-        candidates.push(with_exe);
-    }
-    candidates
-}
-
-fn shell_path_sha256(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        let mut bytes = Vec::new();
-        for unit in path.as_os_str().encode_wide() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        sha256_hex(&bytes)
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        sha256_hex(path.as_os_str().as_bytes())
-    }
-}
-
-fn resolved_executable_candidate(
-    candidates: impl IntoIterator<Item = (PathBuf, &'static str)>,
-) -> Result<Option<(PathBuf, &'static str)>, ErrorData> {
-    for (path, source) in candidates {
-        for candidate in executable_candidate_paths(path) {
-            match fs::metadata(&candidate) {
-                Ok(metadata) if metadata.is_file() => return Ok(Some((candidate, source))),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(shell_tool_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "act_run_shell executable preflight could not read candidate metadata: {error}"
-                        ),
-                        json!({
-                            "code": error_codes::TOOL_INTERNAL_ERROR,
-                            "reason": "executable_preflight_metadata_failed",
-                            "candidate_sha256": shell_path_sha256(&candidate),
-                            "candidate_source": source,
-                            "os_error": error.raw_os_error(),
-                        }),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn shell_executable_preflight(
-    command: &str,
-    effective_working_dir: Option<&str>,
-    delivered: &BTreeMap<String, String>,
-) -> Result<ShellExecutablePreflight, ErrorData> {
-    let spawn_command = prepared_shell_spawn_command(command, effective_working_dir)?;
-    let path_class = shell_command_path_class(spawn_command.as_ref());
-    if spawn_command.trim().is_empty() {
-        return Ok(ShellExecutablePreflight {
-            state: "invalid",
-            source: None,
-            spawn_command_path_class: path_class,
-            resolved_path_sha256: None,
-        });
-    }
-    let spawn_path = PathBuf::from(spawn_command.as_ref());
-    let mut candidates = Vec::new();
-    if spawn_path.is_absolute() {
-        candidates.push((spawn_path, "explicit_absolute_path"));
-    } else if spawn_command.contains(['/', '\\']) {
-        let base = match effective_working_dir {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_dir().map_err(|error| {
-                shell_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("act_run_shell executable preflight could not read current directory: {error}"),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "executable_preflight_current_directory_failed",
-                        "os_error": error.raw_os_error(),
-                    }),
-                )
-            })?,
-        };
-        candidates.push((base.join(spawn_path), "effective_working_directory"));
-    } else {
-        if let Some(path) = delivered_environment_value(delivered, "PATH") {
-            candidates.extend(
-                std::env::split_paths(path).map(|dir| (dir.join(&spawn_path), "child_path")),
-            );
-        }
-        #[cfg(windows)]
-        {
-            let current_exe = std::env::current_exe().map_err(|error| {
-                shell_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("act_run_shell executable preflight could not read current executable: {error}"),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "executable_preflight_current_executable_failed",
-                        "os_error": error.raw_os_error(),
-                    }),
-                )
-            })?;
-            if let Some(dir) = current_exe.parent() {
-                candidates.push((dir.join(&spawn_path), "current_executable_directory"));
-            }
-            if let Some(root) = delivered_environment_value(delivered, "SystemRoot") {
-                let root = PathBuf::from(root);
-                candidates.push((root.join("System32").join(&spawn_path), "system_directory"));
-                candidates.push((root.join(&spawn_path), "windows_directory"));
-            }
-            if let Some(path) = std::env::var_os("PATH") {
-                candidates.extend(
-                    std::env::split_paths(&path).map(|dir| (dir.join(&spawn_path), "parent_path")),
-                );
-            }
-        }
-        #[cfg(not(windows))]
-        if delivered_environment_value(delivered, "PATH").is_none() {
-            candidates.extend(
-                ["/bin", "/usr/bin"]
-                    .into_iter()
-                    .map(|dir| (PathBuf::from(dir).join(&spawn_path), "os_default_path")),
-            );
-        }
-    }
-    let Some((resolved, source)) = resolved_executable_candidate(candidates)? else {
-        return Ok(ShellExecutablePreflight {
-            state: "not_found",
-            source: None,
-            spawn_command_path_class: path_class,
-            resolved_path_sha256: None,
-        });
-    };
-    Ok(ShellExecutablePreflight {
-        state: "resolved",
-        source: Some(source),
-        spawn_command_path_class: path_class,
-        resolved_path_sha256: Some(shell_path_sha256(&resolved)),
-    })
-}
-
-/// Reports, in the structured result, that this command was classified
-/// CUDA-relevant and its durable-`CUDA_PATH` precondition was **not** enforced
-/// because NVML proved the host has no CUDA device (#1887).
-///
-/// Emitted only when the gate actually made that decision, so its presence is
-/// evidence about this command rather than a standing note about the host.
-#[cfg(windows)]
-fn cuda_precondition_skip_diagnostic(
-    env: &BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-    params: &ActRunShellStartParams,
-) -> Option<ActRunShellEnvironmentDiagnostic> {
-    if !shell_command_requires_durable_cuda(&params.command, &params.args)
-        || env_map_contains_key(requested_env, "CUDA_PATH")
-        || !synapse_calyx::host_cuda::host_cuda_device_probe().device_absent_proven
-    {
-        return None;
-    }
-    Some(configured_host_environment_diagnostic(
-        "CUDA_PATH",
-        env,
-        requested_env,
-        SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE,
-        "info",
-    ))
-}
-
-#[cfg(not(windows))]
-const fn cuda_precondition_skip_diagnostic(
-    _env: &BTreeMap<String, (String, String)>,
-    _requested_env: &BTreeMap<String, String>,
-    _params: &ActRunShellStartParams,
-) -> Option<ActRunShellEnvironmentDiagnostic> {
-    None
-}
-
-#[cfg(windows)]
-fn validate_configured_host_build_environment(
-    env: &BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-    command_name: &str,
-    args: &[String],
-) -> Result<(), ErrorData> {
-    if !shell_command_requires_durable_cuda(command_name, args)
-        || env_map_contains_key(requested_env, "CUDA_PATH")
-    {
-        return Ok(());
-    }
-    // #1887: the precondition is unsatisfiable AND irrelevant on a host NVML
-    // proves has no CUDA device. `CUDA_PATH`'s absence there is the correct
-    // state, so refusing work for it blocks legitimate commands for a variable
-    // that should be missing. Only a proven-absent device permits; a present
-    // device with no CUDA_PATH is a genuinely broken install, and an
-    // indeterminate probe is uncertainty, not evidence of absence.
-    let probe = synapse_calyx::host_cuda::host_cuda_device_probe();
-    if probe.device_absent_proven {
-        tracing::info!(
-            code = SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE,
-            command = %command_name,
-            probe_code = probe.code,
-            probe_basis = %probe.basis,
-            "act_run_shell skipped the durable CUDA_PATH precondition because NVML proved this host has no CUDA device"
-        );
-        return Ok(());
-    }
-    let Some(durable_cuda_path) = persisted_environment_value("CUDA_PATH") else {
-        return Err(configured_host_cuda_path_error(
-            env,
-            requested_env,
-            SHELL_ENV_DURABLE_MISSING,
-            "durable_cuda_path_missing",
-            "act_run_shell refused a CUDA-relevant command because CUDA_PATH is missing from durable Windows HKCU/HKLM environment Source of Truth",
-        ));
-    };
-    if durable_cuda_path.value.trim().is_empty() {
-        return Err(configured_host_cuda_path_error(
-            env,
-            requested_env,
-            SHELL_ENV_DURABLE_MISSING,
-            "durable_cuda_path_empty",
-            "act_run_shell refused a CUDA-relevant command because durable Windows CUDA_PATH is empty",
-        ));
-    }
-    let nvcc_path = cuda_path_nvcc_path(&durable_cuda_path.value);
-    if nvcc_path.is_file() {
-        return Ok(());
-    }
-    Err(configured_host_cuda_path_error(
-        env,
-        requested_env,
-        SHELL_ENV_DURABLE_INVALID,
-        "durable_cuda_path_nvcc_missing",
-        "act_run_shell refused a CUDA-relevant command because durable Windows CUDA_PATH does not contain bin\\nvcc.exe",
-    ))
-}
-
-#[cfg(windows)]
-fn configured_host_cuda_path_error(
-    env: &BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-    diagnostic_code: &'static str,
-    reason: &'static str,
-    message: &'static str,
-) -> ErrorData {
-    let diagnostic = configured_host_environment_diagnostic(
-        "CUDA_PATH",
-        env,
-        requested_env,
-        diagnostic_code,
-        "error",
-    );
-    tracing::error!(
-        code = diagnostic_code,
-        variable = %diagnostic.variable,
-        daemon_pid = diagnostic.daemon_pid,
-        process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
-        durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
-        effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
-        validation_path = diagnostic.validation_path.as_deref().unwrap_or("<none>"),
-        source_of_truth = %diagnostic.source_of_truth,
-        remediation = %diagnostic.remediation,
-        "act_run_shell refused a CUDA-relevant shell command because durable Windows CUDA_PATH failed validation"
-    );
-    shell_tool_error(
-        error_codes::ACTION_TARGET_INVALID,
-        message,
-        json!({
-            "code": error_codes::ACTION_TARGET_INVALID,
-            "reason": reason,
-            "diagnostic": diagnostic,
-        }),
-    )
-}
-
-#[cfg(not(windows))]
-fn validate_configured_host_build_environment(
-    _env: &BTreeMap<String, (String, String)>,
-    _requested_env: &BTreeMap<String, String>,
-    _command_name: &str,
-    _args: &[String],
-) -> Result<(), ErrorData> {
-    Ok(())
-}
-
-/// Decides whether a shell command actually needs a working CUDA toolchain.
-///
-/// `nvcc` is the CUDA compiler, so invoking it always needs one. `cargo` does
-/// **not**: this workspace's only CUDA code sits behind `calyx-forge`'s `cuda`
-/// feature, which is off by default and logs `cuda feature not enabled,
-/// skipping kernel compilation` on every ordinary build here. Classifying all
-/// of `cargo` as CUDA-relevant (the pre-#1887 behaviour) made a plain
-/// `cargo check` refuse on a host with no CUDA device.
-///
-/// A `cargo` invocation is CUDA-relevant only when it actually selects CUDA:
-/// a `--features`/`-F` list naming a cuda feature, or `--all-features`, which
-/// turns the cuda feature on by definition.
-fn shell_command_requires_durable_cuda(command_name: &str, args: &[String]) -> bool {
-    let executable = Path::new(command_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command_name)
-        .to_ascii_lowercase();
-    if matches!(executable.as_str(), "nvcc" | "nvcc.exe") {
-        return true;
-    }
-    if matches!(executable.as_str(), "cargo" | "cargo.exe") {
-        return cargo_args_select_cuda(args);
-    }
-    if !matches!(
-        executable.as_str(),
-        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
-    ) {
-        return false;
-    }
-    let command_line = args.join(" ").to_ascii_lowercase();
-    if command_line.contains("nvcc ") || command_line.contains("nvcc.exe") {
-        return true;
-    }
-    // A shell wrapper around cargo is CUDA-relevant on the same terms as cargo
-    // itself: the whole line is scanned because the wrapper's own tokens are
-    // interleaved with cargo's.
-    (command_line.contains("cargo ") || command_line.contains("cargo.exe"))
-        && cargo_args_select_cuda(args)
-}
-
-/// True when a cargo argument vector turns a cuda feature on.
-///
-/// Matches `--all-features`, `--features <list>`, `--features=<list>`, and the
-/// short `-F` forms, treating the list as comma/space separated exactly as
-/// cargo does. A feature counts as cuda when its name contains `cuda`, which
-/// covers `cuda`, `calyx-forge/cuda` and any future `*-cuda` feature.
-fn cargo_args_select_cuda(args: &[String]) -> bool {
-    let mut expecting_feature_list = false;
-    for arg in args {
-        let lowered = arg.to_ascii_lowercase();
-        if expecting_feature_list {
-            expecting_feature_list = false;
-            if feature_list_names_cuda(&lowered) {
-                return true;
-            }
-            continue;
-        }
-        if lowered == "--all-features" {
-            return true;
-        }
-        if lowered == "--features" || lowered == "-f" {
-            expecting_feature_list = true;
-            continue;
-        }
-        if let Some(list) = lowered
-            .strip_prefix("--features=")
-            .or_else(|| lowered.strip_prefix("-f="))
-            && feature_list_names_cuda(list)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// True when a cargo feature list names a cuda feature.
-fn feature_list_names_cuda(list: &str) -> bool {
-    list.split([',', ' '])
-        .any(|feature| feature.contains("cuda"))
-}
-
-#[cfg(windows)]
-fn cuda_path_nvcc_path(cuda_path: &str) -> PathBuf {
-    Path::new(cuda_path.trim().trim_matches('"'))
-        .join("bin")
-        .join("nvcc.exe")
-}
-
-/// Resolves several command names in one ordered directory inventory.
-///
-/// The old resolver performed one `is_file` for the bare name plus every
-/// `PATHEXT` variant at every PATH entry, then repeated that full walk for each
-/// program. `/health` called it synchronously, so four programs over 64 PATH
-/// entries produced thousands of metadata calls and took 16.361 s on the
-/// configured Windows host (#1816). Inventorying each directory once preserves
-/// PATH-first / PATHEXT-second precedence while reducing filesystem round trips
-/// to one directory enumeration plus metadata for matching names.
-#[cfg(windows)]
-fn resolve_programs_on_path(
-    programs: &[&str],
-    path: &str,
-    pathext: &str,
-) -> BTreeMap<String, String> {
-    let extensions = pathext
+fn resolve_program_on_path(program: &str, path: &str, pathext: &str) -> Option<String> {
+    let exts: Vec<&str> = pathext
         .split(';')
         .map(str::trim)
         .filter(|ext| !ext.is_empty())
-        .collect::<Vec<_>>();
-    let candidates = programs
-        .iter()
-        .map(|program| {
-            let mut names = vec![program.to_ascii_lowercase()];
-            names.extend(
-                extensions
-                    .iter()
-                    .map(|ext| format!("{program}{ext}").to_ascii_lowercase()),
-            );
-            ((*program).to_owned(), names)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let wanted = candidates
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<HashSet<_>>();
-    let path_entries = path
-        .split(';')
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-        .collect::<Vec<_>>();
-    let started_at = Instant::now();
-    let mut resolved = BTreeMap::new();
-    let mut scanned_directories = 0_usize;
-    let mut unreadable_directories = 0_usize;
-
-    for dir in &path_entries {
-        if resolved.len() == candidates.len() {
-            break;
-        }
-        scanned_directories += 1;
+        .collect();
+    for dir in path.split(';').map(str::trim).filter(|dir| !dir.is_empty()) {
         let base = Path::new(dir.trim_matches('"'));
-        let entries = match fs::read_dir(base) {
-            Ok(entries) => entries,
-            Err(_) => {
-                unreadable_directories += 1;
-                continue;
-            }
-        };
-        let mut directory_matches = BTreeMap::<String, PathBuf>::new();
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_ascii_lowercase) else {
-                continue;
-            };
-            if !wanted.contains(&name) {
-                continue;
-            }
-            let candidate = entry.path();
-            if candidate.is_file() {
-                directory_matches.entry(name).or_insert(candidate);
-            }
+        // Honor an already-qualified name (e.g. "rg.exe") before appending exts.
+        let direct = base.join(program);
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
         }
-        for (program, names) in &candidates {
-            if resolved.contains_key(program) {
-                continue;
-            }
-            if let Some(found) = names.iter().find_map(|name| directory_matches.get(name)) {
-                resolved.insert(program.clone(), found.to_string_lossy().into_owned());
+        for ext in &exts {
+            let candidate = base.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
             }
         }
     }
-    tracing::info!(
-        code = "M4_SHELL_SEARCH_TOOL_SNAPSHOT_CACHED",
-        path_entries = path_entries.len(),
-        scanned_directories,
-        unreadable_directories,
-        resolved_programs = resolved.len(),
-        requested_programs = programs.len(),
-        elapsed_ms = started_at.elapsed().as_millis(),
-        "cached one deterministic child-PATH search-tool snapshot for health"
-    );
-    resolved
+    None
 }
 
-/// Reports which bounded-search tools resolved in the exact child-process
-/// environment captured at service construction — not the daemon's own PATH.
+/// Reports which bounded-search tools resolve inside the exact child-process
+/// environment Synapse shell jobs receive — not the daemon's own PATH.
 ///
 /// Agents are told to prefer `rg` for fast bounded manual FSV scans, but `rg` may be
 /// absent from the machine entirely (it is not a Windows built-in, and it lived
@@ -17025,15 +9555,11 @@ pub fn shell_search_tool_readback() -> String {
         let env = child_base_environment();
         let path = env_value(&env, "PATH").unwrap_or_default();
         let pathext = env_value(&env, "PATHEXT").unwrap_or(WINDOWS_DEFAULT_PATHEXT);
-        let resolved = resolve_programs_on_path(
-            &["rg", "findstr", "git", "powershell", "pwsh"],
-            path,
-            pathext,
-        );
-        let rg = resolved.get("rg");
-        let findstr = resolved.get("findstr");
-        let git = resolved.get("git");
-        let powershell = resolved.get("powershell").or_else(|| resolved.get("pwsh"));
+        let rg = resolve_program_on_path("rg", path, pathext);
+        let findstr = resolve_program_on_path("findstr", path, pathext);
+        let git = resolve_program_on_path("git", path, pathext);
+        let powershell = resolve_program_on_path("powershell", path, pathext)
+            .or_else(|| resolve_program_on_path("pwsh", path, pathext));
         let primary = if rg.is_some() {
             "rg"
         } else if findstr.is_some() {
@@ -17042,11 +9568,11 @@ pub fn shell_search_tool_readback() -> String {
             "powershell_select_string"
         };
         format!(
-            "shell_search_tools source=daemon_startup_child_environment rg={} findstr={} git={} powershell={} primary={primary} documented_fallback=powershell_select_string",
-            rg.map_or("absent", String::as_str),
-            findstr.map_or("absent", String::as_str),
-            git.map_or("absent", String::as_str),
-            powershell.map_or("absent", String::as_str),
+            "shell_search_tools rg={} findstr={} git={} powershell={} primary={primary} documented_fallback=powershell_select_string",
+            rg.as_deref().unwrap_or("absent"),
+            findstr.as_deref().unwrap_or("absent"),
+            git.as_deref().unwrap_or("absent"),
+            powershell.as_deref().unwrap_or("absent"),
         )
     }
     #[cfg(not(windows))]
@@ -17060,209 +9586,6 @@ fn env_value<'a>(env: &'a BTreeMap<String, (String, String)>, key: &str) -> Opti
     env.get(&key.to_ascii_uppercase())
         .map(|(_key, value)| value.as_str())
         .filter(|value| !value.trim().is_empty())
-}
-
-fn env_map_contains_key(env: &BTreeMap<String, String>, key: &str) -> bool {
-    env.keys()
-        .any(|candidate| candidate.eq_ignore_ascii_case(key))
-}
-
-fn durable_env_override_key(key: &str) -> bool {
-    WINDOWS_DURABLE_ENV_OVERRIDE_KEYS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(key))
-}
-
-#[cfg(windows)]
-fn configured_host_environment_diagnostics(
-    env: &BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-) -> Vec<ActRunShellEnvironmentDiagnostic> {
-    let mut diagnostics = Vec::new();
-    for key in WINDOWS_DURABLE_ENV_OVERRIDE_KEYS {
-        let explicit_override = env_map_contains_key(requested_env, key);
-        if explicit_override {
-            continue;
-        }
-        let process_value = std::env::var(key)
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let durable_value = persisted_environment_value(key);
-        let durable_missing = durable_value
-            .as_ref()
-            .is_none_or(|durable| durable.value.trim().is_empty());
-        if durable_missing && (key.eq_ignore_ascii_case("CUDA_PATH") || process_value.is_some()) {
-            // #1881: a missing CUDA_PATH is only a broken install when this
-            // host can actually run CUDA. Gate the severity on the same NVML
-            // device probe the Calyx math backend uses to justify selecting
-            // the CPU runtime, so both subsystems classify the host from one
-            // piece of physical evidence instead of two guesses.
-            let (diagnostic_code, severity) = if key.eq_ignore_ascii_case("CUDA_PATH") {
-                if synapse_calyx::host_cuda_device_probe().device_absent_proven {
-                    (SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE, "info")
-                } else {
-                    (SHELL_ENV_DURABLE_MISSING, "error")
-                }
-            } else {
-                (SHELL_ENV_DURABLE_MISSING, "warning")
-            };
-            diagnostics.push(configured_host_environment_diagnostic(
-                key,
-                env,
-                requested_env,
-                diagnostic_code,
-                severity,
-            ));
-            continue;
-        }
-        if key.eq_ignore_ascii_case("CUDA_PATH")
-            && durable_value
-                .as_ref()
-                .is_some_and(|durable| !cuda_path_nvcc_path(&durable.value).is_file())
-        {
-            diagnostics.push(configured_host_environment_diagnostic(
-                key,
-                env,
-                requested_env,
-                SHELL_ENV_DURABLE_INVALID,
-                "error",
-            ));
-        }
-        match (process_value.as_deref(), durable_value.as_ref()) {
-            (Some(process), Some(durable))
-                if !environment_values_equivalent(key, process, &durable.value) =>
-            {
-                diagnostics.push(configured_host_environment_diagnostic(
-                    key,
-                    env,
-                    requested_env,
-                    SHELL_ENV_DAEMON_STALE,
-                    "warning",
-                ));
-            }
-            _ => {}
-        }
-    }
-    diagnostics
-}
-
-#[cfg(not(windows))]
-fn configured_host_environment_diagnostics(
-    _env: &BTreeMap<String, (String, String)>,
-    _requested_env: &BTreeMap<String, String>,
-) -> Vec<ActRunShellEnvironmentDiagnostic> {
-    Vec::new()
-}
-
-#[cfg(windows)]
-fn environment_values_equivalent(key: &str, left: &str, right: &str) -> bool {
-    let left = left.trim().trim_matches('"');
-    let right = right.trim().trim_matches('"');
-    if matches!(
-        key.to_ascii_uppercase().as_str(),
-        "CUDA_PATH" | "CUDA_PATH_V13_3" | "FORGE_CUDA_CCBIN" | "NVCC_CCBIN"
-    ) {
-        return normalize_semicolon_path_part(left) == normalize_semicolon_path_part(right);
-    }
-    left == right
-}
-
-#[cfg(windows)]
-fn configured_host_environment_diagnostic(
-    key: &str,
-    env: &BTreeMap<String, (String, String)>,
-    requested_env: &BTreeMap<String, String>,
-    diagnostic_code: &'static str,
-    severity: &'static str,
-) -> ActRunShellEnvironmentDiagnostic {
-    let durable = persisted_environment_value(key);
-    ActRunShellEnvironmentDiagnostic {
-        variable: key.to_owned(),
-        diagnostic_code: diagnostic_code.to_owned(),
-        severity: severity.to_owned(),
-        daemon_pid: std::process::id(),
-        process_value: std::env::var(key)
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        durable_value: durable.as_ref().map(|value| value.value.clone()),
-        effective_value: env_value(env, key).map(ToOwned::to_owned),
-        validation_path: durable
-            .as_ref()
-            .filter(|_| key.eq_ignore_ascii_case("CUDA_PATH"))
-            .map(|value| path_string(&cuda_path_nvcc_path(&value.value))),
-        explicit_override: env_map_contains_key(requested_env, key),
-        source_of_truth: durable
-            .map(|value| value.source_of_truth)
-            .unwrap_or_else(persisted_environment_source_of_truth),
-        remediation: shell_environment_diagnostic_remediation(diagnostic_code, key),
-    }
-}
-
-fn shell_environment_diagnostic_remediation(diagnostic_code: &str, key: &str) -> String {
-    match diagnostic_code {
-        SHELL_ENV_DAEMON_STALE => format!(
-            "{key} differs between the long-lived daemon process and durable Windows environment; Synapse used the durable HKCU/HKLM value for the child. Restart the daemon through scripts\\synapse-setup.ps1 so process env and durable env converge."
-        ),
-        SHELL_ENV_DURABLE_MISSING => format!(
-            "{key} is absent from durable Windows environment. Run scripts\\synapse-setup.ps1 or set the real HKCU/HKLM environment value, then verify the registry Source of Truth before retrying CUDA-relevant shell work."
-        ),
-        SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE => format!(
-            "{key} is absent from durable Windows environment BECAUSE this host has no CUDA device, which is the correct state and needs no action. NVML evidence: {}. Installing the CUDA toolkit here would not make CUDA usable; the Calyx math backend independently selects the CPU runtime on this same probe (SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE). If an NVIDIA GPU is later installed, this diagnostic returns to {SHELL_ENV_DURABLE_MISSING} at error severity on its own.",
-            synapse_calyx::host_cuda_device_probe().basis
-        ),
-        SHELL_ENV_DURABLE_INVALID => format!(
-            "{key} does not resolve to a CUDA root containing bin\\nvcc.exe. Set the durable HKCU/HKLM value to the installed CUDA root, then verify that bin\\nvcc.exe exists before retrying CUDA-relevant shell work."
-        ),
-        _ => "inspect durable Windows environment, daemon process environment, and shell job status.json".to_owned(),
-    }
-}
-
-fn log_shell_environment_diagnostics(diagnostics: &[ActRunShellEnvironmentDiagnostic]) {
-    for diagnostic in diagnostics {
-        if diagnostic.severity == "error" {
-            tracing::error!(
-                code = %diagnostic.diagnostic_code,
-                variable = %diagnostic.variable,
-                daemon_pid = diagnostic.daemon_pid,
-                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
-                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
-                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
-                source_of_truth = %diagnostic.source_of_truth,
-                remediation = %diagnostic.remediation,
-                "act_run_shell configured-host environment diagnostic"
-            );
-        } else if diagnostic.severity == "info" {
-            // #1881: the observation is real and still reported, but it is not
-            // a fault. It carries the NVML verdict that makes it correct.
-            let probe = synapse_calyx::host_cuda_device_probe();
-            tracing::info!(
-                code = %diagnostic.diagnostic_code,
-                variable = %diagnostic.variable,
-                daemon_pid = diagnostic.daemon_pid,
-                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
-                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
-                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
-                source_of_truth = %diagnostic.source_of_truth,
-                host_cuda_probe_code = probe.code,
-                host_cuda_device_absent_proven = probe.device_absent_proven,
-                host_cuda_probe_basis = %probe.basis,
-                remediation = %diagnostic.remediation,
-                "act_run_shell configured-host environment diagnostic"
-            );
-        } else {
-            tracing::warn!(
-                code = %diagnostic.diagnostic_code,
-                variable = %diagnostic.variable,
-                daemon_pid = diagnostic.daemon_pid,
-                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
-                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
-                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
-                source_of_truth = %diagnostic.source_of_truth,
-                remediation = %diagnostic.remediation,
-                "act_run_shell configured-host environment diagnostic"
-            );
-        }
-    }
 }
 
 fn set_env_value(env: &mut BTreeMap<String, (String, String)>, key: &str, value: String) {
@@ -17327,168 +9650,28 @@ fn ensure_child_temp_environment(env: &mut BTreeMap<String, (String, String)>) {
     insert_env_if_absent(env, "TMP", temp);
 }
 
-#[derive(Clone, Debug)]
-struct PersistedEnvironmentValue {
-    value: String,
-    source_of_truth: String,
-}
-
-#[cfg(windows)]
-fn persisted_environment_value(key: &str) -> Option<PersistedEnvironmentValue> {
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-
-    let machine = read_windows_registry_environment_value(
-        HKEY_LOCAL_MACHINE,
-        WINDOWS_MACHINE_ENVIRONMENT_SUBKEY,
-        key,
-    )
-    .map(|value| PersistedEnvironmentValue {
-        value,
-        source_of_truth: format!(r"HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY} value {key}"),
-    });
-    read_windows_registry_environment_value(HKEY_CURRENT_USER, WINDOWS_USER_ENVIRONMENT_SUBKEY, key)
-        .map(|value| PersistedEnvironmentValue {
-            value,
-            source_of_truth: format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY} value {key}"),
-        })
-        .or(machine)
-}
-
-#[cfg(not(windows))]
-fn persisted_environment_value(_key: &str) -> Option<PersistedEnvironmentValue> {
-    None
-}
-
-#[cfg(windows)]
-fn persisted_environment_source_of_truth() -> String {
-    format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY} or HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY}")
-}
-
-#[cfg(not(windows))]
-fn persisted_environment_source_of_truth() -> String {
-    "process environment".to_owned()
-}
-
-/// Merges the durable Windows environment into the child block, machine first
-/// then user, exactly the way `CreateEnvironmentBlock` composes a logon
-/// environment.
-///
-/// Every value under both keys is enumerated. A fixed key list here would
-/// reintroduce the #768 defect from the registry side: a variable that the user
-/// persisted with `setx` after the daemon started would never reach a child,
-/// and the "durable registry is the Source of Truth" repair path would only
-/// work for variables somebody remembered to add to a constant.
 #[cfg(windows)]
 fn add_windows_registry_environment(env: &mut BTreeMap<String, (String, String)>) {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
-    for (root, subkey, source) in [
-        (
-            HKEY_LOCAL_MACHINE,
-            WINDOWS_MACHINE_ENVIRONMENT_SUBKEY,
-            "machine",
-        ),
-        (HKEY_CURRENT_USER, WINDOWS_USER_ENVIRONMENT_SUBKEY, "user"),
-    ] {
-        for key in windows_registry_environment_value_names(root, subkey) {
-            if let Some(value) = read_windows_registry_environment_value(root, subkey, &key) {
-                apply_windows_registry_environment_value(env, &key, value, source);
-            }
+    const MACHINE_ENVIRONMENT: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER_ENVIRONMENT: &str = "Environment";
+
+    for key in PROCESS_BASE_ENV_KEYS {
+        if let Some(value) =
+            read_windows_registry_environment_value(HKEY_LOCAL_MACHINE, MACHINE_ENVIRONMENT, key)
+        {
+            apply_windows_registry_environment_value(env, key, value, "machine");
         }
     }
-}
-
-/// Enumerates the value names under one durable environment registry key.
-///
-/// Returns an empty list (with a structured warning) when the key cannot be
-/// opened or enumerated; the caller still fails closed afterwards through
-/// [`validate_child_base_environment`] if that loss made a required variable
-/// unresolvable.
-#[cfg(windows)]
-fn windows_registry_environment_value_names(
-    root: windows::Win32::System::Registry::HKEY,
-    subkey: &str,
-) -> Vec<String> {
-    use windows::{
-        Win32::{
-            Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
-            System::Registry::{HKEY, KEY_READ, RegCloseKey, RegEnumValueW, RegOpenKeyExW},
-        },
-        core::{PCWSTR, PWSTR},
-    };
-
-    // Registry value names are capped at 16383 characters.
-    const MAX_VALUE_NAME_CHARS: usize = 16_384;
-
-    let subkey_wide = wide_null(subkey);
-    let mut key = HKEY::default();
-    let status = unsafe {
-        RegOpenKeyExW(
-            root,
-            PCWSTR(subkey_wide.as_ptr()),
-            None,
-            KEY_READ,
-            &raw mut key,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        tracing::warn!(
-            code = "M4_CHILD_ENV_REGISTRY_OPEN_FAILED",
-            subkey,
-            status = status.0,
-            "could not open the durable Windows environment registry key; child environments fall back to daemon inheritance plus deterministic derivation"
-        );
-        return Vec::new();
-    }
-
-    let mut names = Vec::new();
-    let mut index = 0_u32;
-    loop {
-        let mut buffer = vec![0_u16; MAX_VALUE_NAME_CHARS];
-        let mut len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        let status = unsafe {
-            RegEnumValueW(
-                key,
-                index,
-                Some(PWSTR(buffer.as_mut_ptr())),
-                &raw mut len,
-                None,
-                None,
-                None,
-                None,
-            )
-        };
-        if status == ERROR_NO_MORE_ITEMS {
-            break;
+    for key in PROCESS_BASE_ENV_KEYS {
+        if let Some(value) =
+            read_windows_registry_environment_value(HKEY_CURRENT_USER, USER_ENVIRONMENT, key)
+        {
+            apply_windows_registry_environment_value(env, key, value, "user");
         }
-        if status != ERROR_SUCCESS {
-            tracing::warn!(
-                code = "M4_CHILD_ENV_REGISTRY_ENUM_FAILED",
-                subkey,
-                index,
-                status = status.0,
-                "durable Windows environment registry enumeration stopped early; later values were not merged into the child environment"
-            );
-            break;
-        }
-        let name_len = (len as usize).min(buffer.len());
-        let name = String::from_utf16_lossy(&buffer[..name_len]);
-        if !name.is_empty() {
-            names.push(name);
-        }
-        index = index.saturating_add(1);
     }
-
-    let close_status = unsafe { RegCloseKey(key) };
-    if close_status != ERROR_SUCCESS {
-        tracing::warn!(
-            code = "M4_CHILD_ENV_REGISTRY_CLOSE_FAILED",
-            subkey,
-            status = close_status.0,
-            "RegCloseKey failed after enumerating the durable Windows environment key"
-        );
-    }
-    names
 }
 
 #[cfg(not(windows))]
@@ -17602,22 +9785,6 @@ fn apply_windows_registry_environment_value(
         return;
     }
 
-    if durable_env_override_key(key) {
-        let before = env_value(env, key).map(ToOwned::to_owned);
-        set_env_value(env, key, value);
-        if before.as_deref() != env_value(env, key) {
-            tracing::info!(
-                code = "M4_CHILD_ENV_REGISTRY_OVERRIDDEN",
-                key,
-                source,
-                before = before.as_deref().unwrap_or("<missing>"),
-                after = env_value(env, key).unwrap_or("<missing>"),
-                "durable Windows environment value overrides process snapshot for child process"
-            );
-        }
-        return;
-    }
-
     if env_value(env, key).is_none() {
         set_env_value(env, key, value);
     }
@@ -17655,22 +9822,6 @@ fn add_windows_standard_environment(env: &mut BTreeMap<String, (String, String)>
             .to_string_lossy()
             .into_owned(),
     );
-    // Variables below are supplied by winlogon/`CreateEnvironmentBlock` at
-    // logon rather than by the registry, so they only reach a child through
-    // inheritance. Derive them from documented Windows invariants when the
-    // daemon's own block lacks them (a service/Scheduled-Task launch can),
-    // instead of shipping a child that a normal process would never see.
-    if let Some(program_data) = env_value(env, "ProgramData").map(ToOwned::to_owned) {
-        // ALLUSERSPROFILE and ProgramData name the same directory on Vista+.
-        insert_env_if_absent(env, "ALLUSERSPROFILE", program_data);
-    }
-    let public_dir = Path::new(&system_drive).join("Users").join("Public");
-    if public_dir.is_dir() {
-        insert_env_if_absent(env, "PUBLIC", public_dir.to_string_lossy().into_owned());
-    }
-    if let Some(computer_name) = windows_computer_name() {
-        insert_env_if_absent(env, "COMPUTERNAME", computer_name);
-    }
     insert_env_if_absent(
         env,
         "ProgramFiles",
@@ -17727,37 +9878,6 @@ fn windows_directory() -> Option<String> {
     }
     buffer.truncate(written as usize);
     Some(String::from_utf16_lossy(&buffer))
-}
-
-/// Reads the NetBIOS computer name, the value winlogon publishes as
-/// `COMPUTERNAME`.
-#[cfg(windows)]
-fn windows_computer_name() -> Option<String> {
-    use windows::{
-        Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW},
-        core::PWSTR,
-    };
-
-    // MAX_COMPUTERNAME_LENGTH is 15; size generously and let the API report the
-    // exact length it wrote.
-    let mut buffer = vec![0_u16; 256];
-    let mut len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-    if let Err(error) = unsafe {
-        GetComputerNameExW(
-            ComputerNameNetBIOS,
-            Some(PWSTR(buffer.as_mut_ptr())),
-            &raw mut len,
-        )
-    } {
-        tracing::warn!(
-            code = "M4_CHILD_ENV_COMPUTERNAME_UNAVAILABLE",
-            detail = %error,
-            "GetComputerNameExW failed; COMPUTERNAME cannot be derived for child processes"
-        );
-        return None;
-    }
-    let len = (len as usize).min(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..len]))
 }
 
 #[cfg(windows)]
@@ -17896,14 +10016,20 @@ fn validate_child_base_environment(
     env: &BTreeMap<String, (String, String)>,
     surface: &'static str,
 ) -> Result<(), ErrorData> {
-    // Every variable a normally-launched Windows process is guaranteed to have
-    // and that real tooling reads. `OS`, `PROCESSOR_ARCHITECTURE` and
-    // `NUMBER_OF_PROCESSORS` come from HKLM Session Manager; the identity and
-    // home variables come from the logon block or the derivations above. None of
-    // them may be quietly absent: a child missing them is the #768 failure mode
-    // (a launcher gated on `$env:OS -eq 'Windows_NT'` refusing to run), so the
-    // spawn is refused here and names exactly what could not be resolved.
-    let required = REQUIRED_CHILD_ENVIRONMENT_KEYS;
+    let required = [
+        "PATH",
+        "PATHEXT",
+        "ComSpec",
+        "SystemRoot",
+        "windir",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "ProgramData",
+        "ProgramFiles",
+    ];
     let missing: Vec<&str> = required
         .into_iter()
         .filter(|key| env_value(env, key).is_none())
@@ -17930,12 +10056,10 @@ fn validate_child_base_environment(
         surface,
         missing = ?missing,
         invalid = ?invalid,
-        daemon_pid = std::process::id(),
-        remediation = %CHILD_ENV_INCOMPLETE_REMEDIATION,
         "child process environment is missing required Windows variables"
     );
     let message = format!(
-        "{surface} cannot spawn a reliable Windows child process because Synapse could not construct required environment variables: missing=[{}] invalid=[{}]. {CHILD_ENV_INCOMPLETE_REMEDIATION}",
+        "{surface} cannot spawn a reliable Windows child process because Synapse could not construct required environment variables: missing=[{}] invalid=[{}]",
         missing.join(", "),
         invalid.join(", ")
     );
@@ -17946,14 +10070,6 @@ fn validate_child_base_environment(
         "missing": missing,
         "invalid": invalid,
         "required": required,
-        "daemon_pid": std::process::id(),
-        "sources": [
-            "daemon process environment (inherited verbatim)",
-            format!(r"HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY}"),
-            format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY}"),
-            "deterministic Windows derivation (SystemRoot/USERPROFILE/GetComputerNameExW)",
-        ],
-        "remediation": CHILD_ENV_INCOMPLETE_REMEDIATION,
     });
     if surface == "act_run_shell" {
         return Err(shell_tool_error(
@@ -18009,18 +10125,6 @@ fn add_windows_profile_environment(env: &mut BTreeMap<String, (String, String)>)
             .to_string_lossy()
             .into_owned(),
     );
-    // winlogon splits USERPROFILE into HOMEDRIVE + HOMEPATH; scripts and build
-    // tools (notably MSYS/Git-bash shims) read them directly.
-    if userprofile.as_bytes().get(1) == Some(&b':') {
-        insert_env_if_absent(env, "HOMEDRIVE", userprofile[..2].to_owned());
-        insert_env_if_absent(env, "HOMEPATH", userprofile[2..].to_owned());
-    } else {
-        tracing::warn!(
-            code = "M4_CHILD_ENV_HOME_UNAVAILABLE",
-            userprofile = %userprofile,
-            "USERPROFILE is not a drive-qualified path; HOMEDRIVE and HOMEPATH cannot be derived"
-        );
-    }
     let system_drive = env
         .get("SYSTEMDRIVE")
         .map(|(_key, value)| value.as_str())
@@ -18786,6 +10890,11 @@ fn shell_job_paths_from_root(root: &Path, job_id: &str) -> ShellJobPaths {
 // caller's thread (the background monitor uses the absolute `ShellJobPaths`
 // resolved at start time), so a thread-local override fully isolates a test
 // without touching the production code path.
+#[cfg(test)]
+thread_local! {
+    static SHELL_JOB_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 // The daemon acquires an OS lock against a canonical shell-job root, then
 // freezes that exact path here before recovery or request serving. Every
@@ -18864,9 +10973,49 @@ pub(crate) fn freeze_shell_job_root_for_daemon(root: &Path) -> Result<(), ErrorD
     Ok(())
 }
 
+#[cfg(test)]
+fn shell_job_root_override() -> Option<PathBuf> {
+    SHELL_JOB_ROOT_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
 #[inline]
 fn shell_job_root_override() -> Option<PathBuf> {
     None
+}
+
+/// RAII guard that redirects the durable shell-job store to a unique temporary
+/// directory for the lifetime of a single test, then restores the previous
+/// override and drops the temp dir. Install it at the top of any test that
+/// starts durable jobs, scans the job root, or asserts cleanup counts so the
+/// test never observes — or is perturbed by — jobs written by other tests
+/// running in parallel (#1509).
+#[cfg(test)]
+struct ShellJobRootGuard {
+    previous: Option<PathBuf>,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl ShellJobRootGuard {
+    fn new() -> Self {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create hermetic shell-jobs root: {error}"));
+        let previous = SHELL_JOB_ROOT_OVERRIDE
+            .with(|cell| cell.borrow_mut().replace(temp.path().to_path_buf()));
+        Self {
+            previous,
+            _temp: temp,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShellJobRootGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SHELL_JOB_ROOT_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
+    }
 }
 
 pub(crate) fn shell_job_root_dir() -> Result<PathBuf, ErrorData> {
@@ -19201,15 +11350,11 @@ fn read_shell_remote_cleanup_invocation(
         serde_json::from_slice(&bytes).map_err(|error| {
             format!("failed to decode remote cleanup sidecar for {job_id}: {error}")
         })?;
-    if !matches!(invocation.schema_version, 1..=5) {
+    if !matches!(invocation.schema_version, 1..=4) {
         return Err(format!(
             "unsupported remote cleanup sidecar schema_version={} for {job_id}",
             invocation.schema_version
         ));
-    }
-    if invocation.schema_version == 5 {
-        validate_wsl_remote_cleanup_invocation(&invocation, paths, job_id)?;
-        return Ok(Some(invocation));
     }
     if invocation.transport != SHELL_REMOTE_TRANSPORT_SSH {
         return Err(format!(
@@ -19402,115 +11547,6 @@ fn read_shell_remote_cleanup_invocation(
         ));
     }
     Ok(Some(invocation))
-}
-
-fn validate_wsl_remote_cleanup_invocation(
-    invocation: &ShellRemoteCleanupInvocation,
-    paths: &ShellJobPaths,
-    job_id: &str,
-) -> Result<(), String> {
-    if invocation.transport != SHELL_REMOTE_TRANSPORT_WSL {
-        return Err(format!(
-            "remote cleanup sidecar v5 has unsupported transport={} for {job_id}",
-            invocation.transport
-        ));
-    }
-    let trusted_command = trusted_wsl_executable(&invocation.command).ok_or_else(|| {
-        format!(
-            "remote cleanup sidecar command is not the canonical System32 wsl.exe for {job_id}: {}",
-            invocation.command
-        )
-    })?;
-    if !Path::new(&invocation.command).is_absolute()
-        || fs::canonicalize(&invocation.command).ok().as_ref() != Some(&trusted_command)
-    {
-        return Err(format!(
-            "remote cleanup sidecar v5 does not bind the exact canonical WSL executable for {job_id}: recorded={} trusted={}",
-            invocation.command,
-            trusted_command.display()
-        ));
-    }
-    let distribution = wsl_distribution_from_control_args(&invocation.control_args)?;
-    let expected_identity = format!("wsl:{distribution}");
-    if invocation.remote_identity != expected_identity {
-        return Err(format!(
-            "remote cleanup sidecar identity differs from its parsed WSL distribution for {job_id}: recorded={} parsed={expected_identity}",
-            invocation.remote_identity
-        ));
-    }
-    validate_lower_sha256(&invocation.args_sha256, "args_sha256", job_id)?;
-    let actual_control_args_sha256 = shell_args_sha256(&invocation.control_args);
-    if actual_control_args_sha256 != invocation.args_sha256 {
-        return Err(format!(
-            "remote cleanup sidecar WSL control argv digest differs for {job_id}: recorded={} actual={actual_control_args_sha256}",
-            invocation.args_sha256
-        ));
-    }
-    let request_args_sha256 = invocation.request_args_sha256.as_deref().ok_or_else(|| {
-        format!("remote cleanup sidecar v5 lacks request_args_sha256 for {job_id}")
-    })?;
-    validate_lower_sha256(request_args_sha256, "request_args_sha256", job_id)?;
-    let request_bytes = fs::read(&paths.request_path).map_err(|error| {
-        format!(
-            "failed to read request JSON while validating WSL remote cleanup sidecar for {job_id}: {error}"
-        )
-    })?;
-    let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
-        format!(
-            "failed to decode request JSON while validating WSL remote cleanup sidecar for {job_id}: {error}"
-        )
-    })?;
-    let recorded_request_args_sha256 = request
-        .get("args_sha256")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("request JSON lacks args_sha256 for {job_id}"))?;
-    if recorded_request_args_sha256 != request_args_sha256 {
-        return Err(format!(
-            "WSL remote cleanup sidecar is not bound to request argv for {job_id}: sidecar={request_args_sha256} request={recorded_request_args_sha256}"
-        ));
-    }
-    let effective_control_args = invocation.effective_control_args.as_ref().ok_or_else(|| {
-        format!("remote cleanup sidecar v5 lacks effective_control_args for {job_id}")
-    })?;
-    let expected_effective_control_args = wsl_cleanup_control_args(&invocation.control_args)?;
-    if effective_control_args != &expected_effective_control_args {
-        return Err(format!(
-            "WSL remote cleanup sidecar effective controls differ from the deterministic cleanup controls for {job_id}"
-        ));
-    }
-    let effective_distribution = wsl_distribution_from_control_args(effective_control_args)?;
-    if effective_distribution != distribution {
-        return Err(format!(
-            "WSL remote cleanup sidecar effective controls changed distribution for {job_id}: request={distribution} cleanup={effective_distribution}"
-        ));
-    }
-    let effective_args_sha256 = invocation.effective_args_sha256.as_deref().ok_or_else(|| {
-        format!("remote cleanup sidecar v5 lacks effective_args_sha256 for {job_id}")
-    })?;
-    validate_lower_sha256(effective_args_sha256, "effective_args_sha256", job_id)?;
-    let actual_effective_args_sha256 = shell_args_sha256(effective_control_args);
-    if effective_args_sha256 != actual_effective_args_sha256 {
-        return Err(format!(
-            "WSL remote cleanup sidecar effective argv digest differs for {job_id}: recorded={effective_args_sha256} actual={actual_effective_args_sha256}"
-        ));
-    }
-    if invocation.request_effective_config.is_some()
-        || invocation.cleanup_effective_config.is_some()
-    {
-        return Err(format!(
-            "WSL remote cleanup sidecar unexpectedly carries SSH effective-config fingerprints for {job_id}"
-        ));
-    }
-    let ownership_token = invocation
-        .ownership_token
-        .as_deref()
-        .ok_or_else(|| format!("remote cleanup sidecar v5 lacks ownership_token for {job_id}"))?;
-    if !valid_remote_ownership_token(ownership_token) {
-        return Err(format!(
-            "remote cleanup sidecar v5 ownership_token is malformed for {job_id}"
-        ));
-    }
-    Ok(())
 }
 
 fn validate_ssh_effective_config_fingerprint(
@@ -20133,20 +12169,6 @@ fn shell_status_replace_in_flight(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Extracts only `schema_version` from raw status bytes, tolerating every other
-/// field being unknown or malformed to this binary. Returns `None` when the
-/// bytes are not JSON at all or carry no usable `schema_version`, which is
-/// itself evidence of genuine corruption rather than schema drift.
-fn peek_shell_job_status_schema_version(bytes: &[u8]) -> Option<u32> {
-    #[derive(Deserialize)]
-    struct SchemaVersionPeek {
-        schema_version: u32,
-    }
-    serde_json::from_slice::<SchemaVersionPeek>(bytes)
-        .ok()
-        .map(|peek| peek.schema_version)
-}
-
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
     let bytes = read_shell_status_bytes(path).map_err(|error| {
         let code = if error.kind() == io::ErrorKind::NotFound {
@@ -20171,62 +12193,17 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
         )
     })?;
     let mut job: ActRunShellJobStatus = serde_json::from_slice(&bytes).map_err(|error| {
-        // Classify the failure before reporting it. A record written by a NEWER
-        // daemon is intact evidence this binary simply cannot interpret; a
-        // record at or below this binary's schema that still fails to decode is
-        // genuine corruption. Collapsing the two let a schema change turn every
-        // pre-existing record into "corrupt" and brick startup (#1858).
-        let peeked = peek_shell_job_status_schema_version(&bytes);
-        match peeked {
-            Some(version) if version > SHELL_JOB_STATUS_SCHEMA_VERSION => shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "act_run_shell job status was written by a newer daemon (record schema_version={version}, this binary reads up to {SHELL_JOB_STATUS_SCHEMA_VERSION}) and cannot be interpreted: {error}"
-                ),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "job_id": job_id,
-                    "path": path,
-                    "reason": "job_status_future_schema",
-                    "record_schema_version": version,
-                    "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
-                    "remediation": "run a daemon build at or above the record's schema version; this record is intact and must not be quarantined, rewritten, or deleted by an older binary",
-                }),
-            ),
-            _ => shell_tool_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!("act_run_shell job status JSON is invalid: {error}"),
-                json!({
-                    "code": error_codes::STORAGE_READ_FAILED,
-                    "job_id": job_id,
-                    "path": path,
-                    "reason": "job_status_decode_failed",
-                    "record_schema_version": peeked,
-                    "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
-                }),
-            ),
-        }
-    })?;
-    if job.schema_version > SHELL_JOB_STATUS_SCHEMA_VERSION {
-        // Structurally decodable but self-declared newer: refuse to interpret
-        // it rather than act on fields whose meaning may have changed.
-        return Err(shell_tool_error(
+        shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
-            format!(
-                "act_run_shell job status declares schema_version={} but this binary reads up to {SHELL_JOB_STATUS_SCHEMA_VERSION}",
-                job.schema_version
-            ),
+            format!("act_run_shell job status JSON is invalid: {error}"),
             json!({
                 "code": error_codes::STORAGE_READ_FAILED,
                 "job_id": job_id,
                 "path": path,
-                "reason": "job_status_future_schema",
-                "record_schema_version": job.schema_version,
-                "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
-                "remediation": "run a daemon build at or above the record's schema version; this record is intact and must not be quarantined, rewritten, or deleted by an older binary",
+                "reason": "job_status_decode_failed",
             }),
-        ));
-    }
+        )
+    })?;
     if job.job_id != job_id {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
@@ -20293,11 +12270,6 @@ fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
     if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_LOCAL {
         return;
     }
-    if is_wsl_executable(&job.command) {
-        job.remote_process_scope =
-            wsl_remote_process_scope(&job.args, "direct_command_wsl:normalized_legacy_record");
-        return;
-    }
     if let Some(client) = ssh_family_client_for_executable(&job.command) {
         let evidence = if client == "ssh" {
             "direct_command_ssh".to_owned()
@@ -20311,11 +12283,7 @@ fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
 fn shell_job_remote_process_scope_from_start_params(
     params: &ActRunShellStartParams,
 ) -> ActRunShellRemoteProcessScope {
-    if is_wsl_executable(&params.command) {
-        wsl_remote_process_scope(&params.args, "direct_command_wsl")
-    } else if let Some(invocation) =
-        shell_job_remote_scope_invocation(&params.command, &params.args)
-    {
+    if let Some(invocation) = shell_job_remote_scope_invocation(&params.command, &params.args) {
         ssh_remote_process_scope(
             &invocation.command,
             &invocation.args,
@@ -20372,391 +12340,6 @@ fn ssh_remote_process_scope(
     }
 }
 
-fn is_wsl_executable(command: &str) -> bool {
-    matches!(
-        executable_leaf(command).to_ascii_lowercase().as_str(),
-        "wsl" | "wsl.exe"
-    )
-}
-
-/// Parse `-d`/`--distribution` out of a `wsl.exe` argv.
-///
-/// Option scanning stops at the first token that begins the payload — `--`,
-/// `-e`/`--exec`, or the first non-option word — so a `-d` that belongs to the
-/// Linux command is never mistaken for the distribution selector.
-fn wsl_distribution_from_args(args: &[String]) -> Option<String> {
-    let mut index = 0;
-    while let Some(raw) = args.get(index) {
-        let arg = trim_arg_quotes(raw);
-        if matches!(arg, "--" | "-e" | "--exec") {
-            return None;
-        }
-        if let Some(value) = arg.strip_prefix("--distribution=") {
-            let value = trim_arg_quotes(value);
-            return (!value.is_empty()).then(|| value.to_owned());
-        }
-        if matches!(arg, "-d" | "--distribution") {
-            let value = trim_arg_quotes(args.get(index + 1)?);
-            return (!value.is_empty()).then(|| value.to_owned());
-        }
-        if matches!(arg, "-u" | "--user" | "--cd" | "--shell-type") {
-            index += 2;
-            continue;
-        }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        return None;
-    }
-    None
-}
-
-/// Split a direct WSL invocation into immutable launcher controls and literal
-/// Linux payload argv.  Durable mode requires an explicit distribution: replay
-/// against a mutable default distro would make later liveness/cancel probes
-/// target a different kernel namespace.
-fn wsl_command_parts(args: &[String]) -> Result<WslCommandParts, String> {
-    let mut control_args = Vec::new();
-    let mut distribution = None;
-    let mut index = 0_usize;
-    while let Some(raw) = args.get(index) {
-        let arg = trim_arg_quotes(raw);
-        if matches!(arg, "--" | "-e" | "--exec") {
-            let payload_args = args.get(index + 1..).unwrap_or_default().to_vec();
-            if payload_args.is_empty() {
-                return Err(
-                    "WSL durable execution requires a non-empty payload after --exec/--".to_owned(),
-                );
-            }
-            let distribution = distribution.ok_or_else(|| {
-                "WSL durable execution requires explicit -d/--distribution so recovery cannot drift to a different default distro".to_owned()
-            })?;
-            return Ok(WslCommandParts {
-                control_args,
-                distribution,
-                payload_args,
-            });
-        }
-        if let Some(value) = arg.strip_prefix("--distribution=") {
-            let value = trim_arg_quotes(value);
-            if value.is_empty() || value.contains('\0') {
-                return Err("WSL --distribution value is empty or contains NUL".to_owned());
-            }
-            if distribution.as_deref().is_some_and(|prior| prior != value) {
-                return Err("WSL invocation contains conflicting distribution selectors".to_owned());
-            }
-            distribution = Some(value.to_owned());
-            control_args.push(raw.clone());
-            index += 1;
-            continue;
-        }
-        if matches!(arg, "-d" | "--distribution") {
-            let value = args
-                .get(index + 1)
-                .map(|value| trim_arg_quotes(value))
-                .filter(|value| !value.is_empty() && !value.contains('\0'))
-                .ok_or_else(|| "WSL distribution selector lacks a valid value".to_owned())?;
-            if distribution.as_deref().is_some_and(|prior| prior != value) {
-                return Err("WSL invocation contains conflicting distribution selectors".to_owned());
-            }
-            distribution = Some(value.to_owned());
-            control_args.push(raw.clone());
-            control_args.push(args[index + 1].clone());
-            index += 2;
-            continue;
-        }
-        if matches!(arg, "-u" | "--user" | "--cd") {
-            let value = args
-                .get(index + 1)
-                .map(|value| trim_arg_quotes(value))
-                .filter(|value| !value.is_empty() && !value.contains('\0'))
-                .ok_or_else(|| format!("WSL option {arg} lacks a valid value"))?;
-            control_args.push(raw.clone());
-            control_args.push(value.to_owned());
-            index += 2;
-            continue;
-        }
-        if (arg.starts_with("--user=") || arg.starts_with("--cd="))
-            && arg
-                .split_once('=')
-                .is_some_and(|(_, value)| !value.is_empty())
-        {
-            control_args.push(raw.clone());
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            return Err(format!(
-                "WSL option {arg} is not replay-safe for durable execution; supported controls are explicit distribution, user, and working directory"
-            ));
-        }
-        let payload_args = args[index..].to_vec();
-        let distribution = distribution.ok_or_else(|| {
-            "WSL durable execution requires explicit -d/--distribution so recovery cannot drift to a different default distro".to_owned()
-        })?;
-        return Ok(WslCommandParts {
-            control_args,
-            distribution,
-            payload_args,
-        });
-    }
-    Err("WSL durable execution requires a non-empty literal payload argv".to_owned())
-}
-
-/// Validate that a persisted WSL control vector contains controls only and
-/// recover its explicit distribution using the same parser as admission.  The
-/// synthetic payload is never executed; it makes the parser prove that every
-/// persisted element was consumed as a replay-safe launcher control.
-fn wsl_distribution_from_control_args(control_args: &[String]) -> Result<String, String> {
-    let mut probe = control_args.to_vec();
-    probe.push("--exec".to_owned());
-    probe.push(":".to_owned());
-    let parts = wsl_command_parts(&probe)?;
-    if parts.control_args != control_args || parts.payload_args != [":".to_owned()] {
-        return Err(
-            "WSL cleanup control argv contains a payload or was not consumed exactly".to_owned(),
-        );
-    }
-    Ok(parts.distribution)
-}
-
-/// Cleanup/liveness do not depend on the payload working directory. Replaying
-/// `--cd` would make ownership recovery fail merely because the payload removed
-/// or renamed its original directory, so persist a second exact control vector
-/// containing only the immutable distribution and user selectors.
-fn wsl_cleanup_control_args(control_args: &[String]) -> Result<Vec<String>, String> {
-    let expected_distribution = wsl_distribution_from_control_args(control_args)?;
-    let mut cleanup = Vec::new();
-    let mut index = 0_usize;
-    while let Some(raw) = control_args.get(index) {
-        let arg = trim_arg_quotes(raw);
-        if arg == "--cd" {
-            if control_args.get(index + 1).is_none() {
-                return Err("WSL --cd control lacks a value".to_owned());
-            }
-            index += 2;
-            continue;
-        }
-        if arg.starts_with("--cd=") {
-            index += 1;
-            continue;
-        }
-        cleanup.push(raw.clone());
-        index += 1;
-    }
-    let actual_distribution = wsl_distribution_from_control_args(&cleanup)?;
-    if actual_distribution != expected_distribution {
-        return Err("WSL cleanup controls changed the explicit distribution".to_owned());
-    }
-    Ok(cleanup)
-}
-
-#[cfg(windows)]
-fn trusted_wsl_executable(command: &str) -> Option<PathBuf> {
-    let expected = fs::canonicalize(
-        PathBuf::from(std::env::var_os("SystemRoot")?)
-            .join("System32")
-            .join("wsl.exe"),
-    )
-    .ok()?;
-    if is_bare_windows_executable_name(command) && is_wsl_executable(command) {
-        return Some(expected);
-    }
-    let actual = fs::canonicalize(command).ok()?;
-    (actual == expected).then_some(actual)
-}
-
-#[cfg(not(windows))]
-fn trusted_wsl_executable(_command: &str) -> Option<PathBuf> {
-    None
-}
-
-fn trusted_remote_replay_executable(command: &str) -> Option<PathBuf> {
-    trusted_ssh_automatic_replay_executable(command).or_else(|| trusted_wsl_executable(command))
-}
-
-fn wsl_remote_guardian_args(
-    job_id: &str,
-    ownership_token: &str,
-    payload_args: &[String],
-) -> Vec<String> {
-    const SCRIPT: &str = r#"import hashlib
-import os
-import signal
-import subprocess
-import sys
-import time
-
-job_id = sys.argv[1]
-process_marker = sys.argv[2]
-exit_marker = sys.argv[3]
-payload_argv = sys.argv[4:]
-ownership_token = os.environ.get("SYNAPSE_REMOTE_JOB_TOKEN", "")
-child = None
-
-def fail(reason):
-    print(f"synapse_wsl_guardian_error error={reason}", file=sys.stderr, flush=True)
-    raise SystemExit(125)
-
-def read_boot_id():
-    try:
-        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
-            value = handle.read().strip()
-    except OSError:
-        fail("boot_identity_unavailable")
-    if not value:
-        fail("boot_identity_unavailable")
-    return value
-
-def read_start_time(pid):
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="strict") as handle:
-            stat_line = handle.read().strip()
-    except OSError:
-        fail("proc_identity_unavailable")
-    _comm, separator, stat_tail = stat_line.rpartition(") ")
-    if not separator:
-        fail("proc_identity_unavailable")
-    fields = stat_tail.split()
-    if len(fields) < 20:
-        fail("proc_identity_unavailable")
-    return fields[19]
-
-def terminate_group(signum, _frame):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pgid = os.getpgrp()
-    if child is not None and child.poll() is None:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        deadline = time.monotonic() + 5
-        while child.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if child.poll() is None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-    raise SystemExit(128 + int(signum))
-
-if not payload_argv:
-    fail("payload_argv_empty")
-if not ownership_token or len(ownership_token) != 32 or any(ch not in "0123456789abcdef" for ch in ownership_token):
-    fail("remote_identity_prerequisite_unavailable")
-try:
-    os.setsid()
-except OSError:
-    if os.getpgrp() != os.getpid():
-        fail("guardian_scope_unavailable")
-
-boot_id = read_boot_id()
-pid = os.getpid()
-pgid = os.getpgrp()
-sid = os.getsid(0)
-start_time = read_start_time(pid)
-signal.signal(signal.SIGTERM, terminate_group)
-# A daemon crash can tear down the Windows-side WSL relay and deliver SIGHUP.
-# Durable ownership intentionally survives that transport event; only an exact
-# identity-bound cleanup sends SIGTERM to this guardian.
-signal.signal(signal.SIGHUP, signal.SIG_IGN)
-signal.signal(signal.SIGINT, terminate_group)
-payload_env = os.environ.copy()
-payload_env.pop("SYNAPSE_REMOTE_JOB_TOKEN", None)
-try:
-    child = subprocess.Popen(payload_argv, env=payload_env)
-except OSError:
-    fail("remote_payload_spawn_failed")
-
-ownership_token_sha256 = hashlib.sha256(ownership_token.encode("ascii")).hexdigest()
-print(
-    f"{process_marker} job_id={job_id} pid={pid} pgid={pgid} sid={sid} "
-    f"boot_id={boot_id} start_time={start_time} scope=setsid "
-    f"ownership_token_sha256={ownership_token_sha256}",
-    file=sys.stderr,
-    flush=True,
-)
-returncode = child.wait()
-exit_code = 1 if returncode is None else (128 + abs(returncode) if returncode < 0 else returncode)
-print(
-    f"{exit_marker} job_id={job_id} pid={pid} pgid={pgid} "
-    f"exit_code={exit_code} ownership_token_sha256={ownership_token_sha256}",
-    file=sys.stderr,
-    flush=True,
-)
-raise SystemExit(exit_code if 0 <= exit_code <= 255 else 1)
-"#;
-    let mut args = vec![
-        "env".to_owned(),
-        format!("SYNAPSE_REMOTE_JOB_TOKEN={ownership_token}"),
-        "python3".to_owned(),
-        "-c".to_owned(),
-        SCRIPT.to_owned(),
-        job_id.to_owned(),
-        SHELL_REMOTE_PROCESS_MARKER.to_owned(),
-        SHELL_REMOTE_EXIT_MARKER.to_owned(),
-    ];
-    args.extend_from_slice(payload_args);
-    args
-}
-
-/// Classify a `wsl.exe` job as its own remote transport.
-///
-/// Recording it as `local` (the previous behavior) asserted two false things:
-/// that the payload was inside the job's Windows kill-on-close job object, and
-/// that the wrapper's absence proved the payload had ended. Neither holds for
-/// WSL2 — the payload runs in the utility VM's own kernel and PID namespace.
-/// Cleanup is therefore required and starts out explicitly unverified.
-fn wsl_remote_process_scope(
-    args: &[String],
-    evidence: impl Into<String>,
-) -> ActRunShellRemoteProcessScope {
-    let distribution = wsl_distribution_from_args(args);
-    let tracked = wsl_command_parts(args).is_ok();
-    let mut detection_evidence = vec![evidence.into()];
-    detection_evidence.push(match distribution.as_deref() {
-        Some(distribution) => format!("wsl_distribution:{distribution}"),
-        None => "wsl_distribution:default_not_specified_on_argv".to_owned(),
-    });
-    detection_evidence.push(
-        "wsl_payload_outside_windows_job_object:separate_wsl2_kernel_and_pid_namespace".to_owned(),
-    );
-    detection_evidence.push(
-        "wsl_wrapper_liveness_is_not_payload_liveness:wslhost_exe_assumes_lifetime_and_redirected_kill_sends_only_sighup"
-            .to_owned(),
-    );
-    detection_evidence.push(if tracked {
-        format!("remote_tracking_pending:setsid_stderr_marker:{SHELL_REMOTE_PROCESS_MARKER}")
-    } else {
-        "wsl_linux_child_identity_untracked:durable_preflight_will_refuse_spawn".to_owned()
-    });
-    ActRunShellRemoteProcessScope {
-        transport: SHELL_REMOTE_TRANSPORT_WSL.to_owned(),
-        local_process_scope: "windows_wsl_exe_wrapper_process_tree_only".to_owned(),
-        remote_cleanup_required: true,
-        remote_cleanup_verified: false,
-        remote_cleanup_status: if tracked {
-            SHELL_REMOTE_CLEANUP_TRACKING_PENDING
-        } else {
-            SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
-        }
-        .to_owned(),
-        remote_identity: Some(match distribution.as_deref() {
-            Some(distribution) => format!("wsl:{distribution}"),
-            None => "wsl:<default-distribution>".to_owned(),
-        }),
-        detection_evidence,
-        ..ActRunShellRemoteProcessScope::default()
-    }
-}
-
 fn ssh_family_client_for_executable(command: &str) -> Option<&'static str> {
     let leaf = executable_leaf(command).to_ascii_lowercase();
     match leaf.as_str() {
@@ -20779,63 +12362,6 @@ fn shell_spawn_command(command: &str) -> Cow<'_, str> {
         return Cow::Owned(resolved);
     }
     Cow::Borrowed(command)
-}
-
-/// Resolve the documented `Command::current_dir` + relative-program ambiguity
-/// before both causal measurement and execution. The exact request remains in
-/// the command audit; only the program passed to `Command::new` is normalized.
-fn prepared_shell_spawn_command<'a>(
-    command: &'a str,
-    effective_working_dir: Option<&str>,
-) -> Result<Cow<'a, str>, ErrorData> {
-    let spawn_command = shell_spawn_command(command);
-    match shell_command_path_class(spawn_command.as_ref()) {
-        "drive_relative" => Err(shell_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "act_run_shell refuses drive-relative executable paths because their resolution depends on ambient per-drive process state",
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "reason": "drive_relative_executable_ambiguous",
-                "requested_path_class": "drive_relative",
-                "remediation": "use an absolute executable path, a bare executable name, or a relative path rooted by working_dir",
-            }),
-        )),
-        "relative_path" => {
-            let base = match effective_working_dir {
-                Some(path) => PathBuf::from(path),
-                None => std::env::current_dir().map_err(|error| {
-                    shell_tool_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "act_run_shell could not resolve its relative executable against the current directory: {error}"
-                        ),
-                        json!({
-                            "code": error_codes::TOOL_INTERNAL_ERROR,
-                            "reason": "relative_executable_current_directory_failed",
-                            "os_error": error.raw_os_error(),
-                        }),
-                    )
-                })?,
-            };
-            let resolved = base
-                .join(spawn_command.as_ref())
-                .into_os_string()
-                .into_string()
-                .map_err(|_| {
-                    shell_tool_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        "act_run_shell relative executable resolved to a non-Unicode path",
-                        json!({
-                            "code": error_codes::TOOL_PARAMS_INVALID,
-                            "reason": "relative_executable_non_unicode",
-                            "remediation": "use an absolute Unicode executable path",
-                        }),
-                    )
-                })?;
-            Ok(Cow::Owned(resolved))
-        }
-        _ => Ok(spawn_command),
-    }
 }
 
 #[cfg(windows)]
@@ -20985,13 +12511,6 @@ struct SshCommandInvocation {
     evidence: &'static str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WslCommandParts {
-    control_args: Vec<String>,
-    distribution: String,
-    payload_args: Vec<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ShellRemoteCleanupInvocation {
@@ -21027,59 +12546,6 @@ struct ShellRemoteCleanupInvocation {
     created_at: String,
 }
 
-fn remote_liveness_replay_args(
-    invocation: &ShellRemoteCleanupInvocation,
-    pid: &str,
-    pgid: &str,
-) -> Result<Vec<String>, String> {
-    match invocation.transport.as_str() {
-        SHELL_REMOTE_TRANSPORT_SSH => {
-            let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
-            args.push(ssh_remote_liveness_command(pid, pgid));
-            Ok(args)
-        }
-        SHELL_REMOTE_TRANSPORT_WSL => {
-            let effective = invocation
-                .effective_control_args
-                .as_ref()
-                .ok_or_else(|| "WSL cleanup sidecar lacks effective controls".to_owned())?;
-            wsl_distribution_from_control_args(effective)?;
-            let mut args = effective.clone();
-            args.push("--exec".to_owned());
-            args.extend(remote_liveness_python_args(pid, pgid));
-            Ok(args)
-        }
-        transport => Err(format!("unsupported remote liveness transport={transport}")),
-    }
-}
-
-fn remote_cleanup_replay_args(
-    invocation: &ShellRemoteCleanupInvocation,
-    pid: &str,
-    pgid: &str,
-    identity: &RemoteProcessOwnershipIdentity,
-) -> Result<Vec<String>, String> {
-    match invocation.transport.as_str() {
-        SHELL_REMOTE_TRANSPORT_SSH => {
-            let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
-            args.push(ssh_remote_cleanup_command(pid, pgid, identity));
-            Ok(args)
-        }
-        SHELL_REMOTE_TRANSPORT_WSL => {
-            let effective = invocation
-                .effective_control_args
-                .as_ref()
-                .ok_or_else(|| "WSL cleanup sidecar lacks effective controls".to_owned())?;
-            wsl_distribution_from_control_args(effective)?;
-            let mut args = effective.clone();
-            args.push("--exec".to_owned());
-            args.extend(remote_cleanup_python_args(pid, pgid, identity));
-            Ok(args)
-        }
-        transport => Err(format!("unsupported remote cleanup transport={transport}")),
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SshEffectiveConfigFingerprint {
@@ -21093,6 +12559,24 @@ struct SshEffectiveConfigReadback {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
+struct SshRemoteTrackingPlan {
+    /// Historical tracker wire fixture only. Production rejects new durable
+    /// SSH promotion before this shape can be constructed.
+    command: String,
+    /// Canonical trusted executable identity used only for preflight and later
+    /// unattended read/cleanup replay.
+    cleanup_command: String,
+    spawn_args: Vec<String>,
+    control_args: Vec<String>,
+    effective_control_args: Vec<String>,
+    remote_identity: String,
+    remote_command: String,
+    marker: String,
+    ownership_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ShellJobSpawnPlan {
     command: String,
     args: Vec<String>,
@@ -21103,22 +12587,12 @@ fn shell_job_spawn_plan(
     params: &ActRunShellStartParams,
     job_id: &str,
 ) -> Result<ShellJobSpawnPlan, ErrorData> {
-    if is_wsl_executable(&params.command) {
-        return tracked_wsl_shell_job_spawn_plan(params, job_id);
-    }
-    if let Some(invocation) = direct_ssh_command_invocation(&params.command, &params.args) {
-        return tracked_direct_ssh_shell_job_spawn_plan(params, job_id, invocation);
-    }
-    if let Some(source_evidence) = durable_ssh_promotion_evidence(&params.command, &params.args) {
-        return Err(durable_ssh_tracking_preflight_error(
-            "ssh_durable_tracking_requires_direct_ssh_argv",
-            "durable SSH tracking only accepts a direct ssh executable with literal argv; shell-wrapped SSH is ambiguous after shell expansion and is refused before spawning",
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(source_evidence),
-        ));
-    }
+    reject_new_durable_ssh_promotion(
+        &params.command,
+        &params.args,
+        Some("durable_spawn_plan"),
+        Some(job_id),
+    )?;
     Ok(ShellJobSpawnPlan {
         command: params.command.clone(),
         args: params.args.clone(),
@@ -21126,274 +12600,48 @@ fn shell_job_spawn_plan(
     })
 }
 
-fn tracked_wsl_shell_job_spawn_plan(
-    params: &ActRunShellStartParams,
-    job_id: &str,
-) -> Result<ShellJobSpawnPlan, ErrorData> {
-    let parts = wsl_command_parts(&params.args).map_err(|reason| {
-        shell_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!("durable WSL tracking refused the command before spawning: {reason}"),
-            json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "job_id": job_id,
-                "command": params.command,
-                "args_sha256": shell_args_sha256(&params.args),
-                "reason": "wsl_durable_tracking_preflight_failed",
-                "detail": reason,
-            }),
-        )
-    })?;
-    let trusted_command = trusted_wsl_executable(&params.command).ok_or_else(|| {
-        shell_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            "durable WSL tracking requires the canonical System32 wsl.exe",
-            json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "job_id": job_id,
-                "command": params.command,
-                "reason": "wsl_executable_not_trusted_for_cleanup_replay",
-                "expected": std::env::var_os("SystemRoot").map(PathBuf::from).map(|root| root.join("System32").join("wsl.exe")),
-            }),
-        )
-    })?;
-    let trusted_command = trusted_command.to_string_lossy().into_owned();
-    let ownership_token = new_remote_ownership_token();
-    let cleanup_control_args = wsl_cleanup_control_args(&parts.control_args).map_err(|reason| {
-        shell_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!("durable WSL cleanup-control derivation failed before spawning: {reason}"),
-            json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "job_id": job_id,
-                "command": params.command,
-                "reason": "wsl_cleanup_control_derivation_failed",
-                "detail": reason,
-                "no_child_spawned": true,
-            }),
-        )
-    })?;
-    let mut spawn_args = parts.control_args.clone();
-    spawn_args.push("--exec".to_owned());
-    spawn_args.extend(wsl_remote_guardian_args(
-        job_id,
-        &ownership_token,
-        &parts.payload_args,
-    ));
-    let remote_identity = format!("wsl:{}", parts.distribution);
-    let remote_cleanup_invocation = ShellRemoteCleanupInvocation {
-        schema_version: 5,
-        transport: SHELL_REMOTE_TRANSPORT_WSL.to_owned(),
-        command: trusted_command.clone(),
-        control_args: parts.control_args.clone(),
-        remote_identity,
-        source_evidence: "direct_command_wsl_explicit_distribution".to_owned(),
-        args_sha256: shell_args_sha256(&parts.control_args),
-        request_args_sha256: Some(shell_args_sha256(&params.args)),
-        effective_control_args: Some(cleanup_control_args.clone()),
-        effective_args_sha256: Some(shell_args_sha256(&cleanup_control_args)),
-        request_effective_config: None,
-        cleanup_effective_config: None,
-        ownership_token: Some(ownership_token),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    Ok(ShellJobSpawnPlan {
-        command: trusted_command,
-        args: spawn_args,
-        remote_cleanup_invocation: Some(remote_cleanup_invocation),
-    })
-}
-
-fn direct_ssh_command_invocation(command: &str, args: &[String]) -> Option<SshCommandInvocation> {
-    (ssh_family_client_for_executable(command) == Some("ssh")).then(|| SshCommandInvocation {
-        command: command.to_owned(),
-        args: args.to_vec(),
-        evidence: "direct_command_ssh",
-    })
-}
-
 fn shell_job_ssh_command_invocation(
     command: &str,
     args: &[String],
 ) -> Option<SshCommandInvocation> {
-    if let Some(invocation) = direct_ssh_command_invocation(command, args) {
-        return Some(invocation);
+    if ssh_family_client_for_executable(command) == Some("ssh") {
+        return Some(SshCommandInvocation {
+            command: command.to_owned(),
+            args: args.to_vec(),
+            evidence: "direct_command_ssh",
+        });
     }
     shell_wrapped_ssh_command_invocation(command, args)
 }
 
-fn tracked_direct_ssh_shell_job_spawn_plan(
-    params: &ActRunShellStartParams,
-    job_id: &str,
-    invocation: SshCommandInvocation,
-) -> Result<ShellJobSpawnPlan, ErrorData> {
-    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
-        return Err(durable_ssh_tracking_preflight_error(
-            "ssh_destination_missing",
-            "direct durable SSH requires a parseable SSH destination before the remote command",
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        ));
-    };
-    let Some(remote_command) = parts.remote_command.as_deref() else {
-        return Err(durable_ssh_tracking_preflight_error(
-            "ssh_remote_command_required",
-            "interactive durable SSH is refused because the shell start facade owns stdin as null and cannot preserve a terminal or prompt contract; provide a remote command argv after the destination",
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        ));
-    };
-    if let Some(reason) = parts.tracking_unsupported_reason {
-        return Err(durable_ssh_tracking_preflight_error(
-            reason,
-            "this SSH mode changes the remote channel or process lifetime in a way that cannot be bound to one cleanup handle",
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        ));
-    }
-    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
-        return Err(durable_ssh_tracking_preflight_error(
-            "ssh_control_args_not_replay_safe",
-            &format!(
-                "automatic SSH cleanup refused the control argv before spawn because it could not be replayed safely: {reason}"
-            ),
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        ));
-    }
-    let trusted_command =
-        trusted_ssh_automatic_replay_executable(&invocation.command).ok_or_else(|| {
-            durable_ssh_tracking_preflight_error(
-                "ssh_executable_not_trusted_for_cleanup_replay",
-                "direct durable SSH requires a canonical OpenSSH client that Synapse can replay for liveness and cleanup; the requested executable is outside the trusted platform locations",
-                &params.command,
-                &params.args,
-                Some(job_id),
-                Some(invocation.evidence.to_owned()),
-            )
-        })?;
-    let trusted_command = trusted_command.to_string_lossy().into_owned();
-
-    let request_config = ssh_effective_config_readback(&trusted_command, &parts.control_args)
-        .map_err(|detail| {
-            durable_ssh_tracking_preflight_error(
-                "ssh_effective_config_read_failed",
-                &detail,
-                &params.command,
-                &params.args,
-                Some(job_id),
-                Some(invocation.evidence.to_owned()),
-            )
-        })?;
-    let mut isolated_request_args = Vec::with_capacity(parts.control_args.len() + 2);
-    isolated_request_args.push("-F".to_owned());
-    isolated_request_args.push(SSH_AUTOMATIC_REPLAY_DISABLED_CONFIG.to_owned());
-    isolated_request_args.extend_from_slice(&parts.control_args);
-    let isolated_request_config =
-        ssh_effective_config_readback(&trusted_command, &isolated_request_args).map_err(
-            |detail| {
-                durable_ssh_tracking_preflight_error(
-                    "ssh_isolated_effective_config_read_failed",
-                    &detail,
-                    &params.command,
-                    &params.args,
-                    Some(job_id),
-                    Some(invocation.evidence.to_owned()),
-                )
-            },
-        )?;
-    if request_config.fingerprint != isolated_request_config.fingerprint {
-        return Err(durable_ssh_tracking_preflight_error(
-            "ssh_config_dependency_unsupported",
-            "direct durable SSH refused before spawn because the caller's effective ssh_config differs from the config-isolated argv; pass explicit replay-safe -o/-i/-l/-p options instead of relying on mutable ssh_config Host entries",
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        ));
-    }
-
-    let effective_control_args =
-        hardened_ssh_automatic_replay_args(&parts.control_args).map_err(|detail| {
-            durable_ssh_tracking_preflight_error(
-                "ssh_hardened_control_args_failed",
-                &detail,
-                &params.command,
-                &params.args,
-                Some(job_id),
-                Some(invocation.evidence.to_owned()),
-            )
-        })?;
-    let cleanup_config = ssh_effective_config_readback(&trusted_command, &effective_control_args)
-        .map_err(|detail| {
-        durable_ssh_tracking_preflight_error(
-            "ssh_cleanup_effective_config_read_failed",
-            &detail,
-            &params.command,
-            &params.args,
-            Some(job_id),
-            Some(invocation.evidence.to_owned()),
-        )
-    })?;
-    let ownership_token = new_remote_ownership_token();
-    let remote_guardian = ssh_remote_guardian_command(job_id, &ownership_token, remote_command);
-    let mut spawn_args = effective_control_args.clone();
-    spawn_args.push(remote_guardian);
-    let remote_cleanup_invocation = ShellRemoteCleanupInvocation {
-        schema_version: 4,
-        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
-        command: trusted_command.clone(),
-        control_args: parts.control_args.clone(),
-        remote_identity: parts.remote_identity,
-        source_evidence: invocation.evidence.to_owned(),
-        args_sha256: shell_args_sha256(&parts.control_args),
-        request_args_sha256: Some(shell_args_sha256(&params.args)),
-        effective_control_args: Some(effective_control_args.clone()),
-        effective_args_sha256: Some(shell_args_sha256(&effective_control_args)),
-        request_effective_config: Some(isolated_request_config.fingerprint),
-        cleanup_effective_config: Some(cleanup_config.fingerprint),
-        ownership_token: Some(ownership_token),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    Ok(ShellJobSpawnPlan {
-        command: trusted_command,
-        args: spawn_args,
-        remote_cleanup_invocation: Some(remote_cleanup_invocation),
-    })
-}
-
-fn durable_ssh_tracking_preflight_error(
-    reason: &str,
-    detail: &str,
+fn reject_new_durable_ssh_promotion(
     command: &str,
     args: &[String],
+    background_reason: Option<&str>,
     requested_job_id: Option<&str>,
-    source_evidence: Option<String>,
-) -> ErrorData {
-    shell_tool_error(
+) -> Result<(), ErrorData> {
+    let Some(source_evidence) = durable_ssh_promotion_evidence(command, args) else {
+        return Ok(());
+    };
+    Err(shell_tool_error(
         error_codes::ACTION_TARGET_INVALID,
-        format!("durable SSH tracking preflight refused the command before spawning: {detail}"),
+        "durable SSH execution is refused because Synapse cannot preserve the inline SSH stdout/stderr, account-shell environment, and stdin contract while acquiring a remote cleanup handle; use bounded inline act_run_shell execution",
         json!({
             "code": error_codes::ACTION_TARGET_INVALID,
-            "reason": reason,
-            "remediation": "use direct ssh with explicit replay-safe control options, a known host key, noninteractive auth, and a remote command; unsupported interactive/shell-wrapped/forwarding/control modes are refused before spawn",
+            "reason": "ssh_durable_semantic_preservation_unavailable",
+            "remediation": "use_bounded_inline_execution",
+            "recommended_tool": "act_run_shell",
+            "recommended_execution_mode": "inline",
+            "maximum_inline_timeout_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
+            "background_reason": background_reason,
             "requested_job_id": requested_job_id,
             "source_evidence": source_evidence,
             "command": command,
             "args_sha256": shell_args_sha256(args),
             "no_child_spawned": true,
-            "no_remote_process_started": true,
-            "maximum_inline_timeout_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
+            "no_job_artifact_created": true,
         }),
-    )
+    ))
 }
 
 fn durable_ssh_promotion_evidence(command: &str, args: &[String]) -> Option<String> {
@@ -21588,6 +12836,62 @@ fn shell_job_cleanup_invocation(
     shell_job_ssh_command_invocation(&job.command, &job.args)
 }
 
+#[cfg(test)]
+fn ssh_remote_tracking_plan(
+    command: &str,
+    args: &[String],
+    job_id: &str,
+) -> Result<Option<SshRemoteTrackingPlan>, String> {
+    if ssh_family_client_for_executable(command) != Some("ssh") {
+        return Ok(None);
+    }
+    let Some(parts) = ssh_direct_command_parts(args) else {
+        return Ok(None);
+    };
+    let Some(remote_command) = parts.remote_command else {
+        return Ok(None);
+    };
+    if remote_command.trim().is_empty() {
+        return Ok(None);
+    }
+    let trusted_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
+        format!("SSH executable is not a trusted automatic-replay binary: {command}")
+    })?;
+    if let Some(reason) = parts.tracking_unsupported_reason {
+        return Err(format!(
+            "SSH remote command cannot be tracked safely: {reason}"
+        ));
+    }
+
+    let marker = format!("{SHELL_REMOTE_PROCESS_MARKER} job_id={job_id}");
+    let exit_marker = format!("{SHELL_REMOTE_EXIT_MARKER} job_id={job_id}");
+    let ownership_token = uuid::Uuid::new_v4().simple().to_string();
+    let remote_wrapper =
+        ssh_remote_tracking_command(&marker, &exit_marker, &ownership_token, &remote_command);
+    // The tracked durable spawn must preserve the caller's SSH connection
+    // contract exactly. The separately persisted `effective_control_args` are
+    // for unattended recovery/cleanup, where mutable ssh_config is isolated
+    // and any destination that cannot be reproduced under that policy fails
+    // closed instead of being silently retargeted. Applying the hardened
+    // replay argv to the initial command would make promotion itself observable
+    // (for example by changing StrictHostKeyChecking or ignoring ssh_config),
+    // which is the semantic split fixed by #1628.
+    let effective_control_args = hardened_ssh_automatic_replay_args(&parts.control_args)?;
+    let mut spawn_args = parts.control_args.clone();
+    spawn_args.push(remote_wrapper);
+    Ok(Some(SshRemoteTrackingPlan {
+        command: command.to_owned(),
+        cleanup_command: trusted_command.to_string_lossy().into_owned(),
+        spawn_args,
+        control_args: parts.control_args,
+        effective_control_args,
+        remote_identity: parts.remote_identity,
+        remote_command,
+        marker,
+        ownership_token,
+    }))
+}
+
 const SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY: &str = r#"import os
 import sys
 
@@ -21640,6 +12944,267 @@ def process_group_exists(expected_pgid):
         raise RuntimeError(f"probe process group {expected_pgid} failed: {error}") from error
     return True
 "#;
+
+#[cfg(test)]
+fn ssh_remote_tracking_command(
+    marker: &str,
+    exit_marker: &str,
+    ownership_token: &str,
+    remote_command: &str,
+) -> String {
+    // The group leader remains an owned guardian for the full command
+    // lifetime. Cleanup signals that guardian through a pidfd; its trap then
+    // terminates its still-anchored process group. This avoids both numeric PID
+    // reuse and the Linux <6.9 lack of PIDFD_SIGNAL_PROCESS_GROUP.
+    const GROUP_PROBE_MAIN: &str = r#"owner_pid = int(sys.argv[1])
+expected_pgid = int(sys.argv[2])
+try:
+    members = live_process_ids_in_group(expected_pgid, (owner_pid, os.getpid()))
+except Exception as error:
+    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
+    raise SystemExit(2)
+raise SystemExit(0 if members else 1)
+"#;
+    const GROUP_EXISTENCE_MAIN: &str = r#"expected_pgid = int(sys.argv[1])
+try:
+    group_exists = process_group_exists(expected_pgid)
+except Exception as error:
+    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
+    raise SystemExit(2)
+raise SystemExit(0 if group_exists else 1)
+"#;
+    let group_probe_script =
+        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_PROBE_MAIN}");
+    let group_existence_script =
+        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_EXISTENCE_MAIN}");
+    const GUARDIAN_SCRIPT: &str = r#"marker=$1
+ownership_token=$2
+ownership_token_sha256=$3
+cmd=$4
+account_shell=$5
+group_probe_script=$6
+pid=$$
+pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+sid=$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id 2>/dev/null || true)
+stat_line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+stat_tail=${stat_line##*) }
+set -f
+set -- $stat_tail
+start_time=${20:-}
+set +f
+case "$pid:$pgid:$sid:$start_time" in
+  *[!0123456789:]*|:*|*::*|*:)
+    printf '%s error=proc_identity_unavailable\n' "$marker" >&2
+    exit 127
+    ;;
+esac
+if [ "$pgid" != "$pid" ] || [ "$sid" != "$pid" ]; then
+  printf '%s error=guardian_scope_unavailable pid=%s pgid=%s sid=%s\n' \
+    "$marker" "$pid" "$pgid" "$sid" >&2
+  exit 127
+fi
+case "$boot_id" in
+  ????????-????-????-????-????????????) ;;
+  *)
+    printf '%s error=boot_identity_unavailable\n' "$marker" >&2
+    exit 127
+    ;;
+esac
+printf '%s pid=%s pgid=%s sid=%s boot_id=%s start_time=%s ownership_token_sha256=%s\n' \
+  "$marker" "$pid" "$pgid" "$sid" "$boot_id" "$start_time" "$ownership_token_sha256" >&2
+
+group_has_other_members() {
+  python3 -c "$group_probe_script" "$pid" "$pgid"
+}
+
+cleanup_failed=0
+payload_rc=
+natural_term_sent=0
+terminate_owned_group() {
+  cleanup_failed=0
+  trap '' TERM HUP INT
+  if ! kill -TERM -"$pgid" 2>/dev/null; then
+    printf '%s error=process_group_term_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
+    cleanup_failed=1
+    trap terminate_owned_group TERM HUP INT
+    return
+  fi
+  i=0
+  while [ "$i" -lt __GROUP_ABSENCE_PROBE_ATTEMPTS__ ]; do
+    group_has_other_members
+    group_state=$?
+    case "$group_state" in
+      0) ;;
+      1) exit 143 ;;
+      *)
+        printf '%s error=process_group_enumeration_failed pgid=%s probe_exit=%s\n' \
+          "$marker" "$pgid" "$group_state" >&2
+        cleanup_failed=1
+        trap terminate_owned_group TERM HUP INT
+        return
+        ;;
+    esac
+    i=$((i + 1))
+    sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__
+  done
+  # The guardian still anchors this PGID, so this group signal cannot target a
+  # recycled group. SIGKILL intentionally includes the guardian itself.
+  if ! kill -KILL -"$pgid" 2>/dev/null; then
+    printf '%s error=process_group_kill_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
+    cleanup_failed=1
+    trap terminate_owned_group TERM HUP INT
+    return
+  fi
+  # A successful group SIGKILL includes this guardian. Reaching this statement
+  # means the destructive result is uncertain, so remain alive and retryable.
+  cleanup_failed=1
+  trap terminate_owned_group TERM HUP INT
+}
+
+trap terminate_owned_group TERM HUP INT
+# POSIX asynchronous lists may implicitly replace stdin with /dev/null. Save
+# the SSH-provided stream before backgrounding, then explicitly pass it to the
+# account shell. Remove the guardian-only ownership token from the payload.
+exec 3<&0
+env -u SYNAPSE_REMOTE_JOB_TOKEN "$account_shell" -c "$cmd" <&3 &
+payload=$!
+exec 3<&-
+while :; do
+  if [ -z "$payload_rc" ]; then
+    wait "$payload"
+    rc=$?
+    if kill -0 "$payload" 2>/dev/null; then
+      if [ "$cleanup_failed" -ne 0 ]; then
+        sleep 1
+      fi
+      continue
+    fi
+    payload_rc=$rc
+  fi
+  # The shell payload can exit after forking/backgrounding same-PGID work. Do
+  # not let that turn into a terminal marker. TERM residual owned members while
+  # this guardian still anchors the non-reusable PGID, then remain observable
+  # until enumeration proves only the guardian/probe remain.
+  if [ "$natural_term_sent" -eq 0 ]; then
+    trap '' TERM HUP INT
+    if ! kill -TERM -"$pgid" 2>/dev/null; then
+      printf '%s error=natural_completion_group_term_failed pgid=%s\n' "$marker" "$pgid" >&2
+      cleanup_failed=1
+      trap terminate_owned_group TERM HUP INT
+      sleep 1
+      continue
+    fi
+    trap terminate_owned_group TERM HUP INT
+    natural_term_sent=1
+  fi
+  group_has_other_members
+  group_state=$?
+  case "$group_state" in
+    0) sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__ ;;
+    1) exit "$payload_rc" ;;
+    *)
+      printf '%s error=natural_completion_group_inspection_failed pgid=%s probe_exit=%s\n' \
+        "$marker" "$pgid" "$group_state" >&2
+      cleanup_failed=1
+      sleep 1
+      ;;
+  esac
+done
+"#;
+
+    const TRACKER_SCRIPT: &str = r#"marker=$1
+exit_marker=$2
+ownership_token=$3
+ownership_token_sha256=$4
+cmd=$5
+guardian_script=$6
+group_probe_script=$7
+group_existence_script=$8
+if ! command -v setsid >/dev/null 2>&1; then
+  printf '%s error=setsid_unavailable\n' "$marker" >&2
+  exit 127
+fi
+    for prerequisite in env ps tr cat python3; do
+  if ! command -v "$prerequisite" >/dev/null 2>&1; then
+    printf '%s error=remote_identity_prerequisite_unavailable prerequisite=%s\n' \
+      "$marker" "$prerequisite" >&2
+    exit 127
+  fi
+done
+if [ ! -r /proc/sys/kernel/random/boot_id ] || [ ! -r /proc/self/stat ]; then
+  printf '%s error=proc_identity_unavailable\n' "$marker" >&2
+  exit 127
+fi
+if ! python3 -c 'import os, signal; assert hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")' >/dev/null 2>&1; then
+  printf '%s error=pidfd_unavailable\n' "$marker" >&2
+  exit 127
+fi
+account_shell=$(python3 -c 'import os, pwd; shell = pwd.getpwuid(os.getuid()).pw_shell; assert shell and os.path.isabs(shell) and os.access(shell, os.X_OK); print(shell, end="")' 2>/dev/null)
+if [ -z "$account_shell" ] || [ ! -x "$account_shell" ]; then
+  printf '%s error=account_login_shell_unavailable\n' "$marker" >&2
+  exit 127
+fi
+# Preserve the caller's finite/EOF/interactive SSH stdin across the
+# asynchronous-list boundary. Without the saved descriptor, POSIX shells are
+# permitted to substitute /dev/null for the background guardian.
+exec 3<&0
+setsid env SYNAPSE_REMOTE_JOB_TOKEN="$ownership_token" \
+  sh -c "$guardian_script" synapse-remote-guardian \
+  "$marker" "$ownership_token" "$ownership_token_sha256" "$cmd" "$account_shell" "$group_probe_script" <&3 &
+child=$!
+exec 3<&-
+pgid=$child
+wait "$child"
+rc=$?
+python3 -c "$group_existence_script" "$pgid"
+group_state=$?
+case "$group_state" in
+  1)
+    printf '%s pid=%s pgid=%s ownership_token_sha256=%s exit_code=%s\n' \
+      "$exit_marker" "$child" "$pgid" "$ownership_token_sha256" "$rc" >&2
+    exit "$rc"
+    ;;
+  0)
+    printf '%s error=remote_group_survived_guardian_exit pgid=%s guardian_exit_code=%s\n' \
+      "$marker" "$pgid" "$rc" >&2
+    exit 125
+    ;;
+  *)
+    printf '%s error=post_guardian_group_inspection_failed pgid=%s probe_exit=%s guardian_exit_code=%s\n' \
+      "$marker" "$pgid" "$group_state" "$rc" >&2
+    exit 126
+    ;;
+esac
+"#;
+    let group_probe_interval_seconds = format!(
+        "{}.{:03}",
+        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS / 1_000,
+        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS % 1_000
+    );
+    let guardian_script = GUARDIAN_SCRIPT
+        .replace(
+            "__GROUP_ABSENCE_PROBE_ATTEMPTS__",
+            &SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS.to_string(),
+        )
+        .replace(
+            "__GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__",
+            &group_probe_interval_seconds,
+        );
+    let ownership_token_sha256 = sha256_hex(ownership_token.as_bytes());
+    format!(
+        "sh -c {} synapse-remote-tracker {} {} {} {} {} {} {} {}",
+        posix_single_quote(TRACKER_SCRIPT),
+        posix_single_quote(marker),
+        posix_single_quote(exit_marker),
+        posix_single_quote(ownership_token),
+        posix_single_quote(&ownership_token_sha256),
+        posix_single_quote(remote_command),
+        posix_single_quote(&guardian_script),
+        posix_single_quote(&group_probe_script),
+        posix_single_quote(&group_existence_script),
+    )
+}
 
 fn ssh_direct_command_parts(args: &[String]) -> Option<SshCommandParts> {
     let mut index = 0;
@@ -21936,168 +13501,8 @@ fn hardened_ssh_automatic_replay_args(control_args: &[String]) -> Result<Vec<Str
     Ok(args)
 }
 
-fn new_remote_ownership_token() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
-}
-
-fn ssh_remote_guardian_command(
-    job_id: &str,
-    ownership_token: &str,
-    remote_command: &str,
-) -> String {
-    const SCRIPT: &str = r#"import hashlib
-import os
-import pwd
-import signal
-import subprocess
-import sys
-import time
-
-job_id = sys.argv[1]
-process_marker = sys.argv[2]
-exit_marker = sys.argv[3]
-remote_command = sys.argv[4]
-ownership_token = os.environ.get("SYNAPSE_REMOTE_JOB_TOKEN", "")
-child = None
-
-def fail(reason):
-    print(f"synapse_remote_guardian_error error={reason}", file=sys.stderr, flush=True)
-    raise SystemExit(125)
-
-def read_boot_id():
-    try:
-        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
-            value = handle.read().strip()
-    except OSError:
-        fail("boot_identity_unavailable")
-    if not value:
-        fail("boot_identity_unavailable")
-    return value
-
-def read_start_time(pid):
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="strict") as handle:
-            stat_line = handle.read().strip()
-    except OSError:
-        fail("proc_identity_unavailable")
-    _comm, separator, stat_tail = stat_line.rpartition(") ")
-    if not separator:
-        fail("proc_identity_unavailable")
-    fields = stat_tail.split()
-    if len(fields) < 20:
-        fail("proc_identity_unavailable")
-    return fields[19]
-
-def terminate_group(signum, _frame):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pgid = os.getpgrp()
-    if child is not None and child.poll() is None:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        deadline = time.monotonic() + 5
-        while child.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if child.poll() is None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-    raise SystemExit(128 + int(signum))
-
-if not ownership_token or len(ownership_token) != 32 or any(ch not in "0123456789abcdef" for ch in ownership_token):
-    fail("remote_identity_prerequisite_unavailable")
-
-scope = "setsid"
-try:
-    os.setsid()
-except OSError:
-    # Some OpenSSH servers already execute the remote command as its own
-    # process-group leader. That is an equivalent cleanup boundary for this
-    # guardian: child shells inherit the group, and cancellation can still kill
-    # exactly this group. Anything broader is refused before the payload starts.
-    if os.getpgrp() != os.getpid():
-        fail("guardian_scope_unavailable")
-    scope = "existing_process_group_leader"
-
-boot_id = read_boot_id()
-pid = os.getpid()
-pgid = os.getpgrp()
-sid = os.getsid(0)
-start_time = read_start_time(pid)
-shell = os.environ.get("SHELL", "")
-if not shell.startswith("/") or not os.path.exists(shell):
-    try:
-        shell = pwd.getpwuid(os.getuid()).pw_shell
-    except KeyError:
-        fail("remote_identity_prerequisite_unavailable")
-if not shell.startswith("/") or not os.path.exists(shell):
-    fail("remote_identity_prerequisite_unavailable")
-
-signal.signal(signal.SIGTERM, terminate_group)
-signal.signal(signal.SIGHUP, terminate_group)
-signal.signal(signal.SIGINT, terminate_group)
-
-payload_env = os.environ.copy()
-payload_env["SYNAPSE_REMOTE_JOB_TOKEN"] = ownership_token
-try:
-    child = subprocess.Popen(
-        remote_command,
-        shell=True,
-        executable=shell,
-        env=payload_env,
-    )
-except OSError:
-    fail("remote_payload_spawn_failed")
-
-ownership_token_sha256 = hashlib.sha256(ownership_token.encode("ascii")).hexdigest()
-print(
-    f"{process_marker} job_id={job_id} pid={pid} pgid={pgid} sid={sid} "
-    f"boot_id={boot_id} start_time={start_time} scope={scope} "
-    f"ownership_token_sha256={ownership_token_sha256}",
-    file=sys.stderr,
-    flush=True,
-)
-returncode = child.wait()
-if returncode is None:
-    exit_code = 1
-elif returncode < 0:
-    exit_code = 128 + abs(returncode)
-else:
-    exit_code = returncode
-print(
-    f"{exit_marker} job_id={job_id} pid={pid} pgid={pgid} "
-    f"exit_code={exit_code} ownership_token_sha256={ownership_token_sha256}",
-    file=sys.stderr,
-    flush=True,
-)
-raise SystemExit(exit_code if 0 <= exit_code <= 255 else 1)
-"#;
-    format!(
-        "env SYNAPSE_REMOTE_JOB_TOKEN={} python3 -c {} {} {} {} {}",
-        posix_single_quote(ownership_token),
-        posix_single_quote(SCRIPT),
-        posix_single_quote(job_id),
-        posix_single_quote(SHELL_REMOTE_PROCESS_MARKER),
-        posix_single_quote(SHELL_REMOTE_EXIT_MARKER),
-        posix_single_quote(remote_command),
-    )
-}
-
 fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatus) {
-    // A WSL job's scope is already the strictly stronger claim (payload outside
-    // the Windows job object, cleanup required and unverified). Never downgrade
-    // it to the SSH scope just because the wrapper tree happens to contain ssh.
-    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH
-        || job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
-    {
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH {
         return;
     }
     let Some(pid) = job.pid else {
@@ -22156,80 +13561,20 @@ fn mark_shell_job_remote_cleanup_unverified(
     if !job.remote_process_scope.remote_cleanup_required {
         return;
     }
-    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
-        && job.remote_process_scope.remote_cleanup_status
-            == SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
-    {
-        // Legacy WSL records predate the guardian and have no identity with
-        // which a destructive cleanup could be authorized.
-        mark_shell_job_wsl_child_unverified(job, trigger);
-        return;
-    }
     let remote_identity = job
         .remote_process_scope
         .remote_identity
         .as_deref()
         .unwrap_or("unknown_remote");
     let message = format!(
-        "{trigger} verified only the local process scope '{}' with local termination status '{local_termination_status}'; {} remote cleanup for '{remote_identity}' is not verified because no identity-bound remote pid/process-group marker exists in the job status",
-        job.remote_process_scope.local_process_scope, job.remote_process_scope.transport,
+        "{trigger} verified only the local process scope '{}' with local termination status '{local_termination_status}'; SSH remote cleanup for '{remote_identity}' is not tracked or verified because no remote pid/process-group metadata exists in the job status",
+        job.remote_process_scope.local_process_scope
     );
     job.remote_process_scope.remote_cleanup_verified = false;
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_UNVERIFIED.to_owned();
     job.remote_process_scope.remote_cleanup_error_code =
         Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
     job.remote_process_scope.remote_cleanup_message = Some(message.clone());
-    if job.error_code.is_none() {
-        job.error_code = Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
-        job.error_message = Some(message);
-    }
-}
-
-/// Publish the honest verdict for a terminal WSL job.
-///
-/// The Windows `wsl.exe` wrapper is the only thing this daemon can observe: the
-/// payload runs in the WSL2 utility VM, in a different kernel and PID namespace,
-/// and is therefore outside the job's Windows kill-on-close job object. Microsoft
-/// documents that `wslhost.exe` assumes the Linux process's lifetime when
-/// `wsl.exe` exits first, and that a wrapper kill with redirected streams only
-/// delivers `SIGHUP`. So wrapper death is NOT evidence the payload stopped, and
-/// the record must say the remote state is unknown rather than imply cleanliness.
-fn mark_shell_job_wsl_child_unverified(job: &mut ActRunShellJobStatus, trigger: &'static str) {
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_WSL
-        || job.remote_process_scope.remote_cleanup_verified
-    {
-        return;
-    }
-    let remote_identity = job
-        .remote_process_scope
-        .remote_identity
-        .clone()
-        .unwrap_or_else(|| "wsl:<default-distribution>".to_owned());
-    let distribution = remote_identity
-        .strip_prefix("wsl:")
-        .unwrap_or("<default-distribution>")
-        .to_owned();
-    let message = format!(
-        "{trigger}: the Windows wsl.exe wrapper for '{remote_identity}' reached terminal status '{}', but the \
-         Linux payload was never bound to a WSL-side identity (distribution + /proc/sys/kernel/random/boot_id + \
-         linux pid + /proc/<pid>/stat field 22 starttime), so Synapse cannot prove whether it is still running. \
-         The Linux child lives in the WSL2 utility VM and is NOT contained by this job's Windows job object; \
-         wslhost.exe takes over its lifetime when wsl.exe exits, and a wrapper kill with redirected streams only \
-         delivers SIGHUP. Verify and clean up manually: `wsl.exe --list --running` (do NOT probe a stopped \
-         distribution — that restarts it and destroys the evidence), then \
-         `wsl.exe -d {distribution} -- ps -eo pid,lstart,args`.",
-        job.status
-    );
-    job.remote_process_scope.remote_cleanup_verified = false;
-    job.remote_process_scope.remote_cleanup_status =
-        SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED.to_owned();
-    job.remote_process_scope.remote_cleanup_error_code =
-        Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
-    job.remote_process_scope.remote_cleanup_message = Some(message.clone());
-    push_unique_evidence(
-        &mut job.remote_process_scope.detection_evidence,
-        format!("wsl_child_liveness_unknown_at_terminal:{trigger}"),
-    );
     if job.error_code.is_none() {
         job.error_code = Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
         job.error_message = Some(message);
@@ -22262,8 +13607,8 @@ fn mark_shell_job_remote_pre_marker_terminal(
         .unwrap_or("unknown_remote");
     let suggested_readback = shell_remote_pre_marker_readback_hint(job);
     let message = format!(
-        "{trigger} classified {} remote tracking as pre-marker terminal failure for '{remote_identity}'; terminal_status='{terminal_status}'; reason={}; no {SHELL_REMOTE_PROCESS_MARKER} pid/process-group marker was found, so Synapse did not acquire a remote cleanup handle and will not report remote cleanup as unresolved. suggested_safe_readback={suggested_readback}",
-        job.remote_process_scope.transport, evidence.reason,
+        "{trigger} classified SSH remote tracking as pre-marker terminal failure for '{remote_identity}'; terminal_status='{terminal_status}'; reason={}; no {SHELL_REMOTE_PROCESS_MARKER} pid/process-group marker was found, so Synapse did not acquire a remote cleanup handle and will not report remote cleanup as unresolved. suggested_safe_readback={suggested_readback}",
+        evidence.reason
     );
     job.remote_process_scope.remote_cleanup_required = false;
     job.remote_process_scope.remote_cleanup_verified = false;
@@ -22290,10 +13635,8 @@ fn mark_shell_job_remote_pre_marker_terminal_if_detected(
     paths: &ShellJobPaths,
     trigger: &'static str,
 ) -> Result<bool, ErrorData> {
-    if !matches!(
-        job.remote_process_scope.transport.as_str(),
-        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-    ) || job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_TRACKING_PENDING
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_TRACKING_PENDING
         || job.remote_process_scope.remote_process_id.is_some()
         || job.remote_process_scope.remote_process_group_id.is_some()
     {
@@ -22349,13 +13692,6 @@ fn remote_pre_marker_terminal_evidence(stderr: &str) -> Option<RemotePreMarkerTe
             "remote_guardian_scope_unavailable",
             "error=guardian_scope_unavailable",
         ),
-        (
-            "remote_payload_spawn_failed",
-            "error=remote_payload_spawn_failed",
-        ),
-        ("remote_python_unavailable", "python3: command not found"),
-        ("remote_python_unavailable", "python3: not found"),
-        ("remote_python_unavailable", "env: python3"),
     ];
     patterns
         .iter()
@@ -22379,17 +13715,6 @@ fn shell_remote_pre_marker_readback_hint(job: &ActRunShellJobStatus) -> String {
             let mut args = parts.control_args;
             args.push(remote_command);
             return shell_command_line_from_parts(&invocation.command, &args);
-        }
-    }
-    if is_wsl_executable(&job.command) {
-        if let Ok(parts) = wsl_command_parts(&job.args) {
-            if let Ok(mut args) = wsl_cleanup_control_args(&parts.control_args) {
-                args.push("--exec".to_owned());
-                args.push("sh".to_owned());
-                args.push("-lc".to_owned());
-                args.push(remote_command);
-                return shell_command_line_from_parts(&job.command, &args);
-            }
         }
     }
     format!(
@@ -22433,10 +13758,7 @@ fn refresh_shell_job_remote_metadata_from_outputs(
     job: &mut ActRunShellJobStatus,
     paths: &ShellJobPaths,
 ) -> Result<bool, ErrorData> {
-    if !matches!(
-        job.remote_process_scope.transport.as_str(),
-        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-    ) {
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH {
         return Ok(false);
     }
     if job.remote_process_scope.remote_process_id.is_some()
@@ -22479,11 +13801,7 @@ fn reconcile_shell_job_remote_exit_marker(
     // the remote exit; the local budget overrun is downgraded to a warning
     // (`downgrade_local_timeout_after_remote_exit`). A deliberate `cancel` is
     // still honored as an explicit operator verdict and is not overridden here.
-    if !matches!(
-        job.remote_process_scope.transport.as_str(),
-        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-    ) || job.cancel_requested
-    {
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH || job.cancel_requested {
         return Ok(false);
     }
     let overriding_local_timeout = job.timed_out;
@@ -22540,10 +13858,7 @@ fn reconcile_shell_job_remote_exit_marker(
     // local verdict already reflects the failure honestly and is left untouched
     // so we never manufacture an "already gone" success out of a remote failure
     // (regression guard for issue1274_remote_exit_marker_nonzero_*).
-    if metadata.exit_code != 0
-        && !overriding_local_timeout
-        && job.status != SHELL_JOB_STATUS_INTERRUPTED
-    {
+    if metadata.exit_code != 0 && !overriding_local_timeout {
         return Ok(false);
     }
     if !running && job.status == "ok" && job.exit_code == Some(0) {
@@ -22628,10 +13943,7 @@ fn verify_shell_job_remote_cleanup_after_terminal(
     original_args: Option<&[String]>,
 ) {
     if !shell_job_terminal_status(&job.status)
-        || !matches!(
-            job.remote_process_scope.transport.as_str(),
-            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-        )
+        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
         || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
         || job.remote_process_scope.remote_cleanup_status == SHELL_REMOTE_CLEANUP_FAILED
@@ -22802,10 +14114,7 @@ fn reconcile_shell_job_remote_already_gone_if_local_stale(
         || !shell_job_live_status(&job.status)
         || job.cancel_requested
         || job.timed_out
-        || !matches!(
-            job.remote_process_scope.transport.as_str(),
-            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-        )
+        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
         || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
         || matches!(
@@ -22871,30 +14180,24 @@ fn probe_shell_job_remote_liveness(
             return None;
         }
     };
-    let Some(invocation) = remote_cleanup.as_ref() else {
+    let Some(invocation) = shell_job_cleanup_invocation(job, None, remote_cleanup.as_ref()) else {
         push_unique_evidence(
             &mut job.remote_process_scope.detection_evidence,
-            "remote_liveness_probe_failed:cleanup_sidecar_missing".to_owned(),
+            "remote_liveness_probe_failed:ssh_destination_unavailable".to_owned(),
         );
         return None;
     };
-    if invocation.transport != job.remote_process_scope.transport {
-        push_unique_evidence(
-            &mut job.remote_process_scope.detection_evidence,
-            "remote_liveness_probe_failed:transport_mismatch".to_owned(),
-        );
-        return None;
-    }
-    let liveness_args = match remote_liveness_replay_args(invocation, pid, pgid) {
+    let mut liveness_args = match hardened_ssh_automatic_replay_args(&invocation.args) {
         Ok(args) => args,
         Err(_) => {
             push_unique_evidence(
                 &mut job.remote_process_scope.detection_evidence,
-                "remote_liveness_probe_failed:control_args_not_replay_safe".to_owned(),
+                "remote_liveness_probe_failed:ssh_control_args_not_replay_safe".to_owned(),
             );
             return None;
         }
     };
+    liveness_args.push(ssh_remote_liveness_command(pid, pgid));
     let readback = match run_shell_cleanup_command_with_timeout(
         &invocation.command,
         &liveness_args,
@@ -22951,8 +14254,7 @@ fn mark_shell_job_remote_already_gone_local_stale(
         .map(|exit_code| format!(" Remote exit code from {SHELL_REMOTE_EXIT_MARKER}={exit_code}."))
         .unwrap_or_else(|| " Remote exit code is unavailable from the stale transport.".to_owned());
     let message = format!(
-        "{trigger} verified remote pid {pid}, process group {pgid} on '{remote_identity}' is already gone while the local {} transport was still live or reported a mismatched terminal state; local process-tree termination status={local_termination_status}.{exit_message}",
-        job.remote_process_scope.transport
+        "{trigger} verified remote pid {pid}, process group {pgid} on '{remote_identity}' is already gone while the local SSH transport was still live or reported a mismatched terminal state; local process-tree termination status={local_termination_status}.{exit_message}"
     );
     job.status = SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE.to_owned();
     job.completed_at
@@ -22990,6 +14292,14 @@ fn mark_shell_job_remote_already_gone_local_stale(
             "{message} Local stale transport still has remaining process ids: {remaining}"
         ));
     }
+}
+
+#[cfg(test)]
+fn parse_remote_process_metadata(
+    stderr: &str,
+    expected_job_id: &str,
+) -> Option<RemoteProcessMetadata> {
+    parse_remote_process_metadata_with_ownership(stderr, expected_job_id, None)
 }
 
 fn parse_remote_process_metadata_with_ownership(
@@ -23155,8 +14465,8 @@ fn apply_remote_process_metadata(job: &mut ActRunShellJobStatus, metadata: Remot
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_TRACKED.to_owned();
     job.remote_process_scope.remote_cleanup_error_code = None;
     job.remote_process_scope.remote_cleanup_message = Some(format!(
-        "{} remote process group tracked for cleanup: job_id={} remote_pid={} remote_pgid={}",
-        job.remote_process_scope.transport, metadata.job_id, metadata.pid, metadata.pgid
+        "SSH remote process group tracked for cleanup: job_id={} remote_pid={} remote_pgid={}",
+        metadata.job_id, metadata.pid, metadata.pgid
     ));
     push_unique_evidence(
         &mut job.remote_process_scope.detection_evidence,
@@ -23257,10 +14567,8 @@ fn attempt_shell_job_remote_cleanup(
     trigger: &'static str,
     original_args: Option<&[String]>,
 ) -> Option<String> {
-    if !matches!(
-        job.remote_process_scope.transport.as_str(),
-        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
-    ) || !job.remote_process_scope.remote_cleanup_required
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
     {
         return None;
@@ -23301,65 +14609,40 @@ fn attempt_shell_job_remote_cleanup(
         );
         return Some("remote_cleanup_sidecar_missing".to_owned());
     };
-    if remote_cleanup.transport != job.remote_process_scope.transport {
+    let Some(invocation) = shell_job_cleanup_invocation(job, original_args, Some(remote_cleanup))
+    else {
         mark_shell_job_remote_cleanup_failed(
             job,
             trigger,
-            "remote_cleanup_transport_mismatch",
+            "ssh_destination_unavailable",
+            "remote process metadata exists but the original SSH destination could not be parsed",
+        );
+        return Some("remote_cleanup_destination_unavailable".to_owned());
+    };
+    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
+        mark_shell_job_remote_cleanup_failed(
+            job,
+            trigger,
+            "ssh_destination_unavailable",
+            "remote process metadata exists but the original SSH destination could not be parsed",
+        );
+        return Some("remote_cleanup_destination_unavailable".to_owned());
+    };
+    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
+        mark_shell_job_remote_cleanup_failed(
+            job,
+            trigger,
+            "remote_cleanup_control_args_unsafe",
             &format!(
-                "status transport={} sidecar transport={}",
-                job.remote_process_scope.transport, remote_cleanup.transport
+                "automatic SSH cleanup refused control option {reason}; replay could execute or load mutable local code"
             ),
         );
-        return Some("remote_cleanup_transport_mismatch".to_owned());
+        return Some("remote_cleanup_control_args_unsafe".to_owned());
     }
-    if remote_cleanup.transport == SHELL_REMOTE_TRANSPORT_SSH {
-        let Some(invocation) =
-            shell_job_cleanup_invocation(job, original_args, Some(remote_cleanup))
-        else {
-            mark_shell_job_remote_cleanup_failed(
-                job,
-                trigger,
-                "ssh_destination_unavailable",
-                "remote process metadata exists but the original SSH destination could not be parsed or did not match the durable sidecar",
-            );
-            return Some("remote_cleanup_destination_unavailable".to_owned());
-        };
-        let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
-            mark_shell_job_remote_cleanup_failed(
-                job,
-                trigger,
-                "ssh_destination_unavailable",
-                "remote process metadata exists but the original SSH destination could not be parsed",
-            );
-            return Some("remote_cleanup_destination_unavailable".to_owned());
-        };
-        if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
-            mark_shell_job_remote_cleanup_failed(
-                job,
-                trigger,
-                "remote_cleanup_control_args_unsafe",
-                &format!(
-                    "automatic SSH cleanup refused control option {reason}; replay could execute or load mutable local code"
-                ),
-            );
-            return Some("remote_cleanup_control_args_unsafe".to_owned());
-        }
-    } else if let Some(original_args) = original_args {
-        let request_digest = shell_args_sha256(original_args);
-        if remote_cleanup.request_args_sha256.as_deref() != Some(request_digest.as_str()) {
-            mark_shell_job_remote_cleanup_failed(
-                job,
-                trigger,
-                "wsl_request_binding_mismatch",
-                "the caller's original WSL argv does not match the request-bound durable cleanup sidecar",
-            );
-            return Some("remote_cleanup_request_binding_mismatch".to_owned());
-        }
-    }
-    if !matches!(remote_cleanup.schema_version, 3..=5) {
+    if !matches!(remote_cleanup.schema_version, 3 | 4) {
         let liveness = run_remote_liveness_probe(
-            remote_cleanup,
+            &invocation.command,
+            &invocation.args,
             &pid,
             &pgid,
             "legacy remote cleanup liveness probe",
@@ -23371,11 +14654,8 @@ fn attempt_shell_job_remote_cleanup(
                     SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
                 job.remote_process_scope.remote_cleanup_error_code = None;
                 job.remote_process_scope.remote_cleanup_message = Some(format!(
-                    "{trigger} verified schema-{} {} remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
-                    remote_cleanup.schema_version,
-                    remote_cleanup.transport,
-                    readback.stdout_sha256,
-                    readback.stderr_sha256
+                    "{trigger} verified schema-{} SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    remote_cleanup.schema_version, readback.stdout_sha256, readback.stderr_sha256
                 ));
                 Some("remote_cleanup_already_gone".to_owned())
             }
@@ -23419,7 +14699,8 @@ fn attempt_shell_job_remote_cleanup(
         // liveness probe may prove the old process is gone, but an alive result
         // can never authorize a signal.
         let liveness = run_remote_liveness_probe(
-            remote_cleanup,
+            &invocation.command,
+            &invocation.args,
             &pid,
             &pgid,
             "legacy remote cleanup liveness probe",
@@ -23431,8 +14712,8 @@ fn attempt_shell_job_remote_cleanup(
                     SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
                 job.remote_process_scope.remote_cleanup_error_code = None;
                 job.remote_process_scope.remote_cleanup_message = Some(format!(
-                    "{trigger} verified legacy {} remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
-                    remote_cleanup.transport, readback.stdout_sha256, readback.stderr_sha256
+                    "{trigger} verified legacy SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    readback.stdout_sha256, readback.stderr_sha256
                 ));
                 if job.error_code.as_deref()
                     == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
@@ -23473,21 +14754,22 @@ fn attempt_shell_job_remote_cleanup(
             }
         };
     };
-    let cleanup_args =
-        match remote_cleanup_replay_args(remote_cleanup, &pid, &pgid, &ownership_identity) {
-            Ok(args) => args,
-            Err(message) => {
-                mark_shell_job_remote_cleanup_failed(
-                    job,
-                    trigger,
-                    "remote_cleanup_control_args_unsafe",
-                    &message,
-                );
-                return Some("remote_cleanup_control_args_unsafe".to_owned());
-            }
-        };
+    let cleanup_command = ssh_remote_cleanup_command(&pid, &pgid, &ownership_identity);
+    let mut cleanup_args = match hardened_ssh_automatic_replay_args(&parts.control_args) {
+        Ok(args) => args,
+        Err(message) => {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_cleanup_control_args_unsafe",
+                &message,
+            );
+            return Some("remote_cleanup_control_args_unsafe".to_owned());
+        }
+    };
+    cleanup_args.push(cleanup_command);
     let output = run_shell_cleanup_command_with_timeout(
-        &remote_cleanup.command,
+        &invocation.command,
         &cleanup_args,
         Duration::from_millis(SHELL_REMOTE_CLEANUP_TIMEOUT_MS),
     );
@@ -23509,8 +14791,7 @@ fn attempt_shell_job_remote_cleanup(
                 SHELL_REMOTE_CLEANUP_VERIFIED.to_owned();
             job.remote_process_scope.remote_cleanup_error_code = None;
             job.remote_process_scope.remote_cleanup_message = Some(format!(
-                "{trigger} verified {} remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={status}",
-                remote_cleanup.transport
+                "{trigger} verified SSH remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={status}"
             ));
             push_unique_evidence(
                 &mut job.remote_process_scope.detection_evidence,
@@ -23530,8 +14811,7 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "remote_process_still_running",
                 &format!(
-                    "{} remote cleanup command returned still_running for pid {pid}, pgid {pgid}",
-                    remote_cleanup.transport
+                    "SSH remote cleanup command returned still_running for pid {pid}, pgid {pgid}"
                 ),
             );
             Some("remote_cleanup_still_running".to_owned())
@@ -23542,8 +14822,7 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "remote_process_ownership_identity_mismatch",
                 &format!(
-                    "{} remote cleanup refused to signal pid {pid}, pgid {pgid}: boot/start/token identity did not match the live process",
-                    remote_cleanup.transport
+                    "SSH remote cleanup refused to signal pid {pid}, pgid {pgid}: boot/start/token identity did not match the live process"
                 ),
             );
             Some("remote_cleanup_identity_mismatch".to_owned())
@@ -23554,8 +14833,7 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "cleanup_readback_unrecognized",
                 &format!(
-                    "{} remote cleanup command did not produce a verified cleanup marker; exit={:?}; stdout_sha256={}; stderr_sha256={}; stdout_excerpt={:?}; stderr_excerpt={:?}",
-                    remote_cleanup.transport,
+                    "SSH remote cleanup command did not produce a verified cleanup marker; exit={:?}; stdout_sha256={}; stderr_sha256={}; stdout_excerpt={:?}; stderr_excerpt={:?}",
                     readback.exit_code,
                     readback.stdout_sha256,
                     readback.stderr_sha256,
@@ -23590,8 +14868,7 @@ fn mark_shell_job_remote_cleanup_failed(
         .as_deref()
         .unwrap_or("unknown_pgid");
     let message = format!(
-        "{trigger} could not verify {} remote cleanup for {remote_identity}; remote_pid={pid}; remote_pgid={pgid}; reason={reason}; detail={detail}",
-        job.remote_process_scope.transport
+        "{trigger} could not verify SSH remote cleanup for {remote_identity}; remote_pid={pid}; remote_pgid={pgid}; reason={reason}; detail={detail}"
     );
     job.remote_process_scope.remote_cleanup_verified = false;
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_FAILED.to_owned();
@@ -23928,21 +15205,21 @@ fn run_shell_cleanup_command_with_timeout(
     // Opportunistically advance any earlier exact-owner cleanup without ever
     // blocking this invocation on an unbounded wait.
     let _ = unresolved_shell_child_owner_report();
-    let spawn_command = trusted_remote_replay_executable(command).ok_or_else(|| {
+    let spawn_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
         format!(
-            "remote replay executable is not one of the canonical trusted SSH/WSL platform installations: {command}"
+            "cleanup SSH executable is not one of the canonical trusted platform installations: {command}"
         )
     })?;
     let mut stdout_capture = tempfile::tempfile()
-        .map_err(|error| format!("create remote replay stdout capture failed: {error}"))?;
+        .map_err(|error| format!("create cleanup ssh stdout capture failed: {error}"))?;
     let mut stderr_capture = tempfile::tempfile()
-        .map_err(|error| format!("create remote replay stderr capture failed: {error}"))?;
+        .map_err(|error| format!("create cleanup ssh stderr capture failed: {error}"))?;
     let stdout_child = stdout_capture
         .try_clone()
-        .map_err(|error| format!("clone remote replay stdout capture failed: {error}"))?;
+        .map_err(|error| format!("clone cleanup ssh stdout capture failed: {error}"))?;
     let stderr_child = stderr_capture
         .try_clone()
-        .map_err(|error| format!("clone remote replay stderr capture failed: {error}"))?;
+        .map_err(|error| format!("clone cleanup ssh stderr capture failed: {error}"))?;
     let mut child = StdCommand::new(&spawn_command);
     child
         .args(args)
@@ -23955,7 +15232,7 @@ fn run_shell_cleanup_command_with_timeout(
     apply_no_window_std(&mut child);
     let mut child = child
         .spawn()
-        .map_err(|error| format!("spawn remote replay command failed: {error}"))?;
+        .map_err(|error| format!("spawn cleanup ssh failed: {error}"))?;
     let owned_root_pid = child.id();
     // As in durable spawn, establish containment while the exact child is
     // suspended before asking a second kernel API for creation identity.
@@ -23984,7 +15261,7 @@ fn run_shell_cleanup_command_with_timeout(
                 })
             });
             return Err(format!(
-                "remote replay pid {owned_root_pid} job ownership failed before execution: {}; exact_child_cleanup={reap:?}; tree_cleanup_verified={tree_cleanup_verified}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}",
+                "cleanup ssh pid {owned_root_pid} job ownership failed before execution: {}; exact_child_cleanup={reap:?}; tree_cleanup_verified={tree_cleanup_verified}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}",
                 assignment_error.message,
             ));
         }
@@ -24014,7 +15291,7 @@ fn run_shell_cleanup_command_with_timeout(
                 })
             });
             return Err(format!(
-                "remote replay pid {owned_root_pid} identity capture failed before execution: {identity_error}; exact_child_cleanup={reap:?}; job_close={job_close:?}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+                "cleanup ssh pid {owned_root_pid} identity capture failed before execution: {identity_error}; exact_child_cleanup={reap:?}; job_close={job_close:?}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
             ));
         }
     };
@@ -24041,7 +15318,7 @@ fn run_shell_cleanup_command_with_timeout(
             })
         });
         return Err(format!(
-            "remote replay pid {owned_root_pid} contained resume failed: {resume_error}; {diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+            "cleanup ssh pid {owned_root_pid} contained resume failed: {resume_error}; {diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
         ));
     }
     let started = Instant::now();
@@ -24063,7 +15340,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "remote replay capture length inspection failed; stdout_error={:?}; stderr_error={:?}; {}",
+                    "cleanup ssh capture length inspection failed; stdout_error={:?}; stderr_error={:?}; {}",
                     stdout_result.err(),
                     stderr_result.err(),
                     cleanup_diagnostic,
@@ -24088,7 +15365,7 @@ fn run_shell_cleanup_command_with_timeout(
                 cleanup,
             );
             return Err(format!(
-                "remote replay diagnostic output exceeded the {SHELL_CLEANUP_CAPTURE_CAP_BYTES}-byte per-stream cap; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                "cleanup ssh diagnostic output exceeded the {SHELL_CLEANUP_CAPTURE_CAP_BYTES}-byte per-stream cap; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
             ));
         }
         let poll = match child.try_wait() {
@@ -24109,7 +15386,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "poll remote replay command failed: {error}; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                    "poll cleanup ssh failed: {error}; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
                 ));
             }
         };
@@ -24131,7 +15408,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "remote replay command timed out after {} ms; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                    "cleanup ssh timed out after {} ms; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
                     timeout.as_millis(),
                 ));
             }
@@ -24147,7 +15424,7 @@ fn run_shell_cleanup_command_with_timeout(
         Err(error) => {
             let job_close = process_job.close_checked();
             return Err(format!(
-                "{error}; completed remote replay job close readback={job_close:?}"
+                "{error}; completed cleanup ssh job close readback={job_close:?}"
             ));
         }
     };
@@ -24160,13 +15437,13 @@ fn run_shell_cleanup_command_with_timeout(
         Err(error) => {
             let job_close = process_job.close_checked();
             return Err(format!(
-                "{error}; completed remote replay job close readback={job_close:?}"
+                "{error}; completed cleanup ssh job close readback={job_close:?}"
             ));
         }
     };
     process_job
         .close_checked()
-        .map_err(|error| format!("completed remote replay job handle close failed: {error}"))?;
+        .map_err(|error| format!("completed cleanup ssh job handle close failed: {error}"))?;
     Ok(CleanupCommandReadback {
         exit_code,
         stdout: stdout.text,
@@ -24207,22 +15484,22 @@ fn read_bounded_cleanup_capture(
 ) -> Result<BoundedCleanupCapture, String> {
     let len = file
         .metadata()
-        .map_err(|error| format!("read remote replay {stream} capture metadata failed: {error}"))?
+        .map_err(|error| format!("read cleanup ssh {stream} capture metadata failed: {error}"))?
         .len();
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek remote replay {stream} capture failed: {error}"))?;
+        .map_err(|error| format!("seek cleanup ssh {stream} capture failed: {error}"))?;
     let mut bytes = Vec::new();
     file.take(cap_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("read remote replay {stream} capture failed: {error}"))?;
+        .map_err(|error| format!("read cleanup ssh {stream} capture failed: {error}"))?;
     let buffered_len = u64::try_from(bytes.len()).map_err(|error| {
         format!(
-            "remote replay {stream} buffered capture length cannot be represented: {error}; physical_bytes={len}"
+            "cleanup ssh {stream} buffered capture length cannot be represented: {error}; physical_bytes={len}"
         )
     })?;
     if len > cap_bytes || buffered_len > cap_bytes {
         return Err(format!(
-            "remote replay {stream} capture exceeded the {cap_bytes}-byte diagnostic cap (actual_bytes={len})"
+            "cleanup ssh {stream} capture exceeded the {cap_bytes}-byte diagnostic cap (actual_bytes={len})"
         ));
     }
     Ok(BoundedCleanupCapture {
@@ -24232,11 +15509,11 @@ fn read_bounded_cleanup_capture(
     })
 }
 
-fn remote_cleanup_python_args(
+fn ssh_remote_cleanup_command(
     pid: &str,
     pgid: &str,
     identity: &RemoteProcessOwnershipIdentity,
-) -> Vec<String> {
+) -> String {
     // A pidfd is the stable kernel reference that numeric PIDs are not. The
     // script verifies boot/start/token both before and after pidfd_open, then
     // signals only that pidfd. The owned guardian's TERM trap performs the
@@ -24360,32 +15637,19 @@ finally:
             &SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS.to_string(),
         );
     let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{cleanup_script}");
-    vec![
-        "python3".to_owned(),
-        "-c".to_owned(),
-        script,
-        pid.to_owned(),
-        pgid.to_owned(),
-        identity.boot_id.clone(),
-        identity.start_time.clone(),
-        identity.ownership_token.clone(),
-        SHELL_REMOTE_CLEANUP_MARKER.to_owned(),
-    ]
+    format!(
+        "python3 -c {} {} {} {} {} {} {}",
+        posix_single_quote(&script),
+        posix_single_quote(pid),
+        posix_single_quote(pgid),
+        posix_single_quote(&identity.boot_id),
+        posix_single_quote(&identity.start_time),
+        posix_single_quote(&identity.ownership_token),
+        posix_single_quote(SHELL_REMOTE_CLEANUP_MARKER),
+    )
 }
 
-fn ssh_remote_cleanup_command(
-    pid: &str,
-    pgid: &str,
-    identity: &RemoteProcessOwnershipIdentity,
-) -> String {
-    remote_cleanup_python_args(pid, pgid, identity)
-        .iter()
-        .map(|arg| posix_single_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn remote_liveness_python_args(pid: &str, pgid: &str) -> Vec<String> {
+fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
     const SCRIPT: &str = r#"pid_text = sys.argv[1]
 pgid_text = sys.argv[2]
 marker = sys.argv[3]
@@ -24424,22 +15688,13 @@ else:
     emit("already_gone", 0)
 "#;
     let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{SCRIPT}");
-    vec![
-        "python3".to_owned(),
-        "-c".to_owned(),
-        script,
-        pid.to_owned(),
-        pgid.to_owned(),
-        SHELL_REMOTE_LIVENESS_MARKER.to_owned(),
-    ]
-}
-
-fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
-    remote_liveness_python_args(pid, pgid)
-        .iter()
-        .map(|arg| posix_single_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    format!(
+        "python3 -c {} {} {} {}",
+        posix_single_quote(&script),
+        posix_single_quote(pid),
+        posix_single_quote(pgid),
+        posix_single_quote(SHELL_REMOTE_LIVENESS_MARKER),
+    )
 }
 
 fn parse_remote_cleanup_status(
@@ -24536,7 +15791,7 @@ fn shell_job_status_record(
     context: Option<&ShellExecutionContext>,
 ) -> ActRunShellJobStatus {
     let status = ActRunShellJobStatus {
-        schema_version: SHELL_JOB_STATUS_SCHEMA_VERSION,
+        schema_version: 4,
         job_id: job_id.to_owned(),
         session_id: context.map(|context| context.session_id().to_owned()),
         status: status.to_owned(),
@@ -24557,7 +15812,6 @@ fn shell_job_status_record(
         session_dir: context.map(|context| path_string(context.session_dir())),
         effective_working_dir: params.working_dir.clone(),
         env_keys: params.env.keys().cloned().collect(),
-        environment_diagnostics: shell_job_environment_diagnostics(params, context),
         session_env_keys: context.map_or_else(Vec::new, shell_session_env_keys),
         timeout_ms: params.timeout_ms,
         started_at,
@@ -24576,8 +15830,6 @@ fn shell_job_status_record(
         remote_process_scope: shell_job_remote_process_scope_from_start_params(params),
         diagnostics: None,
         spawn_failure: None,
-        supervisor: Some(shell_job_supervisor_identity().clone()),
-        supervisor_reconciliation: None,
     };
     shell_job_status_with_safe_command_metadata(&status)
 }
@@ -24672,57 +15924,39 @@ fn spawn_failure_readback(
     }
 }
 
-/// Create the durable shell job's exact child **suspended and contained**, and
-/// leave it suspended.
-///
-/// On Windows the child is created with `CREATE_SUSPENDED`, assigned to its
-/// named kill-on-close Job Object, and bound to its immutable kernel creation
-/// identity — all before it executes a single instruction. Resuming is the
-/// caller's decision and belongs *after* the restart-survival commit; see
-/// `resume_restart_survivable_shell_child`. Because the child is still
-/// suspended, the Job Object assignment cannot be raced either, which is the
-/// same guarantee `PROC_THREAD_ATTRIBUTE_JOB_LIST` would buy without replacing
-/// the process spawner.
 fn spawn_shell_job_child(
     params: &ActRunShellStartParams,
     spawn_plan: &ShellJobSpawnPlan,
-    job_id: &str,
     stdout_file: fs::File,
     stderr_file: fs::File,
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, SpawnShellJobChildFailure> {
-    let spawn_command =
-        prepared_shell_spawn_command(&spawn_plan.command, params.working_dir.as_deref())
-            .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
+    let spawn_command = shell_spawn_command(&spawn_plan.command);
     let mut command = TokioCommand::new(spawn_command.as_ref());
     command.args(&spawn_plan.args);
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
     command.env_clear();
-    let env = shell_child_environment(
-        &params.command,
-        &params.args,
-        &params.env,
-        params.working_dir.as_deref(),
-        context,
-    )
-    .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
-    for (key, value) in env {
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_run_shell")
+        .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
+    for (_sort_key, (key, value)) in env {
         command.env(key, value);
     }
+    command.envs(&params.env);
+    apply_shell_session_environment(&mut command, params.working_dir.as_deref(), context);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        // The kill-on-close job is the fail-closed owner until the durable
-        // restart-survival handoff below is committed.  `kill_on_drop` must be
-        // disabled: Tokio drops monitor tasks during a graceful daemon restart,
-        // and killing the exact child there would recreate #1807/#1808 even
-        // after the job-object kill bit was correctly disarmed.  Every ordinary
-        // error path below explicitly terminates/reaps while the still-armed job
-        // handle is retained.
-        .kill_on_drop(false);
+        // The monitor and the kill-on-close job are the intended long-lived
+        // owners. Before job assignment succeeds, however, Tokio's exact child
+        // handle is the only authority available on several error paths. Keep
+        // kill-on-drop armed so an exceptional unwind/failed bounded reap
+        // cannot detach a suspended or uncontained child.
+        .kill_on_drop(true);
     apply_no_window_tokio(&mut command);
 
     let mut child = command
@@ -24802,7 +16036,11 @@ fn spawn_shell_job_child(
     // Containment only needs the exact suspended child's PID. Acquire and read
     // back the kill-on-close job before identity capture so a GetProcessTimes
     // failure cannot leave an uncontained suspended process behind.
-    let mut process_job = match assign_owned_process_job(pid, "act_run_shell_start", Some(job_id)) {
+    let mut process_job = match assign_owned_process_job(
+        pid,
+        "act_run_shell_start",
+        params.job_id.as_deref(),
+    ) {
         Ok(process_job) => process_job,
         Err(assignment_error) => {
             let cleanup = terminate_and_reap_tokio_child_bounded(
@@ -24900,10 +16138,64 @@ fn spawn_shell_job_child(
             )));
         }
     };
-    // Deliberately NOT resumed here (#1867). The caller resumes only after the
-    // durable `running` row, the child-owned Job Object keeper handle and the
-    // kill-on-close readback are all committed, so a fast-exiting child cannot
-    // reach terminal state before restart survival exists.
+    if let Err(resume_error) = resume_suspended_shell_child(&local_process_identity) {
+        let initial_cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        let job_close = process_job.close_checked();
+        let state_after_job_close = local_process_identity_state(&local_process_identity);
+        let post_job_close_cleanup = (!initial_cleanup.reaped
+            || !terminal_local_process_identity_state(&state_after_job_close))
+        .then(|| {
+            terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            )
+        });
+        let cleanup = merge_exact_child_reap_readbacks(initial_cleanup, post_job_close_cleanup);
+        let final_identity_state = local_process_identity_state(&local_process_identity);
+        let tree_cleanup_verified = cfg!(windows);
+        let cleanup_verified = cleanup.reaped
+            && job_close.is_ok()
+            && tree_cleanup_verified
+            && terminal_local_process_identity_state(&final_identity_state);
+        let readback = spawn_failure_readback(
+            "contained_child_resume_failed",
+            &cleanup,
+            true,
+            Some(&job_close),
+            tree_cleanup_verified,
+            Some(&final_identity_state),
+            cleanup_verified,
+        );
+        let error = shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell_start could not safely resume contained pid {pid}; cleanup_verified={cleanup_verified}; job_close={job_close:?}; final_identity_state={final_identity_state:?}: {resume_error}",
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "reason": "contained_child_resume_failed",
+                "resume_error": resume_error,
+                "job_close": format!("{job_close:?}"),
+                "cleanup_verified": cleanup_verified,
+                "cleanup": cleanup,
+                "final_identity_state": final_identity_state,
+            }),
+        );
+        return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
+            PostSpawnShellJobChildFailure {
+                error,
+                child,
+                process_job: Some(process_job),
+                pid: Some(pid),
+                local_process_identity: Some(local_process_identity),
+                readback,
+            },
+        )));
+    }
     Ok(SpawnedShellChild {
         child,
         process_job,
@@ -24912,21 +16204,17 @@ fn spawn_shell_job_child(
 }
 
 fn apply_shell_session_environment(
-    env: &mut BTreeMap<String, (String, String)>,
+    command: &mut TokioCommand,
     effective_working_dir: Option<&str>,
     context: Option<&ShellExecutionContext>,
 ) {
     let Some(context) = context else {
         return;
     };
-    set_env_value(env, SHELL_SESSION_ID_ENV, context.session_id().to_owned());
-    set_env_value(
-        env,
-        SHELL_SESSION_DIR_ENV,
-        path_string(context.session_dir()),
-    );
+    command.env(SHELL_SESSION_ID_ENV, context.session_id());
+    command.env(SHELL_SESSION_DIR_ENV, context.session_dir());
     if let Some(working_dir) = effective_working_dir {
-        set_env_value(env, SHELL_WORKING_DIR_ENV, working_dir.to_owned());
+        command.env(SHELL_WORKING_DIR_ENV, working_dir);
     }
 }
 
@@ -25018,36 +16306,6 @@ async fn monitor_shell_job(
             &format!("{error:?}"),
         );
     }
-    match process_job.terminate_members_and_close_checked(
-        "act_run_shell_monitor_finalize",
-        status.pid.unwrap_or_default(),
-        &status.job_id,
-    ) {
-        Ok(readback) => {
-            push_unique_evidence(
-                &mut status.remote_process_scope.detection_evidence,
-                format!("local_job_object_terminal_readback:{readback}"),
-            );
-        }
-        Err(error) => {
-            let prior_error = status.error_message.take();
-            status.status = "job_object_terminal_cleanup_failed".to_owned();
-            status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-            status.error_message = Some(match prior_error {
-                Some(prior) => {
-                    format!("{prior}; owned process Job Object terminal cleanup failed: {error}")
-                }
-                None => format!("owned process Job Object terminal cleanup failed: {error}"),
-            });
-            tracing::error!(
-                code = "M4_ACT_RUN_SHELL_JOB_OBJECT_TERMINAL_CLEANUP_FAILED",
-                job_id = %status.job_id,
-                pid = ?status.pid,
-                error,
-                "durable shell monitor could not verify terminal cleanup of its owned Windows process tree"
-            );
-        }
-    }
     persist_shell_job_local_terminal_status(&paths, &status);
     verify_shell_job_remote_cleanup_after_terminal(
         &mut status,
@@ -25055,6 +16313,22 @@ async fn monitor_shell_job(
         "act_run_shell_start_process_exit",
         Some(&original_args),
     );
+    if let Err(error) = process_job.close_checked() {
+        let prior_error = status.error_message.take();
+        status.status = "job_handle_close_failed".to_owned();
+        status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+        status.error_message = Some(match prior_error {
+            Some(prior) => format!("{prior}; owned process job close failed: {error}"),
+            None => format!("owned process job close failed: {error}"),
+        });
+        tracing::error!(
+            code = "M4_ACT_RUN_SHELL_JOB_HANDLE_CLOSE_FAILED",
+            job_id = %status.job_id,
+            pid = ?status.pid,
+            error,
+            "durable shell monitor could not verify owned Windows job handle closure"
+        );
+    }
     if let Err(error) = write_shell_job_status(&paths.status_path, &status) {
         tracing::error!(
             code = "M4_ACT_RUN_SHELL_JOB_FINAL_STATUS_WRITE_FAILED",
@@ -25072,194 +16346,6 @@ async fn monitor_shell_job(
             timed_out = status.timed_out,
             cancel_requested = status.cancel_requested,
             "readback=act_run_shell_start after=process_complete_status_persisted"
-        );
-    }
-}
-
-/// Continue monitoring a durable child whose exact process survived a daemon
-/// restart.  The handle was opened and identity-checked before the new owner row
-/// was committed, so exit code and kernel runtime remain observable even if the
-/// process exits immediately after adoption.
-#[cfg(windows)]
-async fn monitor_adopted_shell_job(
-    child: AdoptedShellChildHandle,
-    mut process_job: OwnedProcessJob,
-    mut status: ActRunShellJobStatus,
-    paths: ShellJobPaths,
-) {
-    let mut timed_out = false;
-    let mut wait_error = None;
-    let mut termination_deadline = None;
-    let exit_code = loop {
-        match child.poll() {
-            Ok(AdoptedShellChildPoll::Exited(code)) => break code,
-            Ok(AdoptedShellChildPoll::Running) => {}
-            Err(error) => {
-                wait_error = Some(format!("adopted_child_wait_failed:{error}"));
-                break None;
-            }
-        }
-
-        if let Some(deadline) = termination_deadline {
-            if Instant::now() >= deadline {
-                wait_error = Some(format!(
-                    "adopted child pid {} remained live beyond the {} ms timeout cleanup backstop",
-                    child.identity.pid, SHELL_CHILD_REAP_BACKSTOP_MS
-                ));
-                break None;
-            }
-        } else if status
-            .timeout_ms
-            .is_some_and(|timeout_ms| child.elapsed() >= Duration::from_millis(timeout_ms))
-        {
-            timed_out = true;
-            let identity = child.identity.clone();
-            let termination =
-                tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(&identity))
-                    .await;
-            match termination {
-                Ok(readback) => {
-                    tracing::warn!(
-                        code = "M4_ACT_RUN_SHELL_ADOPTED_TIMEOUT_TERMINATION",
-                        job_id = %status.job_id,
-                        pid = child.identity.pid,
-                        timeout_ms = ?status.timeout_ms,
-                        termination = ?readback,
-                        "restart-adopted durable job exceeded its original lifetime cap"
-                    );
-                }
-                Err(error) => {
-                    wait_error = Some(format!(
-                        "adopted child timeout termination task failed: {error}"
-                    ));
-                    break None;
-                }
-            }
-            termination_deadline =
-                Some(Instant::now() + Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-
-    if let Ok(latest) = read_shell_job_status(&paths.status_path, &status.job_id) {
-        status.cancel_requested |= latest.cancel_requested;
-        if latest.status == "cancel_requested" {
-            status.status = latest.status;
-        }
-        if latest.remote_process_scope.remote_cleanup_required {
-            status.remote_process_scope = latest.remote_process_scope;
-        }
-        if latest.error_code.as_deref()
-            == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
-            && status.error_code.is_none()
-        {
-            status.error_code = latest.error_code;
-            status.error_message = latest.error_message;
-        }
-    }
-    status.exit_code = exit_code;
-    status.timed_out = timed_out;
-    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    let duration = child.runtime().unwrap_or_else(|| child.elapsed());
-    status.duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-    if let Some(error) = wait_error {
-        status.status = "wait_failed".to_owned();
-        status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-        status.error_message = Some(error);
-    } else if status.timed_out {
-        status.status =
-            terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
-                .to_owned();
-        let timeout_ms = status.timeout_ms.unwrap_or_default();
-        status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
-        status.error_message = Some(format!(
-            "durable job timeout_ms cap expired after {timeout_ms} ms across a daemon restart; the exact adopted process tree was terminated"
-        ));
-        mark_shell_job_remote_cleanup_unverified(
-            &mut status,
-            "act_run_shell_adopted_timeout",
-            "timeout_exact_adopted_process_tree_termination_requested",
-        );
-    } else {
-        status.status =
-            terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
-                .to_owned();
-    }
-    if let Err(error) = refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths) {
-        mark_shell_job_remote_cleanup_failed(
-            &mut status,
-            "act_run_shell_adopted_remote_metadata_readback",
-            "remote_metadata_read_failed",
-            &format!("{error:?}"),
-        );
-    } else if let Err(error) = reconcile_shell_job_remote_exit_marker(
-        &mut status,
-        &paths,
-        false,
-        "act_run_shell_adopted_remote_exit_readback",
-    ) {
-        mark_shell_job_remote_cleanup_failed(
-            &mut status,
-            "act_run_shell_adopted_remote_exit_readback",
-            "remote_exit_marker_read_failed",
-            &format!("{error:?}"),
-        );
-    }
-    match process_job.terminate_members_and_close_checked(
-        "act_run_shell_adopted_monitor_finalize",
-        child.identity.pid,
-        &status.job_id,
-    ) {
-        Ok(readback) => push_unique_evidence(
-            &mut status.remote_process_scope.detection_evidence,
-            format!("local_job_object_terminal_readback:{readback}"),
-        ),
-        Err(error) => {
-            let prior_error = status.error_message.take();
-            status.status = "job_object_terminal_cleanup_failed".to_owned();
-            status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-            status.error_message = Some(match prior_error {
-                Some(prior) => format!(
-                    "{prior}; adopted owned process Job Object terminal cleanup failed: {error}"
-                ),
-                None => {
-                    format!("adopted owned process Job Object terminal cleanup failed: {error}")
-                }
-            });
-            tracing::error!(
-                code = "M4_ACT_RUN_SHELL_ADOPTED_JOB_OBJECT_TERMINAL_CLEANUP_FAILED",
-                job_id = %status.job_id,
-                pid = child.identity.pid,
-                error,
-                "restart-adopted monitor could not verify terminal cleanup of its owned Windows process tree"
-            );
-        }
-    }
-    persist_shell_job_local_terminal_status(&paths, &status);
-    verify_shell_job_remote_cleanup_after_terminal(
-        &mut status,
-        &paths,
-        "act_run_shell_adopted_process_exit",
-        None,
-    );
-    if let Err(error) = write_shell_job_status(&paths.status_path, &status) {
-        tracing::error!(
-            code = "M4_ACT_RUN_SHELL_ADOPTED_FINAL_STATUS_WRITE_FAILED",
-            job_id = %status.job_id,
-            pid = ?status.pid,
-            error = ?error,
-            "restart-adopted durable shell monitor could not persist final job status"
-        );
-    } else {
-        tracing::info!(
-            code = "M4_ACT_RUN_SHELL_ADOPTED_COMPLETED",
-            job_id = %status.job_id,
-            pid = ?status.pid,
-            status = %status.status,
-            exit_code = ?status.exit_code,
-            timed_out = status.timed_out,
-            cancel_requested = status.cancel_requested,
-            "readback=act_run_shell_adopted after=process_complete_status_persisted"
         );
     }
 }
@@ -25351,192 +16437,6 @@ impl Drop for ChildRuntimeProbe {
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle()) };
     }
 }
-
-/// Exact kernel process handle retained by a new daemon after adopting a
-/// restart-surviving durable shell child.  Opening the handle while the child is
-/// still live preserves its exit code and kernel timings even after the process
-/// leaves the process table.
-#[cfg(windows)]
-struct AdoptedShellChildHandle {
-    raw: isize,
-    identity: ActRunShellLocalProcessIdentity,
-    creation_ticks_100ns: u64,
-}
-
-#[cfg(windows)]
-enum AdoptedShellChildPoll {
-    Running,
-    Exited(Option<i32>),
-}
-
-#[cfg(windows)]
-impl AdoptedShellChildHandle {
-    fn open(identity: &ActRunShellLocalProcessIdentity) -> Result<Self, String> {
-        use windows::Win32::{
-            Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-            System::Threading::{
-                GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, WaitForSingleObject,
-            },
-        };
-
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                false,
-                identity.pid,
-            )
-        }
-        .map_err(|error| {
-            format!(
-                "OpenProcess exact adopted child pid {} failed: {error}",
-                identity.pid
-            )
-        })?;
-        let mut creation = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        if let Err(error) = unsafe {
-            GetProcessTimes(
-                handle,
-                std::ptr::addr_of_mut!(creation),
-                std::ptr::addr_of_mut!(exit),
-                std::ptr::addr_of_mut!(kernel),
-                std::ptr::addr_of_mut!(user),
-            )
-        } {
-            let close = unsafe { CloseHandle(handle) };
-            return Err(format!(
-                "GetProcessTimes exact adopted child pid {} failed: {error}; close={close:?}",
-                identity.pid
-            ));
-        }
-        let creation_ticks_100ns = filetime_ticks_100ns(creation);
-        if creation_ticks_100ns != identity.start_time {
-            let close = unsafe { CloseHandle(handle) };
-            return Err(format!(
-                "exact adopted child pid {} creation identity mismatch: expected={} actual={creation_ticks_100ns}; close={close:?}",
-                identity.pid, identity.start_time
-            ));
-        }
-        let wait = unsafe { WaitForSingleObject(handle, 0) };
-        if wait == WAIT_FAILED {
-            let wait_error = windows::core::Error::from_thread();
-            let close = unsafe { CloseHandle(handle) };
-            return Err(format!(
-                "WaitForSingleObject exact adopted child pid {} failed: {wait_error}; close={close:?}",
-                identity.pid
-            ));
-        }
-        if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
-            let close = unsafe { CloseHandle(handle) };
-            return Err(format!(
-                "WaitForSingleObject exact adopted child pid {} returned unexpected state {wait:?}; close={close:?}",
-                identity.pid
-            ));
-        }
-        Ok(Self {
-            raw: handle.0 as isize,
-            identity: identity.clone(),
-            creation_ticks_100ns,
-        })
-    }
-
-    fn handle(&self) -> windows::Win32::Foundation::HANDLE {
-        windows::Win32::Foundation::HANDLE(self.raw as *mut core::ffi::c_void)
-    }
-
-    fn poll(&self) -> Result<AdoptedShellChildPoll, String> {
-        use windows::Win32::{
-            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-        };
-        let wait = unsafe { WaitForSingleObject(self.handle(), 0) };
-        if wait == WAIT_TIMEOUT {
-            return Ok(AdoptedShellChildPoll::Running);
-        }
-        if wait == WAIT_FAILED {
-            return Err(format!(
-                "WaitForSingleObject adopted shell child pid {} failed: {}",
-                self.identity.pid,
-                windows::core::Error::from_thread()
-            ));
-        }
-        if wait != WAIT_OBJECT_0 {
-            return Err(format!(
-                "WaitForSingleObject adopted shell child pid {} returned unexpected state {wait:?}",
-                self.identity.pid
-            ));
-        }
-        let mut code = 0_u32;
-        unsafe { GetExitCodeProcess(self.handle(), &raw mut code) }.map_err(|error| {
-            format!(
-                "GetExitCodeProcess adopted shell child pid {} failed: {error}",
-                self.identity.pid
-            )
-        })?;
-        const STILL_ACTIVE: u32 = 259;
-        if code == STILL_ACTIVE {
-            return Err(format!(
-                "adopted shell child pid {} was signaled but GetExitCodeProcess returned STILL_ACTIVE",
-                self.identity.pid
-            ));
-        }
-        Ok(AdoptedShellChildPoll::Exited(Some(i32::from_ne_bytes(
-            code.to_ne_bytes(),
-        ))))
-    }
-
-    fn elapsed(&self) -> Duration {
-        const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
-        let creation_unix_100ns = self
-            .creation_ticks_100ns
-            .saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS);
-        let now_100ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| {
-                u64::try_from(duration.as_nanos() / 100).unwrap_or(u64::MAX)
-            });
-        Duration::from_nanos(
-            now_100ns
-                .saturating_sub(creation_unix_100ns)
-                .saturating_mul(100),
-        )
-    }
-
-    fn runtime(&self) -> Option<Duration> {
-        use windows::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
-        let mut creation = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        unsafe {
-            GetProcessTimes(
-                self.handle(),
-                std::ptr::addr_of_mut!(creation),
-                std::ptr::addr_of_mut!(exit),
-                std::ptr::addr_of_mut!(kernel),
-                std::ptr::addr_of_mut!(user),
-            )
-        }
-        .ok()?;
-        let creation = filetime_ticks_100ns(creation);
-        let exit = filetime_ticks_100ns(exit);
-        (exit != 0 && exit >= creation)
-            .then(|| Duration::from_nanos(exit.saturating_sub(creation).saturating_mul(100)))
-    }
-}
-
-#[cfg(windows)]
-impl Drop for AdoptedShellChildHandle {
-    fn drop(&mut self) {
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle()) };
-    }
-}
-
-#[cfg(windows)]
-unsafe impl Send for AdoptedShellChildHandle {}
 
 #[cfg(windows)]
 fn filetime_ticks_100ns(value: windows::Win32::Foundation::FILETIME) -> u64 {
@@ -25685,6 +16585,18 @@ async fn wait_shell_job_child_with_identity(
             Err(error) => (None, false, Some(format!("wait_failed:{error}"))),
         },
     }
+}
+
+#[cfg(test)]
+async fn wait_shell_job_child(
+    child: &mut tokio::process::Child,
+    timeout_ms: Option<u64>,
+    started: Instant,
+) -> (Option<i32>, bool, Option<String>) {
+    let identity = child
+        .id()
+        .and_then(|pid| capture_local_process_identity(pid).ok());
+    wait_shell_job_child_with_identity(child, identity.as_ref(), timeout_ms, started).await
 }
 
 fn terminal_shell_job_status(
@@ -26614,7 +17526,7 @@ fn capture_local_process_identity(pid: u32) -> Result<ActRunShellLocalProcessIde
 #[cfg(windows)]
 fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> Result<(), String> {
     use windows::Win32::{
-        Foundation::{CloseHandle, FILETIME},
+        Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -26622,7 +17534,8 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
             },
             Threading::{
                 GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-                ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+                PROCESS_SYNCHRONIZE, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+                THREAD_SUSPEND_RESUME, WaitForSingleObject,
             },
         },
     };
@@ -26630,8 +17543,14 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
     let thread_entry_size = u32::try_from(std::mem::size_of::<THREADENTRY32>())
         .map_err(|error| format!("THREADENTRY32 size conversion failed: {error}"))?;
 
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, identity.pid) }
-        .map_err(|error| format!("open suspended child pid {} failed: {error}", identity.pid))?;
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            identity.pid,
+        )
+    }
+    .map_err(|error| format!("open suspended child pid {} failed: {error}", identity.pid))?;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -26710,35 +17629,49 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
         )
     })?;
     let previous_suspend_count = unsafe { ResumeThread(thread) };
-    // ResumeThread's return is the transition readback. Capture GetLastError
-    // before CloseHandle can overwrite the calling thread's last-error slot.
-    let resume_error = (previous_suspend_count == u32::MAX)
+    let thread_close = unsafe { CloseHandle(thread) }.map_err(|error| error.to_string());
+    let initial_wait = unsafe { WaitForSingleObject(process, 0) };
+    let wait_error = (initial_wait == WAIT_FAILED)
         .then(windows::core::Error::from_thread)
         .map(|error| error.to_string());
-    let thread_close = unsafe { CloseHandle(thread) }.map_err(|error| error.to_string());
-    let resume_verdict = match previous_suspend_count {
-        u32::MAX => "resume_thread_api_failed",
-        0 => "primary_thread_was_not_suspended",
-        1 => "primary_thread_restarted",
-        _ => "primary_thread_remains_suspended",
+    let (state_valid, state_detail) = if initial_wait == WAIT_OBJECT_0 {
+        (
+            true,
+            "exact_process_handle_signaled_after_resume".to_owned(),
+        )
+    } else if initial_wait == WAIT_TIMEOUT {
+        let states = process_tree_suspend_state_platform(&[identity.pid]);
+        if states.len() == 1 && states[0].suspended_threads == 0 {
+            (true, format!("live_thread_state={states:?}"))
+        } else {
+            // The process may have exited between the initial exact-handle wait
+            // and the thread-table read. Keep the exact handle open and accept
+            // only a now-signaled readback; an empty state alone is ambiguous.
+            let post_state_wait = unsafe { WaitForSingleObject(process, 0) };
+            (
+                post_state_wait == WAIT_OBJECT_0,
+                format!(
+                    "thread_state={states:?}; post_state_exact_handle_wait={post_state_wait:?}"
+                ),
+            )
+        }
+    } else {
+        (
+            false,
+            format!("unexpected_exact_handle_wait={initial_wait:?}"),
+        )
     };
     let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
-    if previous_suspend_count != 1 || thread_close.is_err() || process_close.is_err() {
+    if previous_suspend_count != 1
+        || thread_close.is_err()
+        || process_close.is_err()
+        || !state_valid
+    {
         return Err(format!(
-            "CREATE_SUSPENDED primary-thread transition failed for pid {}: resume_verdict={resume_verdict}; previous_suspend_count={previous_suspend_count}; resume_error={resume_error:?}; thread_close={thread_close:?}; process_close={process_close:?}",
+            "documented primary-thread resume readback failed for pid {}: previous_suspend_count={previous_suspend_count}; thread_close={thread_close:?}; initial_process_wait={initial_wait:?}; wait_error={wait_error:?}; state_detail={state_detail}; process_close={process_close:?}",
             identity.pid
         ));
     }
-    tracing::info!(
-        code = "CONTAINED_CHILD_PRIMARY_THREAD_RESUMED",
-        pid = identity.pid,
-        primary_thread_id = thread_id,
-        process_start_time = identity.start_time,
-        process_start_time_source = identity.start_time_source,
-        previous_suspend_count,
-        resume_verdict,
-        "CREATE_SUSPENDED child primary thread restarted from the authoritative ResumeThread transition readback"
-    );
     Ok(())
 }
 
@@ -28062,414 +18995,10 @@ fn persist_running_shell_job_status_or_cleanup(
     ))
 }
 
-/// Transfer a newly admitted Windows durable job from daemon-lifetime
-/// containment to restart-survivable monitoring.
-///
-/// The two durable writes around the kernel mutations are intentional. If the
-/// daemon dies before installing the child-owned keeper, the armed Job Object
-/// reaps the child. After the keeper exists, the named Job Object survives with
-/// its full membership even if the daemon dies before disarm. Recovery reopens
-/// it, verifies the exact child is a member, proves kill-on-close is still
-/// armed, and only then changes ownership. The final row is written only after
-/// that armed containment was independently read back.
-#[cfg(windows)]
-fn handoff_shell_job_to_restart_survivable_monitoring(
-    paths: &ShellJobPaths,
-    status: &mut ActRunShellJobStatus,
-    child: &mut tokio::process::Child,
-    local_process_identity: &ActRunShellLocalProcessIdentity,
-    process_job: &mut OwnedProcessJob,
-    started: Instant,
-) -> Result<(), ErrorData> {
-    let Some(supervisor) = status.supervisor.as_mut() else {
-        return fail_shell_job_restart_survival_handoff(
-            paths,
-            status,
-            child,
-            local_process_identity,
-            process_job,
-            started,
-            "supervisor_identity_missing",
-            "durable job status had no supervisor identity before the restart-survival handoff",
-            None,
-        );
-    };
-    supervisor.child_containment = SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING.to_owned();
-    persist_running_shell_job_status_or_cleanup(
-        paths,
-        status,
-        child,
-        local_process_identity,
-        process_job,
-        started,
-    )?;
-
-    // A child that exits this fast is a normal, expected outcome, not a
-    // control-plane fault. Check before attempting the kernel mutations, because
-    // every one of them can only fail against a dead process (#1866).
-    if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity) {
-        return complete_shell_job_handoff_child_terminal_before_keeper(
-            paths,
-            status,
-            child,
-            local_process_identity,
-            process_job,
-            started,
-            "before_keeper_install",
-            &terminal_state,
-            None,
-        );
-    }
-
-    if let Err(error) =
-        process_job.install_child_job_keeper_handle(local_process_identity, &status.job_id)
-    {
-        let detail = error.message.to_string();
-        // The authoritative re-check. The child can exit between the pre-check
-        // above and any of process creation, job-object assignment, handle
-        // duplication, or keeper acknowledgement; Windows then fails the
-        // duplication with ERROR_ACCESS_DENIED because a terminated process
-        // cannot receive new handles. Only a child that is NOT terminal makes
-        // this a real ownership failure.
-        if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity)
-        {
-            return complete_shell_job_handoff_child_terminal_before_keeper(
-                paths,
-                status,
-                child,
-                local_process_identity,
-                process_job,
-                started,
-                "job_object_child_keeper_install_failed",
-                &terminal_state,
-                Some(&detail),
-            );
-        }
-        return fail_shell_job_restart_survival_handoff(
-            paths,
-            status,
-            child,
-            local_process_identity,
-            process_job,
-            started,
-            "job_object_child_keeper_install_failed",
-            &detail,
-            error.data,
-        );
-    }
-
-    if let Err(error) = process_job.arm_kill_on_close(
-        "act_run_shell_start",
-        local_process_identity.pid,
-        Some(&status.job_id),
-    ) {
-        let detail = error.message.to_string();
-        if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity)
-        {
-            return complete_shell_job_handoff_child_terminal_before_keeper(
-                paths,
-                status,
-                child,
-                local_process_identity,
-                process_job,
-                started,
-                "job_object_kill_on_close_keeper_readback_failed",
-                &terminal_state,
-                Some(&detail),
-            );
-        }
-        return fail_shell_job_restart_survival_handoff(
-            paths,
-            status,
-            child,
-            local_process_identity,
-            process_job,
-            started,
-            "job_object_kill_on_close_keeper_readback_failed",
-            &detail,
-            error.data,
-        );
-    }
-
-    if let Some(supervisor) = status.supervisor.as_mut() {
-        supervisor.child_containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned();
-    }
-    persist_running_shell_job_status_or_cleanup(
-        paths,
-        status,
-        child,
-        local_process_identity,
-        process_job,
-        started,
-    )?;
-    tracing::info!(
-        code = "M4_ACT_RUN_SHELL_RESTART_SURVIVAL_ARMED",
-        job_id = %status.job_id,
-        pid = local_process_identity.pid,
-        child_start_time = local_process_identity.start_time,
-        containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE,
-        status_path = %paths.status_path.display(),
-        "durable shell child can survive daemon exit and was committed for exact-identity adoption"
-    );
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn handoff_shell_job_to_restart_survivable_monitoring(
-    _paths: &ShellJobPaths,
-    _status: &mut ActRunShellJobStatus,
-    _child: &mut tokio::process::Child,
-    _local_process_identity: &ActRunShellLocalProcessIdentity,
-    _process_job: &mut OwnedProcessJob,
-    _started: Instant,
-) -> Result<(), ErrorData> {
-    Ok(())
-}
-
-/// Release the `CREATE_SUSPENDED` durable child, after — and only after —
-/// containment is fully committed (#1867).
-///
-/// Ordering rationale, re-derived rather than assumed: the kill-on-close Job
-/// Object is armed and membership-verified by `assign_owned_process_job` before
-/// this point, so daemon death anywhere in the pre-resume window still reaps the
-/// child, exactly as it did when the resume happened inside the spawner. A
-/// still-suspended child is in fact reaped *more* cleanly, because it cannot
-/// have created descendants or written anything. What the deferral removes is
-/// the window in which a fast child could reach terminal state before
-/// `install_child_job_keeper_handle`, where Windows fails `DuplicateHandle` with
-/// `ERROR_ACCESS_DENIED` because a terminated process cannot receive handles.
-///
-/// A resume failure here is a genuine control-plane fault: containment is
-/// committed but the child will never run, so it fails closed through the same
-/// exact-owned termination/reap path as any other handoff failure.
-#[cfg(windows)]
-fn resume_restart_survivable_shell_child(
-    paths: &ShellJobPaths,
-    status: &mut ActRunShellJobStatus,
-    child: &mut tokio::process::Child,
-    local_process_identity: &ActRunShellLocalProcessIdentity,
-    process_job: &mut OwnedProcessJob,
-    started: Instant,
-) -> Result<(), ErrorData> {
-    // Defence in depth for the #1866 path. A suspended child cannot exit on its
-    // own, but it can still be terminated externally, in which case the handoff
-    // above already reconciled it as a normal terminal job. There is nothing to
-    // resume, and treating an unresumable corpse as a control-plane fault would
-    // destroy exactly the terminal result #1866 recovered.
-    if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity) {
-        tracing::info!(
-            code = "M4_ACT_RUN_SHELL_CONTAINED_CHILD_TERMINAL_BEFORE_RESUME",
-            job_id = %status.job_id,
-            pid = local_process_identity.pid,
-            child_start_time = local_process_identity.start_time,
-            terminal_state = ?terminal_state,
-            status_path = %paths.status_path.display(),
-            "durable shell child was terminated before its post-commit resume; the monitor \
-             reconciles it from its persisted output and exit status"
-        );
-        return Ok(());
-    }
-    match resume_suspended_shell_child(local_process_identity) {
-        Ok(()) => {
-            tracing::info!(
-                code = "M4_ACT_RUN_SHELL_CONTAINED_CHILD_RESUMED",
-                job_id = %status.job_id,
-                pid = local_process_identity.pid,
-                child_start_time = local_process_identity.start_time,
-                containment = %status
-                    .supervisor
-                    .as_ref()
-                    .map_or(SHELL_SUPERVISOR_CONTAINMENT_NONE, |supervisor| {
-                        supervisor.child_containment.as_str()
-                    }),
-                "durable shell child resumed after its containment was durably committed"
-            );
-            Ok(())
-        }
-        Err(resume_error) => fail_shell_job_restart_survival_handoff(
-            paths,
-            status,
-            child,
-            local_process_identity,
-            process_job,
-            started,
-            "contained_child_resume_after_restart_survival_commit_failed",
-            &resume_error,
-            None,
-        ),
-    }
-}
-
-#[cfg(not(windows))]
-fn resume_restart_survivable_shell_child(
-    _paths: &ShellJobPaths,
-    _status: &mut ActRunShellJobStatus,
-    _child: &mut tokio::process::Child,
-    _local_process_identity: &ActRunShellLocalProcessIdentity,
-    _process_job: &mut OwnedProcessJob,
-    _started: Instant,
-) -> Result<(), ErrorData> {
-    Ok(())
-}
-
-/// Prove, against the OS rather than against a return value, whether the exact
-/// child creation identity has reached terminal state.
-///
-/// `Exited` (signaled, handle still open), `Absent` (gone entirely) and
-/// `Mismatch` (the pid now belongs to a different creation identity, so ours is
-/// gone) are all terminal for *our* child. `Unreadable` is deliberately not
-/// terminal: an unprovable state must never be reported as a clean completion.
-#[cfg(windows)]
-fn shell_child_terminal_state_for_handoff(
-    local_process_identity: &ActRunShellLocalProcessIdentity,
-) -> Option<LocalProcessIdentityState> {
-    let state = local_process_identity_state(local_process_identity);
-    terminal_local_process_identity_state(&state).then_some(state)
-}
-
-/// Reconcile a child that reached terminal state before restart-survival could
-/// be armed.
-///
-/// Restart survival exists solely to keep a *running* child alive across daemon
-/// exit. For a terminal child there is nothing to protect, so the already-armed
-/// daemon-lifetime Job Object stays correct containment and the monitor
-/// completes the job from the stdout/stderr/exit status it already persisted.
-/// Reporting TOOL_INTERNAL_ERROR here destroyed the real terminal result of a
-/// fast, expected failure (#1866).
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn complete_shell_job_handoff_child_terminal_before_keeper(
-    paths: &ShellJobPaths,
-    status: &mut ActRunShellJobStatus,
-    child: &mut tokio::process::Child,
-    local_process_identity: &ActRunShellLocalProcessIdentity,
-    process_job: &mut OwnedProcessJob,
-    started: Instant,
-    stage: &'static str,
-    terminal_state: &LocalProcessIdentityState,
-    attempt_detail: Option<&str>,
-) -> Result<(), ErrorData> {
-    if let Some(supervisor) = status.supervisor.as_mut() {
-        supervisor.child_containment =
-            SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER.to_owned();
-    }
-    persist_running_shell_job_status_or_cleanup(
-        paths,
-        status,
-        child,
-        local_process_identity,
-        process_job,
-        started,
-    )?;
-    tracing::info!(
-        code = "M4_ACT_RUN_SHELL_CHILD_TERMINAL_BEFORE_RESTART_SURVIVAL",
-        job_id = %status.job_id,
-        pid = local_process_identity.pid,
-        child_start_time = local_process_identity.start_time,
-        stage,
-        terminal_state = %local_process_identity_state_label(terminal_state),
-        attempt_detail = ?attempt_detail,
-        containment = SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER,
-        status_path = %paths.status_path.display(),
-        "durable shell child reached terminal state before restart survival could be armed; \
-         the monitor reconciles it as a normal terminal job from its persisted output and exit status"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-fn fail_shell_job_restart_survival_handoff(
-    paths: &ShellJobPaths,
-    status: &mut ActRunShellJobStatus,
-    child: &mut tokio::process::Child,
-    local_process_identity: &ActRunShellLocalProcessIdentity,
-    process_job: &mut OwnedProcessJob,
-    started: Instant,
-    reason: &'static str,
-    detail: &str,
-    underlying_data: Option<serde_json::Value>,
-) -> Result<(), ErrorData> {
-    let tree_termination = terminate_shell_job_process_tree(local_process_identity);
-    let initial_reap = terminate_and_reap_tokio_child_bounded(
-        child,
-        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
-    );
-    let state_while_job_held = local_process_identity_state(local_process_identity);
-    let job_close = process_job.close_checked();
-    let post_job_close_reap = (!initial_reap.reaped
-        || !terminal_local_process_identity_state(&state_while_job_held))
-    .then(|| {
-        terminate_and_reap_tokio_child_bounded(
-            child,
-            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
-        )
-    });
-    let final_identity_state = local_process_identity_state(local_process_identity);
-    let exact_child_reaped = initial_reap.reaped
-        || post_job_close_reap
-            .as_ref()
-            .is_some_and(|readback| readback.reaped);
-    let cleanup_verified = exact_child_reaped
-        && tree_termination.remaining_process_ids.is_empty()
-        && terminal_local_process_identity_state(&final_identity_state)
-        && job_close.is_ok();
-    status.status = if cleanup_verified {
-        "restart_survival_handoff_failed_reaped".to_owned()
-    } else {
-        "restart_survival_handoff_failed_cleanup_unverified".to_owned()
-    };
-    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    status.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-    status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-    status.error_message = Some(format!(
-        "durable restart-survival handoff failed at {reason}: {detail}; cleanup_verified={cleanup_verified}; tree={tree_termination:?}; initial_reap={initial_reap:?}; state_while_job_held={state_while_job_held:?}; job_close={job_close:?}; post_job_close_reap={post_job_close_reap:?}; final_identity_state={final_identity_state:?}"
-    ));
-    let terminal_persistence = persist_and_verify_shell_job_status(&paths.status_path, status);
-    let terminal_status_persisted = terminal_persistence.is_ok();
-    let terminal_persistence_failure = terminal_persistence.err();
-    tracing::error!(
-        code = "M4_ACT_RUN_SHELL_RESTART_SURVIVAL_HANDOFF_FAILED",
-        job_id = %status.job_id,
-        pid = local_process_identity.pid,
-        reason,
-        detail,
-        cleanup_verified,
-        terminal_status_persisted,
-        terminal_persistence_failure = ?terminal_persistence_failure,
-        "durable shell restart-survival handoff failed closed and attempted exact owned cleanup"
-    );
-    Err(shell_tool_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        format!(
-            "act_run_shell_start could not establish restart-survivable ownership for pid {}; cleanup_verified={cleanup_verified}; terminal_status_persisted={terminal_status_persisted}: {detail}",
-            local_process_identity.pid
-        ),
-        json!({
-            "code": error_codes::TOOL_INTERNAL_ERROR,
-            "job_id": status.job_id,
-            "pid": local_process_identity.pid,
-            "reason": reason,
-            "detail": detail,
-            "underlying_data": underlying_data,
-            "cleanup_verified": cleanup_verified,
-            "tree_termination": tree_termination,
-            "initial_reap": initial_reap,
-            "state_while_job_held": state_while_job_held,
-            "job_close": format!("{job_close:?}"),
-            "post_job_close_reap": post_job_close_reap,
-            "final_identity_state": final_identity_state,
-            "terminal_status_persisted": terminal_status_persisted,
-            "terminal_persistence_failure": terminal_persistence_failure,
-            "status_path": paths.status_path,
-        }),
-    ))
-}
-
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct OwnedProcessJob {
     handle: Option<windows::Win32::Foundation::HANDLE>,
-    name: Option<String>,
 }
 
 #[cfg(not(windows))]
@@ -28572,325 +19101,62 @@ impl OwnedProcessJob {
         pid: u32,
         resource_id: Option<&str>,
     ) -> Result<(), ErrorData> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
         let handle = self.handle(tool_name, pid)?;
-        set_owned_process_job_kill_on_close(handle, false).map_err(|error| {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = Default::default();
+        let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            .map_err(|error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{tool_name} failed to size Windows job object limits: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "pid": pid,
+                        "resource_id": resource_id,
+                        "reason": "job_object_limit_size_failed",
+                    }),
+                )
+            })?;
+        unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                limit_size,
+            )
+        }
+        .map_err(|error| {
             shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "{tool_name} failed to disarm and verify Windows job object kill-on-close: {error}"
-                ),
+                format!("{tool_name} failed to disarm Windows job object kill-on-close: {error}"),
                 json!({
                     "code": error_codes::TOOL_INTERNAL_ERROR,
                     "pid": pid,
                     "resource_id": resource_id,
                     "reason": "job_object_kill_on_close_disarm_failed",
-                    "detail": error,
                 }),
             )
-        })
-    }
-
-    fn arm_kill_on_close(
-        &self,
-        tool_name: &'static str,
-        pid: u32,
-        resource_id: Option<&str>,
-    ) -> Result<(), ErrorData> {
-        let handle = self.handle(tool_name, pid)?;
-        set_owned_process_job_kill_on_close(handle, true).map_err(|error| {
+        })?;
+        query_owned_process_job_kill_on_close(handle, false).map_err(|error| {
             shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
-                    "{tool_name} failed to arm and verify Windows job object kill-on-close for pid {pid}: {error}"
+                    "{tool_name} could not verify Windows job object kill-on-close disarm for pid {pid}: {error}"
                 ),
                 json!({
                     "code": error_codes::TOOL_INTERNAL_ERROR,
                     "pid": pid,
                     "resource_id": resource_id,
-                    "reason": "job_object_kill_on_close_arm_failed",
+                    "reason": "job_object_kill_on_close_disarm_readback_failed",
                     "detail": error,
                 }),
             )
         })
-    }
-
-    fn install_child_job_keeper_handle(
-        &self,
-        identity: &ActRunShellLocalProcessIdentity,
-        job_id: &str,
-    ) -> Result<(), ErrorData> {
-        use windows::Win32::{
-            Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, HANDLE},
-            System::{
-                JobObjects::IsProcessInJob,
-                Threading::{
-                    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_DUP_HANDLE,
-                    PROCESS_QUERY_LIMITED_INFORMATION,
-                },
-            },
-        };
-
-        let job_handle = self.handle("act_run_shell_start", identity.pid)?;
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                identity.pid,
-            )
-        }
-        .map_err(|error| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "act_run_shell_start could not open exact child pid {} to install the restart-survival job keeper: {error}",
-                    identity.pid
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": identity.pid,
-                    "reason": "job_object_child_keeper_process_open_failed",
-                }),
-            )
-        })?;
-        let result = (|| {
-            let mut creation = FILETIME::default();
-            let mut exit = FILETIME::default();
-            let mut kernel = FILETIME::default();
-            let mut user = FILETIME::default();
-            unsafe {
-                GetProcessTimes(
-                    process,
-                    &raw mut creation,
-                    &raw mut exit,
-                    &raw mut kernel,
-                    &raw mut user,
-                )
-            }
-            .map_err(|error| format!("GetProcessTimes failed: {error}"))?;
-            let actual_start = filetime_ticks_100ns(creation);
-            if actual_start != identity.start_time {
-                return Err(format!(
-                    "child creation identity changed before keeper installation: expected={} actual={actual_start}",
-                    identity.start_time
-                ));
-            }
-            let mut in_job = windows::core::BOOL::default();
-            unsafe { IsProcessInJob(process, Some(job_handle), &raw mut in_job) }
-                .map_err(|error| format!("IsProcessInJob failed: {error}"))?;
-            if !in_job.as_bool() {
-                return Err("exact child is not a member of its named job object".to_owned());
-            }
-            let mut child_owned_handle = HANDLE::default();
-            unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    job_handle,
-                    process,
-                    &raw mut child_owned_handle,
-                    0,
-                    false,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            }
-            .map_err(|error| format!("DuplicateHandle into exact child failed: {error}"))?;
-            if child_owned_handle.is_invalid() {
-                return Err("DuplicateHandle returned an invalid child-owned handle".to_owned());
-            }
-            Ok(child_owned_handle.0 as isize)
-        })();
-        let close = unsafe { CloseHandle(process) };
-        let child_handle_value = result.map_err(|detail| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "act_run_shell_start could not install the restart-survival job keeper for pid {}: {detail}; process_close={close:?}",
-                    identity.pid
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": identity.pid,
-                    "job_object_name": self.name,
-                    "reason": "job_object_child_keeper_install_failed",
-                    "detail": detail,
-                    "process_close": format!("{close:?}"),
-                }),
-            )
-        })?;
-        close.map_err(|error| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "act_run_shell_start installed child-owned job handle {child_handle_value:#x} but could not close the local exact-process handle: {error}"
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": identity.pid,
-                    "reason": "job_object_child_keeper_process_close_failed",
-                    "child_owned_handle": child_handle_value,
-                }),
-            )
-        })?;
-        tracing::info!(
-            code = "M4_ACT_RUN_SHELL_JOB_KEEPER_INSTALLED",
-            job_id,
-            pid = identity.pid,
-            job_object_name = ?self.name,
-            child_owned_handle = child_handle_value,
-            "exact child now keeps its named Job Object alive across supervisor exit"
-        );
-        Ok(())
-    }
-
-    fn open_for_restart_adoption(
-        job_id: &str,
-        child: &AdoptedShellChildHandle,
-        prior_containment: &str,
-    ) -> Result<Self, ErrorData> {
-        use windows::Win32::System::{
-            JobObjects::{IsProcessInJob, OpenJobObjectW},
-            SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_SET_ATTRIBUTES, JOB_OBJECT_TERMINATE},
-        };
-        use windows::core::PCWSTR;
-
-        let name = shell_job_object_name(job_id);
-        let name_wide = name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let handle = unsafe {
-            OpenJobObjectW(
-                JOB_OBJECT_QUERY | JOB_OBJECT_SET_ATTRIBUTES | JOB_OBJECT_TERMINATE,
-                false,
-                PCWSTR(name_wide.as_ptr()),
-            )
-        }
-        .map_err(|error| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "daemon startup could not reopen named Job Object {name} for restart-surviving pid {}: {error}",
-                    child.identity.pid
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": child.identity.pid,
-                    "job_object_name": name,
-                    "reason": "restart_adoption_job_object_open_failed",
-                }),
-            )
-        })?;
-        let owner = Self {
-            handle: Some(handle),
-            name: Some(name.clone()),
-        };
-        let mut in_job = windows::core::BOOL::default();
-        unsafe { IsProcessInJob(child.handle(), Some(handle), &raw mut in_job) }.map_err(
-            |error| {
-                shell_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "daemon startup could not verify restart-surviving pid {} membership in {name}: {error}",
-                        child.identity.pid
-                    ),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "job_id": job_id,
-                        "pid": child.identity.pid,
-                        "job_object_name": name,
-                        "reason": "restart_adoption_job_membership_read_failed",
-                    }),
-                )
-            },
-        )?;
-        if !in_job.as_bool() {
-            return Err(shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "restart-surviving pid {} is not a member of its named Job Object {name}",
-                    child.identity.pid
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": child.identity.pid,
-                    "job_object_name": name,
-                    "reason": "restart_adoption_job_membership_mismatch",
-                }),
-            ));
-        }
-        let armed = read_owned_process_job_kill_on_close(handle).map_err(|detail| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "daemon startup could not read named Job Object containment for restart-surviving pid {}: {detail}",
-                    child.identity.pid
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": child.identity.pid,
-                    "job_object_name": name,
-                    "reason": "restart_adoption_job_limit_read_failed",
-                    "detail": detail,
-                }),
-            )
-        })?;
-        if !armed {
-            return Err(shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "named Job Object {name} is disarmed even though restart-survivable containment requires an armed child keeper"
-                ),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "job_id": job_id,
-                    "pid": child.identity.pid,
-                    "job_object_name": name,
-                    "reason": "restart_adoption_job_limit_state_mismatch",
-                    "prior_containment": prior_containment,
-                    "kill_on_close_armed": armed,
-                }),
-            ));
-        }
-        Ok(owner)
-    }
-
-    fn terminate_members_and_close_checked(
-        &mut self,
-        tool_name: &'static str,
-        pid: u32,
-        job_id: &str,
-    ) -> Result<String, String> {
-        use windows::Win32::System::JobObjects::TerminateJobObject;
-
-        let handle = self
-            .handle(tool_name, pid)
-            .map_err(|error| error.message.to_string())?;
-        let active_before = read_owned_process_job_active_processes(handle)?;
-        let arm = self
-            .arm_kill_on_close(tool_name, pid, Some(job_id))
-            .map_err(|error| error.message.to_string());
-        let terminate = unsafe { TerminateJobObject(handle, 1) }
-            .map_err(|error| format!("TerminateJobObject failed: {error}"));
-        let active_after = read_owned_process_job_active_processes(handle);
-        let close = self.close_checked();
-        let verified = arm.is_ok()
-            && terminate.is_ok()
-            && active_after.as_ref().is_ok_and(|active| *active == 0)
-            && close.is_ok();
-        let diagnostic = format!(
-            "job_object_name={:?}; active_before={active_before}; arm={arm:?}; terminate={terminate:?}; active_after={active_after:?}; close={close:?}; verified={verified}",
-            self.name
-        );
-        if verified {
-            Ok(diagnostic)
-        } else {
-            Err(diagnostic)
-        }
     }
 }
 
@@ -28908,53 +19174,6 @@ impl OwnedProcessJob {
     ) -> Result<(), ErrorData> {
         Ok(())
     }
-
-    fn arm_kill_on_close(
-        &self,
-        _tool_name: &'static str,
-        _pid: u32,
-        _resource_id: Option<&str>,
-    ) -> Result<(), ErrorData> {
-        Ok(())
-    }
-
-    fn terminate_members_and_close_checked(
-        &mut self,
-        _tool_name: &'static str,
-        _pid: u32,
-        _job_id: &str,
-    ) -> Result<String, String> {
-        self.close_checked()?;
-        Ok("non_windows_no_job_object".to_owned())
-    }
-}
-
-#[cfg(windows)]
-fn set_owned_process_job_kill_on_close(
-    handle: windows::Win32::Foundation::HANDLE,
-    enabled: bool,
-) -> Result<(), String> {
-    use windows::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
-    };
-
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    if enabled {
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    }
-    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-        .map_err(|error| format!("Windows job limit size conversion failed: {error}"))?;
-    unsafe {
-        SetInformationJobObject(
-            handle,
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            limit_size,
-        )
-    }
-    .map_err(|error| format!("SetInformationJobObject limit update failed: {error}"))?;
-    query_owned_process_job_kill_on_close(handle, enabled)
 }
 
 #[cfg(windows)]
@@ -28962,19 +19181,6 @@ fn query_owned_process_job_kill_on_close(
     handle: windows::Win32::Foundation::HANDLE,
     expected: bool,
 ) -> Result<(), String> {
-    let actual = read_owned_process_job_kill_on_close(handle)?;
-    if actual != expected {
-        return Err(format!(
-            "Windows job kill-on-close limit readback mismatch: expected={expected} actual={actual}"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn read_owned_process_job_kill_on_close(
-    handle: windows::Win32::Foundation::HANDLE,
-) -> Result<bool, String> {
     use windows::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, QueryInformationJobObject,
@@ -29004,43 +19210,13 @@ fn read_owned_process_job_kill_on_close(
         .BasicLimitInformation
         .LimitFlags
         .contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
-    Ok(actual)
-}
-
-#[cfg(windows)]
-fn read_owned_process_job_active_processes(
-    handle: windows::Win32::Foundation::HANDLE,
-) -> Result<u32, String> {
-    use windows::Win32::System::JobObjects::{
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-        QueryInformationJobObject,
-    };
-
-    let size = u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
-        .map_err(|error| format!("Windows job accounting size conversion failed: {error}"))?;
-    let mut readback = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-    let mut returned_bytes = 0_u32;
-    unsafe {
-        QueryInformationJobObject(
-            Some(handle),
-            JobObjectBasicAccountingInformation,
-            (&raw mut readback).cast(),
-            size,
-            Some(&raw mut returned_bytes),
-        )
-    }
-    .map_err(|error| format!("QueryInformationJobObject accounting readback failed: {error}"))?;
-    if returned_bytes != size {
+    if actual != expected {
         return Err(format!(
-            "QueryInformationJobObject accounting returned {returned_bytes} bytes; expected {size}"
+            "Windows job kill-on-close limit readback mismatch: expected={expected} actual={actual} limit_flags={:#x}",
+            readback.BasicLimitInformation.LimitFlags.0
         ));
     }
-    Ok(readback.ActiveProcesses)
-}
-
-#[cfg(windows)]
-fn shell_job_object_name(job_id: &str) -> String {
-    format!("Local\\SynapseShellJob-{}", sha256_hex(job_id.as_bytes()))
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -29051,7 +19227,7 @@ pub(crate) fn assign_owned_process_job(
 ) -> Result<OwnedProcessJob, ErrorData> {
     use windows::{
         Win32::{
-            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+            Foundation::CloseHandle,
             System::{
                 JobObjects::{
                     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -29067,16 +19243,7 @@ pub(crate) fn assign_owned_process_job(
         core::{BOOL, PCWSTR},
     };
 
-    let job_name = resource_id.map(shell_job_object_name);
-    let job_name_wide = job_name.as_ref().map(|name| {
-        name.encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    });
-    let job_name_ptr = job_name_wide
-        .as_ref()
-        .map_or_else(PCWSTR::null, |name| PCWSTR(name.as_ptr()));
-    let job = unsafe { CreateJobObjectW(None, job_name_ptr) }.map_err(|error| {
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|error| {
         shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("{tool_name} failed to create a Windows job object: {error}"),
@@ -29088,27 +19255,7 @@ pub(crate) fn assign_owned_process_job(
             }),
         )
     })?;
-    if job_name.is_some() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let close = unsafe { CloseHandle(job) };
-        return Err(shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "{tool_name} refused to reuse an existing named Windows job object for pid {pid}; close={close:?}"
-            ),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "pid": pid,
-                "resource_id": resource_id,
-                "job_object_name": job_name,
-                "reason": "job_object_name_already_exists",
-                "job_close": format!("{close:?}"),
-            }),
-        ));
-    }
-    let mut owner = OwnedProcessJob {
-        handle: Some(job),
-        name: job_name,
-    };
+    let mut owner = OwnedProcessJob { handle: Some(job) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     let limit_size = match u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
@@ -29255,34 +19402,21 @@ fn spawn_shell_child(
     params: &ActRunShellParams,
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, ErrorData> {
-    let spawn_command =
-        prepared_shell_spawn_command(&params.command, params.working_dir.as_deref())?;
+    let spawn_command = shell_spawn_command(&params.command);
     let mut command = TokioCommand::new(spawn_command.as_ref());
     command.args(&params.args);
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
     command.env_clear();
-    let env = shell_child_environment(
-        &params.command,
-        &params.args,
-        &params.env,
-        params.working_dir.as_deref(),
-        context,
-    )?;
-    // Delivery-side readback for #768: paired with M4_CHILD_ENV_LAYERS this
-    // says whether a variable was lost during construction or between the
-    // constructed map and CreateProcess.
-    tracing::info!(
-        code = "M4_CHILD_ENV_DELIVERED",
-        surface = "act_run_shell",
-        delivered = env.len(),
-        keys = %env.keys().cloned().collect::<Vec<_>>().join(","),
-        "applying constructed environment to the child command"
-    );
-    for (key, value) in env {
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_run_shell")?;
+    for (_sort_key, (key, value)) in env {
         command.env(key, value);
     }
+    command.envs(&params.env);
+    apply_shell_session_environment(&mut command, params.working_dir.as_deref(), context);
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -29660,6 +19794,27 @@ async fn wait_shell_child_with_identity(
         }
     };
     Ok(result)
+}
+
+#[cfg(test)]
+async fn wait_shell_child(
+    child: &mut tokio::process::Child,
+    timeout_ms: u64,
+    started: Instant,
+    timeout_deadline: tokio::time::Instant,
+) -> Result<(Option<i32>, bool), ErrorData> {
+    let identity = child
+        .id()
+        .and_then(|pid| capture_local_process_identity(pid).ok());
+    wait_shell_child_with_identity(
+        child,
+        identity.as_ref(),
+        timeout_ms,
+        started,
+        timeout_deadline,
+        None,
+    )
+    .await
 }
 
 #[cfg(windows)]
@@ -30296,12 +20451,8 @@ fn launch_tool_error(
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    hex_encode_lower(&digest)
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(encoded, "{byte:02x}");
     }
@@ -30555,3 +20706,6 @@ fn contains_any_character_class_repetition(pattern: &str) -> bool {
     .iter()
     .any(|needle| compact.contains(needle))
 }
+
+#[cfg(test)]
+mod tests;

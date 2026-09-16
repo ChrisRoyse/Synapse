@@ -7,18 +7,15 @@ use std::{
 use chrono::Utc;
 use serde_json::json;
 use synapse_core::{
-    Action, Event, EventSource, ReflexId, ReflexState, SCHEMA_VERSION, StoredReflexAudit,
-    error_codes,
+    Action, Event, EventSource, ReflexId, ReflexLifetime, ReflexState, SCHEMA_VERSION,
+    StoredReflexAudit, error_codes,
 };
 use uuid::Uuid;
 
 use super::{
-    REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, TickSample,
+    REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, SchedulerTrigger, TickSample,
     scheduler_combo::{dispatch_reflex_action, step_active_combos},
-    scheduler_loop::{
-        RuntimeLifetimeFilter, RuntimeSchedulerTrigger, TickLateSignal,
-        advance_pending_terminal_lifecycles,
-    },
+    scheduler_loop::TickLateSignal,
     scheduler_stateful::step_stateful_controllers,
 };
 use crate::{
@@ -28,24 +25,13 @@ use crate::{
         hold_lifetime::{HoldReleaseReason, emit_lifetime_expired},
         on_event::{OnEventTickGuard, publish_debounced, publish_fired},
     },
+    write_audit,
 };
 
 const REFLEX_TICK_JITTER_METRIC: &str = "reflex_tick_jitter_us";
 const REFLEX_STARVED_METRIC: &str = "reflex_starved_total";
 
 pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool) {
-    // Hot-path boundary (#1686). The tick's Calyx-derived guard thresholds are
-    // pinned here, at tick start, from the frozen lowered artifact: one
-    // lock-free `ArcSwap` load, no filesystem access, no live Calyx call. The
-    // pinned value is the authoritative threshold set for the whole tick, so
-    // nothing further down may go looking for a fresher one. When no verified
-    // artifact is published the value is the documented fail-closed default —
-    // never a live lookup.
-    let _frozen_guard_thresholds = runtime
-        .lowered_guard_thresholds
-        .load_for_tick(crate::hot_path::unix_time_ms_now());
-    crate::hot_path::record_hot_tick();
-    advance_pending_terminal_lifecycles(runtime);
     let events = runtime.subscription.drain();
     expire_action_until_event_lifetimes(runtime, &events);
     let mut dispatched_actions = 0_usize;
@@ -150,7 +136,7 @@ fn dispatch_triggered_reflexes(
                 if !guard.can_fire() {
                     guard.report_limit_once(
                         &runtime.event_bus,
-                        runtime.audit_sink.as_deref(),
+                        runtime.audit_db.as_deref(),
                         &trigger.reflex_id,
                         runtime.tick_index,
                         event,
@@ -165,7 +151,7 @@ fn dispatch_triggered_reflexes(
                         guard.record_fire();
                         publish_fired(
                             &runtime.event_bus,
-                            runtime.audit_sink.as_deref(),
+                            runtime.audit_db.as_deref(),
                             &trigger.reflex_id,
                             runtime.tick_index,
                             event,
@@ -205,13 +191,12 @@ fn collect_triggered_reflexes(
         if !controls.get(index).is_some_and(|control| control.active) {
             continue;
         }
-        let runtime_reflex = &runtime.reflexes[index];
-        let reflex = &runtime_reflex.reflex;
+        let reflex = &runtime.reflexes[index].reflex;
         if !matches!(reflex.driver, ScheduledReflexDriver::Actions) {
             continue;
         }
-        match &runtime_reflex.trigger {
-            RuntimeSchedulerTrigger::EveryTick => {
+        match &reflex.trigger {
+            SchedulerTrigger::EveryTick => {
                 triggered.push(TriggeredReflex {
                     reflex_index: index,
                     reflex_id: reflex.reflex_id.clone(),
@@ -219,7 +204,7 @@ fn collect_triggered_reflexes(
                     trigger_event: None,
                 });
             }
-            RuntimeSchedulerTrigger::OnEvent(filter) => {
+            SchedulerTrigger::OnEvent(filter) => {
                 let mut accepted_this_tick = false;
                 let mut same_tick_suppression = DebounceSuppression::default();
                 let mut window_suppression = DebounceSuppression::default();
@@ -282,7 +267,7 @@ fn publish_debounce_suppression(
     };
     publish_debounced(
         &runtime.event_bus,
-        runtime.audit_sink.as_deref(),
+        runtime.audit_db.as_deref(),
         &reflex.reflex_id,
         runtime.tick_index,
         &first_event,
@@ -326,7 +311,7 @@ fn until_event_lifetime_expired(
     if !matches!(reflex.driver, ScheduledReflexDriver::Actions) {
         return None;
     }
-    let RuntimeLifetimeFilter::UntilEvent(filter) = &runtime.reflexes[index].lifetime_filter else {
+    let ReflexLifetime::UntilEvent { filter } = &reflex.lifetime else {
         return None;
     };
     events
@@ -352,7 +337,7 @@ fn record_starvation(
             .increment(1);
             publish_starved(
                 &runtime.event_bus,
-                runtime.audit_sink.as_deref(),
+                runtime.audit_db.as_deref(),
                 loser,
                 runtime.tick_index,
                 runtime.starvation_states[loser.loser_slot].contended_for(),
@@ -375,19 +360,16 @@ fn record_starvation(
 
 fn publish_starved(
     event_bus: &crate::EventBus,
-    audit_sink: Option<&crate::ReflexAuditSink>,
+    audit_db: Option<&synapse_storage::Db>,
     loser: &ConflictLoser,
     tick_index: u64,
     starved_for: Duration,
     audit_context: Option<&synapse_core::StoredAuditContext>,
 ) {
     let starved_for_ms = u64::try_from(starved_for.as_millis()).unwrap_or(u64::MAX);
-    let occurred_at = Utc::now();
-    let audit_ts_ns = audit_sink
-        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_STARVED_KIND));
     let event = Event {
         seq: tick_index,
-        at: occurred_at,
+        at: Utc::now(),
         source: EventSource::Reflex,
         kind: REFLEX_STARVED_KIND.to_owned(),
         data: json!({
@@ -401,17 +383,14 @@ fn publish_starved(
         correlations: Vec::new(),
     };
     let _report = event_bus.publish(event);
-    let Some(sink) = audit_sink else {
-        return;
-    };
-    let Some(ts_ns) = audit_ts_ns else {
+    let Some(db) = audit_db else {
         return;
     };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: loser.loser_reflex_id.clone(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Starved,
         event_id: None,
         audit_context: audit_context.cloned(),
@@ -427,7 +406,15 @@ fn publish_starved(
         redacted: false,
         redactions: Vec::new(),
     };
-    sink.enqueue(audit);
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_conflict",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex starvation audit write failed"
+        );
+    }
 }
 
 fn dispatch_actions(
@@ -457,29 +444,18 @@ fn record_tick_sample(
     let jitter_metric = f64::from(u32::try_from(jitter_us).unwrap_or(u32::MAX));
     metrics::histogram!(REFLEX_TICK_JITTER_METRIC).record(jitter_metric);
     let deadline_late = elapsed > runtime.config.late_after;
-    if deadline_late {
-        runtime.deadline_miss_streak = runtime.deadline_miss_streak.saturating_add(1);
-    } else {
-        runtime.deadline_miss_streak = 0;
-    }
     let late = deadline_late || dispatch_blocked;
-    if let Some((reason, classification)) =
-        tick_late_audit_classification(runtime, elapsed, dispatch_blocked, deadline_late, degraded)
-    {
+    if late {
+        let reason = if dispatch_blocked {
+            "dispatch_blocked"
+        } else {
+            "deadline_miss"
+        };
         let signal = TickLateSignal { reason, degraded };
         if runtime.last_tick_late_signal != Some(signal) {
-            emit_tick_late(
-                runtime,
-                elapsed_us,
-                jitter_us,
-                reason,
-                classification,
-                degraded,
-            );
+            emit_tick_late(runtime, elapsed_us, jitter_us, reason, degraded);
         }
         runtime.last_tick_late_signal = Some(signal);
-    } else if deadline_late {
-        log_deadline_miss_sample(runtime, elapsed_us, jitter_us);
     } else {
         runtime.last_tick_late_signal = None;
     }
@@ -492,7 +468,6 @@ fn record_tick_sample(
         pulled_events: event_count,
         dispatched_actions,
         late,
-        deadline_miss_streak: runtime.deadline_miss_streak,
         degraded,
     };
     tracing::trace!(
@@ -511,63 +486,16 @@ fn record_tick_sample(
     runtime.tick_index = runtime.tick_index.saturating_add(1);
 }
 
-fn tick_late_audit_classification(
-    runtime: &RuntimeState,
-    elapsed: Duration,
-    dispatch_blocked: bool,
-    deadline_late: bool,
-    degraded: bool,
-) -> Option<(&'static str, &'static str)> {
-    if dispatch_blocked {
-        return Some(("dispatch_blocked", "dispatch_blocked"));
-    }
-    if !deadline_late {
-        return None;
-    }
-    if degraded {
-        return Some(("deadline_miss", "degraded_deadline_miss"));
-    }
-    if elapsed >= runtime.config.severe_deadline_miss_after {
-        return Some(("deadline_miss", "severe_deadline_miss"));
-    }
-    if runtime.deadline_miss_streak >= runtime.config.deadline_miss_audit_after {
-        return Some(("deadline_miss", "sustained_deadline_miss"));
-    }
-    None
-}
-
-fn log_deadline_miss_sample(runtime: &RuntimeState, elapsed_us: u64, jitter_us: u64) {
-    tracing::debug!(
-        component = "reflex_scheduler",
-        code = "REFLEX_TICK_JITTER_SAMPLE",
-        tick_index = runtime.tick_index,
-        elapsed_us,
-        jitter_us,
-        target_us = duration_us(runtime.config.target_interval),
-        late_after_us = duration_us(runtime.config.late_after),
-        deadline_miss_streak = runtime.deadline_miss_streak,
-        deadline_miss_audit_after = runtime.config.deadline_miss_audit_after,
-        severe_deadline_miss_after_us = duration_us(runtime.config.severe_deadline_miss_after),
-        "reflex scheduler deadline miss kept as sample telemetry"
-    );
-}
-
 fn emit_tick_late(
     runtime: &RuntimeState,
     elapsed_us: u64,
     jitter_us: u64,
     reason: &str,
-    classification: &str,
     degraded: bool,
 ) {
-    let occurred_at = Utc::now();
-    let audit_ts_ns = runtime
-        .audit_sink
-        .as_deref()
-        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_TICK_LATE_KIND));
     let event = Event {
         seq: runtime.tick_index,
-        at: occurred_at,
+        at: Utc::now(),
         source: EventSource::Reflex,
         kind: REFLEX_TICK_LATE_KIND.to_owned(),
         data: json!({
@@ -576,24 +504,12 @@ fn emit_tick_late(
             "jitter_us": jitter_us,
             "target_us": duration_us(runtime.config.target_interval),
             "reason": reason,
-            "classification": classification,
-            "deadline_miss_streak": runtime.deadline_miss_streak,
-            "deadline_miss_audit_after": runtime.config.deadline_miss_audit_after,
-            "severe_deadline_miss_after_us": duration_us(runtime.config.severe_deadline_miss_after),
             "degraded": degraded,
         }),
         correlations: Vec::new(),
     };
     let _report = runtime.event_bus.publish(event);
-    write_tick_late_audit(
-        runtime,
-        elapsed_us,
-        jitter_us,
-        reason,
-        classification,
-        degraded,
-        audit_ts_ns,
-    );
+    write_tick_late_audit(runtime, elapsed_us, jitter_us, reason, degraded);
 }
 
 fn write_tick_late_audit(
@@ -601,21 +517,16 @@ fn write_tick_late_audit(
     elapsed_us: u64,
     jitter_us: u64,
     reason: &str,
-    classification: &str,
     degraded: bool,
-    audit_ts_ns: Option<u64>,
 ) {
-    let Some(sink) = runtime.audit_sink.as_deref() else {
-        return;
-    };
-    let Some(ts_ns) = audit_ts_ns else {
+    let Some(db) = runtime.audit_db.as_deref() else {
         return;
     };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: "__scheduler__".to_owned(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -629,17 +540,20 @@ fn write_tick_late_audit(
             "target_us": duration_us(runtime.config.target_interval),
             "late_after_us": duration_us(runtime.config.late_after),
             "fallback_interval_us": duration_us(runtime.config.fallback_interval),
-            "deadline_miss_streak": runtime.deadline_miss_streak,
-            "deadline_miss_audit_after": runtime.config.deadline_miss_audit_after,
-            "severe_deadline_miss_after_us": duration_us(runtime.config.severe_deadline_miss_after),
             "reason": reason,
-            "classification": classification,
             "degraded": degraded,
         }),
         redacted: false,
         redactions: Vec::new(),
     };
-    sink.enqueue(audit);
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_scheduler",
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex tick-late audit write failed"
+        );
+    }
 }
 
 fn warn_dispatch_blocked(reflex_id: &ReflexId, error: &ReflexError) {
@@ -683,4 +597,11 @@ fn lock_samples(
 
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn now_ts_ns() -> u64 {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default()
 }

@@ -12,13 +12,10 @@ pub(super) fn audit_response(
         source_of_truth: AUDIT_SOT.to_owned(),
         readback_source_of_truth: readback,
         command_query: None,
-        repair_legacy_probe_row: None,
         lifecycle_events: None,
         lifecycle_exits: None,
         profile_intelligence: None,
         export_bundle: None,
-        verify_chain: None,
-        reproduce: None,
     };
     fill(&mut response);
     response

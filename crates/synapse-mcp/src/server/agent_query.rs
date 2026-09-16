@@ -36,7 +36,7 @@ use synapse_core::{
 };
 use synapse_storage::{
     Db, agent_events::agent_event_scan_start, agent_transcripts::agent_transcript_spawn_prefix, cf,
-    constellations, decode_json,
+    decode_json,
 };
 
 use rmcp::{RoleServer, service::RequestContext};
@@ -165,8 +165,6 @@ pub struct ToolCallSnapshot {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompactEvent {
-    /// Exact `CF_AGENT_EVENTS` row key for physical storage/anchor readback.
-    pub key_hex: String,
     pub ts_unix_ms: u64,
     pub kind: AgentEventKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,8 +196,6 @@ pub struct TurnSnapshot {
     pub total_tokens: u64,
     /// The transcript line number this usage came from (its physical anchor).
     pub source_line_no: u64,
-    /// Exact `CF_AGENT_TRANSCRIPTS` row key for physical storage/anchor readback.
-    pub source_key_hex: String,
 }
 
 /// The cooperative `deep: true` outcome.
@@ -414,8 +410,7 @@ impl SynapseService {
         // ---- Tool-call reconstruction + compact recent events. ----
         let (current_tool_call, last_tool_call) =
             reconstruct_tool_calls(&scan.matched, now_unix_ms);
-        let recent_events =
-            compact_recent_events(&scan.matched, &scan.matched_key_hex, params.max_events);
+        let recent_events = compact_recent_events(&scan.matched, params.max_events);
 
         let anchor = lifecycle
             .as_ref()
@@ -653,7 +648,6 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 
 struct JournalScan {
     matched: Vec<AgentEventRecord>,
-    matched_key_hex: Vec<String>,
     events_scanned: usize,
 }
 
@@ -698,7 +692,6 @@ fn scan_agent_journal(
 fn scan_pass(db: &Db, start_key: &[u8], related: &[String]) -> Result<JournalScan, ErrorData> {
     let mut start = start_key.to_vec();
     let mut matched: Vec<AgentEventRecord> = Vec::new();
-    let mut matched_key_hex: Vec<String> = Vec::new();
     let mut events_scanned: usize = 0;
 
     loop {
@@ -723,7 +716,6 @@ fn scan_pass(db: &Db, start_key: &[u8], related: &[String]) -> Result<JournalSca
             match decode_json::<AgentEventRecord>(value) {
                 Ok(record) => {
                     if record_matches(&record, related) {
-                        matched_key_hex.push(constellations::hex_encode(key));
                         matched.push(record);
                     }
                 }
@@ -750,7 +742,6 @@ fn scan_pass(db: &Db, start_key: &[u8], related: &[String]) -> Result<JournalSca
 
     Ok(JournalScan {
         matched,
-        matched_key_hex,
         events_scanned,
     })
 }
@@ -885,17 +876,11 @@ fn tool_args_digest(payload: &Value) -> Option<Value> {
     }
 }
 
-fn compact_recent_events(
-    records: &[AgentEventRecord],
-    keys_hex: &[String],
-    max_events: usize,
-) -> Vec<CompactEvent> {
+fn compact_recent_events(records: &[AgentEventRecord], max_events: usize) -> Vec<CompactEvent> {
     let start = records.len().saturating_sub(max_events);
     records[start..]
         .iter()
-        .zip(&keys_hex[start..])
-        .map(|(record, key_hex)| CompactEvent {
-            key_hex: key_hex.clone(),
+        .map(|record| CompactEvent {
             ts_unix_ms: record.ts_ns / 1_000_000,
             kind: record.kind,
             reason_code: record.reason_code.clone(),
@@ -926,10 +911,10 @@ fn read_transcript_snapshot(
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let rows_scanned = rows.len();
 
-    let mut latest_usage: Option<(u64, String, AgentTranscriptRecord)> = None;
+    let mut latest_usage: Option<(u64, AgentTranscriptRecord)> = None;
     let mut latest_assistant: Option<(u64, String)> = None;
 
-    for (key, value) in &rows {
+    for (_key, value) in &rows {
         let record = match decode_json::<AgentTranscriptRecord>(value) {
             Ok(record) => record,
             Err(error) => {
@@ -946,9 +931,9 @@ fn read_transcript_snapshot(
         if record.usage.as_ref().is_some_and(|usage| !usage.is_empty())
             && latest_usage
                 .as_ref()
-                .is_none_or(|(seen, _, _)| line_no >= *seen)
+                .is_none_or(|(seen, _)| line_no >= *seen)
         {
-            latest_usage = Some((line_no, constellations::hex_encode(key), record.clone()));
+            latest_usage = Some((line_no, record.clone()));
         }
         if record.role == Some(TranscriptRole::Assistant) {
             if let Some(summary) = record.content_summary.as_ref() {
@@ -965,7 +950,7 @@ fn read_transcript_snapshot(
     }
 
     let (turn, context_estimate) = match latest_usage {
-        Some((line_no, source_key_hex, record)) => {
+        Some((line_no, record)) => {
             let usage = record.usage.unwrap_or_default();
             let input = usage.input_tokens.unwrap_or(0);
             let output = usage.output_tokens.unwrap_or(0);
@@ -991,7 +976,6 @@ fn read_transcript_snapshot(
                     reasoning_output_tokens: reasoning,
                     total_tokens: total,
                     source_line_no: line_no,
-                    source_key_hex,
                 }),
                 Some(estimate),
             )
@@ -1219,3 +1203,6 @@ fn agent_query_attention_class(
         .map(|read| read.attention_class)
         .filter(|attention_class| !attention_class.is_none())
 }
+
+#[cfg(test)]
+mod tests;

@@ -11,25 +11,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
-use crate::ring::{AudioFormat, AudioPacketTimeline, DEFAULT_SAMPLE_RATE_HZ, STEREO_CHANNELS};
+use crate::ring::{AudioFormat, DEFAULT_SAMPLE_RATE_HZ, STEREO_CHANNELS};
 use crate::{
     AudioError, AudioResult, MAX_RING_SECONDS, detectors::DetectorProcessor, ring::AudioRing,
 };
 
 pub const AUDIO_LOOPBACK_FRAMES_TOTAL: &str = "audio_loopback_frames_total";
 const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
-const AUDIO_TIMELINE_DISCONTINUITIES_TOTAL: &str = "audio_timeline_discontinuities_total";
-const AUDIO_TIMELINE_GAP_FRAMES_TOTAL: &str = "audio_timeline_gap_frames_total";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopbackStatus {
     pub running: bool,
     pub frames_captured: u64,
-    pub timeline_discontinuities: u64,
-    pub timeline_gap_frames: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_timeline_discontinuity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_code: Option<String>,
 }
@@ -45,9 +39,6 @@ pub struct LoopbackHandle {
 struct LoopbackStats {
     running: AtomicBool,
     frames_captured: AtomicU64,
-    timeline_discontinuities: AtomicU64,
-    timeline_gap_frames: AtomicU64,
-    last_timeline_discontinuity: Mutex<Option<String>>,
     last_error_code: Mutex<Option<String>>,
 }
 
@@ -57,9 +48,6 @@ impl LoopbackStats {
         Self {
             running: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
-            timeline_discontinuities: AtomicU64::new(0),
-            timeline_gap_frames: AtomicU64::new(0),
-            last_timeline_discontinuity: Mutex::new(None),
             last_error_code: Mutex::new(None),
         }
     }
@@ -71,49 +59,6 @@ impl LoopbackStats {
             Err(poisoned) => poisoned.into_inner(),
         };
         *last = Some(error.code().to_owned());
-    }
-
-    fn record_packet_timeline(&self, outcome: crate::ring::AudioPacketWriteOutcome) {
-        if outcome.gap_frames > 0 {
-            self.timeline_gap_frames
-                .fetch_add(outcome.gap_frames, Ordering::AcqRel);
-            metrics::counter!(AUDIO_TIMELINE_GAP_FRAMES_TOTAL).increment(outcome.gap_frames);
-            if !outcome.data_discontinuity {
-                tracing::warn!(
-                    code = synapse_core::error_codes::AUDIO_TIMELINE_GAP,
-                    expected_device_position = ?outcome.expected_device_position,
-                    actual_device_position = outcome.actual_device_position,
-                    gap_frames = outcome.gap_frames,
-                    "WASAPI device-position gap preserved as explicit silence without a discontinuity flag"
-                );
-            }
-        }
-        if !outcome.data_discontinuity {
-            return;
-        }
-        self.timeline_discontinuities.fetch_add(1, Ordering::AcqRel);
-        metrics::counter!(AUDIO_TIMELINE_DISCONTINUITIES_TOTAL).increment(1);
-        let detail = format!(
-            "expected_position={} actual_position={} gap_frames={}",
-            outcome
-                .expected_device_position
-                .map_or_else(|| "none".to_owned(), |position| position.to_string()),
-            outcome.actual_device_position,
-            outcome.gap_frames
-        );
-        let mut last = match self.last_timeline_discontinuity.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *last = Some(detail);
-        drop(last);
-        tracing::warn!(
-            code = synapse_core::error_codes::AUDIO_TIMELINE_DISCONTINUITY,
-            expected_device_position = ?outcome.expected_device_position,
-            actual_device_position = outcome.actual_device_position,
-            gap_frames = outcome.gap_frames,
-            "WASAPI capture discontinuity preserved as an explicit silence gap"
-        );
     }
 }
 
@@ -129,16 +74,9 @@ impl LoopbackHandle {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let last_timeline_discontinuity = match self.stats.last_timeline_discontinuity.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
         LoopbackStatus {
             running: self.is_running(),
             frames_captured: self.stats.frames_captured.load(Ordering::Acquire),
-            timeline_discontinuities: self.stats.timeline_discontinuities.load(Ordering::Acquire),
-            timeline_gap_frames: self.stats.timeline_gap_frames.load(Ordering::Acquire),
-            last_timeline_discontinuity,
             last_error_code,
         }
     }
@@ -267,12 +205,11 @@ fn capture_loop(
             }
             return Err(AudioError::DeviceLost { detail: error });
         }
-        while let Some(packet) = capture.read_packet()? {
-            let frames = packet.samples.len() / usize::from(capture.format.channels);
-            let timeline_outcome = ring.push_packet(&packet.samples, packet.timeline)?;
-            stats.record_packet_timeline(timeline_outcome);
+        while let Some(samples) = capture.read_packet()? {
+            let frames = samples.len() / usize::from(capture.format.channels);
+            ring.push_interleaved(&samples);
             if let Some(processor) = detectors.as_mut() {
-                processor.process(&packet.samples, capture.format);
+                processor.process(&samples, capture.format);
             }
             let frames = u64::try_from(frames).unwrap_or(u64::MAX);
             stats.frames_captured.fetch_add(frames, Ordering::AcqRel);
@@ -289,12 +226,6 @@ struct WasapiLoopback {
     capture_client: wasapi::AudioCaptureClient,
     format: AudioFormat,
     block_align: usize,
-}
-
-#[cfg(windows)]
-struct CapturePacket {
-    samples: Vec<f32>,
-    timeline: AudioPacketTimeline,
 }
 
 #[cfg(windows)]
@@ -347,7 +278,7 @@ impl WasapiLoopback {
         }
     }
 
-    fn read_packet(&self) -> AudioResult<Option<CapturePacket>> {
+    fn read_packet(&self) -> AudioResult<Option<Vec<f32>>> {
         let frames = self
             .capture_client
             .get_next_packet_size()
@@ -372,16 +303,7 @@ impl WasapiLoopback {
             metrics::counter!(AUDIO_LOOPBACK_UNDERRUNS_TOTAL).increment(1);
             return Ok(None);
         }
-        let samples = raw_f32_stereo(&raw, read_frames, &info);
-        Ok(Some(CapturePacket {
-            samples,
-            timeline: AudioPacketTimeline {
-                device_position: info.index,
-                qpc_position_100ns: info.timestamp,
-                data_discontinuity: info.flags.data_discontinuity,
-                timestamp_error: info.flags.timestamp_error,
-            },
-        }))
+        Ok(Some(raw_f32_stereo(&raw, read_frames, &info)))
     }
 
     fn stop(&self) -> AudioResult<()> {

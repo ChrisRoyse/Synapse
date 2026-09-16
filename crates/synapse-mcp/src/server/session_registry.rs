@@ -9,12 +9,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_STALE_AFTER_MS: u64 = 5 * 60 * 1000;
-/// Closed MCP sessions are durable in `CF_SESSIONS` and the agent-event log.
-/// The process-local registry exists only for recent lifecycle correlation, so
-/// retaining every closed session for the daemon lifetime duplicated history
-/// in heap. Keep a short recent window and a deterministic hard ceiling.
-const CLOSED_SESSION_RETENTION_MS: u64 = 5 * 60 * 1000;
-const MAX_RETAINED_CLOSED_SESSIONS: usize = 256;
 
 pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 
@@ -22,20 +16,6 @@ pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 pub(crate) struct SessionRegistry {
     stale_after_ms: u64,
     entries: BTreeMap<String, SessionRegistryEntry>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SessionRegistryPruneReadback {
-    pub entries_before: usize,
-    pub expired_removed: usize,
-    pub overflow_removed: usize,
-    pub entries_after: usize,
-}
-
-impl SessionRegistryPruneReadback {
-    pub const fn removed(self) -> usize {
-        self.expired_removed + self.overflow_removed
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -130,52 +110,6 @@ pub(crate) struct SpawnedAgentControlRead {
     pub sandbox_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_server_request_bridge_url: Option<String>,
-    // These fields are persisted readiness diagnostics for the strict
-    // codex-control.json reader. They remain file-only evidence rather than
-    // expanding the public agent tool schema/response; callers read the exact
-    // control path when detailed startup diagnosis is needed.
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_ready_url: Option<String>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_health_url: Option<String>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readiness_status: Option<String>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readiness_timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readyz_status_code: Option<u16>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readyz_elapsed_ms: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_healthz_status_code: Option<u16>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readiness_elapsed_ms: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_ready_attempts: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_health_attempts: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_websocket_status: Option<String>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_websocket_opened_at_unix_ms: Option<u64>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_websocket_error: Option<String>,
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    pub app_server_readiness_failure_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_app_server_request_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,51 +152,6 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
-    pub(crate) fn prune_closed(&mut self, now_unix_ms: u64) -> SessionRegistryPruneReadback {
-        let entries_before = self.entries.len();
-        let cutoff = now_unix_ms.saturating_sub(CLOSED_SESSION_RETENTION_MS);
-        let before_expiry = self.entries.len();
-        self.entries.retain(|_session_id, entry| {
-            entry
-                .closed_at_unix_ms
-                .is_none_or(|closed_at| closed_at >= cutoff)
-        });
-        let expired_removed = before_expiry.saturating_sub(self.entries.len());
-
-        let mut closed = self
-            .entries
-            .iter()
-            .filter_map(|(session_id, entry)| {
-                entry
-                    .closed_at_unix_ms
-                    .map(|closed_at| (closed_at, session_id.clone()))
-            })
-            .collect::<Vec<_>>();
-        closed.sort_unstable();
-        let overflow = closed.len().saturating_sub(MAX_RETAINED_CLOSED_SESSIONS);
-        for (_closed_at, session_id) in closed.into_iter().take(overflow) {
-            self.entries.remove(&session_id);
-        }
-        let readback = SessionRegistryPruneReadback {
-            entries_before,
-            expired_removed,
-            overflow_removed: overflow,
-            entries_after: self.entries.len(),
-        };
-        if readback.removed() != 0 {
-            tracing::info!(
-                code = "MCP_SESSION_REGISTRY_CLOSED_PRUNED",
-                entries_before = readback.entries_before,
-                expired_removed = readback.expired_removed,
-                overflow_removed = readback.overflow_removed,
-                entries_after = readback.entries_after,
-                durable_source_of_truth = "CF_SESSIONS + CF_AGENT_EVENTS",
-                "released process-local copies of durably closed MCP sessions"
-            );
-        }
-        readback
-    }
-
     pub(crate) fn set_stale_after(&mut self, ttl: Option<Duration>) {
         self.stale_after_ms = ttl
             .map(duration_millis_u64)
@@ -350,33 +239,6 @@ impl SessionRegistry {
         }
     }
 
-    /// #1800: refresh an existing live session's activity timestamp on a real
-    /// MCP request. Unlike `record_seen` this never fabricates a row and never
-    /// resurrects a closed session, so it is safe to call on the per-request hot
-    /// path: it only advances `last_seen` for sessions that already initialized
-    /// and are still open. Returns `true` when an existing live row was touched.
-    /// This is what makes `last_seen_ms_ago` a true request-idle signal for the
-    /// abandoned-session reaper (rmcp's own store `load`/`store` only fire on
-    /// session hydration, not per tool call, so they cannot supply idle age).
-    pub(crate) fn touch_seen_if_present(
-        &mut self,
-        session_id: &str,
-        action: Option<String>,
-        now_unix_ms: u64,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(session_id) else {
-            return false;
-        };
-        if entry.closed_at_unix_ms.is_some() {
-            return false;
-        }
-        entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
-        if let Some(action) = action {
-            entry.last_action = Some(action);
-        }
-        true
-    }
-
     pub(crate) fn record_closed(&mut self, session_id: &str, now_unix_ms: u64) -> bool {
         self.record_closed_with_reason(session_id, now_unix_ms, None)
     }
@@ -390,7 +252,6 @@ impl SessionRegistry {
         now_unix_ms: u64,
         reason_code: Option<&str>,
     ) -> bool {
-        self.prune_closed(now_unix_ms);
         let entry = self
             .entries
             .entry(session_id.to_owned())
@@ -412,7 +273,6 @@ impl SessionRegistry {
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
-        self.prune_closed(now_unix_ms);
         transitioned
     }
 
@@ -509,16 +369,6 @@ impl SessionRegistry {
             .collect()
     }
 
-    pub(crate) fn read_for_session(
-        &self,
-        session_id: &str,
-        now_unix_ms: u64,
-    ) -> Option<SessionRegistryRead> {
-        self.entries
-            .get(session_id)
-            .map(|entry| self.entry_read(entry, now_unix_ms))
-    }
-
     pub(crate) fn entry_read(
         &self,
         entry: &SessionRegistryEntry,
@@ -552,20 +402,6 @@ impl SessionRegistry {
     }
 }
 
-/// The canonical `last_action` label for a tool call (#1868).
-///
-/// Two independent writers stamp `last_action`: the HTTP transport, from the
-/// JSON-RPC envelope, and the #1800 per-call activity hook, from the decoded
-/// tool name. They must agree, because `act_spawn_agent`'s readiness predicate
-/// accepts a session only once `last_action` proves a real tool call by starting
-/// with `tools/call:`. While the hook wrote the bare tool name it clobbered the
-/// transport's prefixed label on every single call, so a target-less spawn could
-/// never observe readiness and killed a healthy, already-working agent at
-/// `wait_timeout_ms`. One definition, used by both writers.
-pub(crate) fn tool_call_action_label(tool_name: &str) -> String {
-    format!("tools/call:{tool_name}")
-}
-
 pub(crate) fn unix_time_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -587,5 +423,149 @@ pub(crate) fn infer_agent_kind(client_name: &str) -> String {
         "claude".to_owned()
     } else {
         "unknown".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
+
+    use super::*;
+
+    fn state(name: &str) -> SessionState {
+        SessionState::new(InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new(name, "0.0.0-test"),
+        ))
+    }
+
+    #[test]
+    fn registry_marks_live_stale_and_closed_from_heartbeats() {
+        let mut registry = SessionRegistry::default();
+        registry.set_stale_after(Some(Duration::from_millis(100)));
+        registry.record_initialized("s1", &state("codex"), "http", 1_000);
+
+        let live = registry.reads(1_050).remove(0);
+        assert_eq!(live.lifecycle, "live");
+        assert_eq!(live.agent_kind, "codex");
+
+        let stale = registry.reads(1_200).remove(0);
+        assert_eq!(stale.lifecycle, "stale");
+
+        registry.record_closed("s1", 1_250);
+        let closed = registry.reads(1_251).remove(0);
+        assert_eq!(closed.lifecycle, "closed");
+        assert_eq!(closed.closed_at_unix_ms, Some(1_250));
+    }
+
+    #[test]
+    fn registry_records_spawned_agent_process_attribution() {
+        let mut registry = SessionRegistry::default();
+        registry.record_initialized("s1", &state("codex"), "http", 1_000);
+        registry.record_spawned_agent(
+            "s1",
+            SpawnedAgentRead {
+                spawn_id: "spawn-1".to_owned(),
+                cli: "codex".to_owned(),
+                launcher_process_id: 123,
+                agent_process_id: Some(456),
+                started_by_session_id: Some("parent".to_owned()),
+                launched_at_unix_ms: 990,
+                launch_target: "pwsh.exe".to_owned(),
+                log_dir: "C:\\temp\\spawn-1".to_owned(),
+                template_id: None,
+                template_version: None,
+                control: None,
+            },
+            1_050,
+        );
+
+        let read = registry.reads(1_060).remove(0);
+        let spawned = read.spawned_agent.unwrap();
+        assert_eq!(spawned.spawn_id, "spawn-1");
+        assert_eq!(spawned.launcher_process_id, 123);
+        assert_eq!(spawned.agent_process_id, Some(456));
+    }
+
+    #[test]
+    fn registry_initialization_never_moves_heartbeat_backwards() {
+        let mut registry = SessionRegistry::default();
+        registry.record_seen("s1", Some("tools/list".to_owned()), 2_000);
+        registry.record_initialized("s1", &state("codex"), "http", 1_000);
+
+        let read = registry.reads(2_001).remove(0);
+        assert_eq!(read.last_seen_unix_ms, 2_000);
+        assert_eq!(read.last_action.as_deref(), Some("tools/list"));
+    }
+
+    #[test]
+    fn registry_agent_activity_refreshes_existing_session_or_spawn() {
+        let mut registry = SessionRegistry::default();
+        registry.record_seen(
+            "session-direct",
+            Some("tools/call:get_target".to_owned()),
+            1_000,
+        );
+        registry.record_spawned_agent(
+            "session-spawn",
+            SpawnedAgentRead {
+                spawn_id: "agent-spawn-registry-activity".to_owned(),
+                cli: "codex".to_owned(),
+                launcher_process_id: 123,
+                agent_process_id: Some(456),
+                started_by_session_id: Some("parent".to_owned()),
+                launched_at_unix_ms: 990,
+                launch_target: "pwsh.exe".to_owned(),
+                log_dir: "C:\\temp\\agent-spawn-registry-activity".to_owned(),
+                template_id: None,
+                template_version: None,
+                control: None,
+            },
+            1_000,
+        );
+
+        let refreshed = registry.record_agent_activity(
+            Some("session-direct"),
+            Some("agent-spawn-registry-activity"),
+            2_000,
+        );
+        assert_eq!(refreshed, vec!["session-direct", "session-spawn"]);
+
+        let reads = registry.reads(2_001);
+        let direct = reads
+            .iter()
+            .find(|read| read.session_id == "session-direct")
+            .expect("direct session readback");
+        assert_eq!(direct.last_seen_unix_ms, 2_000);
+        assert_eq!(direct.last_action.as_deref(), Some("tools/call:get_target"));
+        let spawned = reads
+            .iter()
+            .find(|read| read.session_id == "session-spawn")
+            .expect("spawn session readback");
+        assert_eq!(spawned.last_seen_unix_ms, 2_000);
+    }
+
+    #[test]
+    fn registry_agent_activity_never_creates_or_reopens_sessions() {
+        let mut registry = SessionRegistry::default();
+        assert!(
+            registry
+                .record_agent_activity(Some("missing-session"), Some("agent-spawn-missing"), 1_000)
+                .is_empty()
+        );
+        assert!(registry.reads(1_001).is_empty());
+
+        registry.record_seen("closed-session", None, 2_000);
+        registry.record_closed("closed-session", 2_100);
+        assert!(
+            registry
+                .record_agent_activity(Some("closed-session"), None, 2_200)
+                .is_empty()
+        );
+
+        let read = registry.reads(2_300).remove(0);
+        assert_eq!(read.lifecycle, "closed");
+        assert_eq!(read.last_seen_unix_ms, 2_100);
+        assert_eq!(read.closed_at_unix_ms, Some(2_100));
     }
 }

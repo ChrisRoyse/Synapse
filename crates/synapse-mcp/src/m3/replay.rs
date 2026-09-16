@@ -14,6 +14,8 @@ mod events;
 mod observations;
 mod record;
 mod serializer;
+#[cfg(test)]
+mod tests;
 
 pub use self::record::record_replay;
 

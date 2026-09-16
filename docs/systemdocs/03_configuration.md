@@ -16,9 +16,9 @@
 - `crates/synapse-models/src/download.rs`, `crates/synapse-a11y/src/cdp.rs`, `crates/synapse-overlay/src/main.rs`
 - `scripts/synapse-setup.ps1`
 
-Synapse has **no global TOML/JSON config file** for the daemon itself. Most configuration is via (1) CLI flags, (2) environment variables, and (3) on-disk locations derived from `%LOCALAPPDATA%` / `%APPDATA%`. The daemon also reads two scoped files: the bearer-token file `%APPDATA%\synapse\token.txt`, and an optional Calyx-only TOML file supplied by `--calyx-config` / `SYNAPSE_CALYX_CONFIG` whose only accepted section is `[calyx]`. Many flags accept a matching `env =` fallback through `clap`.
+Synapse has **no TOML/JSON config file** for the daemon itself. All configuration is via (1) CLI flags, (2) environment variables, and (3) on-disk locations derived from `%LOCALAPPDATA%` / `%APPDATA%`. The one file read for config is the bearer-token file `%APPDATA%\synapse\token.txt`. Many flags accept a matching `env =` fallback through `clap`.
 
-See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the storage backend, and [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for the server/daemon model.
+See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB store, and [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for the server/daemon model.
 
 ---
 
@@ -54,8 +54,7 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--mode` | `SYNAPSE_MODE` | enum | `stdio` | One of `stdio`, `http`, `connect`, `chrome-native-host`, `approval-protocol`, `desktop-worker`, `doctor`, `local-agent`. |
 | `--bind` | `SYNAPSE_BIND` | string | `127.0.0.1:7700` | HTTP server bind address (host:port). Also the single-daemon port. |
 | `--allow-non-loopback` | `SYNAPSE_ALLOW_NON_LOOPBACK` | bool | `false` | Permit binding/serving on a non-loopback address. |
-| `--db` | `SYNAPSE_DB` | path | (derived, see §4) | Storage directory path. |
-| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `calyx` | `calyx` | Selects the `synapse_storage::Db` backend. `calyx` is the only accepted value; unknown values fail startup with `STORAGE_BACKEND_INVALID_CONFIG`. |
+| `--db` | `SYNAPSE_DB` | path | (derived, see §4) | RocksDB store path. |
 | `--profile-dir` | `SYNAPSE_PROFILE_DIR` | path | bundled dir (see [11]) | Profile package directory. See profiles doc (11) for layout. |
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | string | `info` | Tracing level (`off`/`error`/`warn`/`info`/`debug`/`trace`). Parsed as `LevelFilter`. |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | bool | `false` | Disable the reflex runtime. |
@@ -65,9 +64,6 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | read-only (`READ_EVENTS`, `READ_REFLEX`, `READ_PROFILE`, `READ_STORAGE`; plus `READ_AUDIO` only when audio is enabled) | Explicit M3 permission grant allowlist; write/input permissions require opt-in. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | bool | `false` | Force reflex into degraded mode (testing/diagnostic). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | u64 (BYTES) | none | Inject a synthetic free-bytes value for disk-pressure logic. |
-| `--calyx-vault` | `SYNAPSE_CALYX_VAULT` | bool | `true` | Enable the embedded Calyx vault. |
-| `--calyx-vault-dir` | `SYNAPSE_CALYX_VAULT_DIR` | path | same as `--db` | Compatibility assertion for the sole storage-owned Calyx vault. If set, it must resolve to the configured DB path; a conflicting side-vault path is a hard startup error. |
-| `--calyx-config` | `SYNAPSE_CALYX_CONFIG` | path | none | Optional TOML file with exactly one `[calyx]` section. Unknown keys, missing section, unreadable file, invalid values, and contradictory clock settings fail startup with remediation. |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | NonZeroUsize | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | Cap on event-bus subscriptions. |
 | `--allow-shell` (repeatable) | `SYNAPSE_ALLOW_SHELL` (comma-sep) | regex list | empty | Allowlist regexes for `act_run_shell` command lines (merged with env, §1). |
 | `--allow-launch` (repeatable) | `SYNAPSE_ALLOW_LAUNCH` (comma-sep) | regex list | empty | Allowlist regexes for `act_launch` targets (merged with env, §1). |
@@ -91,14 +87,6 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--local-agent-allow-non-loopback` | `SYNAPSE_LOCAL_AGENT_ALLOW_NON_LOOPBACK` | bool | `false` | Allow non-loopback model base URL. |
 | `--local-agent-trusted-unattended-exact-contract` | `SYNAPSE_LOCAL_AGENT_TRUSTED_UNATTENDED_EXACT_CONTRACT` | bool | `false` | Trusted unattended exact-contract mode. |
 
-For the installed supervised daemon, use
-`scripts\synapse-setup.ps1 -EnableAudio` rather than relying on the invoking
-shell's environment. Setup
-persists `--enable-audio` in the generated supervisor, includes it in candidate
-and live-process identity checks, and requires `READ_AUDIO` in
-`-AllowedPermissions`. Supplying only one side fails with
-`SYNAPSE_AUDIO_DEPLOYMENT_CONTRACT_INVALID` before a build or daemon handoff.
-
 ---
 
 ## 3. Environment variables (read directly via `std::env::var`/`var_os`)
@@ -121,48 +109,11 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | Name | Read in | Type | Default | Description |
 |------|---------|------|---------|-------------|
 | `LOCALAPPDATA` | many (telemetry, m3, m4, models, etc.) | path | (Windows-provided) | Root for db/logs/models/runs/shell dirs (see §4). |
-| `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | Storage directory path (also CLI `--db`). |
-| `SYNAPSE_STORAGE_BACKEND` | `m3.rs` (`STORAGE_BACKEND_ENV`) and `main.rs` (`--storage-backend`) | enum | `calyx` | Selects the Calyx backend; invalid strings fail closed before serving. |
-| `SYNAPSE_CALYX_CUDA` | `scripts/synapse-setup.ps1` preflight only | string | unset (CPU-only; `off` also accepted) | Unset or `off` preserves the installed CPU-only contract. `auto` and `require` are explicit typed refusals, and any other value is invalid; setup never enables `calyx-cuda`. |
+| `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | RocksDB store path (also CLI `--db`). |
 | `SYNAPSE_ACTION_RECOVERY_FILE` | `synapse-action/recovery.rs` (`RECOVERY_FILE_ENV`) | path | derived (§4) | Held-input crash-recovery JSONL ledger path. |
 | `SYNAPSE_SHELL_SESSION_DIR` | `m4.rs` (`SHELL_SESSION_DIR_ENV`) | path | derived (§4) | Per-session shell working/session dir override. |
 | `SYNAPSE_SHELL_WORKING_DIR` | `m4.rs` (`SHELL_WORKING_DIR_ENV`) | path | none | Working dir for shell jobs. |
 | `XDG_STATE_HOME`, `HOME` | telemetry, m4 (non-Windows) | path | none | Non-Windows fallbacks for log/state dirs. |
-
-### 3.2.1 Calyx `[calyx]` section
-
-`SYNAPSE_CALYX_CONFIG` / `--calyx-config` points at an optional TOML file with exactly one top-level section:
-
-```toml
-[calyx]
-bit_floor_bits = 0.05
-correlation_ceiling = 0.6
-guard_far_identity = 0.01
-guard_far_content = 0.03
-guard_far_stylistic = 0.05
-guard_cold_start_tau = 0.7
-kernel_fraction = 0.01
-kernel_recall_gate = 0.95
-fusion_k = 60
-temporal_boost_min = 0.0
-temporal_boost_max = 0.10
-vram_budget_bytes = 0
-math_backend = "cpu"
-clock_mode = "system"
-rng_seed = 6491761763268826774
-```
-
-For manual deterministic runtime checks, use:
-
-```toml
-[calyx]
-clock_mode = "fixed"
-fixed_clock_unix_ms = 1720000000123
-```
-
-All omitted keys use the defaults above. Unknown keys, a missing `[calyx]` section, `clock_mode = "fixed"` without `fixed_clock_unix_ms`, `fixed_clock_unix_ms` with `clock_mode = "system"`, non-finite floats, zero `fusion_k`, a nonzero `vram_budget_bytes`, any `math_backend` other than `"cpu"`, and out-of-range guard/temporal values fail startup. `vram_budget_bytes` remains in the serialized configuration contract for compatibility, but the installed runtime requires zero and does not treat it as an allocation budget.
-
-The installed daemon has a binding CPU-only/no-explicit-GPU-provider contract. Setup atomically installs a content-addressed `[calyx]` file containing `math_backend="cpu"` and `vram_budget_bytes=0`, pins its SHA-256 in the supervisor, and validates the same values through health readback. It never enables the optional `calyx-cuda` feature, makes no GPU reservation, and rejects automatic or explicit accelerator requests instead of falling back. The standalone Calyx workspace retains CUDA features only for an explicitly configured dependency compile/probe; they are not forwarded into `synapse-mcp` and standard setup does not configure NVCC for them.
 
 ### 3.3 Logging / telemetry
 
@@ -177,9 +128,7 @@ The installed daemon has a binding CPU-only/no-explicit-GPU-provider contract. S
 
 | Name | Read in | Type | Default | Description |
 |------|---------|------|---------|-------------|
-| `SYNAPSE_CAPTURE_BACKEND` | `synapse-capture/backend.rs` | string | unset (`gdi_bitblt`) | Optional explicit capture policy. Only `cpu`, `gdi`, or `gdi_bitblt` are accepted. Any other value, including `auto`, WGC, or DXGI requests, fails with `CAPTURE_UNSUPPORTED_SEMANTICS`. |
-| `SYNAPSE_CAPTURE_FORCE_DXGI` | `synapse-capture/backend.rs` | string | unset | Legacy contradiction detector. Unset or `0`/`false`/`no` is accepted; a true, invalid, or non-Unicode value fails with `CAPTURE_UNSUPPORTED_SEMANTICS`. It never enables DXGI. |
-| `SYNAPSE_DETECTION_BACKEND` | `m1/detection.rs` | string | unset (`cpu`) | Detection execution-provider policy. Only unset or `cpu` is accepted; `auto`, `cuda`, invalid, and non-Unicode values fail closed under the installed zero-VRAM contract. Setup pins `cpu`. |
+| `SYNAPSE_CAPTURE_FORCE_DXGI` | `synapse-capture/config.rs` | string | unset (Auto backend) | Force the DXGI capture backend preference. |
 | `SYNAPSE_MCP_SYNTHETIC_FIXTURE` | `m1.rs` | string | unset | `notepad` injects a synthetic observation fixture. |
 | `SYNAPSE_MCP_FORCE_NO_PERCEPTION` | `m1.rs` | bool (`1`/`true`) | off | Force perception off. |
 | `SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL` | `m1.rs` | bool (`1`/`true`) | off | Force internal observe path. |
@@ -240,6 +189,7 @@ The installed daemon has a binding CPU-only/no-explicit-GPU-provider contract. S
 | `SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY` | `safety.rs` | bool (1/true/yes/on) | off | Run without the kill-switch hotkey. |
 | `SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY` | `safety.rs` | bool | off | Hard startup failure if hotkey cannot arm. |
 | `SYNAPSE_APPROVAL_GATE_TIMEOUT_MS` | `server/permission_gate.rs` | u64 (ms, `>=1000`) | `1500000` (25 min) | Approval-gate blocking timeout. |
+| `SYNAPSE_ENFORCE_SUPPORTED_USE` | `server/target_policy.rs` | bool (1/true/yes/y/on) | off | Restore legacy supported-use (game-profile) gating. |
 | `SYNAPSE_ALLOW_SHELL_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any shell command unless explicitly disabled. |
 | `SYNAPSE_ALLOW_LAUNCH_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any launch target unless explicitly disabled. |
 | `SYNAPSE_AGENT_SPAWN_SHELL` | `server/m4_tools.rs` (`AGENT_SPAWN_SHELL_ENV_VAR`) | string | none | Override shell used for spawned agents. |
@@ -251,7 +201,6 @@ The installed daemon has a binding CPU-only/no-explicit-GPU-provider contract. S
 |------|---------|------|---------|-------------|
 | `SYNAPSE_ENABLE_AUDIO` | `m3.rs` (also CLI) | bool | `false` | Enable audio runtime. |
 | `SYNAPSE_AUDIO_LOOPBACK` | `m3.rs` (`AUDIO_LOOPBACK_ENV`) | `1`/`0`/`true`/`false` | `1` (on) | System-audio loopback capture. Invalid value = hard error. |
-| `SYNAPSE_STT_BACKEND` | `synapse-audio/stt.rs` | string | unset (`cpu`) | Whisper execution-provider policy. Only unset or `cpu` is accepted; `auto`, `cuda`, invalid, and non-Unicode values fail closed under the installed zero-VRAM contract. Setup pins `cpu`. |
 
 ### 3.9 Recording / Codex bridge
 
@@ -276,7 +225,7 @@ These are written by setup/launcher scripts, not read by the daemon Rust code:
 
 ### 3.11 Test / benchmark only (not production config)
 
-Not part of normal operation; listed for completeness: `SYNAPSE_CAPTURE_BENCH_SECONDS`, `SYNAPSE_A11Y_MANUAL_BENCH`, `SYNAPSE_A11Y_BENCH_ITERS`, `SYNAPSE_ACTION_VIGEM_PAD_REAL`, `SYNAPSE_ACTION_SOFTWARE_PRESS_REAL`, `SYNAPSE_ACTION_SOFTWARE_CLICK_REAL`, `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT`, `SYNAPSE_PTY_TRACE`, `SYNAPSE_MCP_BIN`, `SYNAPSE_LOCAL_AGENT_ITEST_*`, `SYNAPSE_LOCAL_MODEL_TOOL_PROBE_TIMEOUT_MS`, `SYNAPSE_LOCAL_MODEL_NON_TOOL_PROBE_TIMEOUT_MS`.
+Not part of normal operation; listed for completeness: `SYNAPSE_CAPTURE_FORCE_DXGI` (tests), `SYNAPSE_CAPTURE_BENCH_SECONDS`, `SYNAPSE_A11Y_MANUAL_BENCH`, `SYNAPSE_A11Y_BENCH_ITERS`, `SYNAPSE_ACTION_VIGEM_PAD_REAL`, `SYNAPSE_ACTION_SOFTWARE_PRESS_REAL`, `SYNAPSE_ACTION_SOFTWARE_CLICK_REAL`, `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT`, `SYNAPSE_PTY_TRACE`, `SYNAPSE_MCP_BIN`, `SYNAPSE_LOCAL_AGENT_ITEST_*`, `SYNAPSE_LOCAL_MODEL_TOOL_PROBE_TIMEOUT_MS`, `SYNAPSE_LOCAL_MODEL_NON_TOOL_PROBE_TIMEOUT_MS`.
 
 ---
 
@@ -286,15 +235,13 @@ All derivations assume Windows (the supported platform). Non-Windows fallbacks u
 
 | Logical name | Path / derivation | Source | Contents | Tier |
 |--------------|-------------------|--------|----------|------|
-| Storage directory | `--db` / `SYNAPSE_DB`, else `%LOCALAPPDATA%\synapse\db` (falls back to `std::env::temp_dir()\synapse\db` if `LOCALAPPDATA` unset) | `m3.rs::default_db_path`; backend from `--storage-backend` / `SYNAPSE_STORAGE_BACKEND` | Timeline, episodes, agent events/transcripts, routines, KV, profiles history. | sacred (regenerable only by re-observing) |
+| RocksDB store | `--db` / `SYNAPSE_DB`, else `%LOCALAPPDATA%\synapse\db` (falls back to `std::env::temp_dir()\synapse\db` if `LOCALAPPDATA` unset) | `m3.rs::default_db_path` | Timeline, episodes, agent events/transcripts, routines, KV, profiles history. | sacred (regenerable only by re-observing) |
 | Setup daemon db | `%LOCALAPPDATA%\synapse\db-daemon` (setup `-DbPath` default) | `synapse-setup.ps1` | Same as above for the installed daemon. | sacred |
 | Log dir | `%LOCALAPPDATA%\synapse\logs` (or `SYNAPSE_LOG_DIR`) | `synapse-telemetry::default_log_dir` | `synapse.log` (daily-rolled) + GC'd rotations; `daemon-launcher.log`. | regenerable |
 | Models dir | `%LOCALAPPDATA%\synapse\models` (falls back to `.\synapse\models`) | `synapse-models::default_model_dir` | Side-loaded ONNX models (e.g. `yolov10n_general.onnx`). See [13_models_subsystem.md]. | sacred (manually side-loaded; downloads disabled) |
 | Bearer token file | `%APPDATA%\synapse\token.txt` | `http/auth.rs::token_file_path` | HTTP bearer token (preferred over env). | sacred (secret) |
 | Codex tool-surface snapshot | `%APPDATA%\synapse\codex-tool-surface.json` | `synapse-setup.ps1` | tools/list fingerprint for Codex start-guard. | regenerable |
 | Codex start snapshots | `%LOCALAPPDATA%\synapse\codex-start-snapshots` | `synapse-setup.ps1` | Per-start tool-surface snapshots. | ephemeral |
-| Codex doctor reports | `%LOCALAPPDATA%\synapse\codex-no-facade-doctor` | `synapse-codex-doctor.ps1` | Per-run JSON reports and fresh Codex probe event logs for sessions that cannot call the Synapse MCP namespace or report stale Synapse MCP tool schemas. | ephemeral |
-| Codex restart handoffs | `%LOCALAPPDATA%\synapse\codex-restart-handoffs` | `synapse-setup.ps1`, `synapse-codex-doctor.ps1` | Same-agent restart handoffs for stale schema/socket/no-facade Codex sessions. | ephemeral |
 | Action recovery ledger | `SYNAPSE_ACTION_RECOVERY_FILE` → daemon DB dir → `SYNAPSE_DB` → `%LOCALAPPDATA%\synapse\action_recovery.jsonl` | `synapse-action/recovery.rs` | JSONL of currently-held inputs for crash recovery (`action_recovery.jsonl`). | ephemeral |
 | Shell job logs | `%LOCALAPPDATA%\Synapse\shell-jobs` (and `\jobs`) | `m4.rs::shell_job_root_dir` | Durable `act_run_shell` job stdout/stderr/status. | ephemeral |
 | Shell sessions | `%LOCALAPPDATA%\Synapse\shell-sessions` | `m4.rs::shell_session_root_dir` | Per-session shell working dirs. | ephemeral |
@@ -316,7 +263,7 @@ WSL has two separate configuration sources. Keep them distinct:
 
 Do not put `[experimental]`, `autoMemoryReclaim`, or `sparseVhd` in `/etc/wsl.conf`. Current WSL builds report those as unknown per-distro keys on every `wsl.exe` invocation, which pollutes stderr for WSL-backed MCP wrappers and host readbacks.
 
-See [04_storage_and_persistence.md](04_storage_and_persistence.md) for storage internals.
+See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB internals.
 
 ---
 
@@ -337,7 +284,7 @@ See [04_storage_and_persistence.md](04_storage_and_persistence.md) for storage i
 | Item | Value | Source |
 |------|-------|--------|
 | Default bind / daemon port | `127.0.0.1:7700` (`DEFAULT_BIND`) | `m3.rs`, `main.rs`, `synapse-setup.ps1` |
-| Single-daemon invariant | Embedded stdio daemon and HTTP daemon both open the configured storage directory; a single-instance guard prevents a second parallel daemon (#717). | `main.rs` (`run_stdio`), `single_instance.rs` |
+| Single-daemon invariant | Embedded stdio daemon and HTTP daemon both open RocksDB; a single-instance guard prevents a second parallel daemon (#717). | `main.rs` (`run_stdio`), `single_instance.rs` |
 | Local-agent MCP URL | `http://127.0.0.1:7700/mcp` | `main.rs` |
 | Bearer-token source order | `%APPDATA%\synapse\token.txt` (if present & non-empty) → `SYNAPSE_BEARER_TOKEN` env | `http/auth.rs::load_token` |
 | Auth header | `Authorization: Bearer <token>`; scheme case-insensitive, empty token rejected | `http/auth.rs::bearer_token` |
@@ -370,7 +317,7 @@ See [15_mcp_server_architecture.md](15_mcp_server_architecture.md).
 ---
 
 ## 8. Cross-references
-- Storage backend layout & column families: [04_storage_and_persistence.md](04_storage_and_persistence.md)
+- Storage layout & RocksDB column families: [04_storage_and_persistence.md](04_storage_and_persistence.md)
 - Profiles directory layout & loading: profiles doc (11)
 - Models directory & ONNX side-loading: [13_models_subsystem.md](13_models_subsystem.md)
 - Server/daemon architecture, single-instance, HTTP transport: [15_mcp_server_architecture.md](15_mcp_server_architecture.md)

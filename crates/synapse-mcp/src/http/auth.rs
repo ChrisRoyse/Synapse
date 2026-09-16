@@ -1,5 +1,6 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
+use anyhow::{Context, bail};
 use axum::{
     body::Body,
     extract::State,
@@ -10,8 +11,8 @@ use axum::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::bearer_token::{TokenSource, load_token};
-
+const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
+const APPDATA_ENV: &str = "APPDATA";
 const BRIDGE_REGISTER_TOKEN_HEADER: &str = "x-synapse-bridge-register-token";
 const BRIDGE_REGISTER_TOKEN_DOMAIN: &[u8] = b"synapse.chrome_bridge.register.v1";
 
@@ -21,6 +22,12 @@ pub(super) struct HttpAuth {
     bridge_register_token_digest: [u8; 32],
     source: TokenSource,
     bind_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TokenSource {
+    File(PathBuf),
+    Env,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -40,18 +47,9 @@ pub(super) enum OriginFailure {
     OriginRefused,
 }
 
-pub(super) enum HttpSecurityDecision {
-    Authorized,
-    Respond(Response),
-}
-
 impl HttpAuth {
     pub(super) fn load(bind_addr: SocketAddr) -> anyhow::Result<Self> {
-        let resolution = load_token()?;
-        // Name the winning source in the boot log before anything can reject a
-        // request for using the other one (#2099).
-        resolution.report();
-        let (token, source) = (resolution.token, resolution.source);
+        let (token, source) = load_token()?;
         Ok(Self {
             token_digest: digest_token(&token),
             bridge_register_token_digest: digest_token(&derive_bridge_register_token(&token)),
@@ -60,8 +58,21 @@ impl HttpAuth {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn from_token(token: &str) -> Self {
+        Self {
+            token_digest: digest_token(token),
+            bridge_register_token_digest: digest_token(&derive_bridge_register_token(token)),
+            source: TokenSource::Env,
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 7700)),
+        }
+    }
+
     pub(super) const fn source_label(&self) -> &'static str {
-        self.source.label()
+        match self.source {
+            TokenSource::File(_) => "file",
+            TokenSource::Env => "env",
+        }
     }
 
     pub(super) fn authorize(&self, headers: &HeaderMap) -> Result<(), AuthFailure> {
@@ -110,79 +121,70 @@ pub(super) async fn require_http_security(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    match evaluate_http_security(&auth, &request) {
-        HttpSecurityDecision::Authorized => next.run(request).await,
-        HttpSecurityDecision::Respond(response) => response,
-    }
-}
-
-pub(super) fn evaluate_http_security(
-    auth: &HttpAuth,
-    request: &Request<Body>,
-) -> HttpSecurityDecision {
     if auth.bind_addr.ip().is_loopback() && validate_host(request.headers()).is_ok() {
-        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_cors_preflight_request(
-            request.method(),
-            request.headers(),
-            request.uri(),
-        ) {
-            tracing::info!(
-                code = "CHROME_BRIDGE_CORS_PREFLIGHT_ACCEPTED",
-                method = %request.method(),
-                path = request.uri().path(),
-                origin = origin_header(request.headers()).unwrap_or("<missing>"),
-                access_control_request_method = request
-                    .headers()
-                    .get(header::ACCESS_CONTROL_REQUEST_METHOD)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::trim)
-                    .unwrap_or("<missing>"),
-                has_access_control_request_headers = request
-                    .headers()
-                    .contains_key(header::ACCESS_CONTROL_REQUEST_HEADERS),
-                "accepted direct Chrome bridge CORS preflight"
-            );
-            return HttpSecurityDecision::Respond(
-                crate::chrome_debugger_bridge::direct_http_bridge_cors_preflight_response(),
-            );
-        }
         if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
             request.headers(),
             request.uri(),
         ) {
-            return HttpSecurityDecision::Authorized;
+            return next.run(request).await;
         }
-        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_or_probe_request(
+        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_request(
             request.headers(),
             request.uri(),
         ) {
             return match auth.authorize_bridge_register(request.headers()) {
-                Ok(()) => HttpSecurityDecision::Authorized,
-                Err(failure) => HttpSecurityDecision::Respond(unauthorized_request(
-                    failure,
-                    request,
-                    auth.source_label(),
-                )),
+                Ok(()) => next.run(request).await,
+                Err(failure) => unauthorized(failure),
             };
         }
     }
     if let Err(failure) = auth.validate_origin_and_host(request.headers()) {
-        return HttpSecurityDecision::Respond(forbidden(failure));
+        return forbidden(failure);
     }
     match auth.authorize(request.headers()) {
-        Ok(()) => HttpSecurityDecision::Authorized,
-        Err(failure) => HttpSecurityDecision::Respond(unauthorized_request(
-            failure,
-            request,
-            auth.source_label(),
-        )),
+        Ok(()) => next.run(request).await,
+        Err(failure) => unauthorized(failure),
     }
 }
 
-/// Re-export of the crate-wide bearer-token loader (#2099), kept here because
-/// `http::auth` used to own the resolution and in-crate callers reach it via
-/// `crate::http::load_token_value`.
-pub(crate) use crate::bearer_token::load_token_value;
+/// Load the daemon bearer token value (file or env), for in-process consumers
+/// such as the `--mode connect` bridge that must authenticate to the daemon.
+pub(crate) fn load_token_value() -> anyhow::Result<String> {
+    load_token().map(|(token, _source)| token)
+}
+
+fn load_token() -> anyhow::Result<(String, TokenSource)> {
+    match token_file_path() {
+        Some(path) if path.is_file() => {
+            let token = std::fs::read_to_string(&path)
+                .with_context(|| format!("read HTTP bearer token file {}", path.display()))?;
+            let token = normalize_token(&token)
+                .with_context(|| format!("HTTP bearer token file is empty: {}", path.display()))?;
+            Ok((token, TokenSource::File(path)))
+        }
+        Some(_) | None => load_env_token(),
+    }
+}
+
+fn load_env_token() -> anyhow::Result<(String, TokenSource)> {
+    let token = std::env::var(TOKEN_ENV)
+        .with_context(|| format!("{TOKEN_ENV} is unset and token.txt is absent"))?;
+    let token = normalize_token(&token).with_context(|| format!("{TOKEN_ENV} is empty"))?;
+    Ok((token, TokenSource::Env))
+}
+
+fn token_file_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os(APPDATA_ENV)?;
+    Some(PathBuf::from(appdata).join("synapse").join("token.txt"))
+}
+
+fn normalize_token(raw: &str) -> anyhow::Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        bail!("empty token")
+    }
+    Ok(token.to_owned())
+}
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthFailure> {
     let raw = headers
@@ -289,34 +291,10 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn origin_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-}
-
-/// `token_source` names where *this daemon's* token came from (#2099). Without
-/// it, a client authenticating with the other source's token gets an
-/// unexplained 401 and the operator has nothing to compare against.
-fn unauthorized_request(
-    failure: AuthFailure,
-    request: &Request<Body>,
-    token_source: &'static str,
-) -> Response {
+fn unauthorized(failure: AuthFailure) -> Response {
     tracing::warn!(
         code = synapse_core::error_codes::HTTP_TOKEN_INVALID,
         reason = ?failure,
-        token_source,
-        method = %request.method(),
-        path = request.uri().path(),
-        origin = origin_header(request.headers()).unwrap_or("<missing>"),
-        has_authorization = request.headers().contains_key(header::AUTHORIZATION),
-        has_bridge_register_token = request.headers().contains_key(BRIDGE_REGISTER_TOKEN_HEADER),
-        has_bridge_token = request.headers().contains_key("x-synapse-bridge-token"),
-        has_access_control_request_method = request
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD),
         "HTTP bearer token rejected"
     );
     (
@@ -338,4 +316,141 @@ fn forbidden(failure: OriginFailure) -> Response {
         synapse_core::error_codes::HTTP_ORIGIN_REFUSED,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::HttpAuth;
+
+    #[test]
+    fn bearer_compare_accepts_only_exact_token() {
+        let auth = HttpAuth::from_token("synapse-secret");
+        assert!(auth.token_matches("synapse-secret"));
+        assert!(!auth.token_matches("synapse-secreu"));
+        assert!(!auth.token_matches("synapse-secret-longer"));
+        assert!(!auth.token_matches(""));
+    }
+
+    #[test]
+    fn bridge_register_token_is_domain_derived_from_bearer() {
+        let auth = HttpAuth::from_token("synapse-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            super::BRIDGE_REGISTER_TOKEN_HEADER,
+            HeaderValue::from_str(&super::derive_bridge_register_token("synapse-secret"))
+                .expect("derived token is header-safe"),
+        );
+        assert!(auth.authorize_bridge_register(&headers).is_ok());
+
+        headers.insert(
+            super::BRIDGE_REGISTER_TOKEN_HEADER,
+            HeaderValue::from_str(&super::derive_bridge_register_token("other-secret"))
+                .expect("derived token is header-safe"),
+        );
+        assert!(auth.authorize_bridge_register(&headers).is_err());
+        headers.remove(super::BRIDGE_REGISTER_TOKEN_HEADER);
+        assert!(auth.authorize_bridge_register(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_compare_rejects_many_prefix_variants() {
+        let correct = "a".repeat(64);
+        let auth = HttpAuth::from_token(&correct);
+        for index in 0..10_000 {
+            let prefix_len = index % correct.len();
+            let mut wrong = String::with_capacity(correct.len());
+            wrong.push_str(&correct[..prefix_len]);
+            wrong.push('b');
+            wrong.push_str(&"c".repeat(correct.len() - prefix_len - 1));
+            assert!(!auth.token_matches(&wrong), "prefix_len={prefix_len}");
+        }
+    }
+
+    #[test]
+    fn authorization_header_accepts_bearer_case_insensitive() {
+        let auth = HttpAuth::from_token("local-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer local-token"),
+        );
+        assert!(auth.authorize(&headers).is_ok());
+    }
+
+    #[test]
+    fn origin_and_host_accept_loopback_and_reject_edges() {
+        let auth = HttpAuth::from_token("local-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:7700"));
+        assert!(auth.validate_origin_and_host(&headers).is_ok());
+
+        headers.insert(header::ORIGIN, HeaderValue::from_static("http://127.0.0.1"));
+        assert!(auth.validate_origin_and_host(&headers).is_ok());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        assert!(auth.validate_origin_and_host(&headers).is_err());
+
+        headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert!(auth.validate_origin_and_host(&headers).is_err());
+    }
+
+    #[test]
+    fn missing_origin_is_rejected_for_non_loopback_bind() {
+        let mut auth = HttpAuth::from_token("local-token");
+        auth.bind_addr = SocketAddr::from(([0, 0, 0, 0], 7700));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:7700"));
+        assert!(auth.validate_origin_and_host(&headers).is_err());
+    }
+
+    #[test]
+    fn direct_chrome_bridge_origin_does_not_bypass_bridge_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk"),
+        );
+
+        let register_uri = "/chrome-debugger/native/register"
+            .parse()
+            .expect("static uri parses");
+        assert!(
+            crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_request(
+                &headers,
+                &register_uri,
+            )
+        );
+        assert!(
+            !crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+                &headers,
+                &register_uri,
+            )
+        );
+        assert!(
+            !crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+                &headers,
+                &"/mcp".parse().expect("static uri parses"),
+            )
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert!(
+            !crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_request(
+                &headers,
+                &"/chrome-debugger/native/register"
+                    .parse()
+                    .expect("static uri parses"),
+            )
+        );
+    }
 }

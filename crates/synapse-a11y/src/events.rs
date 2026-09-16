@@ -2,11 +2,11 @@ use std::{collections::HashMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use synapse_core::ElementId;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{A11yError, A11yResult, platform};
 
-pub type AccessibleEventSender = Sender<AccessibleEvent>;
+pub type AccessibleEventSender = UnboundedSender<AccessibleEvent>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,9 +120,6 @@ impl WinEventSubscription {
                 stop_requested: true,
                 stop_wake_sent: true,
                 sender_disconnected: true,
-                events_delivered_at_disconnect: 0,
-                events_dropped_queue_full_at_disconnect: 0,
-                event_sends_rejected_at_disconnect: 0,
                 subscription_slot_released: true,
                 thread_owner_present: false,
                 thread_terminal: true,
@@ -154,27 +151,6 @@ pub struct WinEventSubscriptionShutdownReport {
     /// True only after the callback delivery-state lock was acquired within
     /// its shutdown bound and the process-global sender read back empty.
     pub sender_disconnected: bool,
-    /// #1792: total `AccessibleEvent`s this owner accepted into the delivery
-    /// bounded channel, read at the instant the sender was disconnected.
-    ///
-    /// `sender_disconnected` proves the producer side is closed; it does NOT
-    /// prove the consumer can observe the closure. A Tokio `Receiver`
-    /// returns `None` only after every sender is dropped **and every buffered
-    /// value has been received**, so a consumer whose only stop signal is
-    /// channel closure must first drain whatever this counter accumulated but
-    /// the consumer had not yet taken. Publishing the producer-side total makes
-    /// that drain depth computable against the consumer's own published
-    /// sequence, which is what separates "channel closure never reached the
-    /// consumer" from subscription-thread delay, scheduler starvation, and join
-    /// ordering.
-    pub events_delivered_at_disconnect: u64,
-    /// Events explicitly rejected because the bounded ingress queue was full.
-    /// The hook-owner loop emits `A11Y_WIN_EVENT_QUEUE_SATURATED` whenever this
-    /// advances; shutdown preserves the terminal count here for readback.
-    pub events_dropped_queue_full_at_disconnect: u64,
-    /// Sends this owner attempted after its receiver was already gone. Nonzero
-    /// means the consumer stopped before the producer did.
-    pub event_sends_rejected_at_disconnect: u64,
     pub subscription_slot_released: bool,
     pub thread_owner_present: bool,
     pub thread_terminal: bool,
@@ -391,4 +367,86 @@ pub fn win_event_shutdown_report_history() -> Vec<WinEventSubscriptionShutdownRe
 /// or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
 pub fn uia_worker_readback() -> A11yResult<UiaWorkerReadback> {
     platform::uia_worker_readback()
+}
+
+#[cfg(test)]
+mod shutdown_report_tests {
+    use super::WinEventSubscriptionShutdownReport;
+
+    fn clean_report() -> WinEventSubscriptionShutdownReport {
+        WinEventSubscriptionShutdownReport {
+            reason: "test",
+            thread_id: 17,
+            hook_count: 2,
+            stop_requested: true,
+            stop_wake_sent: true,
+            sender_disconnected: true,
+            subscription_slot_released: true,
+            thread_owner_present: true,
+            thread_terminal: true,
+            thread_joined: true,
+            thread_exit_report_received: true,
+            unregister_attempted: 2,
+            unregister_succeeded: 2,
+            unregister_failed_event_ids: Vec::new(),
+            exact_owner_retained: false,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn live_win_event_owner_never_reports_quiescent() {
+        let mut report = clean_report();
+        report.thread_terminal = false;
+        report.thread_joined = false;
+        report.exact_owner_retained = true;
+
+        assert!(!report.owners_quiescent());
+        assert!(report.verdict().is_err());
+    }
+
+    #[test]
+    fn incomplete_unregistration_never_reports_quiescent() {
+        let mut report = clean_report();
+        report.unregister_succeeded = 1;
+        report.unregister_failed_event_ids.push(0x8005);
+
+        assert!(!report.unregister_complete());
+        assert!(!report.owners_quiescent());
+        assert!(report.verdict().is_err());
+    }
+
+    #[test]
+    fn complete_physical_readback_is_quiescent() {
+        let report = clean_report();
+
+        assert!(report.unregister_complete());
+        assert!(report.owners_quiescent());
+        assert!(report.verdict().is_ok());
+    }
+
+    #[test]
+    fn missing_thread_owner_does_not_bypass_nonzero_hook_evidence() {
+        let mut report = clean_report();
+        report.thread_owner_present = false;
+        report.thread_exit_report_received = false;
+        report.unregister_attempted = 0;
+        report.unregister_succeeded = 0;
+
+        assert!(!report.unregister_complete());
+        assert!(!report.owners_quiescent());
+        assert!(report.verdict().is_err());
+    }
+
+    #[test]
+    fn unobserved_bounded_sender_disconnect_fails_the_physical_verdict() {
+        let mut report = clean_report();
+        report.sender_disconnected = false;
+        report.failures.push(
+            "WinEvent delivery-state lock remained contended for the bounded disconnect".to_owned(),
+        );
+
+        assert!(!report.owners_quiescent());
+        assert!(report.verdict().is_err());
+    }
 }

@@ -24,7 +24,7 @@
   Loopback bind for the issue daemon. Defaults to the shared daemon bind.
 
 .PARAMETER DbPath
-  Calyx vault path for the issue daemon.
+  RocksDB path for the issue daemon.
 
 .PARAMETER ProfileDir
   Profile directory passed to synapse-mcp.

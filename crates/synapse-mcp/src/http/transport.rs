@@ -1,6 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    convert::Infallible,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
     fs,
     io::{self, Read as _},
@@ -9,8 +8,8 @@ use std::{
     pin::Pin,
     process::ExitCode,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -39,6 +38,8 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use synapse_action::ActionHandle;
 use synapse_core::{AgentEventKind, AgentEventRecord, EventFilter, EventSource, Health};
 use synapse_storage::{Db, cf};
 use tokio::{
@@ -49,11 +50,6 @@ use tokio::{
     time,
 };
 use tokio_util::sync::CancellationToken;
-use tower::ServiceExt as _;
-#[cfg(windows)]
-use windows::Win32::Foundation::{
-    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
-};
 #[cfg(windows)]
 use windows::Win32::Networking::WinSock::{
     SD_BOTH, SOCKET, WSAGetLastError, shutdown as winsock_shutdown,
@@ -77,7 +73,7 @@ use crate::{
         SynapseService,
         terminal_capture::capture::{
             LiveTerminalSession, TerminalCaptureEvent, TerminalCaptureEventKind,
-            TerminalCaptureStatus, reap_dead_live_terminal_sessions, terminal_capture_session,
+            TerminalCaptureStatus, terminal_capture_session,
         },
     },
 };
@@ -85,95 +81,13 @@ use crate::{
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
 type HttpBackgroundTaskOwner = (&'static str, ShutdownTaskOwner<()>);
 const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
-/// Whole-session lifecycle teardown can close external browser targets and must
-/// not share the held-input expiry cadence. Bound it to a coarse, delayed sweep
-/// so vanished-target reconciliation cannot monopolize runtime workers.
-const STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
-const STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP: usize = 2;
-/// How often the abandoned-session reaper scans (#1800). Distinct from the 250ms
-/// held-input cleanup: reaping evicts whole rmcp sessions, so it runs on a
-/// coarser cadence to bound the process-probe/registry cost while still catching
-/// abandonment orders of magnitude sooner than the 24h rmcp idle timeout.
-const ABANDONED_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
-/// Env override (seconds) for how long an rmcp-registered HTTP session may make
-/// no MCP request before it is treated as abandoned and reaped. `0` disables the
-/// reaper. See `abandoned_session_reap_after`.
-const ABANDONED_SESSION_REAP_AFTER_ENV: &str = "SYNAPSE_HTTP_SESSION_ABANDON_REAP_SECS";
-/// Default idle-abandonment budget (#1800). The 2026-07-23 shutdown showed 54
-/// live sessions, most abandoned FSV/client sessions hours old, none reaped —
-/// the only other expiry is the 24h rmcp idle timeout. 30 minutes reaps a
-/// vanished client long before it becomes shutdown work while comfortably
-/// exceeding any realistic gap between an interactive agent's tool calls;
-/// live spawned agents are protected by the OS process probe regardless of
-/// request idleness (#1238). A reaped session is fully recoverable: the client's
-/// next request gets a session-expired 404 and recreates + rebinds its target.
-const ABANDONED_SESSION_REAP_AFTER_DEFAULT: Duration = Duration::from_mins(30);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Whole-phase deadline for the daemon-shutdown per-session input cleanup
-/// (#1800). The per-session budget above bounds one session; this bounds the
-/// phase, so the number of live HTTP sessions can never multiply into an
-/// unbounded shutdown. Sized from measured behaviour: the 2026-07-25 shutdown
-/// spent 19.98 s here (`AUTHORITY_TRANSACTIONS_DRAINED` 10:21:38.580732Z ->
-/// `MCP_HTTP_SHUTDOWN_INPUT_CLEANUP` 10:21:58.561266Z) while blocked behind a
-/// background Calyx manifest reclaim, so 30 s leaves real headroom over the
-/// worst observed healthy phase while keeping the whole shutdown inside both
-/// the installer's 60 s budget and the 90 s watchdog. Deliberately NOT sized to
-/// rescue a wedged owner: an owner that misses this stays unproven and named,
-/// and the daemon lifetime locks are retained.
-const DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-// Escalation delivery can spend up to one bounded HTTP timeout on contract
-// preflight and one on POST, then must durably checkpoint the outcome. Its
-// supervisor grace must exceed that declared boundary or shutdown itself can
-// create an ambiguous remote side effect.
-const HTTP_ESCALATION_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
-const HTTP_STARTUP_RETRY_AFTER_SECONDS: u8 = 1;
-const HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_SECS";
-/// How long the shutdown may produce **no evidence of progress at all** before
-/// the watchdog forces a nonzero exit (#2131).
-///
-/// This used to be a flat wall-clock budget measured from the moment the
-/// listener came down: 90 s, full stop. On production (#2100/#2131) a graceful
-/// stop flushed the vault durably at 7.9 s and then spent ~82 s inside one
-/// post-flush teardown phase; the watchdog fired at 90 s with **10 s of margin**
-/// against a close that was, as far as anyone could tell, still working. The
-/// obvious fix — raise the number — is the wrong one twice over: it is a guess
-/// about a phase whose cost is proportional to retained version-chain memory
-/// (#2122), and it makes the *hung* case worse by exactly as much as it helps
-/// the slow case.
-///
-/// So the number keeps its value and changes its meaning: it is now a **stall
-/// budget** measured from the last observed progress, not from the arm. A close
-/// that keeps advancing its liveness witnesses is granted more time (up to
-/// [`HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT`]); a close that goes silent still
-/// dies at exactly the same 90 s it always did. That is the same law
-/// `Stop-SynapseMcpProcesses` already applies from outside the process
-/// (`-StallSeconds` / `-MaxWaitSeconds`), and there is no good reason for the
-/// daemon's own watchdog to reason differently about the same close.
-const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
-/// Absolute ceiling on the extended shutdown wait, matching the deploy drain's
-/// own `-MaxWaitSeconds` backstop. A daemon whose close keeps emitting forever
-/// must still reach a terminal decision, or the watchdog has stopped being a
-/// watchdog.
-const HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_SECS";
-/// Ten minutes, i.e. the deploy drain's `-MaxWaitSeconds 600`, stated in the
-/// same units the drain states it in.
-const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT: Duration = Duration::from_mins(10);
-/// How often the watchdog re-samples its liveness witnesses. Also the worst-case
-/// delay between a successful disarm and the thread noticing — which is why it
-/// is short: before #2131 the thread slept the whole budget and lingered ~90 s
-/// past every clean shutdown.
-const HTTP_SHUTDOWN_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Minimum spacing between `MCP_HTTP_SHUTDOWN_WATCHDOG_EXTENDED` lines. The
-/// witnesses can advance several times a second during a busy close, and a
-/// watchdog that logs per observation would itself become the log volume it is
-/// measuring.
-const HTTP_SHUTDOWN_WATCHDOG_EXTENSION_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -373,120 +287,6 @@ struct HttpRouterRuntime {
     background_tasks: Vec<HttpBackgroundTaskOwner>,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartupHttpPhase {
-    StorageCalyxOpen = 1,
-    ActivityRecorder = 2,
-    RuntimeStart = 3,
-    StorageMaintenance = 4,
-    Ready = 5,
-}
-
-impl StartupHttpPhase {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::StorageCalyxOpen => "storage_calyx_open",
-            Self::ActivityRecorder => "activity_recorder",
-            Self::RuntimeStart => "runtime_start",
-            Self::StorageMaintenance => "storage_maintenance",
-            Self::Ready => "ready",
-        }
-    }
-
-    fn from_stored(value: u8) -> Result<Self, u8> {
-        match value {
-            1 => Ok(Self::StorageCalyxOpen),
-            2 => Ok(Self::ActivityRecorder),
-            3 => Ok(Self::RuntimeStart),
-            4 => Ok(Self::StorageMaintenance),
-            5 => Ok(Self::Ready),
-            invalid => Err(invalid),
-        }
-    }
-}
-
-/// One-way startup dispatch gate. The listener serves only the authenticated
-/// 503 surface until the fully initialized production router is published.
-/// `OnceLock` makes a second or partial publication impossible.
-#[derive(Clone)]
-struct StartupHttpDispatch {
-    ready_app: Arc<OnceLock<Router>>,
-    phase: Arc<AtomicU8>,
-    auth: Arc<HttpAuth>,
-    bind_addr: SocketAddr,
-    started_wall_ms: u64,
-}
-
-impl StartupHttpDispatch {
-    fn new(bind_addr: SocketAddr, started_wall_ms: u64, auth: Arc<HttpAuth>) -> Self {
-        Self {
-            ready_app: Arc::new(OnceLock::new()),
-            phase: Arc::new(AtomicU8::new(StartupHttpPhase::StorageCalyxOpen as u8)),
-            auth,
-            bind_addr,
-            started_wall_ms,
-        }
-    }
-
-    fn set_phase(&self, phase: StartupHttpPhase) {
-        self.phase.store(phase as u8, Ordering::Release);
-        tracing::info!(
-            code = "MCP_HTTP_STARTUP_PHASE_PUBLISHED",
-            bind = %self.bind_addr,
-            phase = phase.label(),
-            startup_elapsed_ms = wall_clock_millis_now().saturating_sub(self.started_wall_ms),
-            "HTTP startup listener phase advanced"
-        );
-    }
-
-    fn phase(&self) -> Result<StartupHttpPhase, u8> {
-        StartupHttpPhase::from_stored(self.phase.load(Ordering::Acquire))
-    }
-
-    fn publish_ready(&self, app: Router) -> anyhow::Result<()> {
-        self.ready_app.set(app).map_err(|_app| {
-            anyhow::anyhow!(
-                "HTTP production router publication was attempted more than once for {}",
-                self.bind_addr
-            )
-        })?;
-        self.set_phase(StartupHttpPhase::Ready);
-        Ok(())
-    }
-}
-
-struct StartupHttpServer {
-    task: ShutdownTaskOwner<io::Result<()>>,
-    active_http_sockets: ActiveHttpSockets,
-}
-
-impl StartupHttpServer {
-    fn task_finished_hint(&self) -> bool {
-        self.task.task_finished_hint()
-    }
-}
-
-struct HttpShutdownWatchdog {
-    disarmed: Arc<AtomicBool>,
-    source: &'static str,
-    timeout: Duration,
-}
-
-impl HttpShutdownWatchdog {
-    fn disarm(&self, outcome: &'static str) {
-        self.disarmed.store(true, Ordering::Release);
-        tracing::info!(
-            code = "MCP_HTTP_SHUTDOWN_WATCHDOG_DISARMED",
-            source = self.source,
-            timeout_ms = self.timeout.as_millis(),
-            outcome,
-            pid = std::process::id(),
-            "HTTP shutdown watchdog disarmed after terminal process decision"
-        );
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct DaemonShutdownInputCleanupReport {
     reason: &'static str,
@@ -504,16 +304,6 @@ struct DaemonShutdownInputCleanupReport {
     cleaned_sessions: usize,
     session_cleanup_timeout_ms: u64,
     session_cleanup_timeouts: Vec<String>,
-    /// #1800 phase evidence: the whole per-session cleanup phase is bounded, not
-    /// just each session, so N abandoned sessions cannot multiply into an
-    /// unbounded phase that rides the daemon into the shutdown watchdog.
-    session_cleanup_phase_timeout_ms: u64,
-    session_cleanup_phase_elapsed_ms: u64,
-    session_cleanup_phase_deadline_expired: bool,
-    /// Sessions whose cleanup never published a report before the phase
-    /// deadline. Each also appears in `session_reports` as a failed, explicitly
-    /// unproven row so the lifetime-lock gate stays fail-closed.
-    session_cleanup_phase_unreported_session_ids: Vec<String>,
     orphan_lease_owner_cleanup:
         Option<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
     final_lease_held: bool,
@@ -537,11 +327,6 @@ impl DaemonShutdownInputCleanupReport {
     fn all_input_owners_quiescent(&self) -> bool {
         self.authority_finalizer_owners_quiescent()
             && self.failure_count == 0
-            // A phase that hit its deadline never proved the sessions it was
-            // still running, even if every report it had already published was
-            // clean. Fail closed on the phase verdict itself (#1800).
-            && !self.session_cleanup_phase_deadline_expired
-            && self.session_cleanup_phase_unreported_session_ids.is_empty()
             && self.live_spawn_snapshot_read_before
             && self.live_spawn_snapshot_error.is_none()
             && self.input_owner_snapshot_read_before
@@ -883,7 +668,6 @@ struct HttpLifetimeOwnerReadback {
     m2_emitter_safe: bool,
     activity_owners_quiescent: bool,
     win_event_shutdown_history_quiescent: bool,
-    calyx_vault_closed: bool,
     storage_service_owners_quiescent: bool,
     operator_hotkey_quiescent: bool,
     operator_panic_k2_tasks_quiescent: bool,
@@ -926,60 +710,6 @@ impl HttpOperatorOwnerDrain {
     }
 }
 
-async fn close_http_calyx_vault(
-    m3_state: &crate::m3::SharedM3State,
-    reason: &'static str,
-    expected_open: bool,
-) -> (
-    bool,
-    anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
-) {
-    let maintenance = crate::m3::shutdown_storage_maintenance_tasks(m3_state, reason).await;
-    let maintenance_verdict = maintenance.verdict();
-    let result = if maintenance.owners_quiescent() {
-        let close_result = match m3_state.lock() {
-            Ok(mut state) => state
-                .close_calyx_vault_for_shutdown(reason, expected_open)
-                .map_err(anyhow::Error::new)
-                .and_then(|readback| {
-                    crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
-                    Ok(readback)
-                }),
-            Err(poisoned) => {
-                let detail =
-                    format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
-                drop(poisoned);
-                Err(anyhow::anyhow!(detail))
-            }
-        };
-        match (maintenance_verdict, close_result) {
-            (Ok(()), close_result) => close_result,
-            (Err(maintenance_error), Ok(_readback)) => Err(maintenance_error.context(
-                "periodic storage-maintenance owner joined with a failure before the Calyx vault was closed; retaining the daemon lifetime locks",
-            )),
-            (Err(maintenance_error), Err(close_error)) => Err(anyhow::anyhow!(
-                "storage-maintenance shutdown failed ({maintenance_error:#}); Calyx vault close also failed ({close_error:#})"
-            )),
-        }
-    } else {
-        Err(anyhow::anyhow!(
-            "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
-        ))
-    };
-    let safe_to_terminate = result
-        .as_ref()
-        .is_ok_and(|readback| readback.safe_to_terminate);
-    tracing::info!(
-        code = "MCP_HTTP_CALYX_VAULT_CLOSE_READBACK",
-        reason,
-        expected_open,
-        safe_to_terminate,
-        result = ?result,
-        "readback=calyx_vault edge=http_shutdown after_flush_close"
-    );
-    (safe_to_terminate, result)
-}
-
 async fn drain_http_operator_owners(
     guard: &mut Option<synapse_action::OperatorHotkeyGuard>,
     reason: &'static str,
@@ -1020,7 +750,6 @@ impl HttpLifetimeOwnerReadback {
             && self.m2_emitter_safe
             && self.activity_owners_quiescent
             && self.win_event_shutdown_history_quiescent
-            && self.calyx_vault_closed
             && self.storage_service_owners_quiescent
             && self.operator_hotkey_quiescent
             && self.operator_panic_k2_tasks_quiescent
@@ -1120,12 +849,7 @@ async fn drain_http_background_tasks(
     // gets its own graceful and post-abort deadlines without serially adding
     // those deadlines to every later task's shutdown latency.
     let outcomes = join_all(tasks.into_iter().map(|(name, mut task)| async move {
-        let stop_timeout = if name == "escalation_worker" {
-            HTTP_ESCALATION_WORKER_STOP_TIMEOUT
-        } else {
-            HTTP_BACKGROUND_TASK_STOP_TIMEOUT
-        };
-        match time::timeout(stop_timeout, &mut task).await {
+        match time::timeout(HTTP_BACKGROUND_TASK_STOP_TIMEOUT, &mut task).await {
             Ok(result) => {
                 let outcome = match result {
                     Ok(()) => (name, true, false, true, None),
@@ -1141,61 +865,33 @@ async fn drain_http_background_tasks(
                 outcome
             }
             Err(_elapsed) => {
-                if name == "escalation_worker" {
-                    // Tier-0/Tier-1 effects cross OS/network boundaries. An
-                    // abort would drop the Rust future while its serialized
-                    // WinRT/HTTP operation can still complete, severing the
-                    // durable classification owner. Leave the exact task live;
-                    // ShutdownTaskOwner::drop moves it to the retained-owner
-                    // registry, which keeps daemon lifetime locks held until
-                    // the terminal join and audit are observed.
-                    return (
-                        name,
-                        false,
-                        false,
-                        false,
-                        Some(format!(
-                            "{name}: did not stop within {} ms after shutdown cancellation; abort prohibited for external side-effect ownership, exact JoinHandle retained until terminal durable reconciliation or process teardown",
-                            stop_timeout.as_millis()
-                        )),
-                    );
-                }
                 task.abort();
                 match time::timeout(HTTP_BACKGROUND_TASK_ABORT_TIMEOUT, &mut task).await {
                     Ok(result) => {
-                        let failure = result.err().map(|error| {
-                            format!(
-                                "{name}: terminal join failed after abort request: {error}"
-                            )
-                        });
-                        let outcome = (name, false, true, true, failure);
+                        let outcome = (
+                            name,
+                            false,
+                            true,
+                            true,
+                            Some(format!(
+                                "{name}: did not stop within {} ms after shutdown cancellation; abort_join={result:?}",
+                                HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis()
+                            )),
+                        );
                         task.acknowledge_terminal_outcome();
                         outcome
                     }
-                    Err(_elapsed) => {
-                        // `transcript_ingest` is a spawn_blocking owner. Tokio
-                        // documents that an already-running blocking task
-                        // cannot be aborted, so dropping its JoinHandle here
-                        // would detach live storage authority. Keep the exact
-                        // owner and await its terminal result. The independent
-                        // process watchdog remains the hard deadline for a
-                        // genuinely non-terminating task.
-                        tracing::warn!(
-                            code = "MCP_HTTP_BACKGROUND_TASK_AWAITING_TERMINAL_JOIN",
-                            task = name,
-                            stop_timeout_ms = stop_timeout.as_millis(),
-                            abort_timeout_ms = HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis(),
-                            "background task missed the nominal stop deadlines; retaining and awaiting its exact JoinHandle before storage and lifetime-lock release"
-                        );
-                        let result = (&mut task).await;
-                        let failure = result.err().map(|error| {
-                            format!(
-                                "{name}: terminal join failed after retained wait: {error}"
-                            )
-                        });
-                        task.acknowledge_terminal_outcome();
-                        (name, false, true, true, failure)
-                    }
+                    Err(_elapsed) => (
+                        name,
+                        false,
+                        true,
+                        false,
+                        Some(format!(
+                            "{name}: did not stop within {} ms after shutdown cancellation and did not join within {} ms after abort; exact JoinHandle retained until process teardown",
+                            HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis(),
+                            HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis()
+                        )),
+                    ),
                 }
             }
         }
@@ -1257,484 +953,7 @@ impl HttpRuntimeStartupFailure {
 }
 
 fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBackgroundTaskOwner {
-    (name, ShutdownTaskOwner::new_unit(name, task))
-}
-
-fn startup_http_router(dispatch: StartupHttpDispatch) -> Router {
-    Router::new()
-        .fallback(startup_http_dispatch)
-        .with_state(dispatch)
-        .layer(middleware::map_response(force_connection_close))
-}
-
-async fn startup_http_dispatch(
-    State(dispatch): State<StartupHttpDispatch>,
-    request: Request<Body>,
-) -> Response {
-    if let Some(app) = dispatch.ready_app.get().cloned() {
-        return app
-            .oneshot(request)
-            .await
-            .unwrap_or_else(|error: Infallible| match error {});
-    }
-
-    if let auth::HttpSecurityDecision::Respond(response) =
-        auth::evaluate_http_security(&dispatch.auth, &request)
-    {
-        return response;
-    }
-
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
-    let phase = match dispatch.phase() {
-        Ok(StartupHttpPhase::Ready) => {
-            tracing::error!(
-                code = "MCP_HTTP_STARTUP_DISPATCH_INCONSISTENT",
-                bind = %dispatch.bind_addr,
-                method = %method,
-                path,
-                "startup dispatch reported ready without a published production router"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [
-                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-                    (header::CONNECTION, HeaderValue::from_static("close")),
-                ],
-                Json(serde_json::json!({
-                    "ok": false,
-                    "status": "error",
-                    "code": "MCP_HTTP_STARTUP_DISPATCH_INCONSISTENT",
-                    "message": "startup dispatch reported ready without a published production router",
-                    "pid": std::process::id(),
-                    "bind": dispatch.bind_addr.to_string(),
-                })),
-            )
-                .into_response();
-        }
-        Ok(phase) => phase,
-        Err(stored_phase) => {
-            tracing::error!(
-                code = "MCP_HTTP_STARTUP_PHASE_CORRUPTED",
-                bind = %dispatch.bind_addr,
-                method = %method,
-                path,
-                stored_phase,
-                "startup dispatch phase contained an unrecognized value"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [
-                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-                    (header::CONNECTION, HeaderValue::from_static("close")),
-                ],
-                Json(serde_json::json!({
-                    "ok": false,
-                    "status": "error",
-                    "code": "MCP_HTTP_STARTUP_PHASE_CORRUPTED",
-                    "message": "startup dispatch phase contained an unrecognized value",
-                    "pid": std::process::id(),
-                    "bind": dispatch.bind_addr.to_string(),
-                    "stored_phase": stored_phase,
-                })),
-            )
-                .into_response();
-        }
-    };
-    let startup_elapsed_ms = wall_clock_millis_now().saturating_sub(dispatch.started_wall_ms);
-    tracing::debug!(
-        code = "MCP_HTTP_STARTUP_REQUEST_REFUSED",
-        bind = %dispatch.bind_addr,
-        method = %method,
-        path,
-        phase = phase.label(),
-        startup_elapsed_ms,
-        retry_after_seconds = HTTP_STARTUP_RETRY_AFTER_SECONDS,
-        "authenticated HTTP request refused while daemon readiness prerequisites are incomplete"
-    );
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (header::RETRY_AFTER, HeaderValue::from_static("1")),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-            (header::CONNECTION, HeaderValue::from_static("close")),
-        ],
-        Json(serde_json::json!({
-            "ok": false,
-            "status": "starting",
-            "code": "MCP_HTTP_STARTING",
-            "message": "daemon readiness prerequisites are still initializing",
-            "phase": phase.label(),
-            "pid": std::process::id(),
-            "bind": dispatch.bind_addr.to_string(),
-            "startup_elapsed_ms": startup_elapsed_ms,
-            "retry_after_seconds": HTTP_STARTUP_RETRY_AFTER_SECONDS,
-        })),
-    )
-        .into_response()
-}
-
-fn ensure_startup_http_server_running(
-    server: &StartupHttpServer,
-    phase: &'static str,
-) -> anyhow::Result<()> {
-    if server.task_finished_hint() {
-        anyhow::bail!(
-            "HTTP startup listener task reached a terminal scheduling state during phase {phase}; its exact terminal result must be consumed by startup cleanup"
-        );
-    }
-    Ok(())
-}
-
-fn configured_http_shutdown_watchdog_timeout() -> anyhow::Result<Duration> {
-    configured_positive_seconds(
-        HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV,
-        HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT,
-    )
-}
-
-/// The absolute ceiling on the extended shutdown wait (#2131).
-///
-/// Fails closed on a ceiling below the stall budget: a ceiling that undercuts
-/// the budget would silently convert the stall-aware wait back into a flat
-/// wall-clock one *shorter* than the one it replaced, which is the opposite of
-/// what an operator raising a ceiling is asking for. Say so and refuse to boot
-/// rather than run a watchdog whose configuration contradicts itself.
-fn configured_http_shutdown_watchdog_max_wait(stall_budget: Duration) -> anyhow::Result<Duration> {
-    let max_wait = configured_positive_seconds(
-        HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV,
-        HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT,
-    )?;
-    if max_wait < stall_budget {
-        anyhow::bail!(
-            "{HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV}={}s is below the stall budget \
-             {HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV}={}s; the ceiling must be at least the budget it \
-             bounds",
-            max_wait.as_secs(),
-            stall_budget.as_secs()
-        );
-    }
-    Ok(max_wait)
-}
-
-fn configured_positive_seconds(name: &'static str, default: Duration) -> anyhow::Result<Duration> {
-    match std::env::var(name) {
-        Ok(raw) => {
-            let secs = raw.trim().parse::<u64>().with_context(|| {
-                format!("{name} must be a positive integer seconds value, got {raw:?}")
-            })?;
-            if secs == 0 {
-                anyhow::bail!("{name} must be at least 1 second");
-            }
-            Ok(Duration::from_secs(secs))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(anyhow::anyhow!("{name} is not valid unicode: {error}")),
-    }
-}
-
-/// One exact sample of Calyx close progress (#2148, #2149).
-///
-/// The atomic snapshot is published at each phase begin and completion. Log
-/// volume and lifecycle-file mtime are deliberately absent: unrelated work must
-/// never buy extra shutdown time for a wedged close.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ShutdownLivenessWitness {
-    close_phase: Option<synapse_calyx::SynapseCalyxClosePhaseSnapshot>,
-}
-
-impl ShutdownLivenessWitness {
-    fn sample() -> Self {
-        Self {
-            close_phase: synapse_calyx::current_close_phase_snapshot(),
-        }
-    }
-
-    /// True only after the exact Calyx close beacon exists.
-    const fn available(&self) -> bool {
-        self.close_phase.is_some()
-    }
-
-    fn describe(&self) -> String {
-        self.close_phase.map_or_else(
-            || "close_phase=none".to_owned(),
-            |snapshot| {
-                format!(
-                    "close_phase={} close_transition={} close_sequence={}",
-                    snapshot.phase, snapshot.transition, snapshot.sequence
-                )
-            },
-        )
-    }
-}
-
-/// Runs the stall-aware watchdog wait and returns the verdict that ended it, or
-/// `None` when the watchdog was disarmed because the shutdown reached a terminal
-/// decision (#2131).
-///
-/// The verdict vocabulary names whether an exact close beacon existed and why
-/// the bounded wait ended.
-///
-/// * `stalled` — the close beacon was readable and stopped advancing for the whole
-///   stall budget. This is the honest kill.
-/// * `ceiling` — exact close phases kept advancing up to the absolute backstop.
-/// * `no_close_phase_witness` — the close had not published its first exact
-///   phase, so the flat budget expired without substituting a proxy signal.
-fn run_http_shutdown_watchdog_wait(
-    disarmed: &AtomicBool,
-    source: &'static str,
-    stall_budget: Duration,
-    max_wait: Duration,
-) -> Option<HttpShutdownWatchdogExpiry> {
-    let armed_at = Instant::now();
-    let ceiling = armed_at + max_wait;
-    let mut deadline = (armed_at + stall_budget).min(ceiling);
-    let mut witness = ShutdownLivenessWitness::sample();
-    let mut last_progress_at = armed_at;
-    let mut progress_observations: u64 = 0;
-    // `None` so the FIRST extension always reports. An operator watching a slow
-    // shutdown needs to know the watchdog decided to wait *at the moment it
-    // decided*, not one rate-limit interval later.
-    let mut last_extension_log_at: Option<Instant> = None;
-
-    loop {
-        if disarmed.load(Ordering::Acquire) {
-            return None;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            let witness_available = witness.available();
-            let verdict = if !witness_available {
-                "no_close_phase_witness"
-            } else if deadline >= ceiling {
-                "ceiling"
-            } else {
-                "stalled"
-            };
-            return Some(HttpShutdownWatchdogExpiry {
-                verdict,
-                waited_ms: u64::try_from(now.saturating_duration_since(armed_at).as_millis())
-                    .unwrap_or(u64::MAX),
-                stalled_ms: u64::try_from(
-                    now.saturating_duration_since(last_progress_at).as_millis(),
-                )
-                .unwrap_or(u64::MAX),
-                progress_observations,
-                witness_available,
-                witness: witness.describe(),
-            });
-        }
-        std::thread::sleep(HTTP_SHUTDOWN_WATCHDOG_POLL_INTERVAL.min(deadline - now));
-        let next = ShutdownLivenessWitness::sample();
-        if next == witness {
-            continue;
-        }
-        if !next.available() {
-            witness = next;
-            continue;
-        }
-        witness = next;
-        progress_observations += 1;
-        last_progress_at = Instant::now();
-        let extended = (last_progress_at + stall_budget).min(ceiling);
-        if extended <= deadline {
-            continue;
-        }
-        deadline = extended;
-        if last_extension_log_at.is_some_and(|logged_at| {
-            last_progress_at.duration_since(logged_at)
-                < HTTP_SHUTDOWN_WATCHDOG_EXTENSION_LOG_INTERVAL
-        }) {
-            continue;
-        }
-        last_extension_log_at = Some(last_progress_at);
-        tracing::warn!(
-            code = "MCP_HTTP_SHUTDOWN_WATCHDOG_EXTENDED",
-            source,
-            waited_ms = last_progress_at.duration_since(armed_at).as_millis(),
-            stall_budget_ms = stall_budget.as_millis(),
-            ceiling_ms = max_wait.as_millis(),
-            remaining_ms = deadline.duration_since(last_progress_at).as_millis(),
-            progress_observations,
-            witness = %witness.describe(),
-            "the commanded shutdown is still advancing its liveness witnesses; extending the \
-             watchdog deadline instead of killing a close that is working"
-        );
-    }
-}
-
-/// Why a stall-aware watchdog wait ended, and the evidence behind it (#2131).
-struct HttpShutdownWatchdogExpiry {
-    verdict: &'static str,
-    waited_ms: u64,
-    stalled_ms: u64,
-    progress_observations: u64,
-    witness_available: bool,
-    witness: String,
-}
-
-fn spawn_http_shutdown_watchdog(
-    bind: SocketAddr,
-    db_path: PathBuf,
-    source: &'static str,
-    timeout: Duration,
-    max_wait: Duration,
-) -> HttpShutdownWatchdog {
-    let disarmed = Arc::new(AtomicBool::new(false));
-    let disarmed_for_thread = Arc::clone(&disarmed);
-    let pid = std::process::id();
-    tracing::warn!(
-        code = "MCP_HTTP_SHUTDOWN_WATCHDOG_ARMED",
-        source,
-        bind = %bind,
-        db_path = %db_path.display(),
-        timeout_ms = timeout.as_millis(),
-        stall_budget_ms = timeout.as_millis(),
-        ceiling_ms = max_wait.as_millis(),
-        pid,
-        "HTTP shutdown watchdog armed; the budget is a STALL budget measured from the last \
-         observed progress, bounded by an absolute ceiling"
-    );
-    let db_path_for_thread = db_path.clone();
-    match std::thread::Builder::new()
-        .name("synapse-http-shutdown-watchdog".to_owned())
-        .spawn(move || {
-            let Some(expiry) = run_http_shutdown_watchdog_wait(
-                &disarmed_for_thread,
-                source,
-                timeout,
-                max_wait,
-            ) else {
-                return;
-            };
-            let close_phase = synapse_calyx::current_close_phase_snapshot();
-            if let Some(snapshot) = close_phase
-                && let Err(error) =
-                    crate::daemon_lifecycle::record_exit_intent(source, snapshot.phase)
-            {
-                tracing::error!(
-                    code = "MCP_HTTP_SHUTDOWN_EXACT_PHASE_PERSIST_FAILED",
-                    source,
-                    phase = snapshot.phase,
-                    phase_transition = snapshot.transition,
-                    phase_sequence = snapshot.sequence,
-                    error = %error,
-                    "the watchdog could read the exact Calyx close phase but could not persist it before forced exit"
-                );
-            }
-            // The phase-one marker, refreshed above with the exact in-flight
-            // Calyx phase when one exists. A watchdog kill after this
-            // marker is `interrupted_graceful` at the next boot, never `clean`
-            // — see `daemon_lifecycle::classify_previous_shutdown`. Reporting it
-            // here means the exit event names the phase that was in progress
-            // without anyone having to correlate two files.
-            let (ending_at_unix_ms, ending_reason, ending_phase) =
-                crate::daemon_lifecycle::current_exit_intent_snapshot().map_or_else(
-                    || (None, "none".to_owned(), "none".to_owned()),
-                    |(at, reason, phase)| (Some(at), reason, phase),
-                );
-            let detail = serde_json::json!({
-                "code": "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
-                "source": source,
-                "bind": bind.to_string(),
-                "db_path": db_path_for_thread.display().to_string(),
-                "pid": pid,
-                "verdict": expiry.verdict,
-                "stall_budget_ms": timeout.as_millis(),
-                "ceiling_ms": max_wait.as_millis(),
-                "waited_ms": expiry.waited_ms,
-                "stalled_ms": expiry.stalled_ms,
-                "progress_observations": expiry.progress_observations,
-                "liveness_witness_available": expiry.witness_available,
-                "liveness_witness": expiry.witness,
-                "calyx_close_phase": close_phase,
-                "ending_at_unix_ms": ending_at_unix_ms,
-                "ending_reason": ending_reason,
-                "ending_phase": ending_phase,
-                "reason": "HTTP shutdown accepted and listener teardown started, but the daemon did not reach a terminal process decision before the stall-aware deadline",
-            });
-            tracing::error!(
-                code = "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
-                source,
-                bind = %bind,
-                db_path = %db_path_for_thread.display(),
-                verdict = expiry.verdict,
-                stall_budget_ms = timeout.as_millis(),
-                ceiling_ms = max_wait.as_millis(),
-                waited_ms = expiry.waited_ms,
-                stalled_ms = expiry.stalled_ms,
-                progress_observations = expiry.progress_observations,
-                liveness_witness_available = expiry.witness_available,
-                ending_phase = %ending_phase,
-                pid,
-                detail = ?detail,
-                "HTTP shutdown watchdog forcing nonzero process exit; the next boot reads this as \
-                 interrupted_graceful when the phase-one marker is present, never as clean"
-            );
-            if let Err(error) = crate::daemon_lifecycle::record_forced_exit_nonblocking(
-                "http_shutdown_watchdog_expired",
-                detail.clone(),
-            ) {
-                eprintln!(
-                    "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXIT_LEDGER_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} error={error:#}",
-                    db_path_for_thread.display(),
-                    timeout.as_millis()
-                );
-            }
-            eprintln!(
-                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED pid={pid} source={source} bind={bind} db_path={} verdict={} stall_budget_ms={} ceiling_ms={} waited_ms={} detail={detail}",
-                db_path_for_thread.display(),
-                expiry.verdict,
-                timeout.as_millis(),
-                max_wait.as_millis(),
-                expiry.waited_ms
-            );
-            std::process::exit(1);
-        }) {
-        Ok(_handle) => {}
-        Err(error) => {
-            let detail = serde_json::json!({
-                "code": "MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED",
-                "source": source,
-                "bind": bind.to_string(),
-                "db_path": db_path.display().to_string(),
-                "pid": pid,
-                "timeout_ms": timeout.as_millis(),
-                "error": error.to_string(),
-            });
-            tracing::error!(
-                code = "MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED",
-                source,
-                bind = %bind,
-                db_path = %db_path.display(),
-                timeout_ms = timeout.as_millis(),
-                pid,
-                error = %error,
-                "failed to arm HTTP shutdown watchdog; forcing nonzero exit because listener-less shutdown cannot be supervised"
-            );
-            if let Err(record_error) = crate::daemon_lifecycle::record_forced_exit_nonblocking(
-                "http_shutdown_watchdog_spawn_failed",
-                detail.clone(),
-            ) {
-                eprintln!(
-                    "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXIT_LEDGER_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} error={record_error:#}",
-                    db_path.display(),
-                    timeout.as_millis()
-                );
-            }
-            eprintln!(
-                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} detail={detail}",
-                db_path.display(),
-                timeout.as_millis()
-            );
-            std::process::exit(1);
-        }
-    }
-    HttpShutdownWatchdog {
-        disarmed,
-        source,
-        timeout,
-    }
+    (name, ShutdownTaskOwner::new(name, task))
 }
 
 fn start_http_runtime(
@@ -1742,7 +961,6 @@ fn start_http_runtime(
     shutdown_cancel: &CancellationToken,
     local_addr: SocketAddr,
     sse_state: SseState,
-    auth: Arc<HttpAuth>,
     active_http_sockets: ActiveHttpSockets,
 ) -> Result<HttpRuntimeStartup, HttpRuntimeStartupFailure> {
     let mut background_tasks = Vec::new();
@@ -1807,27 +1025,6 @@ fn start_http_runtime(
         background_tasks.push(own_http_background_task("armed_routine_runner", task));
     }
 
-    let vault_verifier =
-        match crate::server::operational_facades::hygiene::spawn_periodic_vault_verifier(
-            service.clone(),
-            shutdown_cancel.clone(),
-        )
-        .context("spawn periodic physical vault verifier")
-        {
-            Ok(task) => task,
-            Err(error) => {
-                return Err(HttpRuntimeStartupFailure::new(
-                    "vault_verifier",
-                    error,
-                    background_tasks,
-                    None,
-                ));
-            }
-        };
-    if let Some(task) = vault_verifier {
-        background_tasks.push(own_http_background_task("vault_verifier", task));
-    }
-
     let transcript_ingest =
         match crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
             service.m3_state_handle(),
@@ -1869,30 +1066,6 @@ fn start_http_runtime(
         background_tasks.push(own_http_background_task("ambient_ingest", task));
     }
 
-    // #2097: the second writer of CF_PROCESS_HISTORY. Without it the process
-    // graph lane sees only processes this daemon launched, and can derive
-    // nothing but a star centred on the daemon's own pid.
-    let process_topology_observer =
-        match crate::process_topology::spawn_periodic_process_topology_observer(
-            service.clone(),
-            shutdown_cancel.clone(),
-        )
-        .context("spawn periodic process topology observer")
-        {
-            Ok(task) => task,
-            Err(error) => {
-                return Err(HttpRuntimeStartupFailure::new(
-                    "process_topology_observer",
-                    error,
-                    background_tasks,
-                    None,
-                ));
-            }
-        };
-    if let Some(task) = process_topology_observer {
-        background_tasks.push(own_http_background_task("process_topology_observer", task));
-    }
-
     let operator_hotkey_guard = match crate::safety::install_operator_hotkey(service.clone())
         .context("install operator panic hotkey")
     {
@@ -1911,7 +1084,6 @@ fn start_http_runtime(
         local_addr,
         sse_state,
         service.clone(),
-        auth,
         active_http_sockets,
     )
     .context("build HTTP MCP router")
@@ -1942,7 +1114,6 @@ async fn fail_http_startup_after_service(
     a11y_expected: bool,
     shutdown_cancel: CancellationToken,
     connection_closed_cancel: CancellationToken,
-    startup_server: Option<StartupHttpServer>,
     shell_job_store_lock_guard: crate::single_instance::ShellJobStoreLockGuard,
     single_instance_guard: crate::single_instance::SingleInstanceGuard,
 ) -> anyhow::Result<ExitCode> {
@@ -1964,42 +1135,6 @@ async fn fail_http_startup_after_service(
 
     let mut failures = HttpShutdownFailures::default();
     failures.push(phase, primary_detail.clone());
-
-    let (active_socket_owners_quiescent, server_dispatch_quiescent) = if let Some(
-        mut startup_server,
-    ) = startup_server
-    {
-        let shutdown_on_drop = startup_server
-            .active_http_sockets
-            .begin_shutdown_on_drop("http_startup_failure");
-        let socket_shutdown = startup_server
-            .active_http_sockets
-            .shutdown_all("http_startup_failure");
-        failures.inspect_socket_shutdown(&socket_shutdown);
-        let server_stop =
-            wait_for_server_stop(&mut startup_server.task, "http_startup_failure").await;
-        failures.inspect_result("startup_server_stop", server_stop);
-        let final_socket_count = startup_server.active_http_sockets.final_tracked_count();
-        let active_socket_owners_quiescent = matches!(&final_socket_count, Ok(0));
-        failures.inspect_final_socket_count(final_socket_count);
-        let server_dispatch_quiescent = startup_server.task.terminal_join_observed();
-        if server_dispatch_quiescent {
-            startup_server.task.acknowledge_terminal_outcome();
-        }
-        tracing::info!(
-            code = "MCP_HTTP_STARTUP_SERVER_CLEANUP_READBACK",
-            phase,
-            shutdown_on_drop = ?shutdown_on_drop,
-            socket_shutdown = ?socket_shutdown,
-            active_socket_owners_quiescent,
-            server_dispatch_quiescent,
-            "startup-failure cleanup read back the exact HTTP listener and accepted-socket owners"
-        );
-        drop(startup_server);
-        (active_socket_owners_quiescent, server_dispatch_quiescent)
-    } else {
-        (true, true)
-    };
 
     let operator_panic_k2_owners_before = crate::safety::operator_panic_k2_task_owner_readback();
     let hotkey_report =
@@ -2042,20 +1177,16 @@ async fn fail_http_startup_after_service(
             .map_err(anyhow::Error::new),
     );
 
-    // Stop every independent storage producer before asking the activity
-    // recorder to commit the final session_end boundary. Otherwise transcript
-    // ingestion can retain and mutate the shared Db while the recorder is
-    // trying to establish the terminal ordering boundary.
-    let background_task_drain = drain_http_background_tasks(background_tasks).await;
-    let background_tasks_quiescent = background_task_drain.owners_quiescent();
-    failures.inspect_result("background_task_drain", background_task_drain.verdict());
-
     let activity_drain =
         drain_http_activity_owners(&m3_state, recorder_expected, a11y_expected).await;
     let activity_owners_quiescent = activity_drain.safe_to_unlock();
     let win_event_shutdown_history_quiescent =
         activity_drain.win_event_shutdown_history.owners_quiescent();
     failures.inspect_result("activity_owner_drain", activity_drain.verdict());
+
+    let background_task_drain = drain_http_background_tasks(background_tasks).await;
+    let background_tasks_quiescent = background_task_drain.owners_quiescent();
+    failures.inspect_result("background_task_drain", background_task_drain.verdict());
 
     let m2_emitter_drain =
         drain_m2_emitter_owner(Some(m2_emitter_owner), "http", "http_startup_failure").await;
@@ -2096,10 +1227,6 @@ async fn fail_http_startup_after_service(
         session_registry_readback_ok && session_registry_rows.is_empty();
     let session_input_owners_quiescent = authority_finalizers_quiescent && !lease_after.held;
 
-    let (calyx_vault_closed, calyx_vault_close) =
-        close_http_calyx_vault(&m3_state, "http_startup_failure", false).await;
-    failures.inspect_result("calyx_vault_close", calyx_vault_close.map(|_readback| ()));
-
     drop(service);
     drop(shutdown_cancel);
     drop(connection_closed_cancel);
@@ -2115,13 +1242,12 @@ async fn fail_http_startup_after_service(
         authority_finalizers_quiescent,
         session_input_owners_quiescent,
         session_manager_quiescent,
-        active_socket_owners_quiescent,
-        server_dispatch_quiescent,
+        active_socket_owners_quiescent: true,
+        server_dispatch_quiescent: true,
         background_tasks_quiescent,
         m2_emitter_safe,
         activity_owners_quiescent,
         win_event_shutdown_history_quiescent,
-        calyx_vault_closed,
         storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
         operator_hotkey_quiescent,
         operator_panic_k2_tasks_quiescent,
@@ -2149,8 +1275,6 @@ async fn fail_http_startup_after_service(
                 "authority_finalizers_quiescent": authority_finalizers_quiescent,
                 "session_input_owners_quiescent": session_input_owners_quiescent,
                 "session_manager_quiescent": session_manager_quiescent,
-                "active_socket_owners_quiescent": active_socket_owners_quiescent,
-                "server_dispatch_quiescent": server_dispatch_quiescent,
                 "background_tasks_quiescent": background_tasks_quiescent,
                 "storage_service_owners": storage_owner_readback,
                 "m2_emitter": format!("{m2_emitter_drain:?}"),
@@ -2410,20 +1534,6 @@ impl Listener for TrackedTcpListener {
         loop {
             match self.inner.accept().await {
                 Ok((stream, addr)) => {
-                    #[cfg(windows)]
-                    if let Err(error) =
-                        clear_and_verify_socket_inheritance(&stream, "accepted_http_socket")
-                    {
-                        tracing::error!(
-                            code = "MCP_HTTP_ACCEPTED_SOCKET_INHERITANCE_CLEAR_FAILED",
-                            error = %error,
-                            peer_addr = %addr,
-                            raw_socket = stream.as_raw_socket() as usize,
-                            "refusing an accepted HTTP socket whose inheritance flag could not be cleared and read back"
-                        );
-                        drop(stream);
-                        continue;
-                    }
                     if let Err(error) = stream.set_zero_linger() {
                         tracing::error!(
                             code = "MCP_HTTP_ACCEPTED_SOCKET_ZERO_LINGER_FAILED",
@@ -2499,94 +1609,40 @@ impl AsyncWrite for TrackedTcpStream {
     }
 }
 
-/// A single startup phase whose wall time exceeds this bound emits an
-/// incremental `MCP_STARTUP_PHASE_SLOW` warn edge at the moment it completes,
-/// so a slow cold start (dominated by Calyx vault open, see #1798) is
-/// attributable from the daemon log without waiting for the readiness summary.
-const STARTUP_SLOW_PHASE_THRESHOLD_MS: u128 = 3_000;
-
-fn wall_clock_millis_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|delta| delta.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-/// Monotonic per-phase startup stopwatch (#1773). `serve` marks each startup
-/// milestone (single-instance lock, vault open, listener bind, …); every mark
-/// returns the phase delta and slow phases are logged incrementally, while the
-/// full breakdown is emitted once as `MCP_STARTUP_PHASES_READY` at readiness.
-/// This is attribution only — no timeout or control-flow behavior changes.
-struct StartupPhaseTimer {
-    started: Instant,
-    last: Instant,
-    started_wall_ms: u64,
-    listener_bound: bool,
-}
-
-impl StartupPhaseTimer {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            started: now,
-            last: now,
-            started_wall_ms: wall_clock_millis_now(),
-            listener_bound: false,
-        }
-    }
-
-    /// Close out the phase that ended now, returning its elapsed milliseconds.
-    /// Emits `MCP_STARTUP_PHASE_SLOW` incrementally when the phase overran the
-    /// threshold, tagged with whether the production listener was already bound
-    /// so a pre-bind stall is never confused with a post-bind one.
-    fn mark(&mut self, phase: &'static str) -> u64 {
-        let now = Instant::now();
-        let phase_ms = now.duration_since(self.last).as_millis();
-        let total_ms = now.duration_since(self.started).as_millis();
-        self.last = now;
-        if phase_ms >= STARTUP_SLOW_PHASE_THRESHOLD_MS {
-            tracing::warn!(
-                code = "MCP_STARTUP_PHASE_SLOW",
-                phase,
-                phase_ms = phase_ms as u64,
-                total_ms = total_ms as u64,
-                threshold_ms = STARTUP_SLOW_PHASE_THRESHOLD_MS as u64,
-                listener_bound = self.listener_bound,
-                "startup phase exceeded the slow threshold; clients overlapping a bound phase receive authenticated not-ready responses until production routing is published"
-            );
-        }
-        phase_ms as u64
-    }
-
-    fn total_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-}
-
 pub(super) async fn serve(
-    addr: SocketAddr,
+    bind: &str,
+    allow_non_loopback: bool,
     m2_config: &M2ServiceConfig,
     m3_config: M3ServiceConfig,
     m4_config: M4ServiceConfig,
-    parent_watchdog: Option<tokio::sync::oneshot::Receiver<crate::connect::ParentWatchdogEvent>>,
 ) -> anyhow::Result<ExitCode> {
     synapse_action::install_panic_hook();
-    let mut startup_timer = StartupPhaseTimer::new();
 
-    // Single-instance guard: at most one daemon may own a given vault path.
+    // Validate the bind address first — a pure argument check with no side
+    // effects. Doing this before acquiring the single-instance lock means a
+    // misconfigured non-loopback bind always fails with HTTP_BIND_NON_LOOPBACK_
+    // REFUSED (exit 2), even when another daemon already holds the DB lock
+    // (which would otherwise short-circuit to exit 3 and mask the real problem).
+    let addr = bind
+        .parse::<SocketAddr>()
+        .with_context(|| format!("parse HTTP bind address {bind}"))?;
+    if !addr.ip().is_loopback() && !allow_non_loopback {
+        tracing::error!(
+            code = synapse_core::error_codes::HTTP_BIND_NON_LOOPBACK_REFUSED,
+            bind = %addr,
+            "refusing non-loopback HTTP bind without --allow-non-loopback"
+        );
+        return Ok(ExitCode::from(2));
+    }
+
+    // Single-instance guard: at most one daemon may own a given RocksDB path.
     // Acquired before binding the port or opening storage so a duplicate launch
-    // fails fast with a clear, holder-naming error instead of a storage lock
-    // failure surfacing later inside a tool call.
+    // fails fast with a clear, holder-naming error instead of a cryptic RocksDB
+    // LOCK failure surfacing later inside a tool call.
     let db_path = m3_config
         .db_path
         .clone()
         .unwrap_or_else(crate::m3::default_db_path);
-    let shutdown_watchdog_timeout = configured_http_shutdown_watchdog_timeout()?;
-    // #2131: the ceiling is validated at boot, not at shutdown. A daemon that
-    // discovers its watchdog is misconfigured only while it is trying to die
-    // has discovered it too late to do anything about it.
-    let shutdown_watchdog_max_wait =
-        configured_http_shutdown_watchdog_max_wait(shutdown_watchdog_timeout)?;
     let single_instance_guard = match crate::single_instance::SingleInstanceGuard::acquire(&db_path)
     {
         Ok(guard) => {
@@ -2616,7 +1672,6 @@ pub(super) async fn serve(
             return Err(anyhow::Error::new(err)).context("acquire daemon single-instance lock");
         }
     };
-    let startup_single_instance_ms = startup_timer.mark("single_instance_lock");
 
     let shell_job_root = match crate::m4::shell_job_root_dir() {
         Ok(root) => root,
@@ -2700,8 +1755,6 @@ pub(super) async fn serve(
         );
     }
 
-    let startup_shell_job_lock_ms = startup_timer.mark("shell_job_store_lock");
-
     let lifecycle_paths =
         crate::daemon_lifecycle::configure(crate::daemon_lifecycle::DaemonLifecycleConfig {
             mode: "http",
@@ -2718,7 +1771,6 @@ pub(super) async fn serve(
         exit_events_path = %lifecycle_paths.exit_events_path,
         "daemon lifecycle ledger ready"
     );
-    let startup_lifecycle_ledger_ms = startup_timer.mark("lifecycle_ledger");
 
     // #1568: corrupt durable shell-job evidence is a startup safety gate. Run
     // it after the independent shell-job lifetime lock proves this process owns
@@ -2751,11 +1803,18 @@ pub(super) async fn serve(
         .context("record daemon lifecycle startup corrupt-shell-job recovery failure")?;
         return Ok(ExitCode::from(4));
     }
-    #[cfg(windows)]
-    crate::server::operational_facades::host_transition::reconcile_pending_intent_on_startup();
 
-    let startup_shell_job_reap_ms = startup_timer.mark("shell_job_reap");
-
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
+            bind = %addr,
+            "non-loopback HTTP bind allowed by explicit operator flag"
+        );
+    }
+    let listener = bind_http_listener(addr).await?;
+    let local_addr = listener
+        .local_addr()
+        .context("read HTTP listener address")?;
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
     let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
@@ -2770,166 +1829,31 @@ pub(super) async fn serve(
     .context("initialize shared HTTP service state")?;
     let m3_state_for_recorder = service.m3_state_handle();
     let m2_emitter_owner = take_m2_emitter_owner(&service);
-    // #2090: install OS-shutdown handling as soon as there is state worth
-    // draining and before the listener binds. Registered here rather than in
-    // `main` because the handler thread cannot reach the guards this future
-    // owns; the m3 handle, vault path and shell-job root are exactly what the
-    // bounded drain needs to flush the vault and clear the PID sidecars.
-    // The handle is registered WEAKLY: a strong process-global clone would
-    // permanently inflate the m3 storage owner count that the graceful
-    // `/shutdown` postcondition checks, and every graceful shutdown would fail
-    // closed with retained lifetime locks.
-    #[cfg(windows)]
-    crate::os_shutdown::install(crate::os_shutdown::OsShutdownDrainContext {
-        m3_state: Arc::downgrade(&m3_state_for_recorder),
-        db_path: db_path.clone(),
-        shell_job_root: canonical_shell_job_root.clone(),
-    });
-    let startup_service_init_ms = startup_timer.mark("service_init");
 
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
-            bind = %addr,
-            "non-loopback HTTP bind allowed by explicit operator flag"
-        );
-    }
-    let auth = match HttpAuth::load(addr).context("load HTTP bearer token") {
-        Ok(auth) => Arc::new(auth),
-        Err(error) => {
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new("http_auth", error, Vec::new(), None),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                None,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        }
-    };
-    tracing::info!(
-        code = "MCP_HTTP_AUTH_CONFIGURED",
-        source = auth.source_label(),
-        "HTTP bearer token configured before startup listener bind"
-    );
-    tracing::info!(
-        code = "MCP_HTTP_PRE_BIND",
-        bind = %addr,
-        startup_elapsed_ms = startup_timer.total_ms(),
-        listener_bound = false,
-        "about to bind the authenticated HTTP startup listener; no listener is bound at this point in startup"
-    );
-    let listener = match bind_http_listener(addr).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new("listener_bind", error, Vec::new(), None),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                None,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        }
-    };
-    startup_timer.listener_bound = true;
-    let startup_listener_bind_ms = startup_timer.mark("listener_bind");
-    let listener_bind_at_wall_ms = wall_clock_millis_now();
-    let local_addr = match listener.local_addr().context("read HTTP listener address") {
-        Ok(local_addr) => local_addr,
-        Err(error) => {
-            drop(listener);
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "listener_address_readback",
-                    error,
-                    Vec::new(),
-                    None,
-                ),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                None,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        }
-    };
-    let active_http_sockets = ActiveHttpSockets::default();
-    let startup_dispatch =
-        StartupHttpDispatch::new(local_addr, startup_timer.started_wall_ms, Arc::clone(&auth));
-    let startup_app = startup_http_router(startup_dispatch.clone());
-    let startup_server = StartupHttpServer {
-        task: ShutdownTaskOwner::new(
-            "http_server_dispatch",
-            spawn_server(
-                listener,
-                startup_app,
-                shutdown_cancel.clone(),
-                active_http_sockets.clone(),
-            ),
-        ),
-        active_http_sockets: active_http_sockets.clone(),
-    };
-    tracing::info!(
-        code = "MCP_HTTP_STARTUP_LISTENER_STARTED",
-        bind = %local_addr,
-        phase = StartupHttpPhase::StorageCalyxOpen.label(),
-        startup_elapsed_ms = startup_timer.total_ms(),
-        retry_after_seconds = HTTP_STARTUP_RETRY_AFTER_SECONDS,
-        "authenticated startup listener is serving truthful not-ready responses"
-    );
-
-    // Eager storage and Calyx vault open: validate lock/schema/vault state
-    // while the authenticated startup listener returns a bounded, truthful 503.
-    // The production router remains unpublished, so no request can reach
-    // partially initialized service state.
-    //
-    // Periodic maintenance is started after the recorder/router startup
-    // preflights below, otherwise its first Calyx GC tick can hold the vault and
-    // block those preflights before the HTTP server becomes reachable.
+    // Eager storage open + maintenance startup: validate RocksDB and retain the
+    // periodic GC/pressure task handles before serving any MCP request, so a
+    // lock/schema/task/probe fault fails fast instead of reporting healthy
+    // storage while retention is inert. The handle is cached and reused by the
+    // reflex runtime, so there is no open-then-reopen race.
     {
-        tracing::info!(
-            code = "MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START",
-            db_path = %db_path.display(),
-            "daemon storage and Calyx vault eager startup open starting"
-        );
-        let open_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(state.ensure_storage().map_err(anyhow::Error::new).and_then(
-                |_| {
-                    let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
-                    crate::m3::record_calyx_vault_status_event(&status, "opened")?;
-                    Ok(())
-                },
-            )),
+        let open_or_maintenance_result = match m3_state_for_recorder.lock() {
+            Ok(mut state) => Some(
+                state
+                    .ensure_storage()
+                    .and_then(|_| state.ensure_storage_maintenance_tasks()),
+            ),
             Err(poisoned) => {
                 drop(poisoned);
                 None
             }
         };
-        let Some(open_result) = open_result else {
+        let Some(open_or_maintenance_result) = open_or_maintenance_result else {
+            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_state_lock",
                     anyhow::anyhow!(
-                        "m3 service state lock poisoned during startup storage/Calyx open"
+                        "m3 service state lock poisoned during startup storage open/maintenance"
                     ),
                     Vec::new(),
                     None,
@@ -2941,32 +1865,32 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
-                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
             .await;
         };
-        if let Err(error) = open_result {
-            let detail = format!("{error:#}");
+        if let Err(error) = open_or_maintenance_result {
+            let detail = error.to_string();
             if detail.to_lowercase().contains("lock") {
                 tracing::error!(
                     code = "STORAGE_LOCK_CONTENDED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage or Calyx lock is held by another process; inspect the named lock holder, or point this daemon at a different durable path"
+                    "refusing to start: RocksDB storage lock is held by another process; run `synapse-mcp doctor` to find and stop the holder, or point this daemon at a different --db path"
                 );
             } else {
                 tracing::error!(
-                    code = "STORAGE_OR_CALYX_OPEN_START_FAILED",
+                    code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage open or Calyx vault startup failed at daemon startup"
+                    "refusing to start: storage open/maintenance startup failed at daemon startup"
                 );
             }
+            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
-                    "storage_or_calyx_open_start",
+                    "storage_open_or_maintenance_start",
                     anyhow::anyhow!(detail),
                     Vec::new(),
                     None,
@@ -2978,43 +1902,17 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
-                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
             .await;
         }
         tracing::info!(
-            code = "MCP_DAEMON_STORAGE_AND_CALYX_OPENED",
+            code = "MCP_DAEMON_STORAGE_OPENED_AND_MAINTENANCE_STARTED",
             db_path = %db_path.display(),
-            "daemon storage and Calyx vault opened eagerly at startup"
+            "daemon storage opened eagerly and storage maintenance tasks started at startup"
         );
     }
-    // Vault open dominates cold start (#1798): capture its isolated cost so a
-    // handshake that overlaps a slow cold open is attributable to this phase.
-    let startup_storage_calyx_open_ms = startup_timer.mark("storage_calyx_open");
-    if let Err(error) = ensure_startup_http_server_running(&startup_server, "storage_calyx_open") {
-        return fail_http_startup_after_service(
-            HttpRuntimeStartupFailure::new(
-                "startup_listener_storage_calyx_open",
-                error,
-                Vec::new(),
-                None,
-            ),
-            service,
-            m3_state_for_recorder,
-            m2_emitter_owner,
-            false,
-            false,
-            shutdown_cancel,
-            connection_closed_cancel,
-            Some(startup_server),
-            shell_job_store_lock_guard,
-            single_instance_guard,
-        )
-        .await;
-    }
-    startup_dispatch.set_phase(StartupHttpPhase::ActivityRecorder);
 
     // Always-on activity recorder (#837): started eagerly so the operator
     // timeline records whenever the daemon runs, before any tool call can
@@ -3029,6 +1927,7 @@ pub(super) async fn serve(
             }
         };
         let Some(recorder_result) = recorder_result else {
+            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "activity_recorder_state_lock",
@@ -3045,7 +1944,6 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
-                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -3059,6 +1957,7 @@ pub(super) async fn serve(
                 detail = %detail,
                 "refusing to start: activity recorder failed at daemon startup"
             );
+            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "activity_recorder_start",
@@ -3073,7 +1972,6 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
-                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -3084,29 +1982,8 @@ pub(super) async fn serve(
             "activity recorder started eagerly at startup"
         );
     }
-    let startup_activity_recorder_ms = startup_timer.mark("activity_recorder");
-    if let Err(error) = ensure_startup_http_server_running(&startup_server, "activity_recorder") {
-        return fail_http_startup_after_service(
-            HttpRuntimeStartupFailure::new(
-                "startup_listener_activity_recorder",
-                error,
-                Vec::new(),
-                None,
-            ),
-            service,
-            m3_state_for_recorder,
-            m2_emitter_owner,
-            true,
-            true,
-            shutdown_cancel,
-            connection_closed_cancel,
-            Some(startup_server),
-            shell_job_store_lock_guard,
-            single_instance_guard,
-        )
-        .await;
-    }
-    startup_dispatch.set_phase(StartupHttpPhase::RuntimeStart);
+
+    let active_http_sockets = ActiveHttpSockets::default();
     let HttpRuntimeStartup {
         mut background_tasks,
         mut operator_hotkey_guard,
@@ -3116,11 +1993,11 @@ pub(super) async fn serve(
         &shutdown_cancel,
         local_addr,
         sse_state,
-        Arc::clone(&auth),
         active_http_sockets.clone(),
     ) {
         Ok(startup) => startup,
         Err(failure) => {
+            drop(listener);
             return fail_http_startup_after_service(
                 failure,
                 service,
@@ -3130,182 +2007,13 @@ pub(super) async fn serve(
                 true,
                 shutdown_cancel,
                 connection_closed_cancel,
-                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
             .await;
         }
     };
-    let startup_runtime_start_ms = startup_timer.mark("runtime_start");
-    background_tasks.append(&mut runtime.background_tasks);
-    if let Err(error) = ensure_startup_http_server_running(&startup_server, "runtime_start") {
-        return fail_http_startup_after_service(
-            HttpRuntimeStartupFailure::new(
-                "startup_listener_runtime_start",
-                error,
-                background_tasks,
-                operator_hotkey_guard,
-            ),
-            service,
-            m3_state_for_recorder,
-            m2_emitter_owner,
-            true,
-            true,
-            shutdown_cancel,
-            connection_closed_cancel,
-            Some(startup_server),
-            shell_job_store_lock_guard,
-            single_instance_guard,
-        )
-        .await;
-    }
-    startup_dispatch.set_phase(StartupHttpPhase::StorageMaintenance);
-
-    {
-        let maintenance_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(
-                state
-                    .ensure_storage_maintenance_tasks()
-                    .map_err(anyhow::Error::new),
-            ),
-            Err(poisoned) => {
-                drop(poisoned);
-                None
-            }
-        };
-        let Some(maintenance_result) = maintenance_result else {
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "storage_maintenance_state_lock",
-                    anyhow::anyhow!(
-                        "m3 service state lock poisoned during startup storage maintenance start"
-                    ),
-                    background_tasks,
-                    operator_hotkey_guard,
-                ),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                true,
-                true,
-                shutdown_cancel,
-                connection_closed_cancel,
-                Some(startup_server),
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        };
-        if let Err(error) = maintenance_result {
-            let detail = format!("{error:#}");
-            tracing::error!(
-                code = "STORAGE_MAINTENANCE_START_FAILED_AFTER_HTTP_READY_PREREQS",
-                db_path = %db_path.display(),
-                detail = %detail,
-                "refusing to start: storage maintenance failed after HTTP readiness prerequisites completed"
-            );
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "storage_maintenance_start_after_http_ready_prereqs",
-                    anyhow::anyhow!(detail),
-                    background_tasks,
-                    operator_hotkey_guard,
-                ),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                true,
-                true,
-                shutdown_cancel,
-                connection_closed_cancel,
-                Some(startup_server),
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        }
-        tracing::info!(
-            code = "MCP_DAEMON_STORAGE_MAINTENANCE_STARTED_AFTER_HTTP_READY_PREREQS",
-            db_path = %db_path.display(),
-            "daemon storage maintenance started after HTTP readiness prerequisites completed"
-        );
-    }
-    let startup_maintenance_start_ms = startup_timer.mark("maintenance_start");
     let m2_emitter_done = m2_emitter_owner.done_receiver();
-    if let Err(error) = ensure_startup_http_server_running(&startup_server, "maintenance_start") {
-        return fail_http_startup_after_service(
-            HttpRuntimeStartupFailure::new(
-                "startup_listener_maintenance_start",
-                error,
-                background_tasks,
-                operator_hotkey_guard,
-            ),
-            service,
-            m3_state_for_recorder,
-            m2_emitter_owner,
-            true,
-            true,
-            shutdown_cancel,
-            connection_closed_cancel,
-            Some(startup_server),
-            shell_job_store_lock_guard,
-            single_instance_guard,
-        )
-        .await;
-    }
-    if let Err(error) = startup_dispatch.publish_ready(runtime.app.clone()) {
-        return fail_http_startup_after_service(
-            HttpRuntimeStartupFailure::new(
-                "production_router_publish",
-                error,
-                background_tasks,
-                operator_hotkey_guard,
-            ),
-            service,
-            m3_state_for_recorder,
-            m2_emitter_owner,
-            true,
-            true,
-            shutdown_cancel,
-            connection_closed_cancel,
-            Some(startup_server),
-            shell_job_store_lock_guard,
-            single_instance_guard,
-        )
-        .await;
-    }
-    // The server router owns the only dispatch gate needed after publication.
-    // Do not retain a second production Router clone in this startup frame;
-    // shutdown owner-count readbacks must be able to observe it disappear when
-    // the exact server task joins.
-    drop(startup_dispatch);
-
-    // #1773: single structured readiness record attributing where startup time
-    // went, phase by phase, in one line. Vault open (`storage_calyx_open_ms`)
-    // dominates cold start; `listener_bind_at_wall_ms` is the exact wall-clock
-    // moment the port became bound so a client that timed out can be placed
-    // before or after bind from the daemon log alone.
-    tracing::info!(
-        code = "MCP_STARTUP_PHASES_READY",
-        bind = %local_addr,
-        listener_bound = true,
-        total_ms = startup_timer.total_ms(),
-        startup_began_at_wall_ms = startup_timer.started_wall_ms,
-        listener_bind_at_wall_ms,
-        single_instance_lock_ms = startup_single_instance_ms,
-        shell_job_store_lock_ms = startup_shell_job_lock_ms,
-        lifecycle_ledger_ms = startup_lifecycle_ledger_ms,
-        shell_job_reap_ms = startup_shell_job_reap_ms,
-        service_init_ms = startup_service_init_ms,
-        storage_calyx_open_ms = startup_storage_calyx_open_ms,
-        activity_recorder_ms = startup_activity_recorder_ms,
-        listener_bind_ms = startup_listener_bind_ms,
-        runtime_start_ms = startup_runtime_start_ms,
-        maintenance_start_ms = startup_maintenance_start_ms,
-        slow_phase_threshold_ms = STARTUP_SLOW_PHASE_THRESHOLD_MS as u64,
-        "daemon startup reached readiness; per-phase startup timings attributed"
-    );
 
     tracing::info!(
         code = "MCP_HTTP_STARTED",
@@ -3314,17 +2022,18 @@ pub(super) async fn serve(
     );
 
     let shutdown_cancel_for_http_endpoint = shutdown_cancel.clone();
-    let StartupHttpServer {
-        task: mut server_task,
-        active_http_sockets: startup_server_sockets,
-    } = startup_server;
-    drop(startup_server_sockets);
+    let mut server_task = ShutdownTaskOwner::new(
+        "http_server_dispatch",
+        spawn_server(
+            listener,
+            runtime.app.clone(),
+            shutdown_cancel.clone(),
+            active_http_sockets.clone(),
+        ),
+    );
     let m2_done_after_server_stop = m2_emitter_done.clone();
     let m2_done_after_signal = m2_emitter_done.clone();
-    let m2_done_after_parent = m2_emitter_done.clone();
     let m2_done_after_http_endpoint = m2_emitter_done;
-    let parent_watchdog = crate::connect::wait_for_parent_watchdog(parent_watchdog);
-    tokio::pin!(parent_watchdog);
     let (
         code,
         shutdown_source,
@@ -3332,7 +2041,6 @@ pub(super) async fn serve(
         authority_finalizers_quiescent,
         session_input_owners_quiescent,
         operator_owner_drain,
-        shutdown_watchdog,
     ) = tokio::select! {
         result = &mut server_task => {
             let mut failures = HttpShutdownFailures::default();
@@ -3345,13 +2053,6 @@ pub(super) async fn serve(
             } else {
                 "server_task_unexpected_stop"
             };
-            let shutdown_watchdog = spawn_http_shutdown_watchdog(
-                local_addr,
-                db_path.clone(),
-                source,
-                shutdown_watchdog_timeout,
-                shutdown_watchdog_max_wait,
-            );
             if shutdown_was_requested {
                 tracing::info!(
                     code = "MCP_HTTP_SERVER_STOPPED",
@@ -3421,137 +2122,17 @@ pub(super) async fn serve(
                     "HTTP MCP transport stopped without a shutdown request",
                 );
             }
-            let exit_code = if shutdown_was_requested {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            };
             (
-                exit_code,
+                ExitCode::SUCCESS,
                 source,
                 failures,
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
-                shutdown_watchdog,
-            )
-        }
-        parent_event = &mut parent_watchdog => {
-            let mut failures = HttpShutdownFailures::default();
-            let (source, exit_code) = match parent_event {
-                crate::connect::ParentWatchdogEvent::ParentExited {
-                    parent_pid,
-                    parent_creation_time_100ns,
-                } => {
-                    tracing::warn!(
-                        code = "MCP_HTTP_PARENT_EXITED",
-                        source = "parent_exit",
-                        parent_pid,
-                        parent_creation_time_100ns,
-                        "the exact HTTP daemon lifecycle owner exited; beginning ordinary graceful shutdown"
-                    );
-                    ("parent_exit", ExitCode::SUCCESS)
-                }
-                crate::connect::ParentWatchdogEvent::Failed {
-                    code,
-                    parent_pid,
-                    detail,
-                } => {
-                    tracing::error!(
-                        code,
-                        source = "parent_watchdog_failure",
-                        parent_pid,
-                        detail = %detail,
-                        "the exact HTTP parent watchdog failed; draining the daemon and returning nonzero"
-                    );
-                    failures.push(
-                        "parent_watchdog",
-                        format!("code={code} parent_pid={parent_pid:?} detail={detail}"),
-                    );
-                    ("parent_watchdog_failure", ExitCode::from(1))
-                }
-            };
-            let shutdown_watchdog = spawn_http_shutdown_watchdog(
-                local_addr,
-                db_path.clone(),
-                source,
-                shutdown_watchdog_timeout,
-                shutdown_watchdog_max_wait,
-            );
-            let drain = runtime.drain_state.mark_draining(source);
-            let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop(source);
-            tracing::warn!(
-                code = "MCP_HTTP_SOCKET_SHUTDOWN_ON_DROP_ENABLED",
-                source,
-                shutdown_on_drop = ?shutdown_on_drop,
-                "accepted HTTP socket drop now performs socket shutdown during parent-owned daemon drain"
-            );
-            shutdown_cancel.cancel();
-            connection_closed_cancel.cancel();
-            let operator_owner_drain =
-                drain_http_operator_owners(&mut operator_hotkey_guard, source).await;
-            let session_close =
-                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, source).await;
-            tracing::warn!(
-                code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
-                source,
-                session_close = ?session_close,
-                "active MCP sessions received close attempts after exact parent termination"
-            );
-            failures.inspect_session_close(&session_close);
-            let socket_shutdown = active_http_sockets.shutdown_all(source);
-            tracing::warn!(
-                code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
-                source,
-                socket_shutdown = ?socket_shutdown,
-                "accepted HTTP sockets explicitly shut down during parent-owned daemon drain"
-            );
-            failures.inspect_socket_shutdown(&socket_shutdown);
-            let server_stop = wait_for_server_stop(&mut server_task, source).await;
-            let cleanup = cleanup_active_session_inputs_for_shutdown(
-                &runtime.session_lifecycle,
-                &runtime.session_manager,
-                &session_close.session_ids,
-                source,
-            )
-            .await;
-            tracing::info!(
-                code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
-                source,
-                drain = ?drain,
-                cleanup = ?cleanup,
-                "readback=session_input_ownership edge=parent_shutdown after_cleanup"
-            );
-            let authority_finalizers_quiescent =
-                cleanup.authority_finalizer_owners_quiescent();
-            let session_input_owners_quiescent = cleanup.all_input_owners_quiescent();
-            failures.inspect_input_cleanup(&cleanup);
-            let emitter_drain =
-                wait_for_m2_emitter_done(m2_done_after_parent, "http", source).await;
-            failures.inspect_result("server_stop", server_stop);
-            failures.inspect_result(
-                "m2_emitter_drain",
-                emitter_drain.context("drain M2 emitter after exact HTTP parent termination"),
-            );
-            (
-                exit_code,
-                source,
-                failures,
-                authority_finalizers_quiescent,
-                session_input_owners_quiescent,
-                operator_owner_drain,
-                shutdown_watchdog,
             )
         }
         signal = wait_for_shutdown_signal("http") => {
             let mut failures = HttpShutdownFailures::default();
-            let shutdown_watchdog = spawn_http_shutdown_watchdog(
-                local_addr,
-                db_path.clone(),
-                "signal",
-                shutdown_watchdog_timeout,
-                shutdown_watchdog_max_wait,
-            );
             if let Err(error) = &signal {
                 tracing::error!(
                     code = "MCP_HTTP_SHUTDOWN_SIGNAL_WAIT_FAILED",
@@ -3628,18 +2209,10 @@ pub(super) async fn serve(
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
-                shutdown_watchdog,
             )
         }
         _ = shutdown_cancel_for_http_endpoint.cancelled() => {
             let mut failures = HttpShutdownFailures::default();
-            let shutdown_watchdog = spawn_http_shutdown_watchdog(
-                local_addr,
-                db_path.clone(),
-                "http_endpoint",
-                shutdown_watchdog_timeout,
-                shutdown_watchdog_max_wait,
-            );
             // The `/shutdown` handler marks drain state, returns its ACCEPTED
             // response, and only cancels this token after
             // DRAIN_RESPONSE_GRACE_TIMEOUT. Reaching this branch therefore
@@ -3709,13 +2282,12 @@ pub(super) async fn serve(
                 emitter_drain.context("drain M2 emitter after HTTP endpoint shutdown"),
             );
             (
-                ExitCode::from(1),
+                ExitCode::SUCCESS,
                 "http_endpoint",
                 failures,
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
-                shutdown_watchdog,
             )
         }
     };
@@ -3756,14 +2328,19 @@ pub(super) async fn serve(
         "readback=local_session_manager edge=http_server_stopped after_cleanup"
     );
     shutdown_failures.inspect_final_session_ids(&final_session_ids);
+    // Stop the WinEvent source before the recorder so session_end is the final
+    // timeline row, then require terminal readback from all Tokio/OS owners.
+    let activity_drain = drain_http_activity_owners(&m3_state_for_recorder, true, true).await;
+    let activity_owners_quiescent = activity_drain.safe_to_unlock();
+    let win_event_shutdown_history_quiescent =
+        activity_drain.win_event_shutdown_history.owners_quiescent();
+    shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
+
     let m2_emitter_drain =
         drain_m2_emitter_owner(Some(m2_emitter_owner), "http", shutdown_source).await;
     let m2_emitter_safe = m2_emitter_drain.safe_to_unlock();
     shutdown_failures.inspect_result("m2_emitter_owner_join", m2_emitter_drain.verdict());
-    // Stop every independent storage producer before asking the activity
-    // recorder to commit the final session_end boundary. The recorder itself
-    // stops its WinEvent/idle/cadence producers before that write, preserving
-    // the invariant that session_end is the last timeline row.
+    background_tasks.append(&mut runtime.background_tasks);
     let background_task_drain = drain_http_background_tasks(background_tasks).await;
     let background_tasks_quiescent = background_task_drain.owners_quiescent();
     tracing::info!(
@@ -3780,24 +2357,9 @@ pub(super) async fn serve(
             .context("drain HTTP daemon background tasks before releasing lifetime locks"),
     );
 
-    let activity_drain = drain_http_activity_owners(&m3_state_for_recorder, true, true).await;
-    let activity_owners_quiescent = activity_drain.safe_to_unlock();
-    let win_event_shutdown_history_quiescent =
-        activity_drain.win_event_shutdown_history.owners_quiescent();
-    shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
-
-    let (calyx_vault_closed, calyx_vault_close) =
-        close_http_calyx_vault(&m3_state_for_recorder, shutdown_source, true).await;
-    shutdown_failures.inspect_result(
-        "calyx_vault_close",
-        calyx_vault_close
-            .map(|_readback| ())
-            .context("flush and close Calyx vault before releasing lifetime locks"),
-    );
-
-    // The custom daemon lock must outlive every storage/service owner. Dropping
+    // The custom daemon lock must outlive every RocksDB/service owner. Dropping
     // these Arcs and callbacks before unlock prevents a successor from winning
-    // daemon.lock only to collide with this process's still-live vault lock.
+    // daemon.lock only to collide with this process's still-live RocksDB LOCK.
     drop(runtime);
     drop(service);
     drop(shutdown_cancel);
@@ -3826,7 +2388,6 @@ pub(super) async fn serve(
         m2_emitter_safe,
         activity_owners_quiescent,
         win_event_shutdown_history_quiescent,
-        calyx_vault_closed,
         storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
         operator_hotkey_quiescent,
         operator_panic_k2_tasks_quiescent,
@@ -3912,16 +2473,13 @@ pub(super) async fn serve(
         pid = std::process::id(),
         "daemon lifecycle graceful HTTP service completion written"
     );
-    let exit_code_for_log = u8::from(shutdown_source == "http_endpoint");
     tracing::info!(
         code = "MCP_HTTP_PROCESS_EXIT_DECISION",
         source = "http_service_completed",
         pid = std::process::id(),
-        exit_code = exit_code_for_log,
-        restart_requested = shutdown_source == "http_endpoint",
-        "HTTP daemon process returning after graceful shutdown"
+        exit_code = 0,
+        "HTTP daemon process returning success after graceful shutdown"
     );
-    shutdown_watchdog.disarm("http_service_completed");
     Ok(code)
 }
 
@@ -3929,60 +2487,12 @@ async fn bind_http_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind HTTP MCP transport to {addr}"))?;
-    #[cfg(windows)]
-    clear_and_verify_socket_inheritance(&listener, "http_listener")
-        .with_context(|| format!("make HTTP MCP listener {addr} non-inheritable"))?;
-    // #1773: record the exact wall-clock instant the port became bound. The
-    // issue's independent readback saw no listener on 7700; this edge is the
-    // definitive proof-of-bind (and its absence, definitive proof of no-bind).
     tracing::info!(
         code = "MCP_HTTP_BIND_NORMAL",
         bind = %addr,
-        bound_at_wall_ms = wall_clock_millis_now(),
-        listener_bound = true,
         "HTTP listener bound with normal bind path"
     );
     Ok(listener)
-}
-
-#[cfg(windows)]
-fn clear_and_verify_socket_inheritance<T>(socket: &T, socket_role: &'static str) -> io::Result<()>
-where
-    T: AsRawSocket,
-{
-    let raw_socket = socket.as_raw_socket();
-    let handle = HANDLE(raw_socket as *mut std::ffi::c_void);
-    unsafe {
-        SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(|error| {
-            io::Error::other(format!(
-                "{socket_role} raw_socket={} SetHandleInformation(HANDLE_FLAG_INHERIT=0) failed: {error}",
-                raw_socket as usize
-            ))
-        })?;
-    }
-
-    let mut flags = 0_u32;
-    unsafe { GetHandleInformation(handle, &raw mut flags) }.map_err(|error| {
-        io::Error::other(format!(
-            "{socket_role} raw_socket={} GetHandleInformation readback failed: {error}",
-            raw_socket as usize
-        ))
-    })?;
-    if flags & HANDLE_FLAG_INHERIT.0 != 0 {
-        return Err(io::Error::other(format!(
-            "{socket_role} raw_socket={} remained inheritable after SetHandleInformation; flags={flags:#x}",
-            raw_socket as usize
-        )));
-    }
-
-    tracing::debug!(
-        code = "MCP_HTTP_SOCKET_INHERITANCE_CLEARED",
-        socket_role,
-        raw_socket = raw_socket as usize,
-        handle_flags = flags,
-        "HTTP socket handle is non-inheritable"
-    );
-    Ok(())
 }
 
 fn router(
@@ -3990,9 +2500,14 @@ fn router(
     bind_addr: SocketAddr,
     sse_state: SseState,
     service: SynapseService,
-    auth: Arc<HttpAuth>,
     active_http_sockets: ActiveHttpSockets,
 ) -> anyhow::Result<HttpRouterRuntime> {
+    let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
+    tracing::info!(
+        code = "MCP_HTTP_AUTH_CONFIGURED",
+        source = auth.source_label(),
+        "HTTP bearer token configured"
+    );
     let health_service = Arc::new(service.clone());
     let drain_state = service.drain_state_handle();
     let session_registry = service.session_registry_handle();
@@ -4010,14 +2525,6 @@ fn router(
         .map_err(|detail| anyhow::anyhow!("agent liveness configuration invalid: {detail}"))?;
     crate::server::agent_state::rebuild_from_journal(&agent_events_db)
         .context("rebuild agent state tracker from CF_AGENT_EVENTS")?;
-    crate::server::escalation::reconcile_transition_projections(&agent_events_db).map_err(
-        |error| {
-            anyhow::anyhow!(
-                "reconcile durable transition projections before serving MCP traffic: {}",
-                error.message
-            )
-        },
-    )?;
     // Install process-global projections only after every fallible router
     // preflight has passed. Both sinks are non-owning/one-shot callbacks and no
     // fallible return remains after this point.
@@ -4085,14 +2592,8 @@ fn router(
             post(crate::chrome_debugger_bridge::http_register),
         )
         .route(
-            "/chrome-debugger/native/reconnect-probe",
-            get(crate::chrome_debugger_bridge::http_reconnect_probe),
-        )
-        .route(
             "/chrome-debugger/native/message",
-            post(crate::chrome_debugger_bridge::http_message).layer(DefaultBodyLimit::max(
-                crate::chrome_debugger_bridge::NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES,
-            )),
+            post(crate::chrome_debugger_bridge::http_message),
         )
         .route(
             "/chrome-debugger/native/next",
@@ -4408,22 +2909,9 @@ fn spawn_stale_session_input_cleanup(
     session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
     shutdown_cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    let reap_after = abandoned_session_reap_after();
     tokio::spawn(async move {
         let mut interval = time::interval(STALE_SESSION_INPUT_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut lifecycle_interval = time::interval(STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL);
-        lifecycle_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut reap_interval = time::interval(ABANDONED_SESSION_REAP_INTERVAL);
-        reap_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut teardown_backoff = StaleTeardownBackoff::default();
-        tracing::info!(
-            code = "MCP_HTTP_SESSION_ABANDONED_REAPER_STARTED",
-            reap_after_ms = reap_after.map(|d| d.as_millis() as u64),
-            scan_interval_ms = ABANDONED_SESSION_REAP_INTERVAL.as_millis() as u64,
-            enabled = reap_after.is_some(),
-            "abandoned HTTP session reaper running"
-        );
         loop {
             tokio::select! {
                 _ = shutdown_cancel.cancelled() => {
@@ -4434,129 +2922,14 @@ fn spawn_stale_session_input_cleanup(
                     break;
                 }
                 _ = interval.tick() => {
-                    session_lifecycle.cleanup_expired_lease_inputs_once().await;
-                }
-                _ = lifecycle_interval.tick() => {
                     cleanup_stale_session_resources_once(
                         &session_lifecycle,
                         &session_manager,
-                        &mut teardown_backoff,
                     ).await;
-                }
-                _ = reap_interval.tick() => {
-                    if let Some(reap_after) = reap_after {
-                        reap_abandoned_http_sessions_once(
-                            &session_lifecycle,
-                            &session_manager,
-                            reap_after,
-                        ).await;
-                    }
                 }
             }
         }
     })
-}
-
-/// Resolve the idle-abandonment budget for HTTP session reaping. `Some(0)` from
-/// the operator disables the reaper; an invalid value falls back to the
-/// evidence-derived default. See `ABANDONED_SESSION_REAP_AFTER_DEFAULT`.
-fn abandoned_session_reap_after() -> Option<Duration> {
-    match std::env::var(ABANDONED_SESSION_REAP_AFTER_ENV) {
-        Err(_) => Some(ABANDONED_SESSION_REAP_AFTER_DEFAULT),
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(secs) => Some(Duration::from_secs(secs)),
-            Err(_) => {
-                tracing::warn!(
-                    code = "MCP_HTTP_SESSION_ABANDON_REAP_ENV_INVALID",
-                    env = ABANDONED_SESSION_REAP_AFTER_ENV,
-                    raw = %raw,
-                    default_secs = ABANDONED_SESSION_REAP_AFTER_DEFAULT.as_secs(),
-                    "invalid abandoned-session reap override; using evidence-derived default"
-                );
-                Some(ABANDONED_SESSION_REAP_AFTER_DEFAULT)
-            }
-        },
-    }
-}
-
-/// #1800: proactively evict rmcp-registered HTTP sessions that have made no MCP
-/// request for longer than `reap_after`, so abandoned client/FSV sessions never
-/// accumulate into shutdown work. Each reap removes the session from the rmcp
-/// manager (closing its transport), tears down its lifecycle-owned resources,
-/// and emits one structured record naming the session, its age, its idle age,
-/// and its last activity. Live spawned-agent sessions are excluded by the
-/// candidate scan's process probe.
-async fn reap_abandoned_http_sessions_once(
-    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
-    session_manager: &LocalSessionManager,
-    reap_after: Duration,
-) {
-    let now = crate::server::session_registry::unix_time_ms_now();
-    let reap_after_ms = reap_after.as_millis() as u64;
-    let active_sessions = active_http_session_ids(session_manager).await;
-    if active_sessions.is_empty() {
-        return;
-    }
-    let candidates =
-        session_lifecycle.abandoned_http_session_candidates(&active_sessions, reap_after_ms, now);
-    for candidate in candidates {
-        // Remove the session from the rmcp manager first so no new request can
-        // route to it while we tear its resources down; closing the handle is a
-        // trigger that flushes the private session worker.
-        let handle = {
-            let mut guard = session_manager.sessions.write().await;
-            guard.remove(candidate.session_id.as_str())
-        };
-        let close_outcome = match handle {
-            None => "not_in_manager".to_owned(),
-            Some(handle) => match time::timeout(MCP_SESSION_CLOSE_TIMEOUT, handle.close()).await {
-                Ok(Ok(())) => "closed".to_owned(),
-                Ok(Err(SessionError::SessionServiceTerminated)) => "already_terminated".to_owned(),
-                Ok(Err(error)) => format!("close_failed: {error}"),
-                Err(_elapsed) => {
-                    format!("close_timeout_ms={}", MCP_SESSION_CLOSE_TIMEOUT.as_millis())
-                }
-            },
-        };
-        emit_http_active_sessions(active_http_session_ids(session_manager).await.len());
-        match session_lifecycle
-            .teardown_session(
-                &candidate.session_id,
-                crate::server::session_lifecycle::ABANDONED_IDLE_REASON,
-            )
-            .await
-        {
-            Ok(report) => {
-                tracing::warn!(
-                    code = "MCP_HTTP_SESSION_ABANDONED_REAPED",
-                    session_id = %candidate.session_id,
-                    age_ms = candidate.age_ms,
-                    last_seen_ms_ago = candidate.last_seen_ms_ago,
-                    reap_after_ms,
-                    last_action = ?candidate.last_action,
-                    client_name = ?candidate.client_name,
-                    agent_kind = %candidate.agent_kind,
-                    close_outcome = %close_outcome,
-                    report = ?report,
-                    "reaped abandoned HTTP session that had no MCP request within the idle budget"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    detail_code = "MCP_HTTP_SESSION_ABANDONED_REAP_TEARDOWN_FAILED",
-                    session_id = %candidate.session_id,
-                    age_ms = candidate.age_ms,
-                    last_seen_ms_ago = candidate.last_seen_ms_ago,
-                    close_outcome = %close_outcome,
-                    detail = %error.message,
-                    data = ?error.data,
-                    "abandoned HTTP session removed from rmcp manager but lifecycle teardown failed"
-                );
-            }
-        }
-    }
 }
 
 /// #898 liveness sweep: periodically cross-checks heartbeat silence with the
@@ -4606,142 +2979,25 @@ fn spawn_agent_liveness_sweep(
                             "liveness sweep emitted state transitions"
                         );
                     }
-                    let terminal_reap = reap_dead_live_terminal_sessions();
-                    if terminal_reap.dead_process_sessions_reaped > 0 {
-                        tracing::info!(
-                            code = "PTY_CAPTURE_DEAD_SESSION_SWEEP",
-                            sessions_before = terminal_reap.sessions_before,
-                            sessions_reaped = terminal_reap.dead_process_sessions_reaped,
-                            sessions_after = terminal_reap.sessions_after,
-                            "periodic liveness sweep released dead live-terminal ownership"
-                        );
-                    }
                 }
             }
         }
     })
 }
 
-/// Fair, bounded per-session scheduling and exponential backoff for stale
-/// teardowns. Without this, one permanently-unrepairable sub-resource re-fails
-/// across an unbounded sweep and keeps the daemon's cleanup path busy while
-/// agents are handshaking. Retry never silently drops work: 2 s → 4 s → … →
-/// capped 60 s, resetting the moment teardown succeeds.
-#[derive(Default)]
-struct StaleTeardownBackoff {
-    entries: HashMap<String, StaleTeardownBackoffEntry>,
-    cursor_after: Option<String>,
-}
-
-struct StaleTeardownBackoffEntry {
-    consecutive_failures: u32,
-    next_attempt_at: Instant,
-}
-
-const STALE_TEARDOWN_BACKOFF_CAP: Duration = Duration::from_mins(1);
-
-impl StaleTeardownBackoff {
-    fn should_attempt(&self, session_id: &str, now: Instant) -> bool {
-        self.entries
-            .get(session_id)
-            .is_none_or(|entry| now >= entry.next_attempt_at)
-    }
-
-    fn record_success(&mut self, session_id: &str) {
-        self.entries.remove(session_id);
-    }
-
-    fn record_failure(&mut self, session_id: &str, now: Instant) -> (u32, Duration) {
-        let failures = self
-            .entries
-            .get(session_id)
-            .map_or(0, |entry| entry.consecutive_failures)
-            .saturating_add(1);
-        let exponent = failures.saturating_sub(1).min(5);
-        let delay = STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL
-            .saturating_mul(1_u32 << exponent)
-            .min(STALE_TEARDOWN_BACKOFF_CAP);
-        self.entries.insert(
-            session_id.to_owned(),
-            StaleTeardownBackoffEntry {
-                consecutive_failures: failures,
-                next_attempt_at: now + delay,
-            },
-        );
-        (failures, delay)
-    }
-
-    /// Drop tracking for sessions that are no longer stale candidates (cleaned
-    /// up by another path) so the map cannot grow without bound.
-    fn retain_candidates(&mut self, candidates: &BTreeMap<String, &'static str>) {
-        self.entries
-            .retain(|session_id, _| candidates.contains_key(session_id));
-        if candidates.is_empty() {
-            self.cursor_after = None;
-        }
-    }
-
-    fn candidates_for_sweep(
-        &mut self,
-        candidates: &BTreeMap<String, &'static str>,
-        now: Instant,
-    ) -> Vec<String> {
-        let mut selected = Vec::with_capacity(
-            STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP.min(candidates.len()),
-        );
-        let cursor = self.cursor_after.as_deref();
-
-        for session_id in candidates.keys() {
-            if cursor.is_some_and(|cursor| session_id.as_str() <= cursor) {
-                continue;
-            }
-            if self.should_attempt(session_id, now) {
-                selected.push(session_id.clone());
-                if selected.len() == STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
-                    break;
-                }
-            }
-        }
-        if selected.len() < STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
-            if let Some(cursor) = cursor {
-                for session_id in candidates.keys() {
-                    if session_id.as_str() > cursor {
-                        break;
-                    }
-                    if self.should_attempt(session_id, now) {
-                        selected.push(session_id.clone());
-                        if selected.len() == STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(last) = selected.last() {
-            self.cursor_after = Some(last.clone());
-        }
-        selected
-    }
-}
-
 async fn cleanup_stale_session_resources_once(
     session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
     session_manager: &LocalSessionManager,
-    teardown_backoff: &mut StaleTeardownBackoff,
 ) {
     let active_sessions = active_http_session_ids(session_manager).await;
+    session_lifecycle.cleanup_expired_lease_inputs_once().await;
     let stale_sessions = session_lifecycle.stale_session_candidates(&active_sessions);
-    teardown_backoff.retain_candidates(&stale_sessions);
-    let now = Instant::now();
-    let selected = teardown_backoff.candidates_for_sweep(&stale_sessions, now);
-    for session_id in selected {
-        let reason = stale_sessions[&session_id];
+    for (session_id, reason) in stale_sessions {
         match session_lifecycle
             .teardown_session(&session_id, reason)
             .await
         {
-            Ok(report) if report.failure_count == 0 => {
-                teardown_backoff.record_success(&session_id);
+            Ok(report) => {
                 tracing::info!(
                     code = "MCP_HTTP_SESSION_STALE_LIFECYCLE_CLEANUP",
                     session_id = %session_id,
@@ -4751,86 +3007,114 @@ async fn cleanup_stale_session_resources_once(
                     "readback=session_lifecycle edge=http_session_gone after_cleanup"
                 );
             }
-            // Teardown reports embedded failures via Ok(report) rather than Err;
-            // without this arm those sessions re-fail every sweep at full rate
-            // (the 2026-07-23 MCP_SESSION_TEARDOWN_FAILED storm: 15 identical
-            // retries per session in 2.5 min) because record_success cleared
-            // the backoff each pass.
-            Ok(report) => {
-                let (consecutive_failures, retry_after) =
-                    teardown_backoff.record_failure(&session_id, Instant::now());
-                // #1801: the first refusal is the actionable signal; every
-                // repeat is the KNOWN, intentional fail-closed retention
-                // re-observed on schedule (an operator-panic browser-mutation
-                // refusal is a correct outcome, not an incident). Logging each
-                // repeat at ERROR produced ~30.4k ERROR lines/day and drowned
-                // real failures. Keep exactly one ERROR per session per failure
-                // streak and report the continuing state at WARN; the streak
-                // resets to ERROR the moment a teardown succeeds and later
-                // starts failing again, so a genuinely new fault is never
-                // silenced.
-                if consecutive_failures <= 1 {
-                    tracing::error!(
-                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        session_id = %session_id,
-                        reason,
-                        active_session_count = active_sessions.len(),
-                        failure_count = report.failure_count,
-                        consecutive_failures,
-                        retry_after_ms = retry_after.as_millis() as u64,
-                        report = ?report,
-                        "HTTP MCP stale-session lifecycle cleanup completed with embedded failures; retrying with backoff"
-                    );
-                } else {
-                    tracing::warn!(
-                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        session_id = %session_id,
-                        reason,
-                        active_session_count = active_sessions.len(),
-                        failure_count = report.failure_count,
-                        consecutive_failures,
-                        retry_after_ms = retry_after.as_millis() as u64,
-                        report = ?report,
-                        "HTTP MCP stale-session lifecycle cleanup still reporting embedded failures; continuing backoff (first occurrence logged at ERROR)"
-                    );
-                }
-            }
             Err(error) => {
-                let (consecutive_failures, retry_after) =
-                    teardown_backoff.record_failure(&session_id, Instant::now());
-                // #1801: same rule as the embedded-failure arm above - one ERROR
-                // per failure streak, WARN while the known refusal persists.
-                if consecutive_failures <= 1 {
-                    tracing::error!(
-                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        session_id = %session_id,
-                        reason,
-                        active_session_count = active_sessions.len(),
-                        consecutive_failures,
-                        retry_after_ms = retry_after.as_millis() as u64,
-                        detail = %error.message,
-                        data = ?error.data,
-                        "HTTP MCP stale-session lifecycle cleanup failed; retrying with backoff"
-                    );
-                } else {
-                    tracing::warn!(
-                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        session_id = %session_id,
-                        reason,
-                        active_session_count = active_sessions.len(),
-                        consecutive_failures,
-                        retry_after_ms = retry_after.as_millis() as u64,
-                        detail = %error.message,
-                        data = ?error.data,
-                        "HTTP MCP stale-session lifecycle cleanup still failing; continuing backoff (first occurrence logged at ERROR)"
-                    );
-                }
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    session_id = %session_id,
+                    reason,
+                    active_session_count = active_sessions.len(),
+                    detail = %error.message,
+                    data = ?error.data,
+                    "HTTP MCP stale-session lifecycle cleanup failed"
+                );
             }
         }
-        tokio::task::yield_now().await;
     }
-    let _pruned = session_lifecycle
-        .prune_closed_session_registry(crate::server::session_registry::unix_time_ms_now());
+}
+
+#[cfg(test)]
+async fn cleanup_stale_session_inputs_once(
+    action_handle: &ActionHandle,
+    session_manager: &LocalSessionManager,
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
+) {
+    let active_sessions = active_http_session_ids(session_manager).await;
+    cleanup_expired_lease_inputs_once(action_handle).await;
+    cleanup_stale_session_cdp_targets_once(cdp_target_owners, &active_sessions).await;
+
+    let snapshot = match action_handle.session_inputs_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                detail = %error.detail(),
+                "HTTP MCP stale-session cleanup could not read held-input ownership"
+            );
+            return;
+        }
+    };
+    for session in snapshot.sessions {
+        if active_sessions.contains(&session.session_id) {
+            continue;
+        }
+        release_stale_session_inputs_and_lease(action_handle, &session.session_id).await;
+    }
+
+    cleanup_stale_session_lease_once(action_handle, &active_sessions).await;
+}
+
+#[cfg(test)]
+async fn cleanup_stale_session_cdp_targets_once(
+    cdp_target_owners: &crate::server::SharedCdpTargetOwners,
+    active_sessions: &BTreeSet<String>,
+) {
+    let stale_sessions = match cdp_target_owners.lock() {
+        Ok(owners) => owners
+            .values()
+            .filter_map(|owner| {
+                (!active_sessions.contains(&owner.session_id)).then(|| owner.session_id.clone())
+            })
+            .collect::<BTreeSet<_>>(),
+        Err(_error) => {
+            tracing::error!(
+                code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                "HTTP MCP stale-session cleanup could not lock CDP target ownership registry"
+            );
+            return;
+        }
+    };
+    for session_id in stale_sessions {
+        let (owned_before, target_ids) = match cdp_target_owners.lock() {
+            Ok(mut owners) => {
+                let stale_owner_keys = owners
+                    .iter()
+                    .filter_map(|(owner_key, owner)| {
+                        (owner.session_id == session_id).then(|| owner_key.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let target_ids = stale_owner_keys
+                    .iter()
+                    .filter_map(|owner_key| {
+                        owners
+                            .get(owner_key)
+                            .map(|owner| owner.cdp_target_id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for owner_key in &stale_owner_keys {
+                    owners.remove(owner_key);
+                }
+                (target_ids.len(), target_ids)
+            }
+            Err(_error) => {
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "HTTP MCP test stale-session cleanup could not lock CDP target ownership registry"
+                );
+                continue;
+            }
+        };
+        tracing::info!(
+            code = "MCP_HTTP_SESSION_CDP_TARGET_STALE_CLEANUP",
+            session_id = %session_id,
+            active_session_count = active_sessions.len(),
+            cdp_cleanup_reason = "http_stale",
+            cdp_owned_before = owned_before,
+            cdp_closed = 0,
+            cdp_failed = 0,
+            cdp_target_ids = ?target_ids,
+            "readback=cdp_target_ownership edge=http_session_gone after_cleanup"
+        );
+    }
 }
 
 async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
@@ -4928,13 +3212,11 @@ async fn cleanup_active_session_inputs_for_shutdown(
             Err(error) => (Some(error.readback.clone()), Some(error.to_string())),
         };
     let active_sessions = active_http_session_ids(session_manager).await;
-    let (live_spawn_sessions, live_spawn_snapshot_error) = match session_lifecycle
-        .live_spawned_session_ids_for_shutdown()
-        .await
-    {
-        Ok(session_ids) => (session_ids, None),
-        Err(error) => (BTreeSet::new(), Some(error)),
-    };
+    let (live_spawn_sessions, live_spawn_snapshot_error) =
+        match session_lifecycle.live_spawned_session_ids_for_shutdown() {
+            Ok(session_ids) => (session_ids, None),
+            Err(error) => (BTreeSet::new(), Some(error)),
+        };
     let live_spawn_snapshot_read_before = live_spawn_snapshot_error.is_none();
     let close_candidate_sessions = close_candidate_session_ids
         .iter()
@@ -4965,18 +3247,25 @@ async fn cleanup_active_session_inputs_for_shutdown(
     // unbounded reacquisition of the same session gate or an unbounded emitter
     // acknowledgement. Start every independent cleanup so one retained owner
     // cannot suppress the remaining attempts, and give each exact operation its
-    // own terminal deadline — under a phase deadline that stays enforceable
-    // even if one cleanup stops yielding (#1800).
-    let phase =
-        run_shutdown_session_input_cleanup_phase(session_lifecycle, &shutdown_sessions, reason)
-            .await;
-    let ShutdownSessionCleanupPhase {
-        session_reports,
-        mut session_cleanup_timeouts,
-        phase_elapsed_ms,
-        phase_deadline_expired,
-        phase_unreported_session_ids,
-    } = phase;
+    // own terminal deadline.
+    let cleanup_results = join_all(shutdown_sessions.iter().map(|session_id| {
+        await_daemon_session_input_cleanup(
+            session_id,
+            reason,
+            session_lifecycle.release_session_inputs_for_daemon_shutdown(session_id, reason),
+        )
+    }))
+    .await;
+    let mut session_cleanup_timeouts = Vec::new();
+    let session_reports = cleanup_results
+        .into_iter()
+        .map(|(report, timed_out)| {
+            if timed_out {
+                session_cleanup_timeouts.push(report.session_id.clone());
+            }
+            report
+        })
+        .collect::<Vec<_>>();
     let mut orphan_lease_owner_cleanup = None;
     let mut final_lease = synapse_action::lease::status();
     if let Some(owner_session_id) = final_lease.owner_session_id.clone()
@@ -5046,13 +3335,6 @@ async fn cleanup_active_session_inputs_for_shutdown(
         session_cleanup_timeout_ms: u64::try_from(DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis())
             .unwrap_or(u64::MAX),
         session_cleanup_timeouts,
-        session_cleanup_phase_timeout_ms: u64::try_from(
-            DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis(),
-        )
-        .unwrap_or(u64::MAX),
-        session_cleanup_phase_elapsed_ms: phase_elapsed_ms,
-        session_cleanup_phase_deadline_expired: phase_deadline_expired,
-        session_cleanup_phase_unreported_session_ids: phase_unreported_session_ids,
         orphan_lease_owner_cleanup,
         final_lease_held: final_lease.held,
         final_lease_owner_session_id: final_lease.owner_session_id,
@@ -5063,163 +3345,6 @@ async fn cleanup_active_session_inputs_for_shutdown(
         input_owner_snapshot_errors,
         failure_count,
         session_reports,
-    }
-}
-
-/// Outcome of the bounded daemon-shutdown per-session input-cleanup phase
-/// (#1800).
-struct ShutdownSessionCleanupPhase {
-    session_reports: Vec<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
-    session_cleanup_timeouts: Vec<String>,
-    phase_elapsed_ms: u64,
-    phase_deadline_expired: bool,
-    phase_unreported_session_ids: Vec<String>,
-}
-
-/// Run every session's daemon-shutdown input cleanup under a phase deadline
-/// that is *physically* enforceable (#1800).
-///
-/// The per-session `time::timeout` in `await_daemon_session_input_cleanup` is
-/// only enforceable while the guarded future keeps yielding: a future that
-/// never returns `Poll::Pending` is never preempted, because `timeout` polls
-/// the timer from the very task that future has frozen. On 2026-07-23 that is
-/// how a shutdown with 54 live HTTP sessions stayed alive with its listener
-/// closed until `MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED` at 90 s, after the
-/// installer had already abandoned the deploy at 60 s.
-///
-/// `session_lifecycle` now admits its synchronous storage steps to the blocking
-/// pool, so the per-session deadline is real again. This phase adds the
-/// structural guarantee that does not depend on that: the cleanups run on a
-/// spawned task and report incrementally over a channel, while this task only
-/// ever awaits `recv()`/`sleep()`. A cleanup that stops yielding can therefore
-/// no longer freeze the shutdown driver — the phase deadline still fires, the
-/// exact unfinished sessions are named, and shutdown proceeds to a terminal
-/// exit decision instead of burning the watchdog window.
-///
-/// Fail-closed: every session that did not publish a report becomes an
-/// explicitly failed, unproven row, so `failure_count` is non-zero and the
-/// daemon lifetime locks are retained.
-async fn run_shutdown_session_input_cleanup_phase(
-    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
-    shutdown_sessions: &BTreeSet<String>,
-    reason: &'static str,
-) -> ShutdownSessionCleanupPhase {
-    let phase_started = Instant::now();
-    if shutdown_sessions.is_empty() {
-        return ShutdownSessionCleanupPhase {
-            session_reports: Vec::new(),
-            session_cleanup_timeouts: Vec::new(),
-            phase_elapsed_ms: 0,
-            phase_deadline_expired: false,
-            phase_unreported_session_ids: Vec::new(),
-        };
-    }
-    let (report_sender, mut report_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let worker_lifecycle = session_lifecycle.clone();
-    let worker_sessions = shutdown_sessions.iter().cloned().collect::<Vec<_>>();
-    let cleanup_task = tokio::spawn(async move {
-        join_all(worker_sessions.iter().map(|session_id| {
-            let report_sender = report_sender.clone();
-            let worker_lifecycle = &worker_lifecycle;
-            async move {
-                let (report, timed_out) = await_daemon_session_input_cleanup(
-                    session_id,
-                    reason,
-                    worker_lifecycle.release_session_inputs_for_daemon_shutdown(session_id, reason),
-                )
-                .await;
-                // The receiver outlives this send unless the phase deadline
-                // already expired; a dropped receiver simply means the report
-                // was superseded by the unproven row this phase recorded.
-                drop(report_sender.send((report, timed_out)));
-            }
-        }))
-        .await;
-    });
-
-    let mut session_reports = Vec::with_capacity(shutdown_sessions.len());
-    let mut session_cleanup_timeouts = Vec::new();
-    let mut pending = shutdown_sessions.clone();
-    let phase_deadline = time::sleep(DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT);
-    tokio::pin!(phase_deadline);
-    let mut phase_deadline_expired = false;
-    loop {
-        tokio::select! {
-            biased;
-            received = report_receiver.recv() => {
-                let Some((report, timed_out)) = received else {
-                    break;
-                };
-                pending.remove(&report.session_id);
-                if timed_out {
-                    session_cleanup_timeouts.push(report.session_id.clone());
-                }
-                session_reports.push(report);
-            }
-            () = &mut phase_deadline => {
-                phase_deadline_expired = true;
-                break;
-            }
-        }
-    }
-    if phase_deadline_expired {
-        // Timing out a JoinHandle does not cancel its task; the abort request is
-        // what stops the cleanup owner from mutating session state behind the
-        // terminal readbacks that follow this phase.
-        cleanup_task.abort();
-    }
-    let phase_elapsed_ms = u64::try_from(phase_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let phase_unreported_session_ids = pending.into_iter().collect::<Vec<_>>();
-    for session_id in &phase_unreported_session_ids {
-        let detail = if phase_deadline_expired {
-            format!(
-                "daemon-shutdown session input cleanup did not publish a report within the {} ms phase deadline (phase_elapsed_ms={phase_elapsed_ms}); this session's input/lease/browser-continuity ownership is UNPROVEN and the daemon lifetime locks are retained. remediation=search synapse.log for code=MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED with this session_id to see which step stalled, and for the storage pass holding its lock (code=STORAGE_MAINTENANCE_ADMITTED / CALYX_ASTER_MANIFEST_GENERATIONS_RECLAIMED) in the same window",
-                DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis()
-            )
-        } else {
-            format!(
-                "daemon-shutdown session input cleanup owner ended after {phase_elapsed_ms} ms without publishing a report for this session; ownership is UNPROVEN. remediation=search synapse.log for a panic in the cleanup task in this window; the daemon lifetime locks are retained"
-            )
-        };
-        tracing::error!(
-            code = synapse_core::error_codes::ACTION_POSTCONDITION_FAILED,
-            detail_code = "MCP_SESSION_SHUTDOWN_INPUT_CLEANUP_UNPROVEN",
-            session_id = session_id.as_str(),
-            reason,
-            phase_elapsed_ms,
-            phase_timeout_ms = DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis() as u64,
-            phase_deadline_expired,
-            detail,
-            "daemon-shutdown session input cleanup did not reach a proven terminal readback"
-        );
-        session_reports.push(
-            crate::server::session_lifecycle::SessionShutdownInputCleanupReport {
-                session_id: session_id.clone(),
-                reason: reason.to_owned(),
-                failed: true,
-                error_message: Some(detail),
-                ..Default::default()
-            },
-        );
-    }
-    tracing::info!(
-        code = "MCP_HTTP_SHUTDOWN_SESSION_CLEANUP_PHASE",
-        reason,
-        sessions = shutdown_sessions.len(),
-        reported = session_reports.len() - phase_unreported_session_ids.len(),
-        unreported = phase_unreported_session_ids.len(),
-        per_session_timeouts = session_cleanup_timeouts.len(),
-        phase_elapsed_ms,
-        phase_timeout_ms = DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis() as u64,
-        phase_deadline_expired,
-        "readback=session_input_cleanup_phase edge=daemon_shutdown after_bounded_phase"
-    );
-    ShutdownSessionCleanupPhase {
-        session_reports,
-        session_cleanup_timeouts,
-        phase_elapsed_ms,
-        phase_deadline_expired,
-        phase_unreported_session_ids,
     }
 }
 
@@ -5269,6 +3394,160 @@ fn shutdown_cleanup_session_ids(
         .collect()
 }
 
+#[cfg(test)]
+async fn cleanup_expired_lease_inputs_once(action_handle: &ActionHandle) {
+    let _lease_status_readback = synapse_action::lease::status();
+    let pending = synapse_action::lease::expired_cleanup_snapshot();
+    for expired in pending {
+        let Some(session_id) = expired.owner_session_id.clone() else {
+            continue;
+        };
+        release_expired_session_inputs_and_lease(action_handle, &session_id, &expired).await;
+    }
+}
+
+#[cfg(test)]
+async fn cleanup_stale_session_lease_once(
+    action_handle: &ActionHandle,
+    active_sessions: &BTreeSet<String>,
+) {
+    let status = synapse_action::lease::status();
+    let Some(owner_session_id) = status.owner_session_id.clone() else {
+        return;
+    };
+    if owner_session_id == synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID {
+        return;
+    }
+    if active_sessions.contains(&owner_session_id) {
+        return;
+    }
+    let before_ownership = action_handle.session_inputs_snapshot();
+    let result = action_handle
+        .release_session_inputs_and_lease(&owner_session_id)
+        .await;
+    let after_ownership = action_handle.session_inputs_snapshot();
+    let after_lease = synapse_action::lease::status();
+    match result {
+        Ok(summary) => {
+            tracing::info!(
+                code = "MCP_HTTP_SESSION_LEASE_STALE_CLEANUP",
+                session_id = %owner_session_id,
+                input_lease_released = summary.lease_released,
+                expired_lease_cleanup_completed = summary.expired_lease_cleanup_completed,
+                before_lease = ?status,
+                after_lease = ?after_lease,
+                before_ownership = ?before_ownership,
+                after_ownership = ?after_ownership,
+                active_session_count = active_sessions.len(),
+                "readback=input_lease edge=http_session_gone after_cleanup"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                session_id = %owner_session_id,
+                detail = %error.detail(),
+                before_lease = ?status,
+                after_lease = ?after_lease,
+                before_ownership = ?before_ownership,
+                after_ownership = ?after_ownership,
+                active_session_count = active_sessions.len(),
+                "HTTP MCP stale-session lease cleanup failed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+async fn release_stale_session_inputs_and_lease(action_handle: &ActionHandle, session_id: &str) {
+    let before = action_handle.session_inputs_snapshot();
+    let before_lease = synapse_action::lease::status();
+    let result = action_handle
+        .release_session_inputs_and_lease(session_id)
+        .await;
+    let after = action_handle.session_inputs_snapshot();
+    let after_lease = synapse_action::lease::status();
+    match result {
+        Ok(summary) => {
+            tracing::info!(
+                code = "MCP_HTTP_SESSION_INPUT_STALE_CLEANUP",
+                session_id,
+                released_keys = summary.input_summary.released_keys,
+                released_buttons = summary.input_summary.released_buttons,
+                neutralized_pads = summary.input_summary.neutralized_pads,
+                retained_shared_inputs = summary.input_summary.retained_shared_inputs,
+                input_lease_released = summary.lease_released,
+                expired_lease_cleanup_completed = summary.expired_lease_cleanup_completed,
+                before = ?before,
+                after = ?after,
+                before_lease = ?before_lease,
+                after_lease = ?after_lease,
+                "readback=session_input_ownership edge=http_session_gone after_cleanup"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                session_id,
+                detail = %error.detail(),
+                before = ?before,
+                after = ?after,
+                before_lease = ?before_lease,
+                after_lease = ?after_lease,
+                "HTTP MCP stale-session cleanup failed while releasing owned inputs"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+async fn release_expired_session_inputs_and_lease(
+    action_handle: &ActionHandle,
+    session_id: &str,
+    expired: &synapse_action::LeaseStatus,
+) {
+    let before = action_handle.session_inputs_snapshot();
+    let before_lease = synapse_action::lease::status();
+    let result = action_handle
+        .release_session_inputs_and_lease(session_id)
+        .await;
+    let after = action_handle.session_inputs_snapshot();
+    let after_lease = synapse_action::lease::status();
+    match result {
+        Ok(summary) => {
+            tracing::warn!(
+                code = "MCP_HTTP_SESSION_LEASE_EXPIRED_INPUT_CLEANUP",
+                session_id,
+                released_keys = summary.input_summary.released_keys,
+                released_buttons = summary.input_summary.released_buttons,
+                neutralized_pads = summary.input_summary.neutralized_pads,
+                retained_shared_inputs = summary.input_summary.retained_shared_inputs,
+                input_lease_released = summary.lease_released,
+                expired_lease_cleanup_completed = summary.expired_lease_cleanup_completed,
+                expired = ?expired,
+                before = ?before,
+                after = ?after,
+                before_lease = ?before_lease,
+                after_lease = ?after_lease,
+                "readback=session_input_ownership edge=input_lease_expired after_cleanup"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                session_id,
+                detail = %error.detail(),
+                expired = ?expired,
+                before = ?before,
+                after = ?after,
+                before_lease = ?before_lease,
+                after_lease = ?after_lease,
+                "HTTP MCP expired-lease cleanup failed while releasing owned inputs"
+            );
+        }
+    }
+}
+
 fn session_store_db(service: &SynapseService) -> anyhow::Result<Arc<Db>> {
     let m3_handle = service.m3_state_handle();
     let mut state = m3_handle.lock().map_err(|_poisoned| {
@@ -5310,11 +3589,11 @@ struct PersistedMcpSessionState {
 impl SessionStore for SynapseMcpSessionStore {
     async fn load(&self, session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
         let key = mcp_session_store_key(session_id);
-        let Some(value) = self
+        let rows = self
             .db
-            .get_cf(cf::CF_KV, &key)
-            .map_err(session_store_error)?
-        else {
+            .scan_cf_prefix(cf::CF_KV, &key)
+            .map_err(session_store_error)?;
+        let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
             return Ok(None);
         };
         let now_ms = unix_time_ms()?;
@@ -5387,66 +3666,14 @@ impl SessionStore for SynapseMcpSessionStore {
         };
         let encoded = synapse_storage::encode_json(&persisted).map_err(session_store_error)?;
         self.db
-            .put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), encoded.clone())])
+            .put_batch_pressure_bypass(cf::CF_KV, [(key, encoded)])
             .map_err(session_store_error)?;
-        let readback = self
-            .db
-            .get_cf(cf::CF_KV, &key)
-            .map_err(session_store_error)?;
-        let Some(readback) = readback else {
-            tracing::error!(
-                code = "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISSING",
-                session_id,
-                stored_at_unix_ms,
-                cf = cf::CF_KV,
-                key_len = key.len(),
-                "MCP HTTP session write succeeded but its exact CF_KV point readback was absent"
-            );
-            return Err(session_store_error(
-                synapse_storage::StorageError::ReadFailed {
-                    cf_name: cf::CF_KV.to_owned(),
-                    detail: format!(
-                        "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISSING: session_id={session_id:?} key_len={} stored_at_unix_ms={stored_at_unix_ms}",
-                        key.len()
-                    ),
-                },
-            ));
-        };
-        if readback != encoded {
-            let expected_sha256 = session_store_value_sha256(&encoded);
-            let actual_sha256 = session_store_value_sha256(&readback);
-            tracing::error!(
-                code = "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISMATCH",
-                session_id,
-                stored_at_unix_ms,
-                cf = cf::CF_KV,
-                key_len = key.len(),
-                expected_value_len = encoded.len(),
-                actual_value_len = readback.len(),
-                expected_sha256,
-                actual_sha256,
-                "MCP HTTP session write exact CF_KV point readback did not match the committed value"
-            );
-            return Err(session_store_error(
-                synapse_storage::StorageError::ReadFailed {
-                    cf_name: cf::CF_KV.to_owned(),
-                    detail: format!(
-                        "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISMATCH: session_id={session_id:?} key_len={} stored_at_unix_ms={stored_at_unix_ms} expected_value_len={} actual_value_len={} expected_sha256={expected_sha256} actual_sha256={actual_sha256}",
-                        key.len(),
-                        encoded.len(),
-                        readback.len()
-                    ),
-                },
-            ));
-        }
         tracing::info!(
             code = "MCP_HTTP_SESSION_STORE_WRITE",
             session_id,
             stored_at_unix_ms,
             ttl_ms = self.ttl.map(duration_millis_u64),
-            readback_value_len = readback.len(),
-            exact_point_readback = true,
-            "persisted and exactly read back MCP HTTP session state from CF_KV"
+            "persisted MCP HTTP session state to CF_KV"
         );
         let newly_visible = record_registry_initialized(
             &self.session_registry,
@@ -5582,15 +3809,6 @@ fn delete_session_continuity_rows(db: &Db, session_id: &str) -> Result<(), Sessi
 
 fn session_store_error(error: synapse_storage::StorageError) -> SessionStoreError {
     Box::new(error)
-}
-
-fn session_store_value_sha256(value: &[u8]) -> String {
-    let digest = Sha256::digest(value);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 fn unix_time_ms() -> Result<u64, SessionStoreError> {
@@ -6816,6 +5034,8 @@ const TERMINAL_WS_COMMAND_AUTH_INIT: u8 = b'{';
 const TERMINAL_WS_SERVER_OUTPUT: u8 = b'0';
 const TERMINAL_WS_SERVER_TITLE: u8 = b'1';
 const TERMINAL_WS_SERVER_PREFS: u8 = b'2';
+const TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX: usize = 64 * 1024 * 1024;
+
 async fn dashboard_agent_terminal_ws(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -6913,8 +5133,10 @@ async fn dashboard_agent_terminal_ws_loop(
             return;
         }
     };
-    let mut snapshot_seq = snapshot.seq;
+    let snapshot_seq = snapshot.seq;
     let mut paused = false;
+    let mut paused_frames: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut paused_bytes = 0usize;
 
     if terminal_ws_send_prefs(
         &mut sender,
@@ -6970,7 +5192,8 @@ async fn dashboard_agent_terminal_ws_loop(
                                     &connection_id,
                                     mode,
                                     &mut paused,
-                                    &mut snapshot_seq,
+                                    &mut paused_frames,
+                                    &mut paused_bytes,
                                     payload,
                                 ).await.is_err() {
                                     break;
@@ -7002,20 +5225,21 @@ async fn dashboard_agent_terminal_ws_loop(
                             &mut sender,
                             event,
                             paused,
+                            &mut paused_frames,
+                            &mut paused_bytes,
                         ).await.is_err() {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                        match terminal_ws_resync_from_snapshot(
-                            &session,
+                        let _ = terminal_ws_send_prefs(
                             &mut sender,
-                            "stream_lagged",
-                            Some(dropped),
-                        ).await {
-                            Ok(resynced_seq) => snapshot_seq = resynced_seq,
-                            Err(()) => break,
-                        }
+                            serde_json::json!({
+                                "event": "stream_lagged",
+                                "dropped_events": dropped,
+                            }),
+                        ).await;
+                        break;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         let _ = terminal_ws_send_prefs(
@@ -7043,7 +5267,8 @@ async fn terminal_ws_handle_client_payload(
     connection_id: &str,
     mode: DashboardTerminalMode,
     paused: &mut bool,
-    snapshot_seq: &mut u64,
+    paused_frames: &mut VecDeque<Vec<u8>>,
+    paused_bytes: &mut usize,
     payload: Vec<u8>,
 ) -> Result<(), ()> {
     let Some((&command, body)) = payload.split_first() else {
@@ -7122,8 +5347,7 @@ async fn terminal_ws_handle_client_payload(
                 sender,
                 serde_json::json!({
                     "event": "paused",
-                    "retained_output_bytes": 0,
-                    "resume_source_of_truth": "live_terminal_shadow_screen",
+                    "buffered_bytes": paused_bytes,
                 }),
             )
             .await
@@ -7131,9 +5355,22 @@ async fn terminal_ws_handle_client_payload(
         }
         TERMINAL_WS_COMMAND_RESUME => {
             *paused = false;
-            *snapshot_seq = terminal_ws_resync_from_snapshot(session, sender, "resumed", None)
-                .await
-                .map_err(|_| ())?;
+            while let Some(frame) = paused_frames.pop_front() {
+                *paused_bytes = paused_bytes.saturating_sub(frame.len());
+                sender
+                    .send(Message::Binary(frame.into()))
+                    .await
+                    .map_err(|_| ())?;
+            }
+            terminal_ws_send_prefs(
+                sender,
+                serde_json::json!({
+                    "event": "resumed",
+                    "buffered_bytes": paused_bytes,
+                }),
+            )
+            .await
+            .map_err(|_| ())?;
         }
         TERMINAL_WS_COMMAND_AUTH_INIT => {
             terminal_ws_send_prefs(
@@ -7166,10 +5403,9 @@ async fn terminal_ws_deliver_event(
     sender: &mut SplitSink<WebSocket, Message>,
     event: TerminalCaptureEvent,
     paused: bool,
+    paused_frames: &mut VecDeque<Vec<u8>>,
+    paused_bytes: &mut usize,
 ) -> Result<(), ()> {
-    if paused {
-        return Ok(());
-    }
     let frame = match event.kind {
         TerminalCaptureEventKind::Output(bytes) => {
             terminal_ws_frame(TERMINAL_WS_SERVER_OUTPUT, &bytes)
@@ -7190,51 +5426,28 @@ async fn terminal_ws_deliver_event(
             terminal_ws_frame(TERMINAL_WS_SERVER_PREFS, &bytes)
         }
     };
-    sender
-        .send(Message::Binary(frame.into()))
-        .await
-        .map_err(|_| ())
+    if paused {
+        terminal_ws_buffer_paused_frame(paused_frames, paused_bytes, frame)
+    } else {
+        sender
+            .send(Message::Binary(frame.into()))
+            .await
+            .map_err(|_| ())
+    }
 }
 
-async fn terminal_ws_resync_from_snapshot(
-    session: &LiveTerminalSession,
-    sender: &mut SplitSink<WebSocket, Message>,
-    event: &'static str,
-    dropped_events: Option<u64>,
-) -> Result<u64, ()> {
-    let snapshot = session.snapshot().map_err(|error| {
-        tracing::warn!(
-            code = "DASHBOARD_TERMINAL_RESYNC_SNAPSHOT_FAILED",
-            event,
-            error = %error,
-            "terminal WebSocket could not resynchronize from its authoritative shadow screen"
-        );
-    })?;
-    if !snapshot.title.is_empty() {
-        terminal_ws_send_frame(sender, TERMINAL_WS_SERVER_TITLE, snapshot.title.as_bytes())
-            .await
-            .map_err(|_| ())?;
+fn terminal_ws_buffer_paused_frame(
+    paused_frames: &mut VecDeque<Vec<u8>>,
+    paused_bytes: &mut usize,
+    frame: Vec<u8>,
+) -> Result<(), ()> {
+    let new_total = paused_bytes.saturating_add(frame.len());
+    if new_total > TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX {
+        return Err(());
     }
-    terminal_ws_send_frame(
-        sender,
-        TERMINAL_WS_SERVER_OUTPUT,
-        &terminal_snapshot_dump(&snapshot.screen_text),
-    )
-    .await
-    .map_err(|_| ())?;
-    terminal_ws_send_prefs(
-        sender,
-        serde_json::json!({
-            "event": event,
-            "snapshot_seq": snapshot.seq,
-            "dropped_events": dropped_events,
-            "retained_output_bytes": 0,
-            "source_of_truth": "live_terminal_shadow_screen",
-        }),
-    )
-    .await
-    .map_err(|_| ())?;
-    Ok(snapshot.seq)
+    *paused_bytes = new_total;
+    paused_frames.push_back(frame);
+    Ok(())
 }
 
 fn terminal_ws_client_payload(message: Message) -> Option<Vec<u8>> {
@@ -7426,7 +5639,8 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     let state_started = Instant::now();
     let mut timing_segments = Vec::new();
     let active_sessions_started = Instant::now();
-    let (active_sessions, active_sessions_error) = dashboard_active_session_count(&state);
+    let active_sessions = state.session_manager.sessions.read().await.len();
+    emit_http_active_sessions(active_sessions);
     dashboard_push_state_timing(
         &mut timing_segments,
         "active_sessions",
@@ -7435,10 +5649,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     let health = dashboard_timed_state_segment(&mut timing_segments, "health", || {
         state
             .health_service
-            .health_payload_with_http_sessions_and_error(
-                active_sessions,
-                active_sessions_error.clone(),
-            )
+            .health_payload_with_http_sessions(Some(active_sessions))
     });
     let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
         .health_service
@@ -8444,38 +6655,10 @@ fn dashboard_save_view_row(
             None,
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded.clone())])
+    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
         .map_err(|error| {
             dashboard_storage_error_response("dashboard saved view write failed", error)
         })?;
-    let readback = db
-        .get_cf(cf::CF_KV, row_key.as_bytes())
-        .map_err(|error| {
-            dashboard_storage_error_response("dashboard saved view readback failed", error)
-        })?
-        .ok_or_else(|| {
-            dashboard_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                "dashboard saved view row is absent after write",
-                Some(serde_json::json!({
-                    "row_key": row_key,
-                    "expected_bytes": encoded.len(),
-                })),
-            )
-        })?;
-    if readback != encoded {
-        return Err(dashboard_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "dashboard saved view row differs from committed bytes",
-            Some(serde_json::json!({
-                "row_key": row_key,
-                "expected_bytes": encoded.len(),
-                "actual_bytes": readback.len(),
-            })),
-        ));
-    }
     tracing::info!(
         code = "DASHBOARD_SAVED_VIEW_WRITTEN",
         row_key,
@@ -8489,10 +6672,15 @@ fn dashboard_read_saved_view_by_key(
     db: &Db,
     row_key: &str,
 ) -> Result<Option<DashboardSavedViewRow>, Response> {
-    let value = db.get_cf(cf::CF_KV, row_key.as_bytes()).map_err(|error| {
-        dashboard_storage_error_response("dashboard saved view read failed", error)
-    })?;
-    let Some(value) = value else {
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| {
+            dashboard_storage_error_response("dashboard saved view read failed", error)
+        })?;
+    let Some((_key, value)) = rows
+        .into_iter()
+        .find(|(key, _value)| key == row_key.as_bytes())
+    else {
         return Ok(None);
     };
     let row = serde_json::from_slice::<DashboardSavedViewRow>(&value).map_err(|error| {
@@ -8509,26 +6697,6 @@ fn dashboard_read_saved_view_by_key(
             None,
         )
     })?;
-    if row.schema_version != DASHBOARD_SAVED_VIEW_SCHEMA_VERSION
-        || row.row_key != row_key
-        || dashboard_saved_view_row_key(&row.view_id) != row_key
-        || row.updated_unix_ms < row.created_unix_ms
-    {
-        return Err(dashboard_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "dashboard saved view row identity invariant failed",
-            Some(serde_json::json!({
-                "requested_row_key": row_key,
-                "stored_row_key": row.row_key,
-                "stored_view_id": row.view_id,
-                "stored_schema_version": row.schema_version,
-                "expected_schema_version": DASHBOARD_SAVED_VIEW_SCHEMA_VERSION,
-                "created_unix_ms": row.created_unix_ms,
-                "updated_unix_ms": row.updated_unix_ms,
-            })),
-        ));
-    }
     Ok(Some(row))
 }
 
@@ -11207,64 +9375,31 @@ const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-CicCCuUG.css");
 const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-D_jF422B.js");
+#[cfg(test)]
+const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
+#[cfg(test)]
+const DASHBOARD_STATE_SOURCE: &str =
+    include_str!("../../../../dashboard/src/lib/dashboard-state.ts");
+#[cfg(test)]
+const DASHBOARD_UTILS_SOURCE: &str = include_str!("../../../../dashboard/src/lib/utils.ts");
+#[cfg(test)]
+const DASHBOARD_PRIMITIVES_SOURCE: &str =
+    include_str!("../../../../dashboard/src/primitives/index.tsx");
+#[cfg(test)]
+const DASHBOARD_CHARTER_CHECK_SOURCE: &str =
+    include_str!("../../../../dashboard/scripts/check-dashboard-charter.ts");
 async fn health(State(state): State<HttpState>) -> Json<Health> {
-    let started = Instant::now();
     tracing::info!(
         code = "MCP_HTTP_HEALTH",
         "tool.invocation kind=health transport=http"
     );
-    let (active_sessions, active_sessions_error) =
-        active_http_sessions_for_health(&state.session_manager);
-    if let Some(active_sessions) = active_sessions {
-        emit_http_active_sessions(active_sessions);
-    }
-    let payload = state
-        .health_service
-        .health_payload_with_http_sessions_and_error(active_sessions, active_sessions_error);
-    tracing::info!(
-        code = "MCP_HTTP_HEALTH_DONE",
-        ok = payload.ok,
-        duration_ms = started.elapsed().as_millis(),
-        "HTTP health payload assembled"
-    );
-    Json(payload)
-}
-
-fn active_http_sessions_for_health(
-    session_manager: &LocalSessionManager,
-) -> (Option<usize>, Option<String>) {
-    match session_manager.sessions.try_read() {
-        Ok(sessions) => (Some(sessions.len()), None),
-        Err(error) => {
-            let detail = format!("HTTP session manager read lock unavailable for /health: {error}");
-            tracing::error!(
-                code = "MCP_HTTP_HEALTH_SESSION_LOCK_UNAVAILABLE",
-                error = %error,
-                "HTTP health did not wait behind the session manager lock"
-            );
-            (None, Some(detail))
-        }
-    }
-}
-
-fn dashboard_active_session_count(state: &HttpState) -> (Option<usize>, Option<String>) {
-    match state.session_manager.sessions.try_read() {
-        Ok(sessions) => {
-            let count = sessions.len();
-            emit_http_active_sessions(count);
-            (Some(count), None)
-        }
-        Err(error) => {
-            let detail =
-                format!("HTTP session manager read lock unavailable for dashboard state: {error}");
-            tracing::error!(
-                code = "MCP_HTTP_DASHBOARD_SESSION_LOCK_UNAVAILABLE",
-                error = %error,
-                "dashboard state did not wait behind the session manager lock"
-            );
-            (None, Some(detail))
-        }
-    }
+    let active_sessions = state.session_manager.sessions.read().await.len();
+    emit_http_active_sessions(active_sessions);
+    Json(
+        state
+            .health_service
+            .health_payload_with_http_sessions(Some(active_sessions)),
+    )
 }
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -11636,4 +9771,1481 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
     tokio::signal::ctrl_c()
         .await
         .with_context(|| format!("wait for ctrl-c {phase}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeSet, HashMap},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use crate::test_support;
+    use anyhow::Context as _;
+    use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
+    use rmcp::transport::streamable_http_server::session::SessionManager as _;
+    use synapse_action::{ActionBackend, ActionEmitter, RecordingBackend};
+    use synapse_core::{Action, Backend, Key, KeyCode, SCHEMA_VERSION};
+
+    use super::*;
+
+    const TEST_RESET_REASON: &str = "http_transport_lease_test_reset";
+
+    #[test]
+    fn lifetime_unlock_requires_every_physical_http_owner_readback() {
+        let all_quiescent = HttpLifetimeOwnerReadback {
+            authority_finalizers_quiescent: true,
+            session_input_owners_quiescent: true,
+            session_manager_quiescent: true,
+            active_socket_owners_quiescent: true,
+            server_dispatch_quiescent: true,
+            background_tasks_quiescent: true,
+            m2_emitter_safe: true,
+            activity_owners_quiescent: true,
+            win_event_shutdown_history_quiescent: true,
+            storage_service_owners_quiescent: true,
+            operator_hotkey_quiescent: true,
+            operator_panic_k2_tasks_quiescent: true,
+        };
+        assert!(all_quiescent.safe_to_unlock());
+        assert!(http_lifetime_locks_safe_to_close(
+            all_quiescent,
+            0,
+            true,
+            true,
+            true
+        ));
+        assert!(
+            !http_lifetime_locks_safe_to_close(all_quiescent, 1, true, true, true),
+            "any retained desktop-worker exact owner must gate HTTP lifetime-lock release"
+        );
+        assert!(
+            !http_lifetime_locks_safe_to_close(all_quiescent, 0, false, true, true),
+            "any retained shutdown-task incident, including a reaped owner with erased output, must gate HTTP lifetime-lock release"
+        );
+        assert!(
+            !http_lifetime_locks_safe_to_close(all_quiescent, 0, true, false, true),
+            "any unresolved exact shell child/job owner must gate HTTP lifetime-lock release"
+        );
+        assert!(
+            !http_lifetime_locks_safe_to_close(all_quiescent, 0, true, true, false),
+            "any retained recorder task or unresolved Drop producer must gate HTTP lifetime-lock release"
+        );
+
+        macro_rules! rejects_false_field {
+            ($field:ident) => {{
+                let mut readback = all_quiescent;
+                readback.$field = false;
+                assert!(
+                    !readback.safe_to_unlock(),
+                    "{} must gate lifetime-lock release",
+                    stringify!($field)
+                );
+            }};
+        }
+        rejects_false_field!(authority_finalizers_quiescent);
+        rejects_false_field!(session_input_owners_quiescent);
+        rejects_false_field!(session_manager_quiescent);
+        rejects_false_field!(active_socket_owners_quiescent);
+        rejects_false_field!(server_dispatch_quiescent);
+        rejects_false_field!(background_tasks_quiescent);
+        rejects_false_field!(m2_emitter_safe);
+        rejects_false_field!(activity_owners_quiescent);
+        rejects_false_field!(win_event_shutdown_history_quiescent);
+        rejects_false_field!(storage_service_owners_quiescent);
+        rejects_false_field!(operator_hotkey_quiescent);
+        rejects_false_field!(operator_panic_k2_tasks_quiescent);
+    }
+
+    #[test]
+    fn storage_owner_sentinel_detects_hidden_service_clones() {
+        let owner = Arc::new(());
+        assert!(m3_storage_owner_readback(&owner).owners_quiescent);
+
+        let hidden_owner = Arc::clone(&owner);
+        let live = m3_storage_owner_readback(&owner);
+        assert!(!live.owners_quiescent);
+        assert_eq!(live.strong_owner_count, 2);
+
+        drop(hidden_owner);
+        assert!(m3_storage_owner_readback(&owner).owners_quiescent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_task_abort_join_has_a_separate_bounded_verdict() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("publish real task start");
+            release_rx.recv().expect("receive real task release");
+        });
+        started_rx.recv().expect("real blocking task started");
+        let later_task_ran = Arc::new(AtomicBool::new(false));
+        let later_task_state = Arc::clone(&later_task_ran);
+        let later = tokio::spawn(async move {
+            later_task_state.store(true, Ordering::Release);
+        });
+        let drain = tokio::spawn(drain_http_background_tasks(vec![
+            own_http_background_task("non_cooperative_real_task", blocking),
+            own_http_background_task("later_real_task", later),
+        ]));
+
+        tokio::task::yield_now().await;
+        time::advance(HTTP_BACKGROUND_TASK_STOP_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        time::advance(HTTP_BACKGROUND_TASK_ABORT_TIMEOUT + Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let bounded_drain_finished = drain.is_finished();
+        release_tx.send(()).expect("release real blocking task");
+        let report = drain.await.expect("join bounded drain supervisor");
+
+        assert!(
+            bounded_drain_finished,
+            "drain supervisor must finish before the non-cooperative task is externally released"
+        );
+        assert!(!report.owners_quiescent(), "{report:?}");
+        assert_eq!(
+            report.still_live_task_names,
+            vec!["non_cooperative_real_task"]
+        );
+        let error = report
+            .verdict()
+            .expect_err("non-cooperative task must reject graceful drain");
+        let detail = error.to_string();
+        assert!(detail.contains("non_cooperative_real_task"), "{detail}");
+        assert!(detail.contains("did not join"), "{detail}");
+        assert!(
+            later_task_ran.load(Ordering::Acquire),
+            "a failed earlier join must not suppress later task observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_abort_join_is_terminal_but_never_restores_a_graceful_verdict() {
+        let task = tokio::spawn(std::future::pending::<io::Result<()>>());
+        let mut owner = ShutdownTaskOwner::new("test_http_listener_deadline", task);
+
+        let error = wait_for_server_stop_with_timeouts(
+            &mut owner,
+            "test_deadline",
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("missing the graceful deadline must remain non-graceful");
+
+        assert!(owner.terminal_join_observed());
+        assert!(
+            error
+                .to_string()
+                .contains("missed its 0ms graceful shutdown deadline"),
+            "{error:#}"
+        );
+        // The test has incorporated the terminal error into its verdict. The
+        // exact cancelled join is safe to acknowledge even though the process
+        // result remains non-graceful.
+        owner.acknowledge_terminal_outcome();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_every_real_local_session_and_rereads_empty_manager() {
+        let manager = LocalSessionManager::default();
+        let mut transports = Vec::new();
+        let mut expected_ids = BTreeSet::new();
+        for _ in 0..3 {
+            let (session_id, transport) = manager
+                .create_session()
+                .await
+                .map_err(|error| anyhow::anyhow!("create real local session: {error}"))
+                .unwrap();
+            expected_ids.insert(session_id.as_ref().to_owned());
+            transports.push(transport);
+        }
+        assert_eq!(active_http_session_ids(&manager).await, expected_ids);
+
+        let report = close_active_mcp_sessions_for_shutdown(&manager, "test_real_sessions").await;
+        let manager_after = active_http_session_ids(&manager).await;
+        drop(transports);
+
+        assert_eq!(report.sessions_before, 3);
+        assert_eq!(report.close_attempted, 3);
+        assert_eq!(report.failure_count, 0, "{report:?}");
+        assert_eq!(report.close_succeeded + report.already_terminated, 3);
+        assert!(report.sessions_after == 0 && report.session_ids_after.is_empty());
+        assert!(manager_after.is_empty());
+    }
+
+    #[test]
+    fn http_transport_diagnostics_detail_names_request_counters_and_hint() {
+        let detail =
+            http_transport_diagnostics_detail_from_snapshot(HttpTransportDiagnosticsSnapshot {
+                accepted_sockets_total: 7,
+                accepted_sockets_current: 2,
+                mcp_request_started_total: 11,
+                mcp_request_completed_total: 10,
+                mcp_request_in_flight: 1,
+                mcp_request_error_status_total: 3,
+                last_event: Some(HttpMcpTransportEvent {
+                    request_id: 11,
+                    phase: "completed",
+                    method: "POST".to_owned(),
+                    path: "/mcp".to_owned(),
+                    status_code: Some(500),
+                    elapsed_ms: Some(42),
+                    unix_ms: 1234,
+                }),
+            });
+
+        assert!(detail.contains("request_started_total:11"));
+        assert!(detail.contains("request_completed_total:10"));
+        assert!(detail.contains("request_in_flight:1"));
+        assert!(detail.contains("request_error_status_total:3"));
+        assert!(detail.contains("accepted_sockets_current:2"));
+        assert!(detail.contains("request_id:11 phase:completed"));
+        assert!(detail.contains("client send errors"));
+        assert!(detail.contains("daemon HTTP middleware"));
+    }
+
+    #[test]
+    fn shutdown_socket_syscall_success_waits_for_final_registry_readback() {
+        let report = ActiveHttpSocketShutdownReport {
+            reason: "test",
+            tracked_before: 1,
+            shutdown_attempted: 1,
+            shutdown_succeeded: 1,
+            failure_count: 0,
+            tracked_after_shutdown_attempt: 1,
+            sockets: Vec::new(),
+            failures: Vec::new(),
+        };
+        let mut failures = HttpShutdownFailures::default();
+
+        failures.inspect_socket_shutdown(&report);
+        assert!(
+            failures.is_empty(),
+            "a stream remains registered until its connection task drops"
+        );
+
+        failures.inspect_final_socket_count(Ok(1));
+        assert_eq!(failures.failures.len(), 1);
+        assert_eq!(failures.failures[0].phase, "socket_registry_readback");
+    }
+
+    #[test]
+    fn shutdown_input_cleanup_allows_operator_owned_global_lease() {
+        let report = DaemonShutdownInputCleanupReport {
+            reason: "test",
+            authority_finalizer_drain_readback: None,
+            authority_finalizer_drain_error: None,
+            active_sessions_before: 0,
+            live_spawn_snapshot_read_before: true,
+            live_spawn_snapshot_error: None,
+            live_spawn_sessions_before: 0,
+            close_candidate_sessions_before: 0,
+            input_owner_snapshot_read_before: true,
+            input_owner_session_ids_before: Vec::new(),
+            shutdown_sessions_before: 0,
+            shutdown_session_ids: Vec::new(),
+            cleaned_sessions: 0,
+            session_cleanup_timeout_ms: u64::try_from(
+                DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            session_cleanup_timeouts: Vec::new(),
+            orphan_lease_owner_cleanup: None,
+            final_lease_held: true,
+            final_lease_owner_session_id: Some(
+                synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID.to_owned(),
+            ),
+            final_lease_is_operator: true,
+            lease_still_held_after_cleanup: false,
+            input_owner_snapshot_read_after: true,
+            input_owner_session_ids_after: Vec::new(),
+            input_owner_snapshot_errors: Vec::new(),
+            failure_count: 0,
+            session_reports: Vec::new(),
+        };
+        let mut failures = HttpShutdownFailures::default();
+
+        failures.inspect_input_cleanup(&report);
+
+        assert!(failures.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_session_input_cleanup_timeout_is_sticky_and_does_not_block_next_attempt() {
+        let (timed_out, did_time_out) =
+            await_daemon_session_input_cleanup("wedged-session", "test", std::future::pending())
+                .await;
+        assert!(did_time_out, "{timed_out:?}");
+        assert!(timed_out.failed, "{timed_out:?}");
+        assert_eq!(timed_out.session_id, "wedged-session");
+        assert!(
+            timed_out
+                .error_message
+                .as_deref()
+                .is_some_and(|detail| detail.contains("completion remains unproven")),
+            "{timed_out:?}"
+        );
+
+        let completed = crate::server::session_lifecycle::SessionShutdownInputCleanupReport {
+            session_id: "next-session".to_owned(),
+            reason: "test".to_owned(),
+            ..Default::default()
+        };
+        let (next, next_timed_out) = await_daemon_session_input_cleanup(
+            "next-session",
+            "test",
+            std::future::ready(completed),
+        )
+        .await;
+        assert!(!next_timed_out, "{next:?}");
+        assert!(!next.failed, "{next:?}");
+        assert_eq!(next.session_id, "next-session");
+    }
+
+    #[test]
+    fn shutdown_failure_aggregation_retains_every_failed_phase() {
+        let session_report = McpSessionShutdownCloseReport {
+            reason: "test",
+            sessions_before: 2,
+            close_attempted: 2,
+            close_succeeded: 1,
+            already_terminated: 0,
+            failure_count: 1,
+            session_ids: vec!["session-a".to_owned(), "session-b".to_owned()],
+            failures: vec!["session-b: close failed".to_owned()],
+            sessions_after: 1,
+            session_ids_after: vec!["session-b".to_owned()],
+        };
+        let socket_report = ActiveHttpSocketShutdownReport {
+            reason: "test",
+            tracked_before: 1,
+            shutdown_attempted: 1,
+            shutdown_succeeded: 0,
+            failure_count: 1,
+            tracked_after_shutdown_attempt: 1,
+            sockets: Vec::new(),
+            failures: vec!["raw_socket=7 wsa_error=10038".to_owned()],
+        };
+        let input_report = DaemonShutdownInputCleanupReport {
+            reason: "test",
+            authority_finalizer_drain_readback: None,
+            authority_finalizer_drain_error: Some(
+                "authority transaction admission lock poisoned".to_owned(),
+            ),
+            active_sessions_before: 1,
+            live_spawn_snapshot_read_before: false,
+            live_spawn_snapshot_error: Some("session registry lock poisoned".to_owned()),
+            live_spawn_sessions_before: 0,
+            close_candidate_sessions_before: 1,
+            input_owner_snapshot_read_before: true,
+            input_owner_session_ids_before: vec!["session-b".to_owned()],
+            shutdown_sessions_before: 1,
+            shutdown_session_ids: vec!["session-b".to_owned()],
+            cleaned_sessions: 1,
+            session_cleanup_timeout_ms: u64::try_from(
+                DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            session_cleanup_timeouts: Vec::new(),
+            orphan_lease_owner_cleanup: None,
+            final_lease_held: true,
+            final_lease_owner_session_id: Some("session-b".to_owned()),
+            final_lease_is_operator: false,
+            lease_still_held_after_cleanup: true,
+            input_owner_snapshot_read_after: true,
+            input_owner_session_ids_after: vec!["session-b".to_owned()],
+            input_owner_snapshot_errors: Vec::new(),
+            failure_count: 1,
+            session_reports: Vec::new(),
+        };
+        let mut failures = HttpShutdownFailures::default();
+
+        failures.inspect_session_close(&session_report);
+        failures.inspect_socket_shutdown(&socket_report);
+        failures.inspect_input_cleanup(&input_report);
+        failures.inspect_final_socket_count(Err("registry lock poisoned".to_owned()));
+        failures.inspect_final_session_ids(&BTreeSet::from(["late-session".to_owned()]));
+        failures.inspect_result("m2_emitter_drain", Err(anyhow::anyhow!("M2 timeout")));
+
+        let phases = failures
+            .failures
+            .iter()
+            .map(|failure| failure.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                "session_close",
+                "socket_shutdown",
+                "input_cleanup",
+                "socket_registry_readback",
+                "session_manager_readback",
+                "m2_emitter_drain",
+            ]
+        );
+        let error = failures
+            .into_result()
+            .expect_err("any failed shutdown phase must prevent a success verdict");
+        let detail = error.to_string();
+        for phase in phases {
+            assert!(detail.contains(phase), "aggregate omitted phase {phase}");
+        }
+    }
+
+    #[test]
+    fn dashboard_host_gate_accepts_loopback_only() {
+        assert!(dashboard_host_allowed("127.0.0.1:7700"));
+        assert!(dashboard_host_allowed("localhost:7700"));
+        assert!(dashboard_host_allowed("[::1]:7700"));
+        assert!(!dashboard_host_allowed("192.168.1.20:7700"));
+        assert!(!dashboard_host_allowed("evil.example"));
+    }
+
+    #[test]
+    fn dashboard_html_does_not_embed_bearer_material() {
+        assert!(DASHBOARD_HTML.contains("Synapse Command Center"));
+        assert!(!DASHBOARD_HTML.contains("Authorization"));
+        assert!(!DASHBOARD_HTML.contains("Bearer"));
+        assert!(!DASHBOARD_HTML.contains("SYNAPSE_BEARER_TOKEN"));
+        assert!(!DASHBOARD_CSS.contains("Authorization"));
+        assert!(!DASHBOARD_CSS.contains("Bearer"));
+        assert!(!DASHBOARD_CSS.contains("SYNAPSE_BEARER_TOKEN"));
+        assert!(!DASHBOARD_JS.contains("Authorization"));
+        assert!(!DASHBOARD_JS.contains("Bearer"));
+        assert!(!DASHBOARD_JS.contains("SYNAPSE_BEARER_TOKEN"));
+    }
+
+    #[test]
+    fn dashboard_html_uses_external_assets_without_inline_blocks() {
+        assert!(DASHBOARD_HTML.contains(&format!("/dashboard/assets/{DASHBOARD_CSS_FILE}")));
+        assert!(DASHBOARD_HTML.contains(&format!("/dashboard/assets/{DASHBOARD_JS_FILE}")));
+        assert!(DASHBOARD_HTML.contains("id=\"root\""));
+        assert!(DASHBOARD_HTML.contains("<script type=\"module\""));
+        assert!(!DASHBOARD_HTML.contains("<style"));
+        assert!(!DASHBOARD_HTML.contains("src=\"http://"));
+        assert!(!DASHBOARD_HTML.contains("src=\"https://"));
+        assert!(!DASHBOARD_HTML.contains("href=\"http://"));
+        assert!(!DASHBOARD_HTML.contains("href=\"https://"));
+        assert!(!DASHBOARD_HTML.contains("<script>"));
+    }
+
+    #[test]
+    fn dashboard_bundle_contains_asset_reload_contract() {
+        assert!(DASHBOARD_STATE_SOURCE.contains("dashboardAssetReloadDecision"));
+        assert!(DASHBOARD_STATE_SOURCE.contains("invalid_server_asset_id"));
+        assert!(DASHBOARD_STATE_SOURCE.contains("_synapse_dashboard_asset"));
+        assert!(DASHBOARD_APP_SOURCE.contains("claimDashboardAssetReload"));
+        assert!(DASHBOARD_JS.contains("_synapse_dashboard_asset"));
+        assert!(DASHBOARD_JS.contains("synapse.dashboard.asset-reload"));
+        assert!(DASHBOARD_JS.contains("invalid_server_asset_id"));
+    }
+
+    #[test]
+    fn dashboard_event_scope_filters_are_panel_scoped() {
+        let agent_state = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::agent_state::AGENT_STATE_EVENT_KIND,
+        );
+        let profile_changed = dashboard_scope_test_event(EventSource::System, "profile-changed");
+        let audit = dashboard_scope_test_event(EventSource::ActionEmitter, "command_finished");
+        let filesystem = dashboard_scope_test_event(EventSource::Filesystem, "file_changed");
+        let approval_request = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_REQUEST_EVENT_KIND,
+        );
+        let approval_decision = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_DECISION_EVENT_KIND,
+        );
+        let approval_timeout = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_TIMEOUT_EVENT_KIND,
+        );
+
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Fleet,
+            &agent_state
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Agent,
+            &profile_changed
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Tasks,
+            &agent_state
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Fleet,
+            &approval_request
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Fleet,
+            &approval_decision
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Tasks,
+            &approval_timeout
+        ));
+        assert!(dashboard_scope_matches(DashboardEventScope::Audit, &audit));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::System,
+            &filesystem
+        ));
+
+        assert!(!dashboard_scope_matches(DashboardEventScope::Fleet, &audit));
+        assert!(!dashboard_scope_matches(
+            DashboardEventScope::Tasks,
+            &profile_changed
+        ));
+        assert!(!dashboard_scope_matches(
+            DashboardEventScope::Agent,
+            &approval_request
+        ));
+        assert!(!dashboard_scope_matches(
+            DashboardEventScope::Audit,
+            &filesystem
+        ));
+    }
+
+    #[test]
+    fn dashboard_event_url_keeps_subscription_id_for_last_event_id_replay() {
+        assert_eq!(
+            dashboard_event_url("sub-01234567-89ab-cdef"),
+            "/dashboard/events?subscription_id=sub-01234567-89ab-cdef"
+        );
+    }
+
+    #[test]
+    fn dashboard_bundle_contains_terminal_ws_contract() {
+        assert!(DASHBOARD_APP_SOURCE.contains("/dashboard/agent-terminal/"));
+        assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_CLIENT_PAUSE"));
+        assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_CLIENT_RESUME"));
+        assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_CLIENT_INPUT"));
+        assert!(DASHBOARD_APP_SOURCE.contains("TERMINAL_SERVER_OUTPUT"));
+        assert!(DASHBOARD_JS.contains("/dashboard/agent-terminal/"));
+    }
+
+    #[test]
+    fn dashboard_asciicast_parser_returns_cumulative_v3_events() {
+        let text = concat!(
+            "{\"version\":3,\"term\":{\"cols\":80,\"rows\":24},\"timestamp\":1700000000}\n",
+            "[0.25,\"o\",\"first\"]\n",
+            "[0.75,\"m\",\"tool_call_started\"]\n",
+            "[0.5,\"x\",\"7\"]\n"
+        );
+        let replay = dashboard_parse_asciicast_text(text, false).expect("valid asciicast");
+
+        assert_eq!(replay.header["version"], 3);
+        assert_eq!(replay.returned_event_count, 3);
+        assert_eq!(replay.output_event_count, 1);
+        assert_eq!(replay.marker_event_count, 1);
+        assert_eq!(replay.exit_code, Some(7));
+        assert!((replay.duration_secs - 1.5).abs() < f64::EPSILON);
+        assert_eq!(replay.events[0].time_secs, 0.25);
+        assert_eq!(replay.events[1].time_secs, 1.0);
+        assert!(!replay.recording_truncated);
+    }
+
+    #[test]
+    fn dashboard_asciicast_parser_declares_bounded_response_truncation() {
+        let text = concat!(
+            "{\"version\":3,\"term\":{\"cols\":80,\"rows\":24},\"timestamp\":1700000000}\n",
+            "[0.25,\"o\",\"first\"]\n"
+        );
+        let replay = dashboard_parse_asciicast_text(text, true).expect("valid partial asciicast");
+
+        assert_eq!(replay.returned_event_count, 1);
+        assert!(replay.response_truncated);
+        assert!(replay.recording_truncated);
+        assert_eq!(replay.exit_code, None);
+    }
+
+    #[test]
+    fn dashboard_recording_status_flags_crash_and_truncation() {
+        let crashed = serde_json::json!({
+            "status": "crashed",
+            "truncated": true,
+            "reason": "panic in worker",
+        });
+        let clean = serde_json::json!({
+            "status": "finished",
+            "truncated": false,
+        });
+
+        assert!(dashboard_capture_status_declares_truncation(&crashed));
+        assert!(dashboard_capture_status_declares_crash(
+            Some(&crashed),
+            Some(0)
+        ));
+        assert!(dashboard_capture_status_declares_crash(None, Some(2)));
+        assert!(!dashboard_capture_status_declares_truncation(&clean));
+        assert!(!dashboard_capture_status_declares_crash(
+            Some(&clean),
+            Some(0)
+        ));
+    }
+
+    #[test]
+    fn dashboard_bundle_contains_session_replay_contract() {
+        assert!(DASHBOARD_STATE_SOURCE.contains("/dashboard/agent-recordings/"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Session Replay"));
+        assert!(DASHBOARD_APP_SOURCE.contains("fetchAgentRecording"));
+        assert!(DASHBOARD_APP_SOURCE.contains("activeReplayEvent"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Recording ended without a complete exit event"));
+        assert!(DASHBOARD_APP_SOURCE.contains("Exit/crash state is declared"));
+    }
+
+    fn dashboard_scope_matches(scope: DashboardEventScope, event: &synapse_core::Event) -> bool {
+        let (filter, kinds, _) = dashboard_event_subscription(scope);
+        (kinds.is_empty() || kinds.iter().any(|kind| kind == &event.kind)) && filter.matches(event)
+    }
+
+    fn dashboard_scope_test_event(source: EventSource, kind: &str) -> synapse_core::Event {
+        synapse_core::Event {
+            seq: 1,
+            at: chrono::Utc::now(),
+            source,
+            kind: kind.to_owned(),
+            data: serde_json::json!({}),
+            correlations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_ws_resize_payload_accepts_text_and_json() {
+        assert_eq!(
+            terminal_ws_parse_resize(b"120x40").expect("text resize"),
+            (120, 40)
+        );
+        assert_eq!(
+            terminal_ws_parse_resize(br#"{"cols":100,"rows":32}"#).expect("json resize"),
+            (100, 32)
+        );
+        assert!(terminal_ws_parse_resize(b"0x40").is_err());
+        assert!(terminal_ws_parse_resize(b"120").is_err());
+    }
+
+    #[test]
+    fn terminal_ws_paused_buffer_preserves_order_and_caps_floods() {
+        let mut frames = VecDeque::new();
+        let mut bytes = 0usize;
+        let first = terminal_ws_frame(TERMINAL_WS_SERVER_OUTPUT, b"first");
+        let second = terminal_ws_frame(TERMINAL_WS_SERVER_OUTPUT, b"second");
+
+        terminal_ws_buffer_paused_frame(&mut frames, &mut bytes, first.clone())
+            .expect("first paused frame should buffer");
+        terminal_ws_buffer_paused_frame(&mut frames, &mut bytes, second.clone())
+            .expect("second paused frame should buffer");
+
+        assert_eq!(bytes, first.len() + second.len());
+        assert_eq!(frames.pop_front(), Some(first.clone()));
+        assert_eq!(frames.pop_front(), Some(second.clone()));
+
+        let mut near_limit = TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX;
+        let mut full = VecDeque::new();
+        full.push_back(vec![TERMINAL_WS_SERVER_OUTPUT; near_limit]);
+        assert!(terminal_ws_buffer_paused_frame(&mut full, &mut near_limit, vec![b'x']).is_err());
+        assert_eq!(near_limit, TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX);
+        assert_eq!(full.len(), 1);
+    }
+
+    #[test]
+    fn dashboard_session_feed_splits_terminal_unbound_history() {
+        let source = serde_json::json!({
+            "now_unix_ms": 10,
+            "stale_after_ms": 300_000,
+            "registry_entry_count": 1,
+            "target_session_count": 0,
+            "returned_count": 1,
+            "input_lease_held": false,
+            "sessions": [
+                {
+                    "session_id": "live-session",
+                    "lifecycle": "live",
+                    "agent_state": { "state": "idle" }
+                }
+            ],
+            "unbound_agent_states": [
+                {
+                    "anchor": "agent-spawn-dead",
+                    "spawn_id": "agent-spawn-dead",
+                    "state": "dead",
+                    "reason_code": "local_model_registry_row_missing",
+                    "attention_class": "terminal_setup_failure"
+                },
+                {
+                    "anchor": "agent-spawn-cleanup",
+                    "spawn_id": "agent-spawn-cleanup",
+                    "state": "dead",
+                    "reason_code": "process_gone_without_exit_event",
+                    "attention_class": "cleanup_required"
+                },
+                {
+                    "anchor": "agent-spawn-stuck",
+                    "spawn_id": "agent-spawn-stuck",
+                    "state": "stuck",
+                    "reason_code": "silent_timeout"
+                },
+                {
+                    "anchor": "agent-spawn-acked-stuck",
+                    "spawn_id": "agent-spawn-acked-stuck",
+                    "state": "stuck",
+                    "reason_code": "silent_timeout_unprobeable"
+                },
+                {
+                    "anchor": "agent-spawn-needs-input",
+                    "spawn_id": "agent-spawn-needs-input",
+                    "state": "needs_input",
+                    "reason_code": "permission_prompt"
+                },
+                "malformed-row"
+            ]
+        });
+
+        let data = dashboard_primary_session_list_data(
+            &source,
+            Ok(BTreeSet::from(["agent-spawn-acked-stuck".to_owned()])),
+        );
+        let primary = data["unbound_agent_states"]
+            .as_array()
+            .expect("primary rows");
+        let acknowledged = data["acknowledged_unbound_agent_states"]
+            .as_array()
+            .expect("acknowledged rows");
+        let terminal = data["terminal_unbound_agent_states"]
+            .as_array()
+            .expect("terminal rows");
+
+        assert_eq!(primary.len(), 4);
+        assert_eq!(primary[0]["anchor"], "agent-spawn-cleanup");
+        assert_eq!(primary[0]["attention_class"], "cleanup_required");
+        assert_eq!(primary[1]["state"], "stuck");
+        assert_eq!(primary[2]["state"], "needs_input");
+        assert_eq!(primary[3], "malformed-row");
+        assert_eq!(acknowledged.len(), 1);
+        assert_eq!(acknowledged[0]["anchor"], "agent-spawn-acked-stuck");
+        assert_eq!(
+            acknowledged[0]["dashboard_attention_suppressed"]["reason"],
+            "acknowledged_escalation"
+        );
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["anchor"], "agent-spawn-dead");
+        assert_eq!(terminal[0]["attention_class"], "terminal_setup_failure");
+        assert_eq!(
+            data["dashboard_unbound_agent_filter"]["acknowledged_unbound_agent_count"],
+            1
+        );
+        assert_eq!(
+            data["dashboard_unbound_agent_filter"]["terminal_unbound_agent_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn dashboard_security_headers_disallow_inline_script_and_eval() {
+        let response = with_dashboard_security_headers(Html("").into_response());
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .expect("CSP header present");
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("style-src 'self'"));
+        assert!(!csp.contains("'unsafe-inline'"));
+        assert!(!csp.contains("'unsafe-eval'"));
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-content-type-options"))
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, max-age=0")
+        );
+    }
+
+    #[test]
+    fn dashboard_source_uses_charter_guardrails() {
+        let source = [
+            DASHBOARD_APP_SOURCE,
+            DASHBOARD_STATE_SOURCE,
+            DASHBOARD_UTILS_SOURCE,
+            DASHBOARD_PRIMITIVES_SOURCE,
+        ]
+        .join("\n");
+        assert!(source.contains("stripTerminalSequences"));
+        assert!(source.contains("ReactMarkdown"));
+        assert!(source.contains("rehypeSanitize"));
+        assert!(source.contains("RawValue"));
+        assert!(source.contains("Section"));
+        assert!(source.contains("/dashboard/state.json"));
+        assert!(source.contains("cache: \"no-store\""));
+        assert!(DASHBOARD_CHARTER_CHECK_SOURCE.contains("dangerouslySetInnerHTML"));
+        assert!(DASHBOARD_CHARTER_CHECK_SOURCE.contains("insertAdjacentHTML"));
+        assert!(DASHBOARD_CHARTER_CHECK_SOURCE.contains("every Section must declare questions"));
+        assert!(
+            DASHBOARD_CHARTER_CHECK_SOURCE.contains("RawValue disclosure must not default open")
+        );
+        assert!(!source.contains("dangerouslySetInnerHTML"));
+        assert!(!source.contains(".innerHTML"));
+        assert!(!source.contains("insertAdjacentHTML"));
+        assert!(!source.contains("new Function"));
+        assert!(!source.contains("eval("));
+    }
+
+    #[test]
+    fn dashboard_local_model_spawn_params_force_local_model_kind() {
+        let params = dashboard_local_model_spawn_params(DashboardLocalModelSpawnRequest {
+            model_ref: " ollama-gemma4-e4b ".to_owned(),
+            prompt: " write known result ".to_owned(),
+            working_dir: Some(" C:\\code\\Synapse ".to_owned()),
+            wait_timeout_ms: Some(300_000),
+            hold_open_ms: Some(0),
+        })
+        .expect("valid dashboard local model spawn params");
+
+        assert_eq!(params.cli, None);
+        assert_eq!(params.kind, Some(crate::m4::ActSpawnAgentCli::LocalModel));
+        assert_eq!(params.model_ref.as_deref(), Some("ollama-gemma4-e4b"));
+        assert_eq!(params.prompt.as_deref(), Some("write known result"));
+        assert_eq!(params.working_dir.as_deref(), Some("C:\\code\\Synapse"));
+        assert_eq!(params.wait_timeout_ms, 300_000);
+        assert_eq!(params.hold_open_ms, 0);
+    }
+
+    fn empty_dashboard_spawn_agent_request() -> DashboardSpawnAgentRequest {
+        DashboardSpawnAgentRequest {
+            fan_out: None,
+            template_id: None,
+            template_version: None,
+            template_params: BTreeMap::new(),
+            cli: None,
+            kind: None,
+            model: None,
+            model_ref: None,
+            prompt: None,
+            target: None,
+            working_dir: None,
+            wait_timeout_ms: None,
+            hold_open_ms: None,
+            require_approval_gate: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_spawn_agent_request_params_preserves_template_fanout() {
+        let mut request = empty_dashboard_spawn_agent_request();
+        request.fan_out = Some(5);
+        request.template_id = Some(" issue923-template ".to_owned());
+        request.template_version = Some(7);
+        request
+            .template_params
+            .insert("task".to_owned(), "write-known-row".to_owned());
+
+        let (fan_out, spawn) =
+            dashboard_spawn_agent_request_params(request).expect("valid template spawn params");
+
+        assert_eq!(fan_out, 5);
+        assert_eq!(spawn.template_id.as_deref(), Some("issue923-template"));
+        assert_eq!(spawn.template_version, Some(7));
+        assert_eq!(
+            spawn.template_params.get("task").map(String::as_str),
+            Some("write-known-row")
+        );
+        assert_eq!(spawn.kind, None);
+        assert_eq!(spawn.model_ref, None);
+        assert_eq!(
+            spawn.wait_timeout_ms,
+            crate::m4::default_agent_spawn_wait_timeout_ms()
+        );
+        assert_eq!(
+            spawn.hold_open_ms,
+            crate::m4::default_agent_spawn_hold_open_ms()
+        );
+    }
+
+    #[test]
+    fn dashboard_spawn_agent_request_params_trims_direct_spawn_and_target() {
+        let mut request = empty_dashboard_spawn_agent_request();
+        request.kind = Some(crate::m4::ActSpawnAgentCli::Codex);
+        request.model = Some(" gpt-5-codex ".to_owned());
+        request.prompt = Some(" write known row ".to_owned());
+        request.working_dir = Some(" C:\\code\\Synapse ".to_owned());
+        request.target = Some(crate::m4::ActSpawnAgentTarget::Window {
+            window_hwnd: 1116654,
+        });
+        request.wait_timeout_ms = Some(42_000);
+        request.hold_open_ms = Some(0);
+
+        let (fan_out, spawn) =
+            dashboard_spawn_agent_request_params(request).expect("valid direct spawn params");
+
+        assert_eq!(fan_out, 1);
+        assert_eq!(spawn.kind, Some(crate::m4::ActSpawnAgentCli::Codex));
+        assert_eq!(spawn.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(spawn.prompt.as_deref(), Some("write known row"));
+        assert_eq!(spawn.working_dir.as_deref(), Some("C:\\code\\Synapse"));
+        assert_eq!(
+            spawn.target,
+            Some(crate::m4::ActSpawnAgentTarget::Window {
+                window_hwnd: 1116654
+            })
+        );
+        assert_eq!(spawn.wait_timeout_ms, 42_000);
+        assert_eq!(spawn.hold_open_ms, 0);
+    }
+
+    #[test]
+    fn dashboard_spawn_agent_request_params_rejects_invalid_fanout() {
+        for fan_out in [0, DASHBOARD_SPAWN_FAN_OUT_MAX + 1] {
+            let mut request = empty_dashboard_spawn_agent_request();
+            request.fan_out = Some(fan_out);
+            let response = dashboard_spawn_agent_request_params(request)
+                .expect_err("invalid dashboard fan-out should fail closed");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn dashboard_agent_kill_params_trim_id_and_keep_options() {
+        let params = dashboard_agent_kill_params(DashboardAgentKillRequest {
+            session_id: " agent-spawn-issue923 ".to_owned(),
+            grace_ms: Some(0),
+            interrupt_first: Some(false),
+        })
+        .expect("valid dashboard kill params");
+
+        assert_eq!(params.session_id, "agent-spawn-issue923");
+        assert_eq!(params.grace_ms, 0);
+        assert!(!params.interrupt_first);
+    }
+
+    #[test]
+    fn dashboard_agent_kill_params_reject_empty_id() {
+        let response = dashboard_agent_kill_params(DashboardAgentKillRequest {
+            session_id: "   ".to_owned(),
+            grace_ms: None,
+            interrupt_first: None,
+        })
+        .expect_err("empty dashboard kill id should fail closed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_agent_control_params_trim_selected_agent_ids() {
+        let interrupt = dashboard_agent_interrupt_params(DashboardAgentLookupRequest {
+            session_id: " agent-spawn-issue917 ".to_owned(),
+        })
+        .expect("valid dashboard interrupt params");
+        let pause = dashboard_agent_pause_params(DashboardAgentLookupRequest {
+            session_id: " session-issue917 ".to_owned(),
+        })
+        .expect("valid dashboard pause params");
+
+        assert_eq!(interrupt.session_id, "agent-spawn-issue917");
+        assert_eq!(pause.session_id, "session-issue917");
+    }
+
+    #[test]
+    fn dashboard_agent_respawn_params_require_prompt() {
+        let response = dashboard_agent_respawn_params(DashboardAgentRespawnRequest {
+            session_id: "agent-spawn-issue917".to_owned(),
+            prompt: "   ".to_owned(),
+            carry_context: None,
+            grace_ms: None,
+        })
+        .expect_err("empty dashboard respawn prompt should fail closed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_agent_respawn_params_trim_and_default_options() {
+        let params = dashboard_agent_respawn_params(DashboardAgentRespawnRequest {
+            session_id: " agent-spawn-issue917 ".to_owned(),
+            prompt: " continue this work ".to_owned(),
+            carry_context: None,
+            grace_ms: None,
+        })
+        .expect("valid dashboard respawn params");
+
+        assert_eq!(params.session_id, "agent-spawn-issue917");
+        assert_eq!(params.prompt, "continue this work");
+        assert!(params.carry_context);
+        assert_eq!(params.grace_ms, DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS);
+    }
+
+    #[test]
+    fn dashboard_control_lease_force_release_params_trim_owner() {
+        let (owner_session_id, confirmed) = dashboard_control_lease_force_release_params(
+            DashboardControlLeaseForceReleaseRequest {
+                owner_session_id: " lease-owner-session ".to_owned(),
+                confirmed: true,
+            },
+        )
+        .expect("valid dashboard force-release params");
+
+        assert_eq!(owner_session_id, "lease-owner-session");
+        assert!(confirmed);
+    }
+
+    #[test]
+    fn dashboard_control_lease_force_release_params_require_confirmation() {
+        let response = dashboard_control_lease_force_release_params(
+            DashboardControlLeaseForceReleaseRequest {
+                owner_session_id: "lease-owner-session".to_owned(),
+                confirmed: false,
+            },
+        )
+        .expect_err("unconfirmed dashboard force-release should fail closed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_control_lease_handoff_params_trim_sessions_and_default_ttl() {
+        let (from_session_id, to_session_id, ttl_ms) =
+            dashboard_control_lease_handoff_params(DashboardControlLeaseHandoffRequest {
+                from_session_id: " from-session ".to_owned(),
+                to_session_id: " to-session ".to_owned(),
+                ttl_ms: None,
+            })
+            .expect("valid dashboard handoff params");
+
+        assert_eq!(from_session_id, "from-session");
+        assert_eq!(to_session_id, "to-session");
+        assert_eq!(ttl_ms, synapse_action::DEFAULT_LEASE_TTL_MS);
+    }
+
+    #[test]
+    fn dashboard_control_lease_handoff_params_reject_bad_sessions_and_ttl() {
+        let same_session =
+            dashboard_control_lease_handoff_params(DashboardControlLeaseHandoffRequest {
+                from_session_id: "same".to_owned(),
+                to_session_id: " same ".to_owned(),
+                ttl_ms: Some(synapse_action::DEFAULT_LEASE_TTL_MS),
+            })
+            .expect_err("same session handoff should fail closed");
+        assert_eq!(same_session.status(), StatusCode::BAD_REQUEST);
+
+        let bad_ttl = dashboard_control_lease_handoff_params(DashboardControlLeaseHandoffRequest {
+            from_session_id: "from".to_owned(),
+            to_session_id: "to".to_owned(),
+            ttl_ms: Some(synapse_action::MIN_LEASE_TTL_MS - 1),
+        })
+        .expect_err("out-of-range dashboard handoff ttl should fail closed");
+        assert_eq!(bad_ttl.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn test_session_state(name: &str) -> SessionState {
+        SessionState::new(InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new(name, "0.0.0-test"),
+        ))
+    }
+
+    fn test_store_error(error: SessionStoreError) -> anyhow::Error {
+        anyhow::anyhow!("{error}")
+    }
+
+    fn empty_cdp_target_owners() -> crate::server::SharedCdpTargetOwners {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn empty_session_registry() -> crate::server::session_registry::SharedSessionRegistry {
+        Arc::new(Mutex::new(
+            crate::server::session_registry::SessionRegistry::default(),
+        ))
+    }
+
+    #[test]
+    fn shutdown_cleanup_session_ids_union_every_pre_cleanup_source() {
+        let active = BTreeSet::from(["active".to_owned(), "both".to_owned()]);
+        let live_spawns = BTreeSet::from(["both".to_owned(), "idle-spawn".to_owned()]);
+        let close_candidates = BTreeSet::from(["close-failed".to_owned()]);
+        let input_owners = BTreeSet::from(["input-owner".to_owned()]);
+
+        let cleanup =
+            shutdown_cleanup_session_ids(&active, &live_spawns, &close_candidates, &input_owners);
+
+        assert_eq!(
+            cleanup,
+            BTreeSet::from([
+                "active".to_owned(),
+                "both".to_owned(),
+                "close-failed".to_owned(),
+                "idle-spawn".to_owned(),
+                "input-owner".to_owned(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn synapse_mcp_session_store_round_trips_exact_keys_and_deletes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+        let store = SynapseMcpSessionStore::new(
+            Arc::clone(&db),
+            Some(Duration::from_mins(5)),
+            empty_session_registry(),
+        );
+
+        assert!(
+            store
+                .load("codex-session")
+                .await
+                .map_err(test_store_error)?
+                .is_none(),
+            "unknown session should not load"
+        );
+
+        let state = test_session_state("codex-test");
+        let neighboring_state = test_session_state("codex-test-neighbor");
+        store
+            .store("codex-session", &state)
+            .await
+            .map_err(test_store_error)?;
+        let stored_rows = db.scan_cf_prefix(cf::CF_KV, &mcp_session_store_key("codex-session"))?;
+        let stored_row = stored_rows
+            .iter()
+            .find(|(key, _value)| key == &mcp_session_store_key("codex-session"))
+            .context("stored row should exist in CF_KV")?;
+        let persisted = synapse_storage::decode_json::<PersistedMcpSessionState>(&stored_row.1)?;
+        assert_eq!(persisted.state.initialize_params, state.initialize_params);
+
+        store
+            .store("codex-session-extra", &neighboring_state)
+            .await
+            .map_err(test_store_error)?;
+
+        let loaded = store
+            .load("codex-session")
+            .await
+            .map_err(test_store_error)?
+            .context("stored session should load")?;
+        assert_eq!(loaded.initialize_params, state.initialize_params);
+
+        store
+            .delete("codex-session")
+            .await
+            .map_err(test_store_error)?;
+        assert!(
+            store
+                .load("codex-session")
+                .await
+                .map_err(test_store_error)?
+                .is_none(),
+            "deleted session should not load"
+        );
+        assert!(
+            store
+                .load("codex-session-extra")
+                .await
+                .map_err(test_store_error)?
+                .is_some(),
+            "deleting one session should not delete a prefix-sharing neighbor"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn synapse_mcp_session_store_deletes_expired_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+        let store = SynapseMcpSessionStore::new(
+            Arc::clone(&db),
+            Some(Duration::from_millis(1)),
+            empty_session_registry(),
+        );
+        let key = mcp_session_store_key("expired-session");
+
+        store
+            .store("expired-session", &test_session_state("expired-test"))
+            .await
+            .map_err(test_store_error)?;
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, &key)?
+                .into_iter()
+                .any(|(row_key, _value)| row_key == key),
+            "stored row should physically exist before expiry"
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            store
+                .load("expired-session")
+                .await
+                .map_err(test_store_error)?
+                .is_none(),
+            "expired session should not load"
+        );
+        assert!(
+            !db.scan_cf_prefix(cf::CF_KV, &key)?
+                .into_iter()
+                .any(|(row_key, _value)| row_key == key),
+            "expired session row should be deleted from CF_KV"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn synapse_mcp_session_store_deletes_legacy_rows_without_ttl() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+        let store = SynapseMcpSessionStore::new(
+            Arc::clone(&db),
+            Some(Duration::from_mins(5)),
+            empty_session_registry(),
+        );
+        let key = mcp_session_store_key("legacy-session");
+        let legacy_state = test_session_state("legacy-test");
+        let legacy_encoded = synapse_storage::encode_json(&legacy_state)?;
+        db.put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), legacy_encoded)])?;
+
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, &key)?
+                .into_iter()
+                .any(|(row_key, _value)| row_key == key),
+            "legacy row should physically exist before load"
+        );
+
+        assert!(
+            store
+                .load("legacy-session")
+                .await
+                .map_err(test_store_error)?
+                .is_none(),
+            "legacy row without persistent TTL metadata should not load"
+        );
+        assert!(
+            !db.scan_cf_prefix(cf::CF_KV, &key)?
+                .into_iter()
+                .any(|(row_key, _value)| row_key == key),
+            "legacy session row should be deleted from CF_KV"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_releases_absent_inputs_only() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let cancel = CancellationToken::new();
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let (active_session_id, _active_transport) = session_manager
+            .create_session()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let active_session_text = active_session_id.as_ref().to_owned();
+        let stale_session_id = "stale-session".to_owned();
+        let _prior = synapse_action::lease::force_clear("http_stale_inputs_test_reset");
+        let _held = synapse_action::lease::try_acquire(&stale_session_id, Duration::from_secs(30));
+
+        handle
+            .with_session_id(Some(stale_session_id.clone()))
+            .execute(Action::KeyDown {
+                key: test_key("ctrl"),
+                backend: Backend::Software,
+            })
+            .await?;
+        handle
+            .with_session_id(Some(active_session_text.clone()))
+            .execute(Action::KeyDown {
+                key: test_key("shift"),
+                backend: Backend::Software,
+            })
+            .await?;
+
+        let before_state = snapshot_handle.snapshot().await?;
+        let before_ownership = handle.session_inputs_snapshot()?;
+        let before_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_owner before_state={before_state:?} before_ownership={before_ownership:?} before_lease={before_lease:?} active_session_id={active_session_text}"
+        );
+        assert_eq!(
+            before_lease.owner_session_id.as_deref(),
+            Some(stale_session_id.as_str())
+        );
+
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
+
+        let after_state = snapshot_handle.snapshot().await?;
+        let after_ownership = handle.session_inputs_snapshot()?;
+        let after_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_owner after_state={after_state:?} after_ownership={after_ownership:?} after_lease={after_lease:?}"
+        );
+
+        assert_eq!(after_state.held_keys, vec![test_key("shift")]);
+        assert!(!after_lease.held);
+        assert!(
+            after_ownership
+                .sessions
+                .iter()
+                .any(|session| session.session_id == active_session_text),
+            "active session ownership should be retained"
+        );
+        assert!(
+            !after_ownership
+                .sessions
+                .iter()
+                .any(|session| session.session_id == stale_session_id),
+            "stale session ownership should be removed"
+        );
+
+        session_manager
+            .close_session(&active_session_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        handle.execute(Action::ReleaseAll).await?;
+        cancel.cancel();
+        let final_snapshot = join.await?;
+        assert!(final_snapshot.held_keys.is_empty());
+        let _prior = synapse_action::lease::force_clear("http_stale_inputs_test_reset");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_releases_absent_lease_without_inputs() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let cancel = CancellationToken::new();
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
+        let session_manager = LocalSessionManager::default();
+        let stale_session_id = "stale-lease-session";
+        let _prior = synapse_action::lease::force_clear("http_stale_lease_test_reset");
+        let _held = synapse_action::lease::try_acquire(stale_session_id, Duration::from_secs(30));
+
+        let before_state = snapshot_handle.snapshot().await?;
+        let before_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_lease before_state={before_state:?} before_lease={before_lease:?}"
+        );
+
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
+
+        let after_state = snapshot_handle.snapshot().await?;
+        let after_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_lease after_state={after_state:?} after_lease={after_lease:?}"
+        );
+        assert!(!after_lease.held);
+        assert_eq!(after_lease.owner_session_id, None);
+
+        cancel.cancel();
+        let final_snapshot = join.await?;
+        assert!(final_snapshot.held_keys.is_empty());
+        let _prior = synapse_action::lease::force_clear("http_stale_lease_test_reset");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_lease_cleanup_releases_held_input_before_reacquire() -> anyhow::Result<()> {
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        let cancel = CancellationToken::new();
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
+        let session_manager = LocalSessionManager::default();
+        let expired_session_id = "expired-lease-session";
+        let contender_session_id = "expired-lease-contender";
+        let _prior = synapse_action::lease::force_clear("http_expired_lease_test_reset");
+
+        handle
+            .with_session_id(Some(expired_session_id.to_owned()))
+            .execute(Action::KeyDown {
+                key: test_key("ctrl"),
+                backend: Backend::Software,
+            })
+            .await?;
+        let _held = synapse_action::lease::try_acquire(
+            expired_session_id,
+            Duration::from_millis(synapse_action::MIN_LEASE_TTL_MS),
+        );
+        tokio::time::sleep(Duration::from_millis(synapse_action::MIN_LEASE_TTL_MS + 50)).await;
+
+        let before_state = snapshot_handle.snapshot().await?;
+        let before_ownership = handle.session_inputs_snapshot()?;
+        let before_lease = synapse_action::lease::status();
+        let before_pending = synapse_action::lease::expired_cleanup_snapshot();
+        println!(
+            "readback=http_session_cleanup edge=expired_lease before_state={before_state:?} before_ownership={before_ownership:?} before_lease={before_lease:?} before_pending={before_pending:?}"
+        );
+        assert_eq!(before_state.held_keys, vec![test_key("ctrl")]);
+        assert!(!before_lease.held);
+        assert_eq!(before_pending.len(), 1);
+        match synapse_action::lease::try_acquire(contender_session_id, Duration::from_secs(30)) {
+            synapse_action::LeaseOutcome::CleanupPending { expired, .. } => {
+                assert_eq!(
+                    expired.owner_session_id.as_deref(),
+                    Some(expired_session_id)
+                );
+            }
+            other => anyhow::bail!("contender should be refused pending cleanup, got {other:?}"),
+        }
+
+        let cdp_target_owners = empty_cdp_target_owners();
+        cleanup_stale_session_inputs_once(&handle, &session_manager, &cdp_target_owners).await;
+
+        let after_state = snapshot_handle.snapshot().await?;
+        let after_ownership = handle.session_inputs_snapshot()?;
+        let after_pending = synapse_action::lease::expired_cleanup_snapshot();
+        let acquire_after_cleanup =
+            synapse_action::lease::try_acquire(contender_session_id, Duration::from_secs(30));
+        let after_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=expired_lease after_state={after_state:?} after_ownership={after_ownership:?} after_pending={after_pending:?} acquire_after_cleanup={acquire_after_cleanup:?} after_lease={after_lease:?}"
+        );
+        assert!(after_state.held_keys.is_empty());
+        assert!(after_ownership.sessions.is_empty());
+        assert!(after_pending.is_empty());
+        assert!(matches!(
+            acquire_after_cleanup,
+            synapse_action::LeaseOutcome::Acquired(_)
+        ));
+        assert_eq!(
+            after_lease.owner_session_id.as_deref(),
+            Some(contender_session_id)
+        );
+
+        let _released = synapse_action::lease::release_if_owner(contender_session_id);
+        cancel.cancel();
+        let final_snapshot = join.await?;
+        assert!(final_snapshot.held_keys.is_empty());
+        let _prior = synapse_action::lease::force_clear("http_expired_lease_test_reset");
+
+        Ok(())
+    }
+
+    fn test_key(value: &str) -> Key {
+        Key {
+            code: KeyCode::Named {
+                value: value.to_owned(),
+            },
+            use_scancode: false,
+        }
+    }
 }

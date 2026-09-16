@@ -1,0 +1,75 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.chrome.curated.unknown_scope"
+package_version = "0.1.0"
+profile_id = "chrome"
+profile_version = "1.0.0"
+created_at = "2026-05-27T19:40:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic curated starter edge fixture for issue #481."
+
+[source]
+kind = "synthetic_fixture"
+uri = "file://crates/synapse-profiles/tests/fixtures/profile_registry/curated_starter_registry/edge_chrome_unknown_use_scope_manifest.toml"
+revision = "m5-r21-edge"
+built_by = "codex"
+generated_by = "synapse-curated-starter-registry-v1"
+
+[[targets]]
+target_id = "chrome.windows"
+target_kind = "productivity_app"
+app_id = "google.chrome"
+process_name = "chrome.exe"
+title_regex = ".* - Google Chrome$"
+app_version = "148.0.7778.179"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = []
+
+[assumptions.display]
+min_width = 1024
+min_height = 768
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software"]
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "unknown"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = false
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T19:40:00Z"
+summary = "Invalid unknown use scope edge for Chromium browser curated starter registry."
+
+[hashes]
+profile_toml_sha256 = "sha256:3b9a72c266983a25137a54090b11ae1f4169ed886db1bf0513bbf2189a4dcdee"
+package_sha256 = "sha256:4814814814814814814814814814814814814814814814814814814814814814"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/chrome.toml"
+
+[metadata]
+"curated.seed_set_id" = "starter.v1"
+"curated.target_id" = "chrome.windows"
+"curated.tier" = "productivity.seed"
+"curated.priority" = "p1"
+"curated.status" = "edge"
+"curated.backlog_issue" = "#481"
+"curated.minimum_manual_fsv" = "profile_list,profile_registry_install"

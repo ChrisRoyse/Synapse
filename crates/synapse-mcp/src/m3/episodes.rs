@@ -14,10 +14,9 @@
 //! day is a closed replacement unit: re-segmenting any day range converges
 //! to the same physical rows, byte for byte.
 //!
-//! Failure policy: disk pressure refusal, undecodable rows, engine errors, and
-//! constellation measurement failures are loud and structured. The tool never
-//! deletes rows it could not re-derive (a failed day leaves storage untouched
-//! for that day).
+//! Failure policy: disk pressure refusal, undecodable rows, and engine
+//! errors are loud and structured. The tool never deletes rows it could not
+//! re-derive (a failed day leaves storage untouched for that day).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -36,13 +35,11 @@ use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
-    grounding::{self, SOURCE_EPISODE_SEGMENT},
     permissions::{Permission, RequiredPermissions, required},
 };
 
 /// Maximum timeline rows scanned per call; a larger range pauses at a day
-/// boundary and returns `next_start_ts_ns`. A single day exceeding this budget
-/// fails before mutation instead of running past the MCP call window.
+/// boundary and returns `next_start_ts_ns`.
 pub const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 /// Maximum local days replaced per call.
 pub const MAX_DAYS_PER_CALL: u32 = 92;
@@ -78,9 +75,6 @@ pub struct EpisodeSegmentDay {
     pub timeline_rows: u64,
     pub episodes_written: u64,
     pub episodes_deleted: u64,
-    pub constellations_inserted: u64,
-    pub constellations_deduped: u64,
-    pub constellation_failures: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -102,9 +96,6 @@ pub struct EpisodeSegmentResponse {
     pub payload_anomalies: u64,
     pub episodes_written: u64,
     pub episodes_deleted: u64,
-    pub constellations_inserted: u64,
-    pub constellations_deduped: u64,
-    pub constellation_failures: u64,
     pub dry_run: bool,
     /// Per-day breakdown for days that had rows or stale episodes.
     pub days: Vec<EpisodeSegmentDay>,
@@ -150,41 +141,6 @@ pub(crate) fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
-}
-
-fn fixed_width_key_successor(
-    key: &[u8],
-    expected_len: usize,
-    cf_name: &str,
-) -> Result<Vec<u8>, ErrorData> {
-    if key.len() != expected_len {
-        return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "FIXED_WIDTH_RANGE_CURSOR_INVALID in {cf_name}: expected {expected_len} bytes, got {}; key_hex={}",
-                key.len(),
-                hex_encode(key)
-            ),
-        ));
-    }
-
-    let mut successor = key.to_vec();
-    for byte in successor.iter_mut().rev() {
-        if *byte == u8::MAX {
-            *byte = 0;
-            continue;
-        }
-        *byte = byte.saturating_add(1);
-        return Ok(successor);
-    }
-
-    Err(mcp_error(
-        error_codes::STORAGE_READ_FAILED,
-        format!(
-            "FIXED_WIDTH_RANGE_CURSOR_EXHAUSTED in {cf_name}: key has no representable {expected_len}-byte successor; key_hex={}",
-            hex_encode(key)
-        ),
-    ))
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -316,37 +272,38 @@ fn day_timeline_rows(
     day_end_ns: u64,
     scanned_rows: &mut u64,
     invalid_rows: &mut u64,
-) -> Result<Vec<TimelineRecord>, ErrorData> {
+) -> Result<(Vec<TimelineRecord>, Option<u64>), ErrorData> {
     let mut records = Vec::new();
+    let mut next_populated_ts: Option<u64> = None;
     let mut start = timeline_codec::timeline_scan_start(day_start_ns);
-    let end = timeline_codec::timeline_scan_start(day_end_ns);
-    loop {
+    'scan: loop {
         let (rows, more) = runtime
-            .storage_cf_rows_range(cf::CF_TIMELINE, &start, &end, SCAN_CHUNK_ROWS)
+            .storage_cf_rows_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
         }
         for (key, value) in &rows {
             *scanned_rows += 1;
-            if usize::try_from(*scanned_rows).unwrap_or(usize::MAX) > MAX_SCAN_ROWS_PER_CALL {
-                return Err(internal(format!(
-                    "EPISODE_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS_PER_CALL} CF_TIMELINE rows while reading day {day_start_ns}..{day_end_ns}; no episode rows were replaced for this day"
-                )));
-            }
             match timeline_codec::decode_timeline_key(key) {
-                Ok((_ts_ns, _seq)) => match decode_json::<TimelineRecord>(value) {
-                    Ok(record) => records.push(record),
-                    Err(error) => {
-                        *invalid_rows += 1;
-                        tracing::warn!(
-                            code = "TIMELINE_ROW_DECODE_FAILED",
-                            key_hex = %hex_encode(key),
-                            %error,
-                            "episode_segment skipped an undecodable CF_TIMELINE row"
-                        );
+                Ok((ts_ns, _seq)) => {
+                    if ts_ns >= day_end_ns {
+                        next_populated_ts = Some(ts_ns);
+                        break 'scan;
                     }
-                },
+                    match decode_json::<TimelineRecord>(value) {
+                        Ok(record) => records.push(record),
+                        Err(error) => {
+                            *invalid_rows += 1;
+                            tracing::warn!(
+                                code = "TIMELINE_ROW_DECODE_FAILED",
+                                key_hex = %hex_encode(key),
+                                %error,
+                                "episode_segment skipped an undecodable CF_TIMELINE row"
+                            );
+                        }
+                    }
+                }
                 Err(error) => {
                     *invalid_rows += 1;
                     tracing::warn!(
@@ -363,10 +320,9 @@ fn day_timeline_rows(
         }
         let last = rows.last().map(|(key, _value)| key.clone());
         let Some(last) = last else { break };
-        start =
-            fixed_width_key_successor(&last, timeline_codec::TIMELINE_KEY_LEN, cf::CF_TIMELINE)?;
+        start = key_after(&last);
     }
-    Ok(records)
+    Ok((records, next_populated_ts))
 }
 
 /// Existing `CF_EPISODES` keys with start timestamps in `[start_ns, end_ns)`.
@@ -377,17 +333,21 @@ fn existing_episode_keys(
 ) -> Result<Vec<Vec<u8>>, ErrorData> {
     let mut keys = Vec::new();
     let mut start = episode_codec::episode_scan_start(start_ns);
-    let end = episode_codec::episode_scan_start(end_ns);
-    loop {
+    'scan: loop {
         let (rows, more) = runtime
-            .storage_cf_rows_range(cf::CF_EPISODES, &start, &end, SCAN_CHUNK_ROWS)
+            .storage_cf_rows_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
         }
         for (key, _value) in &rows {
             match episode_codec::decode_episode_key(key) {
-                Ok((_ts_ns, _ordinal)) => keys.push(key.clone()),
+                Ok((ts_ns, _ordinal)) => {
+                    if ts_ns >= end_ns {
+                        break 'scan;
+                    }
+                    keys.push(key.clone());
+                }
                 Err(error) => {
                     // A malformed derived-state key is corruption we own:
                     // refuse to replace around it rather than strand it.
@@ -407,7 +367,7 @@ fn existing_episode_keys(
         }
         let last = rows.last().map(|(key, _value)| key.clone());
         let Some(last) = last else { break };
-        start = fixed_width_key_successor(&last, episode_codec::EPISODE_KEY_LEN, cf::CF_EPISODES)?;
+        start = key_after(&last);
     }
     Ok(keys)
 }
@@ -461,9 +421,6 @@ pub fn segment_episodes(
                     payload_anomalies: 0,
                     episodes_written: 0,
                     episodes_deleted: 0,
-                    constellations_inserted: 0,
-                    constellations_deduped: 0,
-                    constellation_failures: 0,
                     dry_run: params.dry_run,
                     days: Vec::new(),
                     next_start_ts_ns: None,
@@ -491,9 +448,6 @@ pub fn segment_episodes(
         payload_anomalies: 0,
         episodes_written: 0,
         episodes_deleted: 0,
-        constellations_inserted: 0,
-        constellations_deduped: 0,
-        constellation_failures: 0,
         dry_run: params.dry_run,
         days: Vec::new(),
         next_start_ts_ns: None,
@@ -515,7 +469,7 @@ pub fn segment_episodes(
         let day_end = next_local_day_start(day_start)?;
         let end_is_day_boundary = day_end < range_end_snapped;
 
-        let records = day_timeline_rows(
+        let (records, next_populated_ts) = day_timeline_rows(
             &runtime,
             day_start,
             day_end,
@@ -552,12 +506,6 @@ pub fn segment_episodes(
         }
         let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
-        let measurement_rows = new_rows
-            .iter()
-            .cloned()
-            .zip(segmentation.episodes.iter().cloned())
-            .map(|((key, value), episode)| (key, value, episode))
-            .collect::<Vec<_>>();
         if !params.dry_run && (deleted > 0 || written > 0) {
             runtime
                 .storage_replace_rows(cf::CF_EPISODES, stale_keys, new_rows)
@@ -571,56 +519,8 @@ pub fn segment_episodes(
                     )
                 })?;
         }
-        let mut constellations_inserted = 0_u64;
-        let mut constellations_deduped = 0_u64;
-        let mut constellation_failures = 0_u64;
-        if !params.dry_run {
-            match runtime.storage_put_episode_constellations(&measurement_rows) {
-                Ok(reports) => {
-                    for report in reports {
-                        if report.inserted() {
-                            constellations_inserted = constellations_inserted.saturating_add(1);
-                        } else if report.deduped() {
-                            constellations_deduped = constellations_deduped.saturating_add(1);
-                        }
-                    }
-                    anchor_segmented_episode_rows(&runtime, &measurement_rows)?;
-                }
-                Err(error) => {
-                    constellation_failures =
-                        u64::try_from(measurement_rows.len()).unwrap_or(u64::MAX);
-                    tracing::error!(
-                        code = "CALYX_EPISODE_CONSTELLATION_BATCH_FAILED",
-                        day_start_ns = day_start,
-                        day_end_ns = day_end,
-                        episode_rows = measurement_rows.len(),
-                        detail = %error,
-                        "episode rows were written but native Calyx constellation batch measurement failed"
-                    );
-                }
-            }
-            if constellation_failures > 0 {
-                return Err(mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
-                    format!(
-                        "episode_segment wrote {written} CF_EPISODES rows for day {day_start}..{day_end}, \
-                         but {constellation_failures} native Calyx constellation measurements failed; \
-                         inspect CALYX_EPISODE_CONSTELLATION_MEASUREMENT_FAILED logs and rerun the same range after fixing storage"
-                    ),
-                ));
-            }
-        }
         response.episodes_deleted += deleted;
         response.episodes_written += written;
-        response.constellations_inserted = response
-            .constellations_inserted
-            .saturating_add(constellations_inserted);
-        response.constellations_deduped = response
-            .constellations_deduped
-            .saturating_add(constellations_deduped);
-        response.constellation_failures = response
-            .constellation_failures
-            .saturating_add(constellation_failures);
         response.days_processed += 1;
         if timeline_rows > 0 || deleted > 0 || written > 0 {
             response.days.push(EpisodeSegmentDay {
@@ -629,9 +529,6 @@ pub fn segment_episodes(
                 timeline_rows,
                 episodes_written: written,
                 episodes_deleted: deleted,
-                constellations_inserted,
-                constellations_deduped,
-                constellation_failures,
             });
         }
         tracing::info!(
@@ -641,62 +538,32 @@ pub fn segment_episodes(
             timeline_rows,
             episodes_written = written,
             episodes_deleted = deleted,
-            constellations_inserted,
-            constellations_deduped,
-            constellation_failures,
             dry_run = params.dry_run,
             "episode_segment replaced one local day"
         );
 
-        day_start = day_end;
+        // Skip empty stretches fast, but never past days holding stale
+        // episodes: jump to the next populated timeline day (clamped to the
+        // range) unless a skipped day still holds episode rows to clean.
+        let target_day = match next_populated_ts {
+            Some(ts_ns) => local_day_start(ts_ns)?.clamp(day_end, range_end_snapped),
+            None => range_end_snapped,
+        };
+        day_start = if target_day > day_end {
+            let stale_between = existing_episode_keys(&runtime, day_end, target_day)?;
+            if stale_between.is_empty() {
+                target_day
+            } else {
+                day_end
+            }
+        } else {
+            day_end
+        };
     }
 
     response.scanned_rows = scanned_rows;
     response.invalid_rows = invalid_rows;
     Ok(response)
-}
-
-fn anchor_segmented_episode_rows(
-    runtime: &ReflexRuntime,
-    rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
-) -> Result<(), ErrorData> {
-    for (source_key, source_value, episode) in rows {
-        let outcome = episode_segment_outcome(episode);
-        let report = grounding::write_runtime_anchor_for_existing_constellation(
-            runtime,
-            cf::CF_EPISODES,
-            source_key,
-            source_value,
-            grounding::enum_anchor(
-                "synapse:episode_segmentation_outcome",
-                outcome,
-                SOURCE_EPISODE_SEGMENT,
-                grounding::observed_at_ms_from_ns(episode.end_ts_ns),
-            ),
-            "episode segmentation anchor",
-        )?;
-        tracing::debug!(
-            code = "EPISODE_SEGMENT_ANCHORED",
-            episode_id = %episode.episode_id,
-            outcome,
-            source_key_hex = %hex_encode(source_key),
-            cx_id = %report.cx_id,
-            ledger_seq = report.ledger_seq,
-            "episode segmentation outcome grounded on episode constellation"
-        );
-    }
-    Ok(())
-}
-
-fn episode_segment_outcome(episode: &EpisodeRecord) -> &'static str {
-    if episode.interruption_count > 0
-        || episode.interrupted_ms > 0
-        || matches!(episode.ended_because, EpisodeBoundary::RangeEdge)
-    {
-        "interrupted"
-    } else {
-        "completed"
-    }
 }
 
 // === episode_list / episode_get (#847) ===
@@ -870,7 +737,7 @@ pub fn required_permissions_get(_params: &EpisodeGetParams) -> RequiredPermissio
     required([Permission::ReadStorage])
 }
 
-pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
     if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
@@ -935,77 +802,6 @@ pub(crate) fn decode_episode_row(
         )
     })?;
     Ok((key_ts_ns, ordinal, record))
-}
-
-/// One decoded `CF_EPISODES` row with the exact physical bytes it was read
-/// from. The raw bytes are load-bearing: a Calyx constellation id is derived
-/// from the source value, so a caller that re-encodes the record instead of
-/// carrying its bytes computes a different `cx_id` than the one storage holds.
-pub(crate) type EpisodeSourceRow = (Vec<u8>, Vec<u8>, EpisodeRecord);
-
-/// Reads the `CF_EPISODES` rows that started inside `[floor_ts_ns, now_ts_ns]`,
-/// newest first, capped at `max_rows` (#2046).
-///
-/// This is the atomic context measurement the assist next-action composer works
-/// from: the operator's most recent observed episodes, straight off the
-/// authoritative rows. Bounded by the same `MAX_SCAN_ROWS_PER_CALL` budget every
-/// other episode reader uses, and loud on any undecodable row — `CF_EPISODES` is
-/// derived state this module owns, so corruption is surfaced, never skipped.
-pub(crate) fn recent_episode_rows(
-    db: &Arc<synapse_storage::Db>,
-    floor_ts_ns: u64,
-    now_ts_ns: u64,
-    max_rows: usize,
-) -> Result<Vec<EpisodeSourceRow>, ErrorData> {
-    if max_rows == 0 || floor_ts_ns > now_ts_ns {
-        return Ok(Vec::new());
-    }
-    let mut collected: Vec<EpisodeSourceRow> = Vec::new();
-    let mut scanned = 0_usize;
-    let mut start = episode_codec::episode_scan_start(floor_ts_ns);
-    loop {
-        if scanned >= MAX_SCAN_ROWS_PER_CALL {
-            return Err(mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "ASSIST_CONTEXT_SCAN_BUDGET_EXHAUSTED: read {MAX_SCAN_ROWS_PER_CALL} \
-                     CF_EPISODES rows from {floor_ts_ns} without reaching {now_ts_ns}; narrow the \
-                     assist context lookback"
-                ),
-            ));
-        }
-        let chunk_rows = SCAN_CHUNK_ROWS.min(MAX_SCAN_ROWS_PER_CALL - scanned);
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_EPISODES, &start, chunk_rows)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut past_end = false;
-        let mut last_key: Option<Vec<u8>> = None;
-        for (key, value) in rows {
-            scanned = scanned.saturating_add(1);
-            let (key_ts_ns, _ordinal, record) = decode_episode_row(&key, &value)?;
-            // Keys iterate in start-timestamp order, so the first start past the
-            // upper bound proves no later row can qualify.
-            if key_ts_ns > now_ts_ns {
-                past_end = true;
-                break;
-            }
-            collected.push((key, value, record));
-            last_key = collected.last().map(|(key, _, _)| key.clone());
-        }
-        if past_end || !more {
-            break;
-        }
-        let Some(last_key) = last_key else {
-            break;
-        };
-        start = key_after(&last_key);
-    }
-    collected.sort_by_key(|(_, _, record)| std::cmp::Reverse(record.start_ts_ns));
-    collected.truncate(max_rows);
-    Ok(collected)
 }
 
 fn episode_view(key: &[u8], ordinal: u32, record: EpisodeRecord) -> EpisodeView {
@@ -1435,4 +1231,193 @@ fn timeline_kind_name(kind: synapse_core::types::TimelineKind) -> String {
         |_error| format!("{kind:?}"),
         |value| value.as_str().unwrap_or_default().to_owned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use synapse_core::types::EPISODE_RECORD_VERSION;
+
+    use super::*;
+
+    fn episode(start_ts_ns: u64, end_ts_ns: u64, app: &str) -> EpisodeRecord {
+        EpisodeRecord {
+            record_version: EPISODE_RECORD_VERSION,
+            ts_ns: start_ts_ns,
+            episode_id: format!("ep1-{start_ts_ns:016x}"),
+            start_ts_ns,
+            end_ts_ns,
+            actor: TimelineActor::Human,
+            app: Some(app.to_owned()),
+            document: None,
+            url: None,
+            title_first: None,
+            title_last: None,
+            distinct_title_count: 0,
+            row_count: 1,
+            keystroke_count: 0,
+            click_count: 0,
+            interruption_count: 0,
+            interrupted_ms: 0,
+            started_because: EpisodeBoundary::AppSwitch,
+            ended_because: EpisodeBoundary::AppSwitch,
+        }
+    }
+
+    fn filters() -> ListFilters {
+        ListFilters {
+            start_ts_ns: 0,
+            end_ts_ns: u64::MAX,
+            apps_lower: Vec::new(),
+            actor: None,
+            min_duration_ms: 0,
+            limit: 10,
+            start_key: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn overlap_matches_inclusive_boundaries_and_rejects_disjoint_spans() {
+        let row = episode(1_000, 2_000, "code.exe");
+        let mut window = filters();
+        // Episode end touching the window start is an overlap.
+        window.start_ts_ns = 2_000;
+        window.end_ts_ns = 3_000;
+        assert!(episode_matches(&row, &window));
+        // Episode start touching the window end is an overlap.
+        window.start_ts_ns = 500;
+        window.end_ts_ns = 1_000;
+        assert!(episode_matches(&row, &window));
+        // Disjoint on either side is not.
+        window.start_ts_ns = 2_001;
+        window.end_ts_ns = 3_000;
+        assert!(!episode_matches(&row, &window));
+        window.start_ts_ns = 0;
+        window.end_ts_ns = 999;
+        assert!(!episode_matches(&row, &window));
+    }
+
+    #[test]
+    fn app_actor_and_min_duration_filters_apply() {
+        let row = episode(0, 5_000_000_000, "Excel.EXE");
+        let mut all = filters();
+        all.apps_lower = vec!["excel.exe".to_owned()];
+        all.actor = Some(EpisodeActorFilter::Human);
+        all.min_duration_ms = 5_000;
+        assert!(episode_matches(&row, &all));
+        all.min_duration_ms = 5_001;
+        assert!(!episode_matches(&row, &all));
+        all.min_duration_ms = 0;
+        all.actor = Some(EpisodeActorFilter::Agent);
+        assert!(!episode_matches(&row, &all));
+        all.actor = None;
+        all.apps_lower = vec!["chrome.exe".to_owned()];
+        assert!(!episode_matches(&row, &all));
+    }
+
+    #[test]
+    fn validate_list_rejects_bad_ranges_limits_apps_actor_and_cursor() {
+        let reject = |params: EpisodeListParams, fragment: &str| {
+            let error = validate_list(&params).expect_err(fragment);
+            assert!(
+                error.message.contains(fragment),
+                "expected {fragment:?} in {:?}",
+                error.message
+            );
+        };
+        reject(
+            EpisodeListParams {
+                start_ts_ns: Some(10),
+                end_ts_ns: Some(5),
+                ..EpisodeListParams::default()
+            },
+            "must be <=",
+        );
+        reject(
+            EpisodeListParams {
+                limit: Some(0),
+                ..EpisodeListParams::default()
+            },
+            "limit",
+        );
+        reject(
+            EpisodeListParams {
+                limit: Some(MAX_LIST_LIMIT + 1),
+                ..EpisodeListParams::default()
+            },
+            "limit",
+        );
+        reject(
+            EpisodeListParams {
+                apps: Some(vec!["  ".to_owned()]),
+                ..EpisodeListParams::default()
+            },
+            "apps entries",
+        );
+        reject(
+            EpisodeListParams {
+                actor: Some("alien".to_owned()),
+                ..EpisodeListParams::default()
+            },
+            "actor",
+        );
+        reject(
+            EpisodeListParams {
+                cursor: Some("zz-not-hex".to_owned()),
+                ..EpisodeListParams::default()
+            },
+            "cursor",
+        );
+        // A hex cursor that is not a CF_EPISODES codec key is rejected too.
+        reject(
+            EpisodeListParams {
+                cursor: Some("0011".to_owned()),
+                ..EpisodeListParams::default()
+            },
+            "cursor",
+        );
+    }
+
+    #[test]
+    fn list_cursor_roundtrips_and_resumes_after_key() {
+        let key = episode_codec::episode_key(42_000_000_000, 7);
+        let cursor = hex_encode(&key);
+        let decoded = hex_decode(&cursor).expect("hex roundtrip");
+        assert_eq!(decoded, key);
+        let params = EpisodeListParams {
+            cursor: Some(cursor),
+            ..EpisodeListParams::default()
+        };
+        let parsed = validate_list(&params).expect("cursor accepted");
+        assert_eq!(parsed.start_key, key_after(&key));
+    }
+
+    #[test]
+    fn overlap_scan_floor_clamps_to_epoch_and_snaps_to_local_midnight() {
+        assert_eq!(overlap_scan_floor(0).expect("zero"), 0);
+        // Sub-day timestamps near the epoch never error, even west of UTC.
+        let floor = overlap_scan_floor(1_000).expect("epoch-adjacent");
+        assert_eq!(floor, 0, "midnight before the epoch must clamp to key 0");
+        // A modern timestamp snaps down to its local midnight, never above
+        // the input and never more than 24h+DST below it.
+        let now_ns = u64::try_from(chrono::Utc::now().timestamp_nanos_opt().expect("now"))
+            .expect("non-negative");
+        let snapped = overlap_scan_floor(now_ns).expect("today");
+        assert!(snapped <= now_ns);
+        assert!(now_ns - snapped < 25 * 3_600 * 1_000_000_000);
+    }
+
+    #[test]
+    fn episode_view_carries_identity_duration_and_actor() {
+        let key = episode_codec::episode_key(1_000_000_000, 3);
+        let mut record = episode(1_000_000_000, 4_500_000_000, "code.exe");
+        record.actor = TimelineActor::Agent {
+            session_id: "sess-9".to_owned(),
+        };
+        let view = episode_view(&key, 3, record);
+        assert_eq!(view.key_hex, hex_encode(&key));
+        assert_eq!(view.ordinal, 3);
+        assert_eq!(view.duration_ms, 3_500);
+        assert_eq!(view.actor, "agent:sess-9");
+        assert_eq!(view.app.as_deref(), Some("code.exe"));
+    }
 }

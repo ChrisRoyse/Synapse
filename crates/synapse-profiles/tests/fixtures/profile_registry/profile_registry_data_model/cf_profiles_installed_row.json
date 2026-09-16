@@ -1,0 +1,28 @@
+{
+  "cf_name": "CF_PROFILES",
+  "key": "profile_registry/v1/installed/synthetic.governance",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "installed_profile",
+    "row_id": "synthetic.governance",
+    "created_at": "2026-05-27T02:03:00Z",
+    "updated_at": "2026-05-27T02:03:00Z",
+    "source_id": "registry.synthetic.local-fixture",
+    "state": "active",
+    "profile_id": "synthetic.governance",
+    "active_profile_version": "1.0.0",
+    "installed_package_id": "profile.synthetic.governance",
+    "installed_package_version": "0.1.0",
+    "installed_at": "2026-05-27T02:03:00Z",
+    "activation_state": "staged",
+    "trust_status": "trusted",
+    "signature_status": "verified",
+    "signer_id": "synapse.fixture.signer",
+    "key_id": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "trust_root_key": "profile_registry/v1/trust_root/synapse.fixture.signer/56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "signature_payload_digest": "sha256:a39fc832f873ed6ae62ee962f52b6bed705c8683beda44f65384dca85409df3e",
+    "trust_policy_id": "signed-required",
+    "trust_required": true,
+    "operator_overrides_path": ""
+  }
+}

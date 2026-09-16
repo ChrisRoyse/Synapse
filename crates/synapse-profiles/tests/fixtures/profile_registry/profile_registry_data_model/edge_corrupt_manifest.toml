@@ -1,0 +1,14 @@
+schema_version = 1
+kind = "registry_install_edge"
+case = "corrupt_manifest"
+source_id = "registry.synthetic.local-fixture"
+package_id = "profile.synthetic.corrupt"
+package_version = "0.1.0"
+manifest_bytes = "{not valid toml or json"
+
+[expected_policy]
+outcome = "reject"
+reason_code = "manifest_decode_failed"
+cf_profiles_rows_added = 0
+cf_kv_rows_added = 0
+partial_install_allowed = false

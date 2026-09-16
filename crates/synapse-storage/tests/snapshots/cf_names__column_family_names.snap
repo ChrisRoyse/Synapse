@@ -1,0 +1,17 @@
+---
+source: crates/synapse-storage/tests/cf_names.rs
+expression: actual
+---
+[
+  "CF_ACTION_LOG",
+  "CF_EVENTS",
+  "CF_KV",
+  "CF_MODEL_CACHE",
+  "CF_OBSERVATIONS",
+  "CF_OCR_CACHE",
+  "CF_PROCESS_HISTORY",
+  "CF_PROFILES",
+  "CF_REFLEX_AUDIT",
+  "CF_SESSIONS",
+  "CF_TELEMETRY"
+]

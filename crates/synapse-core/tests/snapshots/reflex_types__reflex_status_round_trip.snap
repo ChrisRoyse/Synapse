@@ -1,0 +1,19 @@
+---
+source: crates/synapse-core/tests/reflex_types.rs
+expression: "round_trip(\"ReflexStatus\", \"snapshot\", full_status())?"
+---
+{
+  "id": "reflex-starved",
+  "kind_summary": "aim_track(track:42)",
+  "state": "starved",
+  "registered_at": "1970-01-01T00:00:10Z",
+  "last_fired_at": "1970-01-01T00:00:12Z",
+  "fire_count": 64,
+  "priority": 250,
+  "lifetime": {
+    "kind": "duration",
+    "ms": 5000
+  },
+  "exclusive": true,
+  "last_error_code": "REFLEX_STARVED"
+}

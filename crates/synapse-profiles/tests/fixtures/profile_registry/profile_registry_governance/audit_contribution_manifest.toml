@@ -1,0 +1,38 @@
+schema_version = 1
+kind = "audit_contribution_bundle"
+bundle_id = "audit.synthetic.governance.2026-05-27"
+license_spdx = "CC-BY-4.0"
+operator_consent_id = "consent.synthetic.2026-05-27"
+redaction_policy_id = "redaction.synthetic.aggregate-v1"
+created_at = "2026-05-27T00:05:00Z"
+raw_data_included = false
+redacted = true
+export_allowed = true
+
+data_classes = [
+  "profile_quality_summary",
+  "action_outcome_counts",
+  "compatibility_flags",
+]
+
+[source]
+source_profile_package_id = "profile.synthetic.governance"
+source_profile_package_version = "0.1.0"
+source_quality_snapshot_key = "profile_quality/v1/synthetic.governance"
+source_cf_ranges = [
+  "CF_ACTION_LOG:synthetic-range-0001..0004",
+  "CF_PROFILES:profile_quality/v1/synthetic.governance",
+]
+
+[attribution]
+notice = "Synthetic redacted audit contribution fixture for Synapse issue #470."
+contributors = ["Synapse Agent <synthetic@example.invalid>"]
+
+[privacy]
+contains_raw_screenshots = false
+contains_raw_uia_tree = false
+contains_raw_audio = false
+contains_clipboard = false
+contains_local_paths = false
+contains_window_titles = false
+contains_account_ids = false

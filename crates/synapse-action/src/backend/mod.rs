@@ -2,7 +2,7 @@ use synapse_core::{Action, Backend, ProfileBackends};
 
 use crate::{ActionError, EmitState};
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) mod mouse_coordinates;
 pub mod recording;
 #[cfg(windows)]
@@ -10,7 +10,7 @@ pub mod software;
 #[cfg(not(windows))]
 #[path = "software_non_windows.rs"]
 pub mod software;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) mod text_dispatch;
 pub mod unavailable;
 pub mod vigem;

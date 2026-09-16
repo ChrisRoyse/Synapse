@@ -1,0 +1,112 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.chrome.curated"
+package_version = "0.1.0"
+profile_id = "chrome"
+profile_version = "1.0.0"
+created_at = "2026-05-27T19:40:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic curated starter package fixture for Synapse issue #481."
+
+[source]
+kind = "bundled"
+uri = "https://github.com/ChrisRoyse/Synapse"
+revision = "m5-r21-chromium-curated-fixture"
+built_by = "codex"
+generated_by = "synapse-curated-starter-registry-v1"
+
+[[targets]]
+target_id = "chrome.windows"
+target_kind = "productivity_app"
+app_id = "google.chrome"
+process_name = "chrome.exe"
+title_regex = ".* - Google Chrome$"
+app_version = "148.0.7778.179"
+
+[[targets]]
+target_id = "edge.windows"
+target_kind = "productivity_app"
+app_id = "microsoft.edge"
+process_name = "msedge.exe"
+title_regex = ".* - Microsoft Edge$"
+app_version = "148.0.3967.83"
+
+[[targets]]
+target_id = "chromium.windows"
+target_kind = "productivity_app"
+app_id = "chromium"
+process_name = "chromium.exe"
+title_regex = ".*"
+app_version = "declared compatible; Chromium standalone not installed on configured host during issue #481"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = []
+
+[assumptions.display]
+min_width = 1024
+min_height = 768
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software"]
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "productivity"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = true
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T19:40:00Z"
+summary = "Initial Chromium-family browser curated starter registry fixture."
+
+[hashes]
+profile_toml_sha256 = "sha256:3b9a72c266983a25137a54090b11ae1f4169ed886db1bf0513bbf2189a4dcdee"
+package_sha256 = "sha256:4814814814814814814814814814814814814814814814814814814814814814"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/chrome.toml"
+
+[metadata]
+registry_family = "profile-registry/audit-data"
+quality_signal = "profile_quality.chrome"
+local_registry_row = "profile_registry/v1/package/profile.chrome.curated/0.1.0"
+"compat.chrome.exe_path" = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+"compat.chrome.file_version" = "148.0.7778.179"
+"compat.chrome.exe_sha256" = "sha256:2755630a2b432bd863ca95e9f0871af5b2341014c1f8b728bb9488c4c72035ae"
+"compat.chrome.user_data_dir" = "%LOCALAPPDATA%\\Google\\Chrome\\User Data"
+"compat.edge.exe_path" = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+"compat.edge.file_version" = "148.0.3967.83"
+"compat.edge.exe_sha256" = "sha256:b4ea52196967c69a61c114c9934950f511f26bded473107e1b6c37cd8a22bf9e"
+"compat.edge.user_data_dir" = "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data"
+"compat.chromium.runtime_status" = "declared_compatible_not_installed_on_configured_host"
+"compat.browser.address_bar_key" = "ctrl+l"
+"compat.browser.back_key" = "alt+left"
+"compat.browser.forward_key" = "alt+right"
+"compat.browser.new_tab_key" = "ctrl+t"
+"compat.browser.reload_key" = "ctrl+r"
+"compat.browser.switch_tab_left_key" = "ctrl+shift+tab"
+"compat.browser.switch_tab_right_key" = "ctrl+tab"
+"compat.browser.navigation_text_entry_verified_path" = "act_press ctrl+l + act_clipboard write + ctrl+v paste + enter + browser_window_title_readback"
+"curated.seed_set_id" = "starter.v1"
+"curated.target_id" = "chrome.windows"
+"curated.tier" = "productivity.seed"
+"curated.priority" = "p1"
+"curated.status" = "shipped"
+"curated.backlog_issue" = "#481"
+"curated.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,act_clipboard,act_press,storage_inspect,profile_quality_refresh,browser_window_title_readback,browser_history_readback"
+"curated.safe_default_backend_policy" = "auto; local productivity/browser navigation only; no credential/payment/account changes; no remote execution; audit export requires explicit consent"

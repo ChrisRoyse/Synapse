@@ -19,11 +19,9 @@ use tracing_subscriber::{
 
 pub mod metrics;
 
-const DEFAULT_MAX_DIR_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_DIR_BYTES: u64 = 500 * 1024 * 1024;
 const DEFAULT_KEEP_DAYS: u32 = 7;
-// #1818: matched to the hourly rotation boundary. At six hours a crash loop
-// could add tens of gigabytes between collections even with a byte budget set.
-const DEFAULT_GC_INTERVAL: Duration = Duration::from_hours(1);
+const DEFAULT_GC_INTERVAL: Duration = Duration::from_hours(6);
 const GC_INTERVAL_ENV: &str = "SYNAPSE_LOG_GC_INTERVAL_S";
 const PAYLOAD_LOG_TARGETS: &[&str] = &["rmcp", "rmcp::service", "rmcp::transport"];
 
@@ -203,12 +201,7 @@ pub fn init_tracing(cfg: TelemetryConfig) -> Result<TelemetryGuard, TelemetryErr
     prepare_log_dir(&log_dir)?;
     run_log_gc(&log_dir, cfg.keep_days, cfg.max_dir_bytes).map_err(TelemetryError::Gc)?;
 
-    // #1818: date-only rotation let a single day reach 192.8 MB (a crash loop
-    // replayed the whole verbose startup sequence 14+ times in 12 minutes), and
-    // the byte-budget GC below cannot trim the file it is currently writing. An
-    // hourly boundary bounds each file to an hour of traffic and makes the
-    // `max_dir_bytes` budget effective WITHIN a day instead of only across days.
-    let file_appender = tracing_appender::rolling::hourly(&log_dir, "synapse.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "synapse.log");
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
     let file_filter = payload_safe_filter(level_directive(cfg.file_level));
     let file_layer = fmt::layer()
@@ -395,19 +388,6 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
             continue;
         }
 
-        // This collector owns only the daily rolling files created above.
-        // The directory also contains setup-owned daemon launchers, supervisor
-        // state, and durable diagnostic ledgers. Applying age or byte-budget
-        // retention to those foreign files can remove restart authority while
-        // Task Scheduler still points at it.
-        let managed_log = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name == "synapse.log" || name.starts_with("synapse.log."));
-        if !managed_log {
-            continue;
-        }
-
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if now.duration_since(modified).unwrap_or_default() > keep {
             fs::remove_file(entry.path()).map_err(|err| err.to_string())?;
@@ -423,12 +403,7 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
     }
 
     entries.sort_by_key(|(_, modified, _)| *modified);
-    // Never evict the newest managed log: that is the file the live appender is
-    // writing to. Removing it silently detaches the process from its own log
-    // (the open handle keeps writing to an unlinked/recreated path) and loses
-    // exactly the diagnostics a byte-budget collection implies you still have.
-    let evictable = entries.len().saturating_sub(1);
-    for (path, _, len) in entries.into_iter().take(evictable) {
+    for (path, _, len) in entries {
         fs::remove_file(path).map_err(|err| err.to_string())?;
         total = total.saturating_sub(len);
         if total <= max_dir_bytes {

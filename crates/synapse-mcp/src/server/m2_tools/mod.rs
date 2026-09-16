@@ -175,42 +175,12 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
-        // #2063 finding 4: resolve the claim target BEFORE any delivery, and
-        // never let a screen-coordinate click fall through to
-        // `current_foreground_session_target()`. A coordinate is meaningful only
-        // on the input desktop, so a coordinate click issued by a session bound
-        // to a window on another desktop must fail loud with both desktops
-        // named, not silently re-aim at whatever the human has in front of them.
-        let click_claim = match self.act_click_claim_target(&params, &request_context) {
-            Ok(target) => target,
-            Err(error) => {
-                return audit_target_claim_denial(self, "act_click", error, &request_context);
-            }
-        };
-        if let Err(error) =
-            self.ensure_target_claim_allows_action("act_click", click_claim, &request_context)
-        {
+        if let Err(error) = self.ensure_target_claim_allows_action(
+            "act_click",
+            click_claim_target(&params),
+            &request_context,
+        ) {
             return audit_target_claim_denial(self, "act_click", error, &request_context);
-        }
-        // #2063 finding 1: a UIA element click whose window lives on a
-        // session-owned hidden desktop runs entirely through that desktop's
-        // worker, so the delivery, the route label, and the verification
-        // readback all belong to the desktop that owns the window.
-        match self
-            .act_click_hidden_desktop_route(&params, &request_context, boundary)
-            .await
-        {
-            Ok(Some(response)) => {
-                let result: Result<ActClickResponse, ErrorData> = Ok(response);
-                self.audit_action_result_for_request("act_click", &result, &request_context)?;
-                return result.map(Json);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let result: Result<ActClickResponse, ErrorData> = Err(error);
-                self.audit_action_result_for_request("act_click", &result, &request_context)?;
-                return result.map(Json);
-            }
         }
         if let Err(error) = maybe_auto_wait_for_actionability(
             self,
@@ -465,12 +435,9 @@ impl SynapseService {
             self.audit_action_result_for_request("act_type", &result, &request_context)?;
             return result.map(Json);
         }
-        // The lease must outlive the *planned* emission timeline, and keep being
-        // re-armed while that timeline actually runs; a 5 s default truncated
-        // anything past ~70 characters (#2065).
-        let (_lease_guard, _emission_budget_guard) = if requires_foreground_route {
-            match acquire_act_type_foreground_input_lease(self, &request_context, &params) {
-                Ok((lease_guard, budget_guard)) => (Some(lease_guard), Some(budget_guard)),
+        let _lease_guard = if requires_foreground_route {
+            match acquire_tool_foreground_input_lease(self, "act_type", &request_context) {
+                Ok(guard) => Some(guard),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
                     self.audit_action_result_for_request("act_type", &result, &request_context)?;
@@ -478,7 +445,7 @@ impl SynapseService {
                 }
             }
         } else {
-            (None, None)
+            None
         };
         let before_text_signature = if let Some(target) = foreground_fallback.as_ref() {
             let mut foreground_params = params.clone();
@@ -552,19 +519,6 @@ impl SynapseService {
         } else {
             None
         };
-        if let (Some(expected_hwnd), Some(before)) = (
-            visual_delta_target_window_hwnd,
-            before_text_signature.as_ref(),
-        ) && let Err(error) = ensure_act_type_signature_matches_expected_target(
-            expected_hwnd,
-            &before.signature,
-            "before_foreground_type_dispatch",
-            true,
-        ) {
-            let result: Result<ActTypeResponse, ErrorData> = Err(error);
-            self.audit_action_result_for_request("act_type", &result, &request_context)?;
-            return result.map(Json);
-        }
         let before_visual_signature =
             if act_type_should_capture_visual_signature(&params, visual_delta_target_window_hwnd) {
                 match self
@@ -600,7 +554,6 @@ impl SynapseService {
                     &emitted,
                     browser_url_policy.as_ref(),
                     session_id.as_deref(),
-                    visual_delta_target_window_hwnd,
                 )
                 .await
             {
@@ -673,47 +626,6 @@ impl SynapseService {
             &request_context,
         ) {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
-        }
-        // #2056: a target on a session-owned hidden desktop is unreachable from
-        // the daemon's desktop, so resolve the owning desktop's worker route
-        // before any daemon-desktop HWND probe (including the foreground guard,
-        // whose GetAncestor/IsWindow readback cannot see that HWND).
-        let hidden_desktop_route = {
-            let hidden_desktop_names = match self.session_owned_desktop_names(&request_context) {
-                Ok(names) => names,
-                Err(error) => {
-                    let result: Result<ActSetValueResponse, ErrorData> = Err(error);
-                    self.audit_action_result_for_request(
-                        "act_set_value",
-                        &result,
-                        &request_context,
-                    )?;
-                    return result.map(Json);
-                }
-            };
-            match crate::m2::resolve_hidden_desktop_value_route(
-                "act_set_value",
-                &params.element_id,
-                &hidden_desktop_names,
-            ) {
-                Ok(route) => route,
-                Err(error) => {
-                    let result: Result<ActSetValueResponse, ErrorData> = Err(error);
-                    self.audit_action_result_for_request(
-                        "act_set_value",
-                        &result,
-                        &request_context,
-                    )?;
-                    return result.map(Json);
-                }
-            }
-        };
-        if let Some(route) = hidden_desktop_route {
-            let result = self
-                .act_set_value_hidden_desktop_guarded(params, route, boundary)
-                .await;
-            self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
-            return result.map(Json);
         }
         let foreground_guard = match act_set_value_target_foreground_guard(&params.element_id) {
             Ok(guard) => guard,
@@ -899,15 +811,7 @@ impl SynapseService {
             boundary,
         )
         .await?;
-        // #2056: session-owned hidden desktops own their windows exclusively —
-        // the daemon's own desktop cannot resolve, validate, or message those
-        // HWNDs — so the owning desktop's worker is resolved before any
-        // daemon-desktop routing probe runs.
-        let hidden_desktop_names = self.session_owned_desktop_names(request_context)?;
-        let route = match crate::m2::set_field_text_route_with_hidden_desktops(
-            element_id,
-            &hidden_desktop_names,
-        ) {
+        let route = match crate::m2::set_field_text_route(element_id) {
             Ok(route) => route,
             Err(error) => {
                 return Err(error);
@@ -917,7 +821,6 @@ impl SynapseService {
             code = "M2_ACT_SET_FIELD_TEXT_ROUTE_RESOLVED",
             element_id = %element_id,
             resolution_phase,
-            hidden_desktop_count = hidden_desktop_names.len(),
             "readback=act_set_field_text route resolved"
         );
         match route {
@@ -959,228 +862,7 @@ impl SynapseService {
                 })
                 .await
             }
-            crate::m2::SetFieldTextRoute::HiddenDesktopBackground(hidden_route) => {
-                let foreground_guard =
-                    hidden_desktop_target_foreground_guard("act_set_field_text", element_id)?;
-                self.act_set_field_text_guarded_with(params, foreground_guard, move |params| {
-                    Box::pin(crate::m2::act_set_field_text_hidden_desktop(
-                        params,
-                        hidden_route,
-                        boundary,
-                    ))
-                })
-                .await
-            }
         }
-    }
-
-    /// #2056 `act_set_value` hidden-desktop route, wrapped in the same
-    /// visible-foreground before/after guard the daemon-desktop background
-    /// tiers use, so the audit row proves the human foreground was untouched.
-    async fn act_set_value_hidden_desktop_guarded(
-        &self,
-        params: crate::m2::ActSetValueParams,
-        route: crate::m2::HiddenDesktopValueRoute,
-        boundary: OperatorPanicActionBoundary,
-    ) -> Result<ActSetValueResponse, ErrorData> {
-        let foreground_guard =
-            hidden_desktop_target_foreground_guard("act_set_value", &params.element_id)?;
-        let foreground_before = self
-            .current_audit_foreground()
-            .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
-        let result =
-            crate::m2::act_set_value_hidden_desktop_with_boundary(params, route, boundary).await;
-        let action_source_of_truth = background_result_source_of_truth(
-            &result,
-            |response| response.source_of_truth.as_str(),
-            "act_set_value.hidden_desktop_worker_tier",
-        );
-        match self.current_audit_foreground() {
-            Ok(foreground_after) => background_result_with_foreground_guard(
-                "act_set_value",
-                &action_source_of_truth,
-                foreground_guard,
-                &foreground_before,
-                &foreground_after,
-                result,
-            ),
-            Err(error) => background_result_with_foreground_read_error(
-                result,
-                act_set_value_foreground_read_error("after", &action_source_of_truth, &error),
-            ),
-        }
-    }
-
-    /// #2056: names of the hidden Win32 desktops this MCP session owns, as
-    /// recorded by the session process/desktop lease registry. Empty when the
-    /// request carries no MCP session or the session owns no desktop.
-    fn session_owned_desktop_names(
-        &self,
-        request_context: &RequestContext<RoleServer>,
-    ) -> Result<Vec<String>, ErrorData> {
-        Ok(self
-            .session_hidden_desktop_for_request(request_context)?
-            .map(|readback| readback.desktop_names)
-            .unwrap_or_default())
-    }
-
-    /// #2063: the session's hidden-desktop registry row, or `None` when the
-    /// request carries no MCP session or the session owns no desktop.
-    fn session_hidden_desktop_for_request(
-        &self,
-        request_context: &RequestContext<RoleServer>,
-    ) -> Result<Option<super::session_lifecycle::SessionHiddenDesktopReadback>, ErrorData> {
-        let Some(session_id) =
-            super::context::mcp_session_id_from_request_context(request_context)?
-        else {
-            return Ok(None);
-        };
-        self.session_hidden_desktop_readback(&session_id)
-    }
-
-    /// #2063 finding 4: the exact target whose claim a click must satisfy.
-    ///
-    /// For element clicks this is unchanged (the element's own root window).
-    /// For screen-coordinate clicks it is the session's *bound* target and
-    /// nothing else. Previously a coordinate click passed `None` here, so
-    /// `ensure_target_claim_allows_action` fell back to
-    /// `current_foreground_session_target()` — the human's OS foreground window
-    /// — which is how a hidden-desktop-owning session ended up making a claim
-    /// against a live agent's PowerShell window on the visible desktop. Only an
-    /// unrelated session's claim stopped that click.
-    fn act_click_claim_target(
-        &self,
-        params: &ActClickParams,
-        request_context: &RequestContext<RoleServer>,
-    ) -> Result<Option<SessionTarget>, ErrorData> {
-        let crate::m2::ActClickTarget::Point(point) = &params.target else {
-            return Ok(click_claim_target(params));
-        };
-        // A hidden Win32 desktop is never the input desktop, so a physical
-        // cursor click cannot be aimed at it at all. Refuse with the exact
-        // reason instead of letting a later generic guard mislabel it.
-        if let Some(hidden_desktop) = self.session_hidden_desktop_for_request(request_context)? {
-            return Err(hidden_desktop_coordinate_click_refusal(
-                "act_click",
-                &hidden_desktop,
-                point.x,
-                point.y,
-                // `ActClickPointTarget` is defined in screen coordinates; the
-                // facade has already converted any window-relative request by
-                // the time it reaches this tool.
-                "screen",
-            ));
-        }
-        let Some(session_id) =
-            super::context::mcp_session_id_from_request_context(request_context)?
-        else {
-            return Ok(click_claim_target(params));
-        };
-        let Some(bound) = self.session_target(Some(&session_id))? else {
-            return Ok(click_claim_target(params));
-        };
-        let bound_hwnd = match &bound {
-            SessionTarget::Window { hwnd } => *hwnd,
-            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
-        };
-        // Compare roots on both sides: `WindowFromPoint` hit-tests a child, and
-        // a session may legitimately have bound a child HWND.
-        let bound_hwnd = synapse_a11y::top_level_root_hwnd(bound_hwnd).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "act_click could not read the top-level root of this session's bound target HWND {bound_hwnd:#x} before a screen-coordinate click: {error}"
-                ),
-            )
-        })?;
-        let resolved = crate::m2::window_root_at_screen_point(synapse_core::Point {
-            x: point.x,
-            y: point.y,
-        });
-        if resolved != Some(bound_hwnd) {
-            // Attribute both HWNDs to a physical desktop, including desktops
-            // owned by *other* sessions, so the refusal names the cross-desktop
-            // aim instead of just the HWND mismatch.
-            let probe_desktops = self
-                .hidden_desktop_readbacks()?
-                .into_iter()
-                .flat_map(|readback| readback.desktop_names)
-                .collect::<Vec<_>>();
-            return Err(coordinate_click_foreign_window_error(
-                "act_click",
-                &session_id,
-                point.x,
-                point.y,
-                resolved,
-                bound_hwnd,
-                &probe_desktops,
-            ));
-        }
-        Ok(Some(bound))
-    }
-
-    /// #2063 finding 1: routes a UIA element click through the worker process
-    /// attached to the session-owned desktop that physically owns the element's
-    /// window. `Ok(None)` keeps the ordinary daemon-desktop tier router.
-    async fn act_click_hidden_desktop_route(
-        &self,
-        params: &ActClickParams,
-        request_context: &RequestContext<RoleServer>,
-        boundary: OperatorPanicActionBoundary,
-    ) -> Result<Option<ActClickResponse>, ErrorData> {
-        let crate::m2::ActClickTarget::Element(element) = &params.target else {
-            return Ok(None);
-        };
-        // `use_invoke_pattern=false` asks for the coordinate/foreground tier,
-        // which the #2056 hidden-desktop policy already refuses by name.
-        if !params.use_invoke_pattern {
-            return Ok(None);
-        }
-        // Web element ids reach their tab over the DevTools channel, which is
-        // not desktop-scoped; rerouting them through a desktop worker would be
-        // wrong, not safer.
-        #[cfg(windows)]
-        if synapse_a11y::cdp_backend_from_element_id(&element.element_id).is_some() {
-            return Ok(None);
-        }
-        let hwnd = element
-            .element_id
-            .parts()
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-                    format!(
-                        "act_click element id {} is malformed: {error}",
-                        element.element_id
-                    ),
-                )
-            })?
-            .hwnd;
-        let Some(route) =
-            self.hidden_desktop_window_route_for_request("act_click", hwnd, request_context)?
-        else {
-            return Ok(None);
-        };
-        crate::m2::act_click_hidden_desktop_worker(params, &element.element_id, route, boundary)
-            .await
-            .map(Some)
-    }
-
-    /// #2063: resolves which session-owned hidden desktop physically owns
-    /// `hwnd`, for the HWND-addressed action tiers (click / key). `Ok(None)`
-    /// means the ordinary daemon-desktop background tiers are the correct route;
-    /// a stale HWND that no desktop owns fails loud.
-    fn hidden_desktop_window_route_for_request(
-        &self,
-        tool: &'static str,
-        hwnd: i64,
-        request_context: &RequestContext<RoleServer>,
-    ) -> Result<Option<crate::m2::HiddenDesktopWindowRoute>, ErrorData> {
-        let desktop_names = self.session_owned_desktop_names(request_context)?;
-        if desktop_names.is_empty() {
-            return Ok(None);
-        }
-        crate::m2::resolve_hidden_desktop_window_route(tool, hwnd, &desktop_names)
     }
 
     fn act_set_field_text_resolve_params(
@@ -1219,15 +901,10 @@ impl SynapseService {
         resolution_phase: &'static str,
     ) -> Result<ElementId, ErrorData> {
         let find_params = set_field_text_locator_find_params(locator, window_hwnd);
-        let observation_snapshot = {
-            let state = self.m1_state()?;
-            crate::m1::M1ObservationSnapshot::from_state(&state)
+        let input = {
+            let mut state = self.m1_state()?;
+            crate::m1::build_find_input(&mut state, &find_params, Some(window_hwnd))?
         };
-        let input = crate::m1::build_find_input_from_snapshot(
-            &observation_snapshot,
-            &find_params,
-            Some(window_hwnd),
-        )?;
         let response = crate::m1::match_find_input(&input, &find_params);
         let results = response
             .results
@@ -1746,31 +1423,7 @@ impl SynapseService {
             recording.is_some(),
             plan.requires_input_lease(),
         ) {
-            // #2071: a stroke is a multi-emission action — one cursor mutation
-            // per planned sample, each re-gated by the #2057 fence — so its
-            // lease is sized from the plan the emitter will replay, not from the
-            // 5 s action default.
-            let stroke_lease_ttl_ms = match act_stroke_planned_lease_ttl_ms(&stroke_details) {
-                Ok(ttl_ms) => ttl_ms,
-                Err(error) => {
-                    let failure_details =
-                        act_stroke_failure_audit_details(&stroke_details, &preflight, &error);
-                    log_act_stroke_failure(&failure_details, &error);
-                    self.audit_action_error_with_details_for_request(
-                        "act_stroke",
-                        &error,
-                        &failure_details,
-                        &request_context,
-                    )?;
-                    return Err(error);
-                }
-            };
-            match acquire_tool_foreground_input_lease_with_ttl(
-                self,
-                "act_stroke",
-                &request_context,
-                stroke_lease_ttl_ms,
-            ) {
+            match acquire_tool_foreground_input_lease(self, "act_stroke", &request_context) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let failure_details =
@@ -1832,6 +1485,40 @@ impl SynapseService {
                     error,
                     &failure_details,
                     &request_context,
+                )?;
+            }
+        }
+        result.map(Json)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn act_clipboard_for_session_test_entrypoint(
+        &self,
+        params: Parameters<ActClipboardParams>,
+        session_id: &str,
+    ) -> Result<Json<ActClipboardResponse>, ErrorData> {
+        let params = params.0;
+        let request_details = clipboard_request_audit_details(&params);
+        self.audit_action_started_with_details_for_session(
+            "act_clipboard",
+            &request_details,
+            session_id,
+        )?;
+        let result = self.act_clipboard_for_session(params, session_id, "session_clipboard_buffer");
+        match &result {
+            Ok(response) => {
+                self.audit_action_ok_with_details_for_session(
+                    "act_clipboard",
+                    &clipboard_response_audit_details(response),
+                    session_id,
+                )?;
+            }
+            Err(error) => {
+                self.audit_action_error_with_details_for_session(
+                    "act_clipboard",
+                    error,
+                    &request_details,
+                    session_id,
                 )?;
             }
         }
@@ -2346,16 +2033,7 @@ impl SynapseService {
     }
 }
 
-/// #2056/#2063: the precise refusal for a raw-input/foreground-lane request made
-/// by a session that owns a hidden Win32 desktop.
-///
-/// Only one desktop at a time is the *input desktop*, and a hidden desktop is
-/// never it, so `SetForegroundWindow`/`SetCursorPos`/`SendInput` can never aim
-/// at such a target. The generic "the foreground moved" guard reaches the same
-/// verdict by accident and prints remediation ("focus the target, then retry")
-/// that can never work here — so every path that can refuse for this reason must
-/// name it (#2063 finding 3).
-pub(crate) fn hidden_desktop_foreground_refusal(
+fn hidden_desktop_foreground_refusal(
     tool: &'static str,
     hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
 ) -> ErrorData {
@@ -2375,172 +2053,6 @@ pub(crate) fn hidden_desktop_foreground_refusal(
             "launch_pids": hidden_desktop.launch_pids,
             "resource_count": hidden_desktop.resource_count,
             "foreground_tier_allowed": false,
-        })),
-    )
-}
-
-/// #2063: ledger tier name for the hidden-desktop keyboard route. Distinct from
-/// the plain `postmessage` tier so a `CF_ACTION_LOG` reader can tell them apart.
-const PRESS_TIER_HIDDEN_DESKTOP_WORKER: &str = "postmessage_hidden_desktop_worker";
-const HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH: &str =
-    "session_owned_desktop_worker_target_hwnd_text_or_selection";
-
-/// Re-frames a hidden-desktop worker failure with the exact route and stage so a
-/// refusal is never mistaken for a daemon-desktop failure (#2063).
-fn hidden_desktop_press_stage_error(
-    route: &crate::m2::HiddenDesktopWindowRoute,
-    stage: &'static str,
-    error: ErrorData,
-) -> ErrorData {
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    let route_label = route.route_label();
-    tracing::error!(
-        code = code.as_str(),
-        tool = "act_press",
-        hwnd = route.hwnd,
-        desktop_route = route_label.as_str(),
-        stage,
-        required_foreground = false,
-        detail = %error.message,
-        "act_press hidden-desktop worker stage failed"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act_press hidden-desktop {stage} failed for HWND {:#x} on session-owned desktop {}: {}",
-            route.hwnd, route.desktop_name, error.message
-        ),
-        Some(json!({
-            "code": code,
-            "tool": "act_press",
-            "operation": stage,
-            "desktop_route": route_label,
-            "desktop_name": route.desktop_name,
-            "hwnd": route.hwnd,
-            "required_foreground": false,
-            "backend_tier_used": PRESS_TIER_HIDDEN_DESKTOP_WORKER,
-            "source_of_truth": HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
-            "worker_error": error.data,
-        })),
-    )
-}
-
-/// #2063 finding 3/4: a screen-coordinate click asked for by a session that
-/// owns a hidden Win32 desktop. Named separately from the generic
-/// "foreground moved" guard because the remediation is different in kind: there
-/// is no focus step that can make a hidden desktop the input desktop.
-///
-/// `coordinate_space` is the space the **caller** actually asked in, not the
-/// space this tier would have converted to. The #2063 FSV of `be7386d1` found
-/// the refusal echoing `"screen"` for a `coordinate_space:"window"` request:
-/// the verdict was right but the evidence misquoted the request, and the whole
-/// point of this refusal is that its evidence is exact.
-pub(crate) fn hidden_desktop_coordinate_click_refusal(
-    tool: &'static str,
-    hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
-    x: i32,
-    y: i32,
-    coordinate_space: &str,
-) -> ErrorData {
-    tracing::warn!(
-        code = error_codes::FOREGROUND_ACTIVATION_REFUSED,
-        reason = "hidden_desktop_foreground_tier_refused",
-        tool,
-        session_id = %hidden_desktop.session_id,
-        desktop_names = ?hidden_desktop.desktop_names,
-        x,
-        y,
-        coordinate_space,
-        source_of_truth = "session process/desktop lease registry",
-        "coordinate click refused: the requesting session owns hidden desktops and screen coordinates only exist on the input desktop"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{tool} refused the {coordinate_space}-coordinate click at ({x}, {y}) because MCP session {:?} owns hidden desktop(s) {:?}. Coordinates address the *input* desktop only, so this click could only ever land on the human's visible desktop, never on the session's own desktop. Use an element-addressed action (act_click element_id / act_set_field_text), which routes through the owning desktop's worker.",
-            hidden_desktop.session_id, hidden_desktop.desktop_names
-        ),
-        Some(json!({
-            "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
-            "reason": "hidden_desktop_foreground_tier_refused",
-            "tool": tool,
-            "refused_before_delivery": true,
-            "session_id": hidden_desktop.session_id,
-            "desktop_names": hidden_desktop.desktop_names,
-            "launch_pids": hidden_desktop.launch_pids,
-            "resource_count": hidden_desktop.resource_count,
-            "requested_point": { "x": x, "y": y, "coordinate_space": coordinate_space },
-            "foreground_tier_allowed": false,
-            "session_target_rebound": false,
-            "source_of_truth": "session process/desktop lease registry",
-            "remediation": "address the target by element id so Synapse can route through the session-owned desktop's worker; Synapse will not aim raw input at the human's input desktop on this session's behalf",
-        })),
-    )
-}
-
-/// #2063 finding 4: a screen-coordinate click whose hit-tested window is not the
-/// session's bound target. Carries both HWNDs *and* both owning desktops, so the
-/// operator can see the cross-desktop aim that was refused, and requires an
-/// explicit re-target rather than silently adopting the resolved window.
-fn coordinate_click_foreign_window_error(
-    tool: &'static str,
-    session_id: &str,
-    x: i32,
-    y: i32,
-    resolved_hwnd: Option<i64>,
-    bound_hwnd: i64,
-    probe_desktops: &[String],
-) -> ErrorData {
-    let resolved_desktop =
-        resolved_hwnd.map(|hwnd| crate::m2::desktop_label_for_hwnd(hwnd, probe_desktops));
-    let bound_desktop = crate::m2::desktop_label_for_hwnd(bound_hwnd, probe_desktops);
-    tracing::warn!(
-        code = error_codes::ACTION_TARGET_INVALID,
-        reason = "coordinate_click_resolved_foreign_window",
-        tool,
-        session_id,
-        x,
-        y,
-        resolved_hwnd = resolved_hwnd.unwrap_or_default(),
-        resolved_desktop = resolved_desktop
-            .as_deref()
-            .unwrap_or("no_window_under_point"),
-        bound_hwnd,
-        bound_desktop = bound_desktop.as_str(),
-        source_of_truth = "WindowFromPoint on the input desktop + session target registry",
-        "coordinate click refused: the window under the requested point is not this session's bound target"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{tool} refused the screen-coordinate click at ({x}, {y}): the window physically under that point is {} ({}), but this session's bound target is HWND {bound_hwnd:#x} ({bound_desktop}). Synapse will not re-aim a coordinate click at a window the session did not bind, and will not rebind the session target on your behalf. Re-target explicitly (target operation=set) if this other window is really the intended target.",
-            resolved_hwnd
-                .map(|hwnd| format!("HWND {hwnd:#x}"))
-                .unwrap_or_else(|| "no window at all".to_owned()),
-            resolved_desktop
-                .as_deref()
-                .unwrap_or("no_window_under_point"),
-        ),
-        Some(json!({
-            "code": error_codes::ACTION_TARGET_INVALID,
-            "reason": "coordinate_click_resolved_foreign_window",
-            "tool": tool,
-            "refused_before_delivery": true,
-            "session_id": session_id,
-            "requested_point": { "x": x, "y": y, "coordinate_space": "screen" },
-            "resolved_hwnd": resolved_hwnd,
-            "resolved_desktop": resolved_desktop,
-            "bound_target_hwnd": bound_hwnd,
-            "bound_target_desktop": bound_desktop,
-            "session_target_rebound": false,
-            "source_of_truth": "WindowFromPoint on the input desktop + session target registry",
-            "remediation": "bind the intended window with target operation=set (or click it by element id), then retry; Synapse never rebinds an explicitly bound session target as a side effect of an action",
         })),
     )
 }
@@ -2907,11 +2419,6 @@ fn visual_delta_text_integrity(source_of_truth: &str) -> String {
     format!("verify_delta_visual_readback:{source_of_truth}")
 }
 
-/// Acquires the foreground input lease for a single-shot action at the default
-/// action TTL.
-///
-/// The default is a **floor**, never a clamp: see
-/// [`effective_action_lease_ttl_ms`].
 fn acquire_tool_foreground_input_lease(
     service: &SynapseService,
     tool: &'static str,
@@ -2931,30 +2438,6 @@ fn acquire_tool_foreground_input_lease_with_ttl(
     request_context: &RequestContext<RoleServer>,
     ttl_ms: u64,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
-    acquire_tool_foreground_input_lease_sized(service, tool, request_context, ttl_ms)
-        .map(|(guard, _lease_ttl_ms)| guard)
-}
-
-/// The single foreground-input-lease acquisition funnel for every m2 tool, and
-/// the one place the non-reducing TTL rule (#2065, generalized in #2071) is
-/// applied.
-///
-/// `action_required_ttl_ms` is what *this action* needs: the action default for
-/// a single-shot verb, or the action's own planned emission timeline when it can
-/// compute one (`act_type`, `act_set_field_text`, `act_stroke`, and the
-/// `hold_ms`-sized keyboard verbs). The effective TTL handed to the lease
-/// registry is [`effective_action_lease_ttl_ms`] of that number, so a caller who
-/// bought a longer window with `act operation=lease_acquire` keeps it.
-///
-/// Returns the guard together with the effective TTL, so a caller that also arms
-/// the emission heartbeat budget arms it against the window actually granted
-/// rather than the one it asked for.
-fn acquire_tool_foreground_input_lease_sized(
-    service: &SynapseService,
-    tool: &'static str,
-    request_context: &RequestContext<RoleServer>,
-    action_required_ttl_ms: u64,
-) -> Result<(crate::m2::ForegroundInputLeaseGuard, u64), ErrorData> {
     // `None` here means the stdio transport by construction — an HTTP request
     // without Mcp-Session-Id fails hard upstream. stdio is single-client, so
     // the stable "stdio" owner (the same idiom the m3 layer uses) gives the
@@ -2965,321 +2448,11 @@ fn acquire_tool_foreground_input_lease_sized(
     if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
         return Err(hidden_desktop_foreground_refusal(tool, &hidden_desktop));
     }
-    let lease_ttl_ms = effective_action_lease_ttl_ms(tool, &session_id, action_required_ttl_ms);
-    let guard =
-        crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), lease_ttl_ms)?;
-    Ok((guard, lease_ttl_ms))
+    crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), ttl_ms)
 }
 
-/// Computes the TTL an action lease acquisition may actually install, and logs
-/// the decision.
-///
-/// The rule, from #2065 and generalized to every foreground verb by #2071: an
-/// action lease may be **raised** to fit the action's own planned timeline, but
-/// must never be **lowered** below what the acquiring session's live lease still
-/// has left. Before this, every verb except `act_type` renewed its own caller's
-/// 60 s lease down to `DEFAULT_LEASE_TTL_MS` (5 s) — physically reproduced in
-/// #2071 as `INPUT_LEASE_ACTION_RENEWED tool="act_focus_window" ttl_ms=5000`
-/// immediately after `INPUT_LEASE_ACQUIRED ttl_ms=60000`. After #2057's
-/// per-emission fence that silent shortening aborts any *later* multi-emission
-/// action mid-sequence with `M2_EMISSION_FENCE_LEASE_NOT_HELD`.
-///
-/// The caller floor is read through [`synapse_action::lease::owner_remaining_ttl_ms`],
-/// which expires a lapsed lease first and ignores a lease owned by anyone else
-/// or tagged as an operator-panic preemption — so this can only ever preserve
-/// authority the same session provably still holds, never manufacture it. The
-/// result stays capped at `MAX_LEASE_TTL_MS`; nothing here widens the ceiling,
-/// touches the per-emission fence, or introduces a grace window.
-fn effective_action_lease_ttl_ms(
-    tool: &'static str,
-    session_id: &str,
-    action_required_ttl_ms: u64,
-) -> u64 {
-    let caller_lease_remaining_ms = synapse_action::lease::owner_remaining_ttl_ms(session_id);
-    let lease_ttl_ms = action_required_ttl_ms
-        .max(caller_lease_remaining_ms)
-        .min(synapse_action::MAX_LEASE_TTL_MS);
-    let reason = if caller_lease_remaining_ms > action_required_ttl_ms {
-        "caller_lease_remaining_preserved"
-    } else if action_required_ttl_ms > synapse_action::DEFAULT_LEASE_TTL_MS {
-        "action_planned_timeline"
-    } else {
-        "action_default_floor"
-    };
-    tracing::info!(
-        code = "INPUT_LEASE_ACTION_TTL_SIZED",
-        tool,
-        session_id,
-        action_required_ttl_ms,
-        caller_lease_remaining_ms,
-        lease_ttl_ms,
-        ttl_ms_before = caller_lease_remaining_ms,
-        ttl_ms_after = lease_ttl_ms,
-        reduced_caller_ttl = lease_ttl_ms < caller_lease_remaining_ms,
-        reason,
-        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
-        "readback=input_lease action lease TTL sized; a live same-owner lease is never shortened"
-    );
-    lease_ttl_ms
-}
-
-/// Sizes the keyboard verbs (`act_press`, `act_keymap`) from their declared
-/// hold: `DEFAULT_LEASE_TTL_MS` as a floor, raised by `hold_ms` plus the
-/// foreground-restore stability window. The caller's own live TTL is applied on
-/// top of this by [`effective_action_lease_ttl_ms`], so the hold-derived number
-/// is a floor too, never a clamp (#2071).
 fn lease_ttl_for_hold_ms(hold_ms: u32) -> u64 {
     crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
-}
-
-/// Per-sample cost of a stroke emission beyond the planned sample timeline: the
-/// cursor mutation itself plus the per-emission foreground fence readbacks
-/// (#2057). Deliberately an over-estimate — unlike `act_type` the mouse emission
-/// loop has no in-flight heartbeat, so the up-front number is the only budget.
-const ACT_STROKE_EMISSION_SAMPLE_OVERHEAD_MS: u64 = 1;
-/// Head/tail margin around a stroke's sample timeline: button press/release,
-/// modifier settle, the delta-signature readbacks and the postcondition verify,
-/// all of which run under the same lease.
-const ACT_STROKE_SETUP_MARGIN_MS: u64 = 10_000;
-
-/// Sizes the `act_stroke` foreground input lease from the stroke plan Synapse
-/// already validated and audited (#2071).
-///
-/// The source of truth is the same `StrokePlan` the emitter replays, read from
-/// the audited request details (`plan.duration_ms` = the planned sample
-/// timeline, `plan.point_stream_count` = the number of gated cursor emissions).
-/// A drag whose path takes 20 s used to run under a 5 s lease and, after the
-/// #2057 per-emission fence, would refuse part-way through with
-/// `M2_EMISSION_FENCE_LEASE_NOT_HELD`.
-///
-/// Fails loud rather than guessing: this is only ever called on the leased
-/// (non-CDP-aim) route, where the plan is always present, so a missing or
-/// non-finite planned duration is an internal invariant violation, not a case to
-/// fall back on. `MAX_STROKE_DURATION_MS` (60 000) and `MAX_STROKE_SAMPLES`
-/// (60 001) bound the result at ~130 s, well inside `MAX_LEASE_TTL_MS`; the
-/// explicit over-max refusal exists so raising those caps can never turn into a
-/// silently truncated lease.
-fn act_stroke_planned_lease_ttl_ms(stroke_details: &Value) -> Result<u64, ErrorData> {
-    let planned = &stroke_details["plan"];
-    let planned_duration_ms = planned["duration_ms"]
-        .as_f64()
-        .filter(|duration| duration.is_finite() && *duration >= 0.0)
-        .ok_or_else(|| act_stroke_plan_field_unusable_error("a finite duration_ms", planned))?;
-    let point_stream_count = planned["point_stream_count"]
-        .as_u64()
-        .ok_or_else(|| act_stroke_plan_field_unusable_error("a point_stream_count", planned))?;
-    let planned_emission_ms = (planned_duration_ms.ceil() as u64)
-        .saturating_add(point_stream_count.saturating_mul(ACT_STROKE_EMISSION_SAMPLE_OVERHEAD_MS));
-    let required_lease_ttl_ms = planned_emission_ms
-        .saturating_add(ACT_STROKE_SETUP_MARGIN_MS)
-        .max(synapse_action::DEFAULT_LEASE_TTL_MS);
-    if required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_stroke refused before emitting: this path needs a foreground input lease of {required_lease_ttl_ms} ms ({point_stream_count} gated cursor emissions over {planned_duration_ms:.0} ms of planned motion plus {ACT_STROKE_SETUP_MARGIN_MS} ms of setup/verify margin), but the maximum foreground input lease is {} ms. Split the stroke into shorter segments or raise its speed.",
-                synapse_action::MAX_LEASE_TTL_MS
-            ),
-        ));
-    }
-    tracing::info!(
-        code = "M2_ACT_STROKE_EMISSION_LEASE_SIZED",
-        tool = "act_stroke",
-        point_stream_count,
-        planned_duration_ms,
-        planned_emission_ms,
-        required_lease_ttl_ms,
-        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
-        source_of_truth = "validated act_stroke plan (duration_ms, point_stream_count)",
-        "readback=input_lease act_stroke lease sized from its planned sample timeline"
-    );
-    Ok(required_lease_ttl_ms)
-}
-
-/// The leased stroke route always runs on a validated plan, so a plan field the
-/// lease sizing needs but cannot read is an internal invariant violation. It
-/// fails the action loudly instead of quietly falling back to a default TTL that
-/// would abort the stroke mid-path at the #2057 fence.
-fn act_stroke_plan_field_unusable_error(field: &'static str, planned: &Value) -> ErrorData {
-    mcp_error(
-        error_codes::TOOL_PARAMS_INVALID,
-        format!(
-            "act_stroke internal error: the validated stroke plan carried no {field}, so its foreground input lease cannot be sized from the planned motion timeline; plan={planned}"
-        ),
-    )
-}
-
-/// Per-UTF-16-unit cost of a foreground type emission *beyond* the sampled
-/// inter-keystroke interval: the `SendInput` itself, the per-emission foreground
-/// fence readbacks (#2057), and OS scheduling slop. The #2065 FSV measured
-/// ~68 ms/unit end to end against a 32 ms mean IKI on that machine, i.e. ~36 ms
-/// of overhead; this rounds up so the planned budget is an over-estimate rather
-/// than an under-estimate. Under-estimating here is not a truncation bug — the
-/// in-loop heartbeat covers estimate error — but the declared budget should still
-/// be honest.
-const ACT_TYPE_EMISSION_UNIT_OVERHEAD_MS: u64 = 50;
-/// Head/tail margin around the emission timeline itself: focus/click settling,
-/// the before/after text-signature readbacks, queue hand-off to the action
-/// emitter, and the postcondition verify, none of which are part of the sampled
-/// keystroke schedule but all of which run under the same lease.
-const ACT_TYPE_EMISSION_SETUP_MARGIN_MS: u64 = 10_000;
-
-/// The planned emission timeline of one `act_type`, used to size its input lease
-/// before a single character is typed (#2065).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct ActTypeEmissionPlan {
-    unit_total: u64,
-    planned_emission_ms: u64,
-    required_lease_ttl_ms: u64,
-}
-
-/// Sizes the planned emission timeline from the exact schedule the software
-/// backend will replay.
-///
-/// `synapse_action::sample_typing_schedule` is deterministic in
-/// `(text, dynamics)` with no explicit seed, and the backend samples it the same
-/// way in `backend::text_dispatch::text_dispatch_plan`, so the inter-keystroke
-/// sum computed here is the same one the emission loop will sleep through.
-fn act_type_emission_plan(text: &str, dynamics: &KeystrokeDynamics) -> ActTypeEmissionPlan {
-    let mut unit_total = 0_u64;
-    let mut planned_iki_ms = 0_u64;
-    for event in synapse_action::sample_typing_schedule(text, dynamics, None) {
-        planned_iki_ms = planned_iki_ms.saturating_add(u64::from(event.iki_ms_before));
-        // Mirrors `backend::text_dispatch::dispatch_inputs`: newline/carriage
-        // return and tab collapse to one virtual-key emission, everything else
-        // is one emission per UTF-16 unit.
-        unit_total = unit_total.saturating_add(match event.r#char {
-            '\n' | '\r' | '\t' => 1,
-            ch if ch.len_utf16() == 2 => 2,
-            _ => 1,
-        });
-    }
-    let planned_emission_ms = planned_iki_ms
-        .saturating_add(unit_total.saturating_mul(ACT_TYPE_EMISSION_UNIT_OVERHEAD_MS));
-    ActTypeEmissionPlan {
-        unit_total,
-        planned_emission_ms,
-        required_lease_ttl_ms: planned_emission_ms
-            .saturating_add(ACT_TYPE_EMISSION_SETUP_MARGIN_MS),
-    }
-}
-
-/// Acquires the foreground input lease for `act_type`, sized for the planned
-/// emission timeline, and arms the in-flight emission heartbeat (#2065).
-///
-/// Three properties this must hold:
-///
-/// * the TTL is derived from how long this specific string will actually take to
-///   emit, not from `DEFAULT_LEASE_TTL_MS`;
-/// * a longer TTL the caller already bought with `act operation=foreground` is
-///   never silently shortened — the effective TTL is the max of the two, and both
-///   numbers are logged. Since #2071 that rule lives in
-///   [`effective_action_lease_ttl_ms`] and applies to every foreground verb; this
-///   site adds the typing-specific plan numbers to the audit trail;
-/// * a payload whose planned timeline cannot fit inside `MAX_LEASE_TTL_MS` is
-///   refused **before** any character is typed, naming the limit and the plan,
-///   instead of being truncated mid-flight.
-fn acquire_act_type_foreground_input_lease(
-    service: &SynapseService,
-    request_context: &RequestContext<RoleServer>,
-    params: &ActTypeParams,
-) -> Result<
-    (
-        crate::m2::ForegroundInputLeaseGuard,
-        synapse_action::lease::EmissionBudgetGuard,
-    ),
-    ErrorData,
-> {
-    let mut plan_params = params.clone();
-    // The chromium foreground fallback still carries `into_element` at this
-    // point and clears it only after the fallback click lands; the emitted text
-    // and dynamics are identical either way.
-    plan_params.into_element = None;
-    let (text, dynamics) = match action_from_type_params(&plan_params)? {
-        Action::TypeText { text, dynamics, .. } => (text, dynamics),
-        other => {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("act_type produced a non-type action while planning its lease: {other:?}"),
-            ));
-        }
-    };
-    let plan = act_type_emission_plan(&text, &dynamics);
-    if plan.required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
-        return Err(act_type_emission_budget_exceeds_max_lease_error(&plan));
-    }
-    let session_id =
-        foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
-    let caller_lease_remaining_ms = synapse_action::lease::owner_remaining_ttl_ms(&session_id);
-    tracing::info!(
-        code = "M2_ACT_TYPE_EMISSION_LEASE_SIZED",
-        tool = "act_type",
-        session_id,
-        unit_total = plan.unit_total,
-        planned_emission_ms = plan.planned_emission_ms,
-        required_lease_ttl_ms = plan.required_lease_ttl_ms,
-        caller_lease_remaining_ms,
-        lease_ttl_ms = plan
-            .required_lease_ttl_ms
-            .max(caller_lease_remaining_ms)
-            .min(synapse_action::MAX_LEASE_TTL_MS),
-        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
-        source_of_truth =
-            "synapse_action::sample_typing_schedule over the emitted text and resolved dynamics",
-        "readback=input_lease act_type lease sized from its planned emission timeline; a longer caller TTL is never shortened"
-    );
-    // The funnel applies the same non-reducing rule and returns the window it
-    // actually installed, so the heartbeat budget is armed against the granted
-    // TTL rather than the requested one.
-    let (lease_guard, lease_ttl_ms) = acquire_tool_foreground_input_lease_sized(
-        service,
-        "act_type",
-        request_context,
-        plan.required_lease_ttl_ms,
-    )?;
-    let budget_guard = synapse_action::lease::arm_emission_budget(
-        &session_id,
-        Duration::from_millis(lease_ttl_ms),
-        Duration::from_millis(synapse_action::MAX_LEASE_TTL_MS),
-    );
-    Ok((lease_guard, budget_guard))
-}
-
-fn act_type_emission_budget_exceeds_max_lease_error(plan: &ActTypeEmissionPlan) -> ErrorData {
-    let max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS;
-    tracing::warn!(
-        code = error_codes::TOOL_PARAMS_INVALID,
-        tool = "act_type",
-        unit_total = plan.unit_total,
-        planned_emission_ms = plan.planned_emission_ms,
-        required_lease_ttl_ms = plan.required_lease_ttl_ms,
-        max_lease_ttl_ms,
-        "act_type refused before emitting: the planned typing timeline cannot fit inside the maximum foreground input lease"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act_type refused before typing anything: emitting this text needs a foreground input lease of {} ms ({} OS emissions, {} ms of planned keystroke timeline plus {} ms of setup/verify margin), but the maximum foreground input lease is {max_lease_ttl_ms} ms. Synapse will not start a sequence it cannot hold the foreground for and would have to abandon part-typed. Split the text into shorter act_type calls, or use faster dynamics (dynamics=burst or a smaller linear_ms_per_char).",
-            plan.required_lease_ttl_ms,
-            plan.unit_total,
-            plan.planned_emission_ms,
-            ACT_TYPE_EMISSION_SETUP_MARGIN_MS,
-        ),
-        Some(json!({
-            "code": error_codes::TOOL_PARAMS_INVALID,
-            "detail_code": "M2_ACT_TYPE_EMISSION_BUDGET_EXCEEDS_MAX_LEASE",
-            "tool": "act_type",
-            "refused_before_delivery": true,
-            "delivery_state": "refused_before_delivery",
-            "planned_emission_units": plan.unit_total,
-            "planned_emission_ms": plan.planned_emission_ms,
-            "setup_margin_ms": ACT_TYPE_EMISSION_SETUP_MARGIN_MS,
-            "required_lease_ttl_ms": plan.required_lease_ttl_ms,
-            "max_lease_ttl_ms": max_lease_ttl_ms,
-            "source_of_truth": "synapse_action::sample_typing_schedule over the emitted text and resolved dynamics",
-            "remediation": "split the text across several act_type calls so each planned timeline fits the maximum foreground input lease, or lower the per-character pacing",
-        })),
-    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3877,8 +3050,6 @@ impl SynapseService {
             required_foreground: tier_attempts
                 .iter()
                 .any(|attempt| attempt.required_foreground),
-            desktop_route: None,
-            desktop_route_hwnds: None,
             tier_attempts,
             postcondition,
             press_hold_ms: params.hold_ms,
@@ -3904,20 +3075,10 @@ impl SynapseService {
         require_browser_url: bool,
         session_id: Option<&str>,
     ) -> Result<ActTypeTextReadback, ErrorData> {
-        let observation_snapshot = {
+        let mut input = {
             let state = self.m1_state()?;
-            crate::m1::M1ObservationSnapshot::from_state(&state)
+            crate::m1::current_input(&state, 6)?
         };
-        let mut input = tokio::task::spawn_blocking(move || {
-            crate::m1::current_input_from_snapshot(&observation_snapshot, 6)
-        })
-        .await
-        .map_err(|error| {
-            mcp_error(
-                synapse_core::error_codes::OBSERVE_INTERNAL,
-                format!("act_type_text blocking perception gather task failed: {error}"),
-            )
-        })??;
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
         let bridge_target = self
@@ -4040,10 +3201,6 @@ impl SynapseService {
                 expected, target,
             ));
         }
-        crate::m2::foreground_fence::arm_expected_target(
-            target.root_hwnd,
-            "act_type_foreground_fallback_target",
-        )?;
         Ok(())
     }
 
@@ -4070,9 +3227,6 @@ impl SynapseService {
         ];
         for action in actions {
             boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
-            crate::m2::foreground_fence::ensure(
-                "immediately_before_act_type_foreground_fallback_click",
-            )?;
             handle
                 .execute(action)
                 .await
@@ -4113,32 +3267,6 @@ impl SynapseService {
     {
         let element_id = crate::m2::required_element_id(params)?;
         let foreground_guard = act_set_value_target_foreground_guard(element_id)?;
-        self.act_set_field_text_guarded_with(params, foreground_guard, run)
-            .await
-    }
-
-    /// Same visible-foreground guard, with the target guard supplied by the
-    /// caller. #2056 hidden-desktop targets cannot be normalized to a top-level
-    /// root from the daemon's desktop, but the human's visible foreground must
-    /// still be proven unchanged across the action.
-    async fn act_set_field_text_guarded_with<'params, Run>(
-        &self,
-        params: &'params crate::m2::ActSetFieldTextParams,
-        foreground_guard: BackgroundTargetForegroundGuard,
-        run: Run,
-    ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData>
-    where
-        Run: FnOnce(
-            &'params crate::m2::ActSetFieldTextParams,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<crate::m2::ActSetFieldTextResponse, ErrorData>,
-                    > + Send
-                    + 'params,
-            >,
-        >,
-    {
         let foreground_before = self
             .current_audit_foreground()
             .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
@@ -4228,46 +3356,8 @@ impl SynapseService {
             )
         })?;
 
-        // #2071: the Chromium foreground tier types the whole replacement under
-        // this one lease — one gated `SendInput` per UTF-16 unit — so it is sized
-        // from the same deterministic schedule `act_type` plans with, and arms
-        // the same in-flight emission heartbeat (#2065): the software text
-        // backend heartbeats every unit that has already cleared the fence.
-        let replacement_dynamics = KeystrokeDynamics::Natural {
-            params: KeystrokeNaturalParams::FAST,
-        };
-        let replacement_plan = act_type_emission_plan(&params.text, &replacement_dynamics);
-        if replacement_plan.required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
-            return Err(set_field_text_foreground_error(
-                &target,
-                error_codes::TOOL_PARAMS_INVALID,
-                "emission_budget_exceeds_max_lease",
-                format!(
-                    "act_set_field_text refused before typing anything: replacing this field needs a foreground input lease of {} ms ({} OS emissions, {} ms of planned keystroke timeline), but the maximum foreground input lease is {} ms. Split the replacement across shorter calls.",
-                    replacement_plan.required_lease_ttl_ms,
-                    replacement_plan.unit_total,
-                    replacement_plan.planned_emission_ms,
-                    synapse_action::MAX_LEASE_TTL_MS
-                ),
-            ));
-        }
-        let lease_session_id =
-            foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
-        let (_lease_guard, lease_ttl_ms) = acquire_tool_foreground_input_lease_sized(
-            self,
-            "act_set_field_text",
-            request_context,
-            replacement_plan.required_lease_ttl_ms,
-        )?;
-        let _emission_budget_guard = synapse_action::lease::arm_emission_budget(
-            &lease_session_id,
-            Duration::from_millis(lease_ttl_ms),
-            Duration::from_millis(synapse_action::MAX_LEASE_TTL_MS),
-        );
-        crate::m2::foreground_fence::arm_expected_target(
-            target.root_hwnd,
-            "act_set_field_text_foreground_target",
-        )?;
+        let _lease_guard =
+            acquire_tool_foreground_input_lease(self, "act_set_field_text", request_context)?;
 
         // Actionability before the coordinate click (the Playwright `fill`
         // discipline): scroll an off-viewport target into view, re-read its
@@ -4354,9 +3444,6 @@ impl SynapseService {
         ];
         for action in click_actions {
             boundary.ensure("immediately_before_set_field_text_foreground_click")?;
-            crate::m2::foreground_fence::ensure(
-                "immediately_before_set_field_text_foreground_click",
-            )?;
             handle.execute(action).await.map_err(|error| {
                 set_field_text_foreground_error(
                     &target,
@@ -4386,7 +3473,6 @@ impl SynapseService {
 
         let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
         boundary.ensure("immediately_before_set_field_text_select_all")?;
-        crate::m2::foreground_fence::ensure("immediately_before_set_field_text_select_all")?;
         handle.execute(select_all).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -4406,14 +3492,14 @@ impl SynapseService {
                 crate::m2::METHOD_FOREGROUND_REPLACE,
                 Action::TypeText {
                     text: params.text.clone(),
-                    // Exactly the dynamics the lease above was sized from.
-                    dynamics: replacement_dynamics,
+                    dynamics: KeystrokeDynamics::Natural {
+                        params: KeystrokeNaturalParams::FAST,
+                    },
                     backend: Backend::Auto,
                 },
             )
         };
         boundary.ensure("immediately_before_set_field_text_replacement_input")?;
-        crate::m2::foreground_fence::ensure("immediately_before_set_field_text_replacement_input")?;
         handle.execute(replace_action).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -4465,30 +3551,23 @@ impl SynapseService {
         include_cursor: bool,
         target_window_hwnd: Option<i64>,
     ) -> Result<ClickDeltaSignature, ErrorData> {
-        let observation_snapshot = {
+        let mut input = {
             let state = self.m1_state()?;
-            crate::m1::M1ObservationSnapshot::from_state(&state)
-        };
-        let mut input = tokio::task::spawn_blocking(move || {
             if let Some(hwnd) = target_window_hwnd {
-                let params = crate::m1::ObserveParams {
-                    depth: Some(6),
-                    max_elements: Some(max_elements),
-                    window_hwnd: Some(hwnd),
-                    ..crate::m1::ObserveParams::default()
-                };
-                crate::m1::observe_input_from_snapshot(&observation_snapshot, &params, None)
+                crate::m1::observe_input(
+                    &state,
+                    &crate::m1::ObserveParams {
+                        depth: Some(6),
+                        max_elements: Some(max_elements),
+                        window_hwnd: Some(hwnd),
+                        ..crate::m1::ObserveParams::default()
+                    },
+                    None,
+                )?
             } else {
-                crate::m1::current_input_from_snapshot(&observation_snapshot, 6)
+                crate::m1::current_input(&state, 6)?
             }
-        })
-        .await
-        .map_err(|error| {
-            mcp_error(
-                synapse_core::error_codes::OBSERVE_INTERNAL,
-                format!("action delta blocking perception gather task failed: {error}"),
-            )
-        })??;
+        };
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
 
@@ -4675,8 +3754,6 @@ impl SynapseService {
             ok: true,
             chars_typed,
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-            backend_used: readback.readback_backend.clone(),
-            method: readback.method,
             backend_tier_used: ACT_TYPE_CHROME_BRIDGE_ACTIVE_ELEMENT_TIER.to_owned(),
             required_foreground: false,
             target_text_integrity: ACT_TYPE_CHROME_BRIDGE_ACTIVE_ELEMENT_TEXT_INTEGRITY.to_owned(),
@@ -4850,7 +3927,6 @@ impl SynapseService {
         emitted: &str,
         browser_url_policy: Option<&ActTypeBrowserUrlPolicy>,
         session_id: Option<&str>,
-        expected_target_window_hwnd: Option<i64>,
     ) -> Result<ActTypeResponse, ErrorData> {
         let started = Instant::now();
         let timeout = Duration::from_millis(u64::from(verify_timeout_ms));
@@ -4875,14 +3951,6 @@ impl SynapseService {
                     session_id,
                 )
                 .await?;
-            if let Some(expected_hwnd) = expected_target_window_hwnd {
-                ensure_act_type_signature_matches_expected_target(
-                    expected_hwnd,
-                    &after.signature,
-                    "after_foreground_type_dispatch",
-                    false,
-                )?;
-            }
             let before_hash = verify_hash_json(&before.signature)?;
             let after_hash = verify_hash_json(&after.signature)?;
             let result = if let Some(policy) = browser_url_policy {
@@ -4930,14 +3998,6 @@ impl SynapseService {
             Ok(after) => after,
             Err(error) => return Err(last_error.unwrap_or(error)),
         };
-        if let Some(expected_hwnd) = expected_target_window_hwnd {
-            ensure_act_type_signature_matches_expected_target(
-                expected_hwnd,
-                &after.signature,
-                "final_after_foreground_type_dispatch",
-                false,
-            )?;
-        }
         let before_hash = verify_hash_json(&before.signature)?;
         let after_hash = verify_hash_json(&after.signature)?;
         if let Some(policy) = browser_url_policy {
@@ -5046,117 +4106,11 @@ impl SynapseService {
                 .act_press_cdp_background_target(window_hwnd, cdp_target_id, params, boundary)
                 .await
                 .map(Some),
-            // #2063 finding 2: the PostMessage keyboard tier used to run here
-            // unconditionally, ahead of the hidden-desktop gate that lives in
-            // `acquire_tool_foreground_input_lease_with_ttl`, and reported
-            // `delivered_unverified` against a hidden-desktop HWND. Windows
-            // documents that window messages can be sent only between processes
-            // on the same desktop, so that "delivery" was unprovable. Consult
-            // the desktop-membership oracle BEFORE the desktop-agnostic tier and
-            // run the whole sequence on the owning desktop instead.
-            SessionTarget::Window { hwnd } => {
-                if let Some(route) = self.hidden_desktop_window_route_for_request(
-                    "act_press",
-                    hwnd,
-                    request_context,
-                )? {
-                    return self
-                        .act_press_hidden_desktop_target(route, params, boundary)
-                        .await
-                        .map(Some);
-                }
-                self.act_press_postmessage_background_target(hwnd, params, boundary)
-                    .await
-                    .map(Some)
-            }
+            SessionTarget::Window { hwnd } => self
+                .act_press_postmessage_background_target(hwnd, params, boundary)
+                .await
+                .map(Some),
         }
-    }
-
-    /// #2063 finding 2: delivers a keystroke to a window on a session-owned
-    /// hidden desktop through worker processes attached to that exact desktop.
-    ///
-    /// Three separate worker processes: the before-read, the delivery, and the
-    /// after-read. The mutation is never its own witness, and the readbacks are
-    /// taken on the desktop that owns the window rather than on the daemon's own
-    /// desktop, where `IsWindow` for that HWND is false. No visual fallback: if
-    /// the on-desktop text/selection Source of Truth shows no change, the call
-    /// fails loud with `ACTION_NO_OBSERVED_DELTA` rather than claiming
-    /// `delivered_unverified`.
-    async fn act_press_hidden_desktop_target(
-        &self,
-        route: crate::m2::HiddenDesktopWindowRoute,
-        params: ActPressParams,
-        boundary: OperatorPanicActionBoundary,
-    ) -> Result<ActPressResponse, ErrorData> {
-        let started = Instant::now();
-        let route_label = route.route_label();
-        let key_labels = act_press_normalized_labels(&params)?;
-        let expected_effect = hwnd_keyboard_expected_effect(&params)?;
-        let verify_timeout_ms = params.verify_timeout_ms;
-
-        let before = HwndKeyboardDeltaSignature {
-            target: crate::desktop_worker::hidden_desktop_key_state(
-                &route.desktop_name,
-                route.hwnd,
-            )
-            .map_err(|error| hidden_desktop_press_stage_error(&route, "before_read", error))?,
-            clipboard_sequence: crate::m2::press::clipboard_sequence_number(),
-        };
-
-        boundary.ensure("immediately_before_hidden_desktop_press_keys")?;
-        let (keys_pressed, _delivery_state) = crate::desktop_worker::hidden_desktop_press_keys(
-            &route.desktop_name,
-            route.hwnd,
-            &key_labels,
-            params.hold_ms,
-        )
-        .map_err(|error| hidden_desktop_press_stage_error(&route, "press_keys", error))?;
-
-        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
-
-        let after = HwndKeyboardDeltaSignature {
-            target: crate::desktop_worker::hidden_desktop_key_state(
-                &route.desktop_name,
-                route.hwnd,
-            )
-            .map_err(|error| hidden_desktop_press_stage_error(&route, "after_read", error))?,
-            clipboard_sequence: crate::m2::press::clipboard_sequence_number(),
-        };
-
-        tracing::info!(
-            code = "M2_ACT_PRESS_HIDDEN_DESKTOP_READBACK",
-            tool = "act_press",
-            hwnd = route.hwnd,
-            desktop_route = route_label.as_str(),
-            backend_tier_used = PRESS_TIER_HIDDEN_DESKTOP_WORKER,
-            required_foreground = false,
-            keys = ?key_labels,
-            keys_pressed,
-            expected_effect = hwnd_keyboard_expected_effect_name(&expected_effect),
-            source_of_truth = HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
-            "readback=act_press route={route_label} keys={key_labels:?} keys_pressed={keys_pressed}"
-        );
-
-        let postcondition = verify_hwnd_keyboard_delta_signature(
-            "act_press",
-            HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
-            verify_timeout_ms,
-            before,
-            after,
-            expected_effect,
-            "observed target HWND text/selection change on the session-owned desktop after PostMessage keyboard delivery",
-        )?;
-
-        Ok(ActPressResponse {
-            ok: true,
-            keys_pressed,
-            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-            backend_used: "software".to_owned(),
-            backend_tier_used: PRESS_TIER_HIDDEN_DESKTOP_WORKER.to_owned(),
-            required_foreground: false,
-            desktop_route: Some(route_label),
-            postcondition,
-        })
     }
 
     async fn try_act_keymap_background_target(
@@ -5940,25 +4894,7 @@ fn act_type_visual_delta_target_window(
             "conflicting_postconditions",
         ));
     }
-    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
-        ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "act_type verify_target_window_hwnd 0x{hwnd:x} is not a live target window: {error}"
-            ),
-            Some(json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "detail_code": "ACT_TYPE_VERIFY_TARGET_WINDOW_INVALID",
-                "refused_before_delivery": true,
-                "target_hwnd": hwnd,
-                "source_of_truth": "IsWindow + GetAncestor(GA_ROOT) before foreground typing",
-                "readback_error_code": error.code(),
-                "readback_error": error.to_string(),
-                "remediation": "bind a live agent-owned window target and retry",
-            })),
-        )
-    })?;
-    Ok(Some(root_hwnd))
+    Ok(Some(hwnd))
 }
 
 fn act_type_requires_foreground_route(
@@ -7016,54 +5952,6 @@ fn act_type_foreground_identity_changed(
         || before.foreground_process != after.foreground_process
 }
 
-/// Proves that a global focused-text readback belongs to the exact window the
-/// caller bound for delivery. A delta in some unrelated human-foreground edit
-/// control is never evidence that the target changed (#1830).
-fn ensure_act_type_signature_matches_expected_target(
-    expected_root_hwnd: i64,
-    signature: &ActTypeTextSignature,
-    stage: &'static str,
-    refused_before_delivery: bool,
-) -> Result<(), ErrorData> {
-    if signature.foreground_hwnd == expected_root_hwnd {
-        return Ok(());
-    }
-    tracing::error!(
-        code = error_codes::ACTION_FOREGROUND_LOST,
-        detail_code = "ACT_TYPE_TEXT_READBACK_TARGET_MISMATCH",
-        stage,
-        expected_root_hwnd,
-        actual_foreground_hwnd = signature.foreground_hwnd,
-        actual_foreground_pid = signature.foreground_pid,
-        actual_foreground_process = %signature.foreground_process,
-        refused_before_delivery,
-        "act_type focused-text readback belongs to a different foreground window than the exact bound target"
-    );
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act_type target verification failed at {stage}: focused-text readback came from hwnd 0x{:x} ({}), not exact target root hwnd 0x{expected_root_hwnd:x}",
-            signature.foreground_hwnd, signature.foreground_process
-        ),
-        Some(json!({
-            "code": error_codes::ACTION_FOREGROUND_LOST,
-            "detail_code": "ACT_TYPE_TEXT_READBACK_TARGET_MISMATCH",
-            "refused_before_delivery": refused_before_delivery,
-            "stage": stage,
-            "expected_target_root_hwnd": expected_root_hwnd,
-            "actual_foreground": {
-                "hwnd": signature.foreground_hwnd,
-                "pid": signature.foreground_pid,
-                "process_name": &signature.foreground_process,
-                "window_title_sha256": &signature.foreground_title_sha256,
-            },
-            "readback": signature,
-            "source_of_truth": "GetForegroundWindow identity attached to the focused UIA/CDP/OCR text readback",
-            "remediation": "use a background target-scoped UIA/CDP route, or explicitly focus the exact bound target under the input lease before retrying raw foreground typing",
-        })),
-    ))
-}
-
 fn act_type_text_terminal_failure(
     before: &ActTypeTextReadback,
     after: &ActTypeTextReadback,
@@ -7376,7 +6264,6 @@ fn set_field_text_password_response(
         before_sha256: signature(before_len),
         after_sha256: signature(after_len),
         changed,
-        desktop_route: None,
         postcondition: ActPostcondition {
             status: "verified_state".to_owned(),
             observed_delta: Some(changed),
@@ -8104,34 +6991,6 @@ impl BackgroundTargetForegroundGuard {
     }
 }
 
-/// #2056: visible-foreground guard for a target on a session-owned hidden
-/// desktop. `GetAncestor(GA_ROOT)`/`IsWindow` cannot normalize a hidden-desktop
-/// HWND from the daemon's desktop, so the element HWND stands for the whole
-/// target here. The guard's job is unchanged: prove the human's visible
-/// foreground did not become this target across the action. A window on a
-/// non-input desktop can never be the visible foreground, so a trip here is a
-/// hard invariant violation, not a routine refusal.
-fn hidden_desktop_target_foreground_guard(
-    tool: &'static str,
-    element_id: &ElementId,
-) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
-    let hwnd = element_id
-        .parts()
-        .map_err(|error| {
-            mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "{tool} element id {element_id} could not be parsed for the hidden-desktop foreground guard: {error}"
-                ),
-            )
-        })?
-        .hwnd;
-    Ok(BackgroundTargetForegroundGuard {
-        element_hwnd: hwnd,
-        root_hwnd: hwnd,
-    })
-}
-
 fn act_set_value_target_foreground_guard(
     element_id: &ElementId,
 ) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
@@ -8211,9 +7070,6 @@ fn set_field_text_locator_find_params(
         limit: Some(20),
         in_window: None,
         window_hwnd: Some(window_hwnd),
-        // Locator resolution is strictly perception recall over the live
-        // observation; fused memory recall would answer a different question.
-        similar: None,
     }
 }
 
@@ -8534,6 +7390,17 @@ fn attempt_background_foreground_restore(
     before: &ForegroundContext,
     after: &ForegroundContext,
 ) -> Value {
+    #[cfg(test)]
+    {
+        let _ = (tool, action_source_of_truth, target, before, after);
+        return json!({
+            "attempted": false,
+            "status": "skipped",
+            "reason": "unit_test",
+        });
+    }
+
+    #[cfg(not(test))]
     {
         let prior = match synapse_a11y::foreground_context(before.hwnd) {
             Ok(prior) => prior,
@@ -8964,3 +7831,6 @@ fn clipboard_request_audit_details(params: &ActClipboardParams) -> Value {
         "lease_required": false,
     })
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,79 +1,60 @@
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CaptureBackend {
-    GdiBitBlt,
+    GraphicsCaptureApi,
+    DxgiDuplication,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CaptureBackendPreference {
-    GdiBitBlt,
+    Auto,
     GraphicsCaptureApi,
     DxgiDuplication,
-    InvalidEnvironment,
+}
+
+impl CaptureBackendPreference {
+    #[must_use]
+    pub fn from_force_dxgi_value(value: Option<&str>) -> Self {
+        capture_backend_from_env(value)
+    }
 }
 
 pub const fn resolved_backend(preference: CaptureBackendPreference) -> CaptureBackend {
-    let _ = preference;
-    CaptureBackend::GdiBitBlt
+    match preference {
+        CaptureBackendPreference::Auto | CaptureBackendPreference::GraphicsCaptureApi => {
+            CaptureBackend::GraphicsCaptureApi
+        }
+        CaptureBackendPreference::DxgiDuplication => CaptureBackend::DxgiDuplication,
+    }
 }
 
-/// Resolves the strict no-explicit-GPU-API capture policy from environment.
-///
-/// # Errors
-///
-/// Returns [`crate::CaptureError`] for non-Unicode values or any explicit
-/// automatic/GPU-backed/unknown backend request.
-pub fn capture_backend_preference_from_environment()
--> Result<CaptureBackendPreference, crate::CaptureError> {
-    let explicit = std::env::var("SYNAPSE_CAPTURE_BACKEND");
-    let explicit_preference = match explicit {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "cpu" | "gdi" | "gdi_bitblt" => Some(CaptureBackendPreference::GdiBitBlt),
-            _ => {
-                return Err(crate::CaptureError::UnsupportedSemantics {
-                    detail: format!(
-                        "SYNAPSE_CAPTURE_BACKEND={value:?} contradicts the no-explicit-GPU-API capture contract; accepted values are cpu, gdi, or gdi_bitblt"
-                    ),
-                });
-            }
-        },
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(crate::CaptureError::UnsupportedSemantics {
-                detail: "SYNAPSE_CAPTURE_BACKEND is not valid Unicode; remove it or set it to cpu"
-                    .to_owned(),
-            });
-        }
-    };
+pub fn capture_backend_from_env(value: Option<&str>) -> CaptureBackendPreference {
+    match value {
+        Some("1" | "true" | "TRUE" | "yes" | "YES") => CaptureBackendPreference::DxgiDuplication,
+        _ => CaptureBackendPreference::Auto,
+    }
+}
 
-    let legacy = std::env::var("SYNAPSE_CAPTURE_FORCE_DXGI");
-    let legacy_preference = match legacy {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "no" => None,
-            "1" | "true" | "yes" => {
-                return Err(crate::CaptureError::UnsupportedSemantics {
-                    detail: "SYNAPSE_CAPTURE_FORCE_DXGI requests an explicit GPU API prohibited by the capture contract; remove it or set it to false"
-                        .to_owned(),
-                });
-            }
-            _ => {
-                return Err(crate::CaptureError::UnsupportedSemantics {
-                    detail: format!(
-                        "SYNAPSE_CAPTURE_FORCE_DXGI={value:?} is invalid; remove it or set it to false"
-                    ),
-                });
-            }
-        },
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(crate::CaptureError::UnsupportedSemantics {
-                detail:
-                    "SYNAPSE_CAPTURE_FORCE_DXGI is not valid Unicode; remove it or set it to false"
-                        .to_owned(),
-            });
+pub const fn backend_after_fallback(
+    preference: CaptureBackendPreference,
+    err: &crate::CaptureError,
+) -> CaptureBackend {
+    match (preference, err) {
+        (CaptureBackendPreference::Auto, crate::CaptureError::GraphicsApiUnsupported { .. }) => {
+            CaptureBackend::DxgiDuplication
         }
-    };
+        _ => resolved_backend(preference),
+    }
+}
 
-    Ok(explicit_preference
-        .or(legacy_preference)
-        .unwrap_or(CaptureBackendPreference::GdiBitBlt))
+pub const fn should_fallback_to_dxgi(
+    preference: CaptureBackendPreference,
+    err: &crate::CaptureError,
+) -> bool {
+    matches!(
+        (preference, err),
+        (
+            CaptureBackendPreference::Auto,
+            crate::CaptureError::GraphicsApiUnsupported { .. }
+        )
+    )
 }

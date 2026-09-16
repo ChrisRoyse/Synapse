@@ -1,0 +1,95 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.terminal.curated"
+package_version = "0.1.0"
+profile_id = "terminal"
+profile_version = "1.0.0"
+created_at = "2026-05-27T18:50:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic curated starter package fixture for Synapse issue #480."
+
+[source]
+kind = "bundled"
+uri = "https://github.com/ChrisRoyse/Synapse"
+revision = "m5-r20-terminal-curated-fixture"
+built_by = "codex"
+generated_by = "synapse-curated-starter-registry-v1"
+
+[[targets]]
+target_id = "terminal.windows"
+target_kind = "productivity_app"
+app_id = "microsoft.windows_terminal"
+process_name = "WindowsTerminal.exe"
+title_regex = ".*"
+app_version = "package:1.24.11321.0; file:1.24.2605.12001"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = []
+
+[assumptions.display]
+min_width = 800
+min_height = 600
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software"]
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "productivity"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = true
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T18:50:00Z"
+summary = "Initial Windows Terminal curated starter registry fixture."
+
+[hashes]
+profile_toml_sha256 = "sha256:ab56673ccc00816d959af30c3ba3a5450b6563ae49a694c32e5a603b6ab9d679"
+package_sha256 = "sha256:4804804804804804804804804804804804804804804804804804804804804804"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/terminal.toml"
+
+[metadata]
+registry_family = "profile-registry/audit-data"
+quality_signal = "profile_quality.terminal"
+local_registry_row = "profile_registry/v1/package/profile.terminal.curated/0.1.0"
+"compat.terminal.package_full_name" = "Microsoft.WindowsTerminal_1.24.11321.0_x64__8wekyb3d8bbwe"
+"compat.terminal.package_version" = "1.24.11321.0"
+"compat.terminal.exe_file_version" = "1.24.2605.12001"
+"compat.terminal.exe_sha256" = "sha256:35e0f0ded9fbd1d7615d02a324e54499d17cb7c20be5e8d599eaeb253965eb3e"
+"compat.terminal.defaults_sha256" = "sha256:39d3d978ebd3f3429e7eaf84b1e6020cdbf09bedf4e139751fdf537180475d0a"
+"compat.terminal.settings_sha256" = "sha256:2440f4ea10ec78ca7412327bdeca54ef86f2cba77f03a1087f741eddc2053b7f"
+"compat.terminal.wt_alias_path" = "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\wt.exe"
+"compat.terminal.wt_alias_hash_status" = "app_execution_alias_inaccessible_to_GetFileHash"
+"compat.terminal.copy_key" = "ctrl+c"
+"compat.terminal.paste_key" = "ctrl+v"
+"compat.terminal.command_palette_key" = "ctrl+shift+p"
+"compat.terminal.find_key" = "ctrl+shift+f"
+"compat.terminal.split_pane_key" = "alt+shift+d"
+"compat.terminal.title_policy" = "exe_only_match; tab titles may be arbitrary working-directory names"
+"compat.terminal.text_entry_verified_path" = "act_clipboard write + ctrl+v paste + enter + terminal_command_output_readback"
+"compat.terminal.act_type_direct_policy" = "dispatch_only_requires_target_readback; not a verified Windows Terminal command-output path on this host"
+"curated.seed_set_id" = "starter.v1"
+"curated.target_id" = "terminal.windows"
+"curated.tier" = "productivity.seed"
+"curated.priority" = "p1"
+"curated.status" = "shipped"
+"curated.backlog_issue" = "#480"
+"curated.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,act_clipboard,act_press,storage_inspect,profile_quality_refresh,terminal_command_output_readback,terminal_settings_readback"
+"curated.safe_default_backend_policy" = "auto; local productivity only; prefer clipboard paste keybinding for Terminal command text; act_type dispatch requires target readback; no remote execution; audit export requires explicit consent"

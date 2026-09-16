@@ -7,8 +7,7 @@ mod template_match;
 
 pub use error::{PerceptionError, PerceptionResult};
 pub use event_extensions::{
-    CompiledEventExtension, compile_event_extensions, evaluate_event_extensions,
-    validate_event_extension, validate_event_extensions,
+    evaluate_event_extensions, validate_event_extension, validate_event_extensions,
 };
 pub use hud::{
     ExtractionSource, FieldExtraction, FieldExtractionRequest, HudAnchor, HudAnchorRegion,
@@ -18,7 +17,7 @@ pub use hud::{
 pub use observe::{
     A11yTreeSummary, ObservationAssembler, ObservationInput, ObserveInclude, assemble,
     assemble_from_input, auto_mode, auto_mode_with_a11y, bounded_sensor_latency,
-    is_interactable_node, parse_perception_mode, refresh_size_fields,
+    is_interactable_node, is_known_game_process, parse_perception_mode,
 };
 pub use ocr::{
     OcrProvider, SystemOcrProvider, TextRegion, TextRegionConfidenceSource, is_empty_region,

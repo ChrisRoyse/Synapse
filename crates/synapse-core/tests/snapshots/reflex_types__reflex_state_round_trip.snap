@@ -1,0 +1,5 @@
+---
+source: crates/synapse-core/tests/reflex_types.rs
+expression: "round_trip(\"ReflexState\", \"snapshot\", ReflexState::Starved)?"
+---
+"starved"

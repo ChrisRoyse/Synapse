@@ -1,0 +1,8 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "Point { x: -10, y: 20 }"
+---
+{
+  "x": -10,
+  "y": 20
+}

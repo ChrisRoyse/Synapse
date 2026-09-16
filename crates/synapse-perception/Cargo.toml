@@ -5,9 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
-# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
-# makes this crate `private` for `cargo deny check licenses` (#1930).
-publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
@@ -15,12 +12,35 @@ image.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
+
+[[bench]]
+name = "ocr_read_text"
+harness = false
+
+[[bench]]
+name = "observe_warm_a11y_only"
+harness = false
+
+[[bench]]
+name = "observe_warm_hybrid"
+harness = false
+
+[[bench]]
+name = "hud_template_match"
+harness = false
 
 [lints]
 workspace = true

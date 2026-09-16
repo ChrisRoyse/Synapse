@@ -5,15 +5,16 @@ use std::{
 
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, retention::RetentionTtl};
-use synapse_storage::{Db, cf, decode_json, encode_json};
+use synapse_reflex::ReflexRuntime;
+use synapse_storage::{cf, decode_json, encode_json};
 
 use crate::m1::mcp_error;
 
 pub const AUDIT_RETENTION_MODE: &str = "AUDIT_RETENTION";
 
-const RETENTION_SCHEMA_VERSION: u32 = 2;
+const RETENTION_SCHEMA_VERSION: u32 = 1;
 const MAX_RUN_ID_BYTES: usize = 80;
 const MAX_SCAN_ROWS_PER_CF: usize = 100_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -78,6 +79,7 @@ pub struct AuditRetentionReport {
     pub total_expired_rows_deleted: u64,
     pub total_duplicate_rows_deleted: u64,
     pub total_cap_rows_deleted: u64,
+    pub total_backfilled_rows: u64,
     pub total_unknown_schema_rows: u64,
     pub preserved_strategic_rows: u64,
     pub dedupe_keys: Vec<String>,
@@ -110,8 +112,10 @@ pub struct AuditRetentionCfReport {
     pub expired_rows_deleted: u64,
     pub duplicate_rows_deleted: u64,
     pub cap_rows_deleted: u64,
+    pub backfilled_rows: u64,
     pub preserved_strategic_rows: u64,
     pub deletion_keys_hex: Vec<String>,
+    pub backfilled_keys_hex: Vec<String>,
 }
 
 #[must_use]
@@ -165,7 +169,7 @@ pub fn validate_audit_retention_config(params: &AuditRetentionRunConfig) -> Resu
 }
 
 pub fn run_audit_retention(
-    db: &Db,
+    runtime: &ReflexRuntime,
     params: &AuditRetentionRunConfig,
 ) -> Result<AuditRetentionRunResult, ErrorData> {
     validate_audit_retention_config(params)?;
@@ -174,7 +178,7 @@ pub fn run_audit_retention(
         .as_deref()
         .map_or_else(|| format!("run-{}", current_time_ns()), str::to_owned);
     let now_ns = params.now_ns.unwrap_or_else(current_time_ns);
-    let before_row_counts = db.cf_row_counts().map_err(storage_error)?;
+    let before_row_counts = runtime.storage_cf_row_counts().map_err(storage_error)?;
     let mut report = AuditRetentionReport {
         schema_version: RETENTION_SCHEMA_VERSION,
         row_kind: "audit_retention_report".to_owned(),
@@ -184,7 +188,7 @@ pub fn run_audit_retention(
             .profile_id
             .as_ref()
             .map(|profile| profile.trim().to_owned()),
-        pressure_level: format!("{:?}", db.pressure_level()),
+        pressure_level: format!("{:?}", runtime.storage_pressure_level()),
         soft_cap_rows: params.soft_cap_rows,
         hard_cap_rows: params.hard_cap_rows,
         max_age_ns: params.max_age_ns,
@@ -208,6 +212,7 @@ pub fn run_audit_retention(
         total_expired_rows_deleted: 0,
         total_duplicate_rows_deleted: 0,
         total_cap_rows_deleted: 0,
+        total_backfilled_rows: 0,
         total_unknown_schema_rows: 0,
         preserved_strategic_rows: 0,
         dedupe_keys: Vec::new(),
@@ -215,19 +220,23 @@ pub fn run_audit_retention(
 
     let mut dedupe_keys = BTreeSet::new();
     for spec in policy_specs() {
-        let cf_report = run_policy(db, spec, params, now_ns, &mut dedupe_keys)?;
+        let cf_report = run_policy(runtime, spec, params, now_ns, &mut dedupe_keys)?;
         accumulate_report(&mut report, &cf_report);
         report.cf_reports.push(cf_report);
     }
-    report.after_row_counts = db.cf_row_counts().map_err(storage_error)?;
+    report.after_row_counts = runtime.storage_cf_row_counts().map_err(storage_error)?;
     report.dedupe_keys = dedupe_keys.into_iter().collect();
 
     let report_key = report_key(&run_id);
     let encoded = encode_json(&report).map_err(encode_error)?;
-    db.put_batch_pressure_bypass(cf::CF_KV, vec![(report_key.as_bytes().to_vec(), encoded)])
+    runtime
+        .storage_put_rows_pressure_bypass(
+            cf::CF_KV,
+            vec![(report_key.as_bytes().to_vec(), encoded)],
+        )
         .map_err(storage_error)?;
-    let readback_report = db
-        .get_cf(cf::CF_KV, report_key.as_bytes())
+    let readback_report = runtime
+        .storage_kv_row(report_key.as_bytes())
         .map_err(storage_error)?
         .ok_or_else(|| {
             mcp_error(
@@ -245,13 +254,13 @@ pub fn run_audit_retention(
 }
 
 fn run_policy(
-    db: &Db,
+    runtime: &ReflexRuntime,
     spec: PolicySpec,
     params: &AuditRetentionRunConfig,
     now_ns: u64,
     dedupe_keys: &mut BTreeSet<String>,
 ) -> Result<AuditRetentionCfReport, ErrorData> {
-    let rows = rows_for_policy(db, spec)?;
+    let rows = rows_for_policy(runtime, spec)?;
     let before_rows = rows.len() as u64;
     let ttl_ns = params.max_age_ns.or(spec.ttl_ns);
     let profile_filter = params.profile_id.as_deref().map(str::trim);
@@ -269,8 +278,10 @@ fn run_policy(
         expired_rows_deleted: 0,
         duplicate_rows_deleted: 0,
         cap_rows_deleted: 0,
+        backfilled_rows: 0,
         preserved_strategic_rows: 0,
         deletion_keys_hex: Vec::new(),
+        backfilled_keys_hex: Vec::new(),
     };
     if spec.strategic {
         report.preserved_strategic_rows = before_rows;
@@ -289,7 +300,7 @@ fn run_policy(
     };
     collect_policy_changes(rows, &mut report, &mut state, &mut collect)?;
     apply_row_cap(params.soft_cap_rows, &mut state);
-    apply_policy_changes(db, spec, &mut report, state)?;
+    apply_policy_changes(runtime, spec, &mut report, state)?;
     Ok(report)
 }
 
@@ -297,6 +308,7 @@ fn run_policy(
 struct PolicyRunState {
     retained: Vec<RetainedRow>,
     delete_reasons: BTreeMap<Vec<u8>, DeleteReason>,
+    backfilled_rows: RawRows,
     first_by_dedupe: BTreeMap<String, (Vec<u8>, Option<u64>)>,
 }
 
@@ -317,7 +329,7 @@ fn collect_policy_changes(
 ) -> Result<(), ErrorData> {
     for (key, value) in rows {
         let parsed = parse_row(&value, context.spec);
-        let ParsedRow::Known(row) = parsed else {
+        let ParsedRow::Known(mut row) = parsed else {
             match parsed {
                 ParsedRow::DecodeFailed => report.decode_failed_rows += 1,
                 ParsedRow::UnknownSchema => report.unknown_schema_rows += 1,
@@ -349,6 +361,11 @@ fn collect_policy_changes(
                 .delete_reasons
                 .insert(key.clone(), DeleteReason::Expired);
             continue;
+        }
+
+        if row.backfill(context.now_ns) {
+            let encoded = encode_json(&row.value).map_err(encode_error)?;
+            state.backfilled_rows.push((key.clone(), encoded));
         }
 
         let dedupe_key = row.dedupe_key(context.spec);
@@ -397,7 +414,7 @@ fn apply_row_cap(soft_cap_rows: u64, state: &mut PolicyRunState) {
 }
 
 fn apply_policy_changes(
-    db: &Db,
+    runtime: &ReflexRuntime,
     spec: PolicySpec,
     report: &mut AuditRetentionCfReport,
     state: PolicyRunState,
@@ -412,11 +429,24 @@ fn apply_policy_changes(
         report.deletion_keys_hex.push(hex_encode(key));
         delete_keys.push(key.clone());
     }
-    if !delete_keys.is_empty() {
-        db.delete_batch(spec.cf_name, delete_keys)
+    report.backfilled_rows = state.backfilled_rows.len() as u64;
+    report.backfilled_keys_hex = state
+        .backfilled_rows
+        .iter()
+        .map(|(key, _value)| hex_encode(key))
+        .collect();
+
+    if !state.backfilled_rows.is_empty() {
+        runtime
+            .storage_put_rows_pressure_bypass(spec.cf_name, state.backfilled_rows)
             .map_err(storage_error)?;
     }
-    report.after_rows = rows_for_policy(db, spec)?.len() as u64;
+    if !delete_keys.is_empty() {
+        runtime
+            .storage_delete_rows(spec.cf_name, delete_keys)
+            .map_err(storage_error)?;
+    }
+    report.after_rows = rows_for_policy(runtime, spec)?.len() as u64;
     report.retained_rows = report.after_rows;
     Ok(())
 }
@@ -439,21 +469,17 @@ const fn within_dedupe_window(
     }
 }
 
-fn rows_for_policy(db: &Db, spec: PolicySpec) -> Result<RawRows, ErrorData> {
+fn rows_for_policy(runtime: &ReflexRuntime, spec: PolicySpec) -> Result<RawRows, ErrorData> {
     spec.key_prefix.map_or_else(
         || {
-            let mut rows = db
-                .scan_cf_prefix(spec.cf_name, &[])
-                .map_err(storage_error)?;
-            rows.truncate(MAX_SCAN_ROWS_PER_CF);
-            Ok(rows)
+            runtime
+                .storage_cf_prefix_rows(spec.cf_name, &[], MAX_SCAN_ROWS_PER_CF)
+                .map_err(storage_error)
         },
         |prefix| {
-            let mut rows = db
-                .scan_cf_prefix(spec.cf_name, prefix.as_bytes())
-                .map_err(storage_error)?;
-            rows.truncate(MAX_SCAN_ROWS_PER_CF);
-            Ok(rows)
+            runtime
+                .storage_cf_prefix_rows(spec.cf_name, prefix.as_bytes(), MAX_SCAN_ROWS_PER_CF)
+                .map_err(storage_error)
         },
     )
 }
@@ -463,6 +489,7 @@ const fn accumulate_report(report: &mut AuditRetentionReport, cf_report: &AuditR
     report.total_expired_rows_deleted += cf_report.expired_rows_deleted;
     report.total_duplicate_rows_deleted += cf_report.duplicate_rows_deleted;
     report.total_cap_rows_deleted += cf_report.cap_rows_deleted;
+    report.total_backfilled_rows += cf_report.backfilled_rows;
     report.total_unknown_schema_rows += cf_report.unknown_schema_rows;
     report.preserved_strategic_rows += cf_report.preserved_strategic_rows;
     report.total_deleted_rows += cf_report
@@ -489,6 +516,57 @@ impl AuditRow {
             .or_else(|| string_at(&self.value, &["foreground", "profile_id"]))
             .or_else(|| string_at(&self.value, &["active_profile_id"]))
             .or_else(|| string_at(&self.value, &["active_profile"]))
+    }
+
+    fn profile_schema_version(&self) -> Option<u32> {
+        u32_at(&self.value, &["profile_schema_version"])
+            .or_else(|| u32_at(&self.value, &["audit_context", "profile_schema_version"]))
+            .or_else(|| u32_at(&self.value, &["foreground", "profile_schema_version"]))
+            .or_else(|| u32_at(&self.value, &["active_profile_schema_version"]))
+    }
+
+    fn backfill(&mut self, now_ns: u64) -> bool {
+        let profile_changed = self.backfill_profile_id();
+        let version_changed = self.backfill_profile_schema_version();
+        let changed = profile_changed || version_changed;
+        if changed {
+            set_field(
+                &mut self.value,
+                "audit_retention",
+                json!({
+                    "schema_version": RETENTION_SCHEMA_VERSION,
+                    "backfilled_at_ns": now_ns,
+                    "source": "storage_gc_once:AUDIT_RETENTION",
+                }),
+            );
+        }
+        changed
+    }
+
+    fn backfill_profile_id(&mut self) -> bool {
+        if self.value.get("profile_id").is_some() {
+            return false;
+        }
+        let Some(profile_id) = self.profile_id() else {
+            return false;
+        };
+        set_field(&mut self.value, "profile_id", json!(profile_id));
+        true
+    }
+
+    fn backfill_profile_schema_version(&mut self) -> bool {
+        if self.value.get("profile_schema_version").is_some() {
+            return false;
+        }
+        let Some(schema_version) = self.profile_schema_version() else {
+            return false;
+        };
+        set_field(
+            &mut self.value,
+            "profile_schema_version",
+            json!(schema_version),
+        );
+        true
     }
 
     fn dedupe_key(&self, spec: PolicySpec) -> Option<String> {
@@ -720,7 +798,7 @@ fn parse_row(value: &[u8], _spec: PolicySpec) -> ParsedRow {
 }
 
 fn report_key(run_id: &str) -> String {
-    format!("audit_retention/v2/report/{run_id}")
+    format!("audit_retention/v1/report/{run_id}")
 }
 
 fn validate_run_id(run_id: &str) -> Result<(), ErrorData> {
@@ -770,6 +848,22 @@ fn string_at(row: &Value, path: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn u32_at(row: &Value, path: &[&str]) -> Option<u32> {
+    path.iter()
+        .try_fold(row, |value, field| value.get(*field))?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn set_field(row: &mut Value, field: &str, value: Value) {
+    if !row.is_object() {
+        *row = Value::Object(Map::new());
+    }
+    if let Some(object) = row.as_object_mut() {
+        object.insert(field.to_owned(), value);
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len().saturating_mul(2));
@@ -807,4 +901,65 @@ fn decode_error(error: synapse_storage::StorageError) -> ErrorData {
 
 fn invalid(message: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reality_rows_have_retention_classes() {
+        let policies = audit_retention_policies();
+        let by_class = |audit_class: &str| {
+            policies
+                .iter()
+                .find(|policy| policy.audit_class == audit_class)
+                .unwrap_or_else(|| panic!("missing policy {audit_class}"))
+        };
+
+        let baseline = by_class("reality_baselines");
+        assert_eq!(baseline.cf_name, cf::CF_KV);
+        assert_eq!(baseline.key_prefix.as_deref(), Some("reality/baseline/v1/"));
+        assert!(baseline.strategic);
+        assert!(baseline.pressure_preserve);
+
+        let head = by_class("reality_heads");
+        assert_eq!(head.key_prefix.as_deref(), Some("reality/head/v1/"));
+        assert!(head.strategic);
+        assert!(head.pressure_preserve);
+
+        let audit = by_class("reality_audits");
+        assert_eq!(audit.key_prefix.as_deref(), Some("reality/audit/v1/"));
+        assert!(audit.strategic);
+        assert!(audit.pressure_preserve);
+
+        let delta = by_class("reality_delta_journal");
+        assert_eq!(delta.cf_name, cf::CF_KV);
+        assert_eq!(delta.key_prefix.as_deref(), Some("reality/delta/v1/"));
+        assert!(!delta.strategic);
+        assert!(!delta.pressure_preserve);
+    }
+
+    #[test]
+    fn process_history_has_retention_class() {
+        let policies = audit_retention_policies();
+        let process_history = policies
+            .iter()
+            .find(|policy| policy.audit_class == "process_history")
+            .unwrap_or_else(|| panic!("missing process_history retention policy"));
+
+        assert_eq!(process_history.cf_name, cf::CF_PROCESS_HISTORY);
+        assert_eq!(process_history.ttl, "6h");
+        assert_eq!(
+            process_history.dedupe_key_fields,
+            vec![
+                "tool".to_owned(),
+                "status".to_owned(),
+                "target".to_owned(),
+                "pid".to_owned()
+            ]
+        );
+        assert!(!process_history.strategic);
+        assert!(!process_history.pressure_preserve);
+    }
 }

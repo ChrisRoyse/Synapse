@@ -21,12 +21,12 @@ The existing storage layer cannot host this data as-is:
 - The agent-audit pipeline hash-redacts window titles, paths, and clipboard
   content. The timeline needs that content in plaintext to be searchable and
   minable.
-- TTL eviction was originally implemented as a storage compaction filter keyed on a
+- TTL eviction is implemented as a RocksDB compaction filter keyed on a
   top-level `ts_ns` JSON field. Compaction filters only run when a file is
   compacted. Synapse's short-TTL CFs churn enough that files compact
   naturally; a 90-day, low-write CF accumulates cold SST files that may
   never be selected for compaction, so expired rows would linger
-  indefinitely. The documented remedy was
+  indefinitely. RocksDB's documented remedy is
   `periodic_compaction_seconds`, which forces files older than the bound
   through the compaction (and therefore the filter).
 
@@ -159,18 +159,23 @@ silent drops, and pause supports a Recall-style auto-resume deadline.
   bump. Rolling back the binary leaves an unused CF behind (harmless).
 - The TTL filter's JSON `ts_ns` scan is reused unchanged; the typed
   envelope guarantees the field exists in every row.
-- Long-retention plaintext content now lives in the daemon's storage vault.
+- Long-retention plaintext content now lives in the daemon's RocksDB.
   This is the operator-decided posture; the purge/pause/exclusion controls
   (#843) are the user-freedom counterweight, not consent machinery.
 - `periodic_compaction_seconds` requires `max_open_files` headroom; the DB
-  already caps open files, and the storage layer handles reopening files
+  already caps at 256 open files, which RocksDB handles by reopening files
   during periodic compaction (only FIFO-with-TTL requires `-1`).
 
 ## Sources
 
-- Calyx integration plan:
-  ../calyx/INTEGRATION_PLAN.md
-- Storage and persistence:
-  ../systemdocs/04_storage_and_persistence.md
+- RocksDB wiki, Compaction Filter:
+  https://github.com/facebook/rocksdb/wiki/Compaction-Filter
+- RocksDB wiki, RocksDB Tuning Guide (Periodic and TTL Compaction):
+  https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide
+- RocksDB wiki, FIFO compaction style (considered, rejected: whole-file
+  drops conflict with leveled reads and the shared GC/caps engine):
+  https://github.com/facebook/rocksdb/wiki/FIFO-compaction-style
+- RocksDB wiki, Delete A Range Of Keys (purge mechanics):
+  https://github.com/facebook/rocksdb/wiki/Delete-A-Range-Of-Keys
 - ActivityWatch docs, Buckets and Events (record-kind prior art):
   https://docs.activitywatch.net/en/latest/buckets-and-events.html

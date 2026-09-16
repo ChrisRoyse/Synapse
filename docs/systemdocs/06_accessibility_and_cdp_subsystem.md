@@ -297,7 +297,7 @@ Types: `ConsoleEntry`, `ConsoleReadResult`, `ConsoleCaptureStatus`, `ConsoleRead
 
 ### 5.7 `cdp_dialog.rs` — JavaScript Dialog Capture (#1097)
 
-`Page.javascriptDialogOpening` is live. Keeps a long-lived connection per armed target, records dialog open/close state, and immediately applies a configured default policy so an unhandled dialog cannot silently block page execution. The MCP `browser_handle_dialog` tool is raw-CDP-only. The debugger-free normal authenticated Chrome bridge rejects it before Chrome mutation so dialog control cannot display a debugger infobar in the human profile.
+`Page.javascriptDialogOpening` is live. Keeps a long-lived connection per armed target, records dialog open/close state, and immediately applies a configured default policy so an unhandled dialog cannot silently block page execution. The MCP `browser_handle_dialog` tool uses these raw-CDP helpers for raw targets and the normal Chrome bridge's narrow `chrome.debugger` `Page.javascriptDialogOpening`/`Page.handleJavaScriptDialog` lane for session-owned `chrome-tab:*` targets in the already-open profile.
 
 | Function | Signature |
 |---|---|
@@ -315,7 +315,7 @@ Enums: `CdpDialogDefaultPolicy`, `CdpDialogAutoAction`, `CdpDialogHandleAction`.
 
 ### 5.8 `cdp_files.rs` — File Input / Chooser Helpers (#1101-#1103)
 
-Wraps the raw-CDP file-upload primitives:
+Wraps the CDP file-upload primitives used by both raw-CDP automation and the normal Chrome bridge contract:
 
 | Function | Signature |
 |---|---|
@@ -325,7 +325,7 @@ Wraps the raw-CDP file-upload primitives:
 | `cdp_set_intercept_file_chooser` | `async (page, enabled, cancel) -> A11yResult<()>` |
 | `cdp_file_chooser_entry_from_event` | `(EventFileChooserOpened, seq, opened_at_unix_ms) -> CdpFileChooserEntry` |
 
-`DOM.setFileInputFiles` assigns local file paths to a file input node by `backendNodeId`. `Page.setInterceptFileChooserDialog` prevents the native OS picker and emits `Page.fileChooserOpened` with mode and backing node metadata. `browser_file_upload` uses these primitives only on a session-owned raw-CDP target; the debugger-free normal bridge rejects the operation before Chrome mutation.
+`DOM.setFileInputFiles` assigns local file paths to a file input node by `backendNodeId`. `Page.setInterceptFileChooserDialog` prevents the native OS picker and emits `Page.fileChooserOpened` with mode and backing node metadata. The normal-profile MCP `browser_file_upload` tool uses the extension bridge's narrow `chrome.debugger` lane for the same primitives on session-owned `chrome-tab:*` targets.
 
 ### 5.9 `cdp_emulation.rs` — Browser Emulation (#1173–#1178)
 

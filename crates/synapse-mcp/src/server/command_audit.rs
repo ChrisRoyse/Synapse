@@ -3,22 +3,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rmcp::{ErrorData, model::ErrorCode};
+#[cfg(test)]
+use std::cell::Cell;
+
+use rmcp::ErrorData;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use synapse_storage::{
-    RevisionGuard,
-    action_log::{
-        ACTION_LOG_KEY_LEN, ActionLogRowDiagnostic, ActionLogRowKind, COMMAND_AUDIT_ROW_KIND,
-        diagnostic_for_invalid_row, validate_action_log_row,
-    },
-    cf,
-};
+use synapse_storage::cf;
 
 use super::SynapseService;
 use crate::m1::mcp_error;
 
+const COMMAND_AUDIT_ROW_KIND: &str = "command_audit";
 const COMMAND_AUDIT_SCHEMA_VERSION: u32 = 1;
 const COMMAND_AUDIT_PAYLOAD_MAX_BYTES: usize = 8192;
 const COMMAND_AUDIT_SNAPSHOT_SCAN_LIMIT: usize = 1000;
@@ -28,107 +25,13 @@ const COMMAND_AUDIT_QUERY_MAX_LIMIT: usize = 250;
 const COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT: usize = 1000;
 const COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT: usize = 5000;
 const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
-const COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT: usize = 8;
+const COMMAND_AUDIT_KEY_LEN: usize = 12;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Default)]
-struct CommandAuditIntegrityFailures {
-    count: usize,
-    examples: Vec<CommandAuditIntegrityFailure>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct CommandAuditIntegrityFailure {
-    #[serde(flatten)]
-    diagnostic: ActionLogRowDiagnostic,
-    physical_revision_sha256: Option<String>,
-    revision_readback_error: Option<String>,
-}
-
-impl CommandAuditIntegrityFailures {
-    fn observe(
-        &mut self,
-        db: &synapse_storage::Db,
-        key: &[u8],
-        value: &[u8],
-        error: &synapse_storage::action_log::ActionLogCodecError,
-    ) {
-        self.count = self.count.saturating_add(1);
-        if self.examples.len() < COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT {
-            let diagnostic = diagnostic_for_invalid_row(key, value, error);
-            let (physical_revision_sha256, revision_readback_error) = match db
-                .get_cf_revisioned(cf::CF_ACTION_LOG, key)
-            {
-                Ok(Some(physical)) => (Some(revision_sha256_text(&physical.revision_sha256)), None),
-                Ok(None) => (
-                    None,
-                    Some("physical row became absent during exact revision readback".to_owned()),
-                ),
-                Err(read_error) => (
-                    None,
-                    Some(format!(
-                        "exact physical revision readback failed code={} detail={read_error}",
-                        read_error.code()
-                    )),
-                ),
-            };
-            tracing::error!(
-                code = "COMMAND_AUDIT_INTEGRITY_FAILURE",
-                failure_code = diagnostic.failure_code,
-                key_len_bytes = diagnostic.key_len_bytes,
-                key_sha256 = %diagnostic.key_sha256,
-                value_len_bytes = diagnostic.value_len_bytes,
-                value_sha256 = %diagnostic.value_sha256,
-                physical_revision_sha256 = physical_revision_sha256.as_deref(),
-                revision_readback_error = revision_readback_error.as_deref(),
-                failure_detail = %diagnostic.failure_detail,
-                "audit read found an invalid CF_ACTION_LOG row and will fail closed"
-            );
-            self.examples.push(CommandAuditIntegrityFailure {
-                diagnostic,
-                physical_revision_sha256,
-                revision_readback_error,
-            });
-        }
-    }
-
-    fn fail_if_any(&self, scanned_rows: usize, operation: &'static str) -> Result<(), ErrorData> {
-        if self.count == 0 {
-            return Ok(());
-        }
-        let failures_omitted = self.count.saturating_sub(self.examples.len());
-        tracing::error!(
-            code = "COMMAND_AUDIT_INTEGRITY_FAILED",
-            operation,
-            scanned_rows,
-            failure_count = self.count,
-            failures_reported = self.examples.len(),
-            failures_omitted,
-            "CF_ACTION_LOG read refused noncanonical physical rows"
-        );
-        Err(ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "audit operation={operation} found noncanonical CF_ACTION_LOG rows; no partial result was returned"
-            ),
-            Some(json!({
-                "code": synapse_core::error_codes::STORAGE_READ_FAILED,
-                "failure_code": "COMMAND_AUDIT_INTEGRITY_FAILED",
-                "operation": operation,
-                "source_id": cf::CF_ACTION_LOG,
-                "source_of_truth": "CF_ACTION_LOG physical rows",
-                "scanned_rows": scanned_rows,
-                "failure_count": self.count,
-                "failure_examples": self.examples,
-                "failure_example_limit": COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT,
-                "failures_omitted": failures_omitted,
-                "raw_key_value_omitted": true,
-                "page_complete": false,
-                "remediation": "stop trusting audit output; use audit operation=repair_legacy_probe_row only for a positively identified #1540 synthetic row, passing the exact hashes, lengths, and physical revision from this error; otherwise preserve the row and investigate its writer before any mutation",
-            })),
-        ))
-    }
+#[cfg(test)]
+thread_local! {
+    static COMMAND_AUDIT_FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Debug)]
@@ -160,11 +63,6 @@ pub(crate) struct CommandAuditRowReadback {
     pub key_hex: String,
     pub value_len_bytes: u64,
     pub value_sha256: String,
-    /// Exact content-addressed Calyx constellation measured from this physical
-    /// action-log row. Supported action-family Oracles must use this identity;
-    /// reconstructing a query from a tool name or audit id is forbidden.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub constellation_cx_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -209,31 +107,6 @@ pub(crate) struct CommandAuditQueryParams {
     pub status: Option<String>,
     pub error_code: Option<String>,
     pub row_kind: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CommandAuditLegacyProbeRepairParams {
-    pub key_len_bytes: u64,
-    pub key_sha256: String,
-    pub value_len_bytes: u64,
-    pub value_sha256: String,
-    pub expected_revision_sha256: String,
-    pub reason: String,
-    pub actor_session_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct CommandAuditLegacyProbeRepairResponse {
-    pub source_of_truth: &'static str,
-    pub legacy_marker: String,
-    pub previous_key_len_bytes: u64,
-    pub previous_key_sha256: String,
-    pub previous_value_len_bytes: u64,
-    pub previous_value_sha256: String,
-    pub previous_revision_sha256: String,
-    pub source_row_absent: bool,
-    pub committed_seq: Option<u64>,
-    pub repair_audit: CommandAuditRowReadback,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -365,7 +238,6 @@ impl SynapseService {
     }
 
     pub(crate) fn command_audit_snapshot(&self) -> Result<CommandAuditSnapshot, ErrorData> {
-        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while reading command audit")
@@ -375,23 +247,18 @@ impl SynapseService {
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let scanned_rows = rows.len();
         let mut parsed = Vec::new();
-        let mut integrity_failures = CommandAuditIntegrityFailures::default();
         for (key, value) in rows.into_iter().rev() {
-            let validated = match validate_action_log_row(&key, &value) {
-                Ok(validated) => validated,
-                Err(error) => {
-                    integrity_failures.observe(&db, &key, &value, &error);
-                    continue;
-                }
+            let Ok(row) = synapse_storage::decode_json::<Value>(&value) else {
+                continue;
             };
-            if validated.row_kind != ActionLogRowKind::CommandAudit {
+            if row.get("row_kind").and_then(Value::as_str) != Some(COMMAND_AUDIT_ROW_KIND) {
                 continue;
             }
-            if parsed.len() < COMMAND_AUDIT_SNAPSHOT_ROW_LIMIT {
-                parsed.push(command_audit_snapshot_row(&key, &validated.value));
+            parsed.push(command_audit_snapshot_row(&key, &row));
+            if parsed.len() >= COMMAND_AUDIT_SNAPSHOT_ROW_LIMIT {
+                break;
             }
         }
-        integrity_failures.fail_if_any(scanned_rows, "command_snapshot")?;
         Ok(CommandAuditSnapshot {
             source_of_truth: cf::CF_ACTION_LOG,
             scanned_rows,
@@ -455,7 +322,6 @@ impl SynapseService {
         };
         let start_key_hex = (!start_key.is_empty()).then(|| hex_encode(&start_key));
 
-        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while querying action audit")
@@ -464,7 +330,8 @@ impl SynapseService {
         let mut cursor = start_key;
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
-        let mut integrity_failures = CommandAuditIntegrityFailures::default();
+        let mut corrupt_row_count = 0_usize;
+        let mut noncanonical_key_count = 0_usize;
         let mut returned = Vec::new();
         let mut next_start_key_hex = None;
         let mut more_after_window = false;
@@ -489,15 +356,22 @@ impl SynapseService {
             for (key, value) in batch {
                 scanned_rows = scanned_rows.saturating_add(1);
                 last_scanned_key = Some(key.clone());
-                let validated = match validate_action_log_row(&key, &value) {
-                    Ok(validated) => validated,
-                    Err(error) => {
-                        integrity_failures.observe(&db, &key, &value, &error);
+                let row = match synapse_storage::decode_json::<Value>(&value) {
+                    Ok(row) => row,
+                    Err(_error) => {
+                        corrupt_row_count = corrupt_row_count.saturating_add(1);
                         continue;
                     }
                 };
-                let ts_ns = validated.ts_ns;
-                let row = validated.value;
+                let Some((key_ts_ns, _key_seq)) = decode_command_audit_key(&key) else {
+                    noncanonical_key_count = noncanonical_key_count.saturating_add(1);
+                    continue;
+                };
+                let ts_ns = audit_row_ts_ns(&row);
+                if ts_ns != key_ts_ns {
+                    corrupt_row_count = corrupt_row_count.saturating_add(1);
+                    continue;
+                }
                 if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
                     stopped_at_end_ts = true;
                     break;
@@ -528,8 +402,6 @@ impl SynapseService {
             }
         }
 
-        integrity_failures.fail_if_any(scanned_rows, "command_query")?;
-
         let scan_budget_exhausted =
             scanned_rows >= scan_limit && more_after_window && !stopped_at_end_ts;
         let partial = scan_budget_exhausted || more_matching_rows;
@@ -546,8 +418,8 @@ impl SynapseService {
             scanned_rows,
             matched_rows,
             returned_count,
-            corrupt_row_count: 0,
-            noncanonical_key_count: 0,
+            corrupt_row_count,
+            noncanonical_key_count,
             partial,
             exhausted: !partial,
             start_key_hex,
@@ -556,305 +428,6 @@ impl SynapseService {
             has_older: partial,
             oldest_returned_ts_ns: None,
             rows: returned,
-        })
-    }
-
-    pub(crate) fn command_audit_repair_legacy_probe_row(
-        &self,
-        params: CommandAuditLegacyProbeRepairParams,
-    ) -> Result<CommandAuditLegacyProbeRepairResponse, ErrorData> {
-        validate_sha256_text(&params.key_sha256, "key_sha256")?;
-        validate_sha256_text(&params.value_sha256, "value_sha256")?;
-        let expected_revision =
-            parse_sha256_text(&params.expected_revision_sha256, "expected_revision_sha256")?;
-        if params.key_len_bytes == 0 || params.key_len_bytes > 512 {
-            return Err(command_audit_params_error(
-                "repair_legacy_probe_row key_len_bytes must be between 1 and 512",
-            ));
-        }
-        if params.value_len_bytes == 0 || params.value_len_bytes > 1_048_576 {
-            return Err(command_audit_params_error(
-                "repair_legacy_probe_row value_len_bytes must be between 1 and 1048576",
-            ));
-        }
-        let reason = params.reason.trim();
-        if reason.is_empty() || reason.chars().count() > 512 {
-            return Err(command_audit_params_error(
-                "repair_legacy_probe_row reason must contain 1..=512 characters",
-            ));
-        }
-
-        let db = self.m3_storage()?;
-        let rows = db
-            .scan_cf_tail(cf::CF_ACTION_LOG, COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let mut matches = rows
-            .into_iter()
-            .filter(|(key, _value)| sha256_hex(key) == params.key_sha256)
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "COMMAND_AUDIT_LEGACY_REPAIR_IDENTITY_UNRESOLVED: expected exactly one live row with key_sha256={} in the bounded {}-row CF_ACTION_LOG tail, found {}; no mutation occurred; remediation=rerun command_query for a fresh exact integrity diagnostic and investigate any omitted failure before retrying",
-                    params.key_sha256,
-                    COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT,
-                    matches.len()
-                ),
-            ));
-        }
-        let (legacy_key, legacy_value) = matches.pop().ok_or_else(|| {
-            command_audit_internal_error(
-                "legacy repair identity selection became empty after exact cardinality validation",
-            )
-        })?;
-        if legacy_key.len() as u64 != params.key_len_bytes
-            || legacy_value.len() as u64 != params.value_len_bytes
-            || sha256_hex(&legacy_value) != params.value_sha256
-        {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "COMMAND_AUDIT_LEGACY_REPAIR_CONTENT_MISMATCH: expected key_len={} value_len={} value_sha256={}, actual key_len={} value_len={} value_sha256={}; no mutation occurred; remediation=use one fresh command_query diagnostic without changing any field",
-                    params.key_len_bytes,
-                    params.value_len_bytes,
-                    params.value_sha256,
-                    legacy_key.len(),
-                    legacy_value.len(),
-                    sha256_hex(&legacy_value)
-                ),
-            ));
-        }
-        let legacy_marker = validate_issue1540_probe_row(&legacy_key, &legacy_value)?;
-        let physical = db
-            .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-            .ok_or_else(|| {
-                mcp_error(
-                    synapse_core::error_codes::STORAGE_WRITE_FAILED,
-                    "COMMAND_AUDIT_LEGACY_REPAIR_ROW_DISAPPEARED: exact physical row became absent before revision guard acquisition; no mutation occurred",
-                )
-            })?;
-        if physical.value.as_deref() != Some(legacy_value.as_slice()) {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_WRITE_FAILED,
-                "COMMAND_AUDIT_LEGACY_REPAIR_LOGICAL_READBACK_MISMATCH: exact revisioned value differs from the bounded scan result; no mutation occurred",
-            ));
-        }
-        if physical.revision_sha256 != expected_revision {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "COMMAND_AUDIT_LEGACY_REPAIR_REVISION_MISMATCH: expected_revision_sha256={} actual_revision_sha256={}; no mutation occurred; remediation=rerun command_query and use its fresh exact physical revision",
-                    params.expected_revision_sha256,
-                    revision_sha256_text(&physical.revision_sha256)
-                ),
-            ));
-        }
-
-        let (repair_ts_ns, repair_seq) = next_command_audit_key_parts();
-        let repair_key = command_audit_key(repair_ts_ns, repair_seq);
-        let repair_key_hex = hex_encode(&repair_key);
-        let mut audit_context = self.current_action_audit_context()?;
-        audit_context.session_id = params.actor_session_id.clone();
-        let payload = json!({
-            "legacy_marker": legacy_marker,
-            "key_len_bytes": params.key_len_bytes,
-            "key_sha256": params.key_sha256,
-            "value_len_bytes": params.value_len_bytes,
-            "value_sha256": params.value_sha256,
-            "previous_revision_sha256": params.expected_revision_sha256,
-            "reason": reason,
-        });
-        let payload_bytes = synapse_storage::encode_json(&payload).map_err(|error| {
-            command_audit_internal_error(format!("legacy repair payload encode failed: {error}"))
-        })?;
-        let repair_record = json!({
-            "schema_version": COMMAND_AUDIT_SCHEMA_VERSION,
-            "row_kind": COMMAND_AUDIT_ROW_KIND,
-            "audit_id": format!("{repair_ts_ns:020}-{repair_seq:010}"),
-            "ts_ns": repair_ts_ns,
-            "seq": repair_seq,
-            "phase": "final",
-            "actor": {
-                "channel": "mcp",
-                "tool": "audit",
-                "session_id": params.actor_session_id,
-            },
-            "audit_context": audit_context,
-            "tool": "audit",
-            "verb": "repair_legacy_probe_row",
-            "channel": "mcp",
-            "target_session_id": Value::Null,
-            "target": Value::Null,
-            "payload_sha256": sha256_hex(&payload_bytes),
-            "payload_bytes": payload_bytes.len(),
-            "payload_bounded": payload,
-            "payload_truncated": false,
-            "payload_hash_scope": "redacted_payload",
-            "redacted": false,
-            "redactions": [],
-            "before": {
-                "source_row_present": true,
-                "key_sha256": params.key_sha256,
-                "value_sha256": params.value_sha256,
-                "physical_revision_sha256": params.expected_revision_sha256,
-            },
-            "after": {
-                "source_row_present": false,
-            },
-            "outcome": "ok",
-            "error_code": Value::Null,
-            "error": Value::Null,
-            "source_of_truth": {
-                "cf_name": cf::CF_ACTION_LOG,
-                "row_kind": COMMAND_AUDIT_ROW_KIND,
-                "retention": "24h",
-                "key_hex": repair_key_hex,
-                "repaired_legacy_key_sha256": params.key_sha256,
-            },
-        });
-        let repair_value = synapse_storage::encode_json(&repair_record).map_err(|error| {
-            command_audit_internal_error(format!("legacy repair audit encode failed: {error}"))
-        })?;
-
-        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
-            cf::CF_ACTION_LOG,
-            [
-                RevisionGuard::new(legacy_key.clone(), Some(expected_revision)),
-                RevisionGuard::new(repair_key.clone(), None),
-            ],
-            [legacy_key.clone()],
-            [(repair_key.clone(), repair_value.clone())],
-        );
-        let committed_seq = match outcome {
-            Ok(outcome) if outcome.applied => Some(outcome.committed_seq),
-            Ok(outcome) => {
-                return Err(mcp_error(
-                    synapse_core::error_codes::STORAGE_WRITE_FAILED,
-                    format!(
-                        "COMMAND_AUDIT_LEGACY_REPAIR_CONFLICT: conflict_guard_index={:?} expected_revision_sha256={} actual_revision_sha256={}; no repair was applied; remediation=rerun command_query and rebase on the current exact row",
-                        outcome
-                            .conflict
-                            .as_ref()
-                            .map(|conflict| conflict.guard_index),
-                        outcome
-                            .conflict
-                            .as_ref()
-                            .and_then(|conflict| conflict.expected_revision_sha256)
-                            .map_or_else(
-                                || "absent".to_owned(),
-                                |value| revision_sha256_text(&value)
-                            ),
-                        outcome
-                            .conflict
-                            .as_ref()
-                            .and_then(|conflict| conflict.actual_revision_sha256)
-                            .map_or_else(
-                                || "absent".to_owned(),
-                                |value| revision_sha256_text(&value)
-                            ),
-                    ),
-                ));
-            }
-            Err(error) => {
-                let legacy_after = db
-                    .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
-                    .map_err(|read_error| {
-                        mcp_error(
-                            read_error.code(),
-                            format!(
-                                "COMMAND_AUDIT_LEGACY_REPAIR_COMMIT_AMBIGUOUS: commit failed ({error}) and source-row readback failed ({read_error})"
-                            ),
-                        )
-                    })?;
-                let repair_after = db
-                    .get_cf(cf::CF_ACTION_LOG, &repair_key)
-                    .map_err(|read_error| {
-                        mcp_error(
-                            read_error.code(),
-                            format!(
-                                "COMMAND_AUDIT_LEGACY_REPAIR_COMMIT_AMBIGUOUS: commit failed ({error}) and repair-audit readback failed ({read_error})"
-                            ),
-                        )
-                    })?;
-                if legacy_after.is_none()
-                    && repair_after.as_deref() == Some(repair_value.as_slice())
-                {
-                    tracing::warn!(
-                        code = "COMMAND_AUDIT_LEGACY_REPAIR_AMBIGUOUS_COMMIT_RECONCILED",
-                        legacy_key_sha256 = %params.key_sha256,
-                        repair_key_hex = %repair_key_hex,
-                        "separate exact physical readback proved the guarded repair committed"
-                    );
-                    None
-                } else {
-                    return Err(mcp_error(
-                        error.code(),
-                        format!(
-                            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_COMMITTED: guarded atomic repair failed: {error}; exact source/repair readback did not prove the requested state"
-                        ),
-                    ));
-                }
-            }
-        };
-
-        let source_row_absent = db
-            .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-            .is_none();
-        if !source_row_absent {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                "COMMAND_AUDIT_LEGACY_REPAIR_DELETE_READBACK_FAILED: guarded commit returned applied but the exact legacy row remains present",
-            ));
-        }
-        let repair_readback = db
-            .get_cf(cf::CF_ACTION_LOG, &repair_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-            .ok_or_else(|| {
-                mcp_error(
-                    synapse_core::error_codes::STORAGE_CORRUPTED,
-                    "COMMAND_AUDIT_LEGACY_REPAIR_AUDIT_READBACK_MISSING: exact canonical repair audit row is absent after commit",
-                )
-            })?;
-        if repair_readback != repair_value {
-            return Err(mcp_error(
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                "COMMAND_AUDIT_LEGACY_REPAIR_AUDIT_READBACK_MISMATCH: exact canonical repair audit bytes differ after commit",
-            ));
-        }
-        let repair_audit = CommandAuditRowReadback {
-            cf_name: cf::CF_ACTION_LOG,
-            key_hex: repair_key_hex,
-            value_len_bytes: repair_readback.len() as u64,
-            value_sha256: sha256_hex(&repair_readback),
-            // The revision-guarded legacy cleanup writes one atomic raw repair
-            // audit rather than publishing a causal action observation.
-            constellation_cx_id: None,
-        };
-        tracing::warn!(
-            code = "COMMAND_AUDIT_LEGACY_PROBE_ROW_REPAIRED",
-            legacy_marker,
-            legacy_key_sha256 = %params.key_sha256,
-            legacy_value_sha256 = %params.value_sha256,
-            previous_revision_sha256 = %params.expected_revision_sha256,
-            repair_key_hex = %repair_audit.key_hex,
-            repair_value_sha256 = %repair_audit.value_sha256,
-            committed_seq,
-            "exact revision-guarded #1540 probe cleanup committed with separate physical readback"
-        );
-        Ok(CommandAuditLegacyProbeRepairResponse {
-            source_of_truth: "CF_ACTION_LOG exact legacy-row absence + canonical repair audit row",
-            legacy_marker,
-            previous_key_len_bytes: params.key_len_bytes,
-            previous_key_sha256: params.key_sha256,
-            previous_value_len_bytes: params.value_len_bytes,
-            previous_value_sha256: params.value_sha256,
-            previous_revision_sha256: params.expected_revision_sha256,
-            source_row_absent,
-            committed_seq,
-            repair_audit,
         })
     }
 
@@ -870,7 +443,6 @@ impl SynapseService {
         scan_limit: usize,
         filters: CommandAuditQueryFilters,
     ) -> Result<CommandAuditQueryResponse, ErrorData> {
-        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error(
@@ -887,22 +459,29 @@ impl SynapseService {
 
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
-        let mut integrity_failures = CommandAuditIntegrityFailures::default();
+        let mut corrupt_row_count = 0_usize;
+        let mut noncanonical_key_count = 0_usize;
         let mut returned = Vec::new();
         let mut has_older = false;
 
         for (key, value) in tail.into_iter().rev() {
             scanned_rows = scanned_rows.saturating_add(1);
-            let validated = match validate_action_log_row(&key, &value) {
-                Ok(validated) => validated,
-                Err(error) => {
-                    integrity_failures.observe(&db, &key, &value, &error);
+            let row = match synapse_storage::decode_json::<Value>(&value) {
+                Ok(row) => row,
+                Err(_error) => {
+                    corrupt_row_count = corrupt_row_count.saturating_add(1);
                     continue;
                 }
             };
-            let ts_ns = validated.ts_ns;
-            let key_seq = validated.seq;
-            let row = validated.value;
+            let Some((key_ts_ns, key_seq)) = decode_command_audit_key(&key) else {
+                noncanonical_key_count = noncanonical_key_count.saturating_add(1);
+                continue;
+            };
+            let ts_ns = audit_row_ts_ns(&row);
+            if ts_ns != key_ts_ns {
+                corrupt_row_count = corrupt_row_count.saturating_add(1);
+                continue;
+            }
             // In newest-first mode end_ts_ns is an upper bound: skip rows newer
             // than it (they are outside the requested window), keep scanning down.
             if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
@@ -913,12 +492,11 @@ impl SynapseService {
             }
             if returned.len() >= limit {
                 has_older = true;
-                continue;
+                break;
             }
             matched_rows = matched_rows.saturating_add(1);
             returned.push((ts_ns, key_seq, command_audit_query_row(&key, &value, row)));
         }
-        integrity_failures.fail_if_any(scanned_rows, "command_query")?;
         returned.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         let newest_start_key_hex = returned
             .first()
@@ -944,8 +522,8 @@ impl SynapseService {
             scanned_rows,
             matched_rows,
             returned_count,
-            corrupt_row_count: 0,
-            noncanonical_key_count: 0,
+            corrupt_row_count,
+            noncanonical_key_count,
             partial: false,
             exhausted: !has_older,
             start_key_hex: newest_start_key_hex,
@@ -962,6 +540,13 @@ impl SynapseService {
         phase: &'static str,
         input: CommandAuditInput,
     ) -> Result<CommandAuditRowReadback, ErrorData> {
+        #[cfg(test)]
+        if COMMAND_AUDIT_FORCE_FAIL.with(Cell::get) {
+            return Err(command_audit_internal_error(
+                "command audit forced failure for test",
+            ));
+        }
+
         let (ts_ns, seq) = next_command_audit_key_parts();
         let key = command_audit_key(ts_ns, seq);
         let key_hex = hex_encode(&key);
@@ -1024,23 +609,11 @@ impl SynapseService {
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while writing command audit")
         })?;
-        let constellation_reports = runtime
+        runtime
             .storage_put_action_log_rows(vec![(key.clone(), encoded.clone())])
             .map_err(|error| {
                 command_audit_internal_error(format!("command audit write failed: {error}"))
             })?;
-        let [constellation_report] = constellation_reports.as_slice() else {
-            return Err(command_audit_internal_error(format!(
-                "command audit constellation measurement returned {} reports for one row key_hex={key_hex}",
-                constellation_reports.len()
-            )));
-        };
-        if constellation_report.source_key_hex != key_hex {
-            return Err(command_audit_internal_error(format!(
-                "command audit constellation source key mismatch: row={key_hex} measured={}",
-                constellation_report.source_key_hex
-            )));
-        }
         let (readback_rows, _has_more) = runtime
             .storage_cf_rows_from(cf::CF_ACTION_LOG, &key, 1)
             .map_err(|error| {
@@ -1061,7 +634,6 @@ impl SynapseService {
             key_hex,
             value_len_bytes: read_value.len() as u64,
             value_sha256: sha256_hex(read_value),
-            constellation_cx_id: Some(constellation_report.cx_id.clone()),
         };
         tracing::info!(
             code = "COMMAND_AUDIT_RECORDED",
@@ -1082,6 +654,11 @@ pub(super) fn command_audit_error_from_error_data(error: &ErrorData) -> CommandA
         message: error.message.to_string(),
         data: error.data.clone(),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn set_command_audit_force_fail_for_tests(enabled: bool) {
+    COMMAND_AUDIT_FORCE_FAIL.with(|force_fail| force_fail.set(enabled));
 }
 
 #[derive(Debug)]
@@ -1389,110 +966,6 @@ fn normalize_row_kind_filter(value: Option<&str>) -> Result<Option<String>, Erro
     }
 }
 
-fn validate_sha256_text(value: &str, field: &'static str) -> Result<(), ErrorData> {
-    parse_sha256_text(value, field).map(|_digest| ())
-}
-
-fn parse_sha256_text(value: &str, field: &'static str) -> Result<[u8; 32], ErrorData> {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return Err(command_audit_params_error(format!(
-            "repair_legacy_probe_row {field} must use sha256:<64 lowercase hex>"
-        )));
-    };
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(command_audit_params_error(format!(
-            "repair_legacy_probe_row {field} must use sha256:<64 lowercase hex>"
-        )));
-    }
-    let decoded = decode_hex(hex).map_err(command_audit_params_error)?;
-    decoded.try_into().map_err(|_error| {
-        command_audit_params_error(format!(
-            "repair_legacy_probe_row {field} must decode to exactly 32 bytes"
-        ))
-    })
-}
-
-fn revision_sha256_text(revision: &[u8; 32]) -> String {
-    format!("sha256:{}", hex_encode(revision))
-}
-
-fn validate_issue1540_probe_row(key: &[u8], value: &[u8]) -> Result<String, ErrorData> {
-    let key_text = std::str::from_utf8(key).map_err(|_error| {
-        mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: noncanonical key is not UTF-8; no mutation occurred",
-        )
-    })?;
-    let (prefix, expected_marker) = if key_text.starts_with("issue1540-final-redaction-") {
-        ("issue1540-final-redaction", "ISSUE1540_FINAL_SYNTHETIC")
-    } else if key_text.starts_with("issue1540-redaction-") {
-        ("issue1540-redaction", "ISSUE1540_SYNTHETIC")
-    } else {
-        return Err(mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: key does not carry either exact #1540 probe prefix; no mutation occurred",
-        ));
-    };
-    if !key_text.ends_with(":00000000000000000000") {
-        return Err(mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: key does not carry the exact one-row prefix_index suffix emitted by storage_put_probe_rows; no mutation occurred",
-        ));
-    }
-    let record = serde_json::from_slice::<Value>(value).map_err(|error| {
-        mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            format!(
-                "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: value is not JSON (line {} column {}); no mutation occurred",
-                error.line(),
-                error.column()
-            ),
-        )
-    })?;
-    if !record.is_object() {
-        return Err(mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: value is not a JSON object; no mutation occurred",
-        ));
-    }
-    let marker = record
-        .get("error_code")
-        .and_then(Value::as_str)
-        .filter(|marker| *marker == expected_marker)
-        .ok_or_else(|| {
-            mcp_error(
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: error_code does not match the exact #1540 marker {expected_marker} paired with key prefix {prefix}; no mutation occurred"
-                ),
-            )
-        })?;
-    // #1540 used the historical generic `storage_put_probe_rows` producer.
-    // That producer accepted an arbitrary JSON object and used `or_insert` for
-    // `probe_id` and `seq`: it guaranteed that both keys were present, but it
-    // deliberately preserved arbitrary caller-supplied values and added
-    // `ts_ns` only when the request supplied `ts_ns_start`. Requiring specific
-    // values (or requiring `ts_ns` to exist) invents a contract the producer
-    // never had and makes this migration reject the artifact it exists to
-    // remove. The exact paired #1540 key/marker plus the caller-supplied key and
-    // value lengths, SHA-256 identities, and physical revision keep the delete
-    // content-addressed and non-generic.
-    if !record
-        .as_object()
-        .is_some_and(|object| object.contains_key("seq") && object.contains_key("probe_id"))
-    {
-        return Err(mcp_error(
-            synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: JSON lacks the seq/probe_id keys guaranteed by the historical #1540 probe writer; no mutation occurred",
-        ));
-    }
-    Ok(format!("{prefix}/{marker}"))
-}
-
 fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = Vec::with_capacity(key.len().saturating_add(1));
     next.extend_from_slice(key);
@@ -1500,7 +973,7 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
-pub(crate) fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if !value.len().is_multiple_of(2) {
         return Err("audit query cursor must be even-length hex".to_owned());
@@ -1550,10 +1023,21 @@ fn next_command_audit_key_parts() -> (u64, u32) {
 }
 
 fn command_audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(ACTION_LOG_KEY_LEN);
+    let mut key = Vec::with_capacity(COMMAND_AUDIT_KEY_LEN);
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
+}
+
+fn decode_command_audit_key(key: &[u8]) -> Option<(u64, u32)> {
+    if key.len() != COMMAND_AUDIT_KEY_LEN {
+        return None;
+    }
+    let mut ts_ns = [0_u8; 8];
+    ts_ns.copy_from_slice(&key[..8]);
+    let mut seq = [0_u8; 4];
+    seq.copy_from_slice(&key[8..]);
+    Some((u64::from_be_bytes(ts_ns), u32::from_be_bytes(seq)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1577,4 +1061,264 @@ fn error_data_code(error: &ErrorData) -> Option<&str> {
         .as_ref()
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{num::NonZeroUsize, path::Path};
+
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+
+    fn service_with_db(path: &Path) -> SynapseService {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+        .expect("construct service")
+    }
+
+    fn seed_command_rows(service: &SynapseService, tool: &'static str, rows: usize) {
+        for index in 0..rows {
+            service
+                .command_audit_final(CommandAuditInput::mcp(
+                    tool,
+                    "list",
+                    Some("issue1487-session".to_owned()),
+                    None,
+                    json!({ "index": index }),
+                    json!({}),
+                    json!({ "ok": true }),
+                    "ok",
+                ))
+                .expect("write command audit row");
+        }
+    }
+
+    fn seed_action_log_row(service: &SynapseService, key: Vec<u8>, row: Value) {
+        let encoded = synapse_storage::encode_json(&row).expect("encode seeded audit row");
+        service
+            .m3_storage()
+            .expect("storage")
+            .put_batch(cf::CF_ACTION_LOG, vec![(key, encoded)])
+            .expect("seed audit row");
+    }
+
+    #[test]
+    fn command_audit_redacts_sensitive_payload_fields() {
+        let payload = json!({
+            "token": "raw-token",
+            "nested": {
+                "api_key": "raw-key",
+                "safe": "kept",
+            },
+            "items": [
+                {"cookie": "raw-cookie"},
+                {"name": "kept"}
+            ]
+        });
+        let bounded = bounded_redacted_payload(&payload);
+        assert!(bounded.redacted);
+        assert!(bounded.redactions.contains(&"$.token".to_owned()));
+        assert!(bounded.redactions.contains(&"$.nested.api_key".to_owned()));
+        assert!(bounded.redactions.contains(&"$.items[0].cookie".to_owned()));
+        assert_eq!(bounded.value["token"], "[REDACTED]");
+        assert_eq!(bounded.value["nested"]["safe"], "kept");
+        assert!(bounded.sha256.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn command_audit_bounds_large_payload() {
+        let payload = json!({"body": "A".repeat(COMMAND_AUDIT_PAYLOAD_MAX_BYTES + 128)});
+        let bounded = bounded_redacted_payload(&payload);
+        assert!(bounded.truncated);
+        assert!(bounded.bytes > COMMAND_AUDIT_PAYLOAD_MAX_BYTES);
+        assert!(
+            bounded
+                .value
+                .get("omitted_bytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|omitted| omitted > 0)
+        );
+    }
+
+    #[test]
+    fn command_audit_query_unwindowed_newest_first_exact_complete_extra_reports_has_older() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let tool = "issue1487_browser_tabs";
+        seed_command_rows(&service, tool, 3);
+
+        let exact = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(3),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                ..Default::default()
+            })
+            .expect("exact-limit page should query");
+        assert_eq!(exact.returned_count, 3);
+        assert_eq!(exact.matched_rows, 3);
+        assert!(!exact.partial);
+        assert!(exact.exhausted);
+        assert!(exact.next_start_key_hex.is_none());
+
+        let extra_match = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(2),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                ..Default::default()
+            })
+            .expect("limit-plus-one page should query");
+        assert_eq!(extra_match.returned_count, 2);
+        assert_eq!(extra_match.matched_rows, 2);
+        // #1550: an unwindowed default query now scans newest-first and returns the
+        // most-recent rows as a COMPLETE success page. `partial` is the fail-closed
+        // signal reserved for explicit start_key_hex paging, so it stays false here;
+        // "more matching rows exist" is reported via `has_older`, and the caller pages
+        // further back by windowing with end_ts_ns = oldest_returned_ts_ns.
+        assert!(!extra_match.partial);
+        assert!(extra_match.has_older);
+        assert!(!extra_match.exhausted);
+        assert_eq!(extra_match.scan_order, "newest_first");
+        assert!(extra_match.next_start_key_hex.is_none());
+        let oldest_returned_ts_ns = extra_match
+            .oldest_returned_ts_ns
+            .expect("a newest-first page with returned rows must expose its oldest-ts anchor");
+
+        // Supporting regression readback for the documented resume: `has_older`
+        // promises the caller can page further back by windowing with
+        // `end_ts_ns`. Verify that is actionable (not a dead end) by actually
+        // retrieving the one remaining older
+        // match straight from the real on-disk CF_ACTION_LOG.
+        let older_page = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(20),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                end_ts_ns: Some(oldest_returned_ts_ns - 1),
+                ..Default::default()
+            })
+            .expect("window-back page should query");
+        assert_eq!(
+            older_page.returned_count, 1,
+            "the one older match must be retrievable by windowing end_ts_ns"
+        );
+        assert_eq!(older_page.matched_rows, 1);
+        assert_eq!(older_page.scan_order, "newest_first");
+        assert!(
+            older_page
+                .oldest_returned_ts_ns
+                .is_some_and(|ts| ts < oldest_returned_ts_ns),
+            "window-back must reach a strictly older row than the first page"
+        );
+        assert!(!older_page.has_older);
+        assert!(older_page.exhausted);
+    }
+
+    #[test]
+    fn command_audit_query_unwindowed_newest_first_scan_capped_no_match_reports_has_older() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        seed_command_rows(&service, "issue1487_other_tool", 3);
+
+        let response = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(20),
+                scan_limit: Some(2),
+                tool: Some("issue1487_no_match".to_owned()),
+                ..Default::default()
+            })
+            .expect("scan-limited no-match page should query");
+
+        assert_eq!(response.returned_count, 0);
+        assert_eq!(response.matched_rows, 0);
+        assert_eq!(response.scanned_rows, 2);
+        // #1550: the unwindowed default scans newest-first. A scan_limit-capped page
+        // that matched nothing reports `has_older` (rows remain beyond the scanned
+        // tail) as a SUCCESS, not a fail-closed partial. To search older history for
+        // a specific tool, window with start_ts_ns/end_ts_ns — the newest-first
+        // default intentionally surfaces recent activity first.
+        assert!(!response.partial);
+        assert!(response.has_older);
+        assert!(!response.exhausted);
+        assert_eq!(response.scan_order, "newest_first");
+    }
+
+    #[test]
+    fn command_audit_query_newest_first_skips_noncanonical_tail_keys() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let old_tool = "issue1550_old_synthetic";
+        let new_tool = "issue1550_new_real";
+        let newer_ts = 1_783_983_154_070_087_400_u64;
+
+        seed_action_log_row(
+            &service,
+            b"issue1540-final-redaction-sorts-after-canonical".to_vec(),
+            json!({
+                "schema_version": 1,
+                "row_kind": COMMAND_AUDIT_ROW_KIND,
+                "audit_id": "issue1540-synthetic",
+                "ts_ns": 0,
+                "tool": old_tool,
+                "phase": "final",
+                "outcome": "error",
+                "error_code": "ISSUE1540_SYNTHETIC"
+            }),
+        );
+        seed_action_log_row(
+            &service,
+            command_audit_key(newer_ts, 7),
+            json!({
+                "schema_version": 1,
+                "row_kind": COMMAND_AUDIT_ROW_KIND,
+                "audit_id": "issue1550-real-current",
+                "ts_ns": newer_ts,
+                "tool": new_tool,
+                "phase": "final",
+                "outcome": "ok"
+            }),
+        );
+
+        let response = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(10),
+                scan_limit: Some(10),
+                ..Default::default()
+            })
+            .expect("mixed canonical/noncanonical tail should query");
+
+        assert_eq!(response.scan_order, AUDIT_SCAN_ORDER_NEWEST_FIRST);
+        assert_eq!(response.noncanonical_key_count, 1);
+        assert_eq!(response.corrupt_row_count, 0);
+        assert_eq!(response.returned_count, 1);
+        assert_eq!(response.rows[0].tool, new_tool);
+        assert_eq!(response.rows[0].ts_ns, newer_ts);
+        assert_ne!(response.rows[0].tool, old_tool);
+        let expected_key_hex = hex_encode(&command_audit_key(newer_ts, 7));
+        assert_eq!(
+            response.start_key_hex.as_deref(),
+            Some(expected_key_hex.as_str())
+        );
+    }
 }

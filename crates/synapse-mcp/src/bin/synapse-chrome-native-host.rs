@@ -6,7 +6,9 @@ use anyhow::{Context, bail};
 use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
 use tracing_subscriber::filter::LevelFilter;
 
-use synapse_chrome_bridge as chrome_debugger_bridge;
+#[allow(dead_code)]
+#[path = "../chrome_debugger_bridge/mod.rs"]
+mod chrome_debugger_bridge;
 
 #[tokio::main]
 async fn main() -> ExitCode {

@@ -18,41 +18,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
         &[
             ("inspect", params.inspect.is_some()),
             ("summary", params.summary.is_some()),
-            ("snapshot_gc_status", params.snapshot_gc_status.is_some()),
             ("gc_once", params.gc_once.is_some()),
-            ("anchors", params.anchors.is_some()),
-            ("row_read", params.row_read.is_some()),
-            ("snapshot_open", params.snapshot_open.is_some()),
-            ("snapshot_read", params.snapshot_read.is_some()),
-            ("snapshot_release", params.snapshot_release.is_some()),
-            ("temporal_panels", params.temporal_panels.is_some()),
-            ("corpus_histogram", params.corpus_histogram.is_some()),
-            ("panel_coverage", params.panel_coverage.is_some()),
-            ("temporal_rerank", params.temporal_rerank.is_some()),
-            ("temporal_backfill", params.temporal_backfill.is_some()),
-            ("search_rebuild", params.search_rebuild.is_some()),
-            (
-                "transcript_order_status",
-                params.transcript_order_status.is_some(),
-            ),
-            (
-                "transcript_order_rebuild",
-                params.transcript_order_rebuild.is_some(),
-            ),
-            ("panel_lifecycle", params.panel_lifecycle.is_some()),
-            ("find_similar", params.find_similar.is_some()),
-            (
-                "retire_orphan_slot_cfs",
-                params.retire_orphan_slot_cfs.is_some(),
-            ),
-            (
-                "retire_search_generation",
-                params.retire_search_generation.is_some(),
-            ),
-            ("backup", params.backup.is_some()),
-            ("backup_status", params.backup_status.is_some()),
-            ("restore_verify", params.restore_verify.is_some()),
-            ("intelligence", params.intelligence.is_some()),
         ],
     )
 }
@@ -68,8 +34,6 @@ pub(super) fn validate_model_params(params: &ModelParams) -> Result<(), ErrorDat
             ("register", params.register.is_some()),
             ("update", params.update.is_some()),
             ("remove", params.remove.is_some()),
-            ("recommend", params.recommend.is_some()),
-            ("override", params.r#override.is_some()),
         ],
     )
 }
@@ -83,40 +47,16 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("scan_storage", params.scan_storage.is_some()),
             ("flags", params.flags.is_some()),
             ("report", params.report.is_some()),
-            ("grounding_gap", params.grounding_gap.is_some()),
-            ("blind_spot", params.blind_spot.is_some()),
-            ("drift", params.drift.is_some()),
-            ("vault_verify", params.vault_verify.is_some()),
-            ("kernel", params.kernel.is_some()),
-            ("kernel_rebuild", params.kernel_rebuild.is_some()),
-            ("guard_calibrate", params.guard_calibrate.is_some()),
-            ("guard_verify", params.guard_verify.is_some()),
-            ("anneal_status", params.anneal_status.is_some()),
-            (
-                "anneal_search_propose",
-                params.anneal_search_propose.is_some(),
-            ),
-            ("anneal_rollback", params.anneal_rollback.is_some()),
         ],
     )
 }
 
 pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorData> {
     match params.operation {
-        SetupOperation::Status
-            if params.doctor.is_none()
-                && params.repair.is_none()
-                && params.launchd_service.is_none()
-                && params.host_transition.is_none() =>
-        {
+        SetupOperation::Status if params.doctor.is_none() && params.repair.is_none() => {
             return Ok(());
         }
-        SetupOperation::Doctor
-            if params.status.is_none()
-                && params.repair.is_none()
-                && params.launchd_service.is_none()
-                && params.host_transition.is_none() =>
-        {
+        SetupOperation::Doctor if params.status.is_none() && params.repair.is_none() => {
             return Ok(());
         }
         _ => {}
@@ -128,8 +68,6 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
             ("status", params.status.is_some()),
             ("doctor", params.doctor.is_some()),
             ("repair", params.repair.is_some()),
-            ("launchd_service", params.launchd_service.is_some()),
-            ("host_transition", params.host_transition.is_some()),
         ],
     )
 }
@@ -172,4 +110,136 @@ fn validate_exact_spec(
             "remediation": "pass exactly one payload object whose key matches operation",
         })),
     ))
+}
+#[cfg(test)]
+mod tests {
+    use crate::m3::storage::StorageInspectParams;
+    use serde_json::json;
+
+    use super::*;
+    use crate::server::operational_facades::types::{
+        SetupParams, SetupRepairParams, SetupStatusParams, StorageOperation, TelemetryOperation,
+        TelemetryStatusParams,
+    };
+
+    #[test]
+    fn validation_requires_matching_storage_payload_only() {
+        let ok = StorageParams {
+            operation: StorageOperation::Inspect,
+            inspect: Some(StorageInspectParams::default()),
+            summary: None,
+            gc_once: None,
+        };
+        validate_storage_params(&ok).expect("matching payload accepted");
+
+        let missing = StorageParams {
+            operation: StorageOperation::Inspect,
+            inspect: None,
+            summary: None,
+            gc_once: None,
+        };
+        validate_storage_params(&missing).expect_err("missing payload rejected");
+
+        let extra = StorageParams {
+            operation: StorageOperation::Inspect,
+            inspect: Some(StorageInspectParams::default()),
+            summary: Some(StorageInspectParams::default()),
+            gc_once: None,
+        };
+        validate_storage_params(&extra).expect_err("extra payload rejected");
+    }
+
+    #[test]
+    fn storage_facade_rejects_probe_row_operation_schema() {
+        let error = serde_json::from_value::<StorageParams>(json!({
+            "operation": "put_probe_rows",
+            "put_probe_rows": {
+                "cf_name": "CF_ACTION_LOG",
+                "key_prefix": "issue1595",
+                "rows": 1,
+                "value_bytes": 8
+            }
+        }))
+        .expect_err("production storage facade must not deserialize synthetic write operation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown variant `put_probe_rows`")
+                || message.contains("unknown field `put_probe_rows`"),
+            "unexpected serde error: {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_status_accepts_schema_valid_empty_payload() {
+        let missing = TelemetryParams {
+            operation: TelemetryOperation::Status,
+            status: None,
+        };
+        validate_telemetry_params(&missing).expect("status payload is optional");
+
+        let ok = TelemetryParams {
+            operation: TelemetryOperation::Status,
+            status: Some(TelemetryStatusParams::default()),
+        };
+        validate_telemetry_params(&ok).expect("status payload accepted");
+    }
+
+    #[test]
+    fn setup_status_and_doctor_accept_operation_only() {
+        let status = SetupParams {
+            operation: SetupOperation::Status,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&status).expect("setup status has no required fields");
+
+        let doctor = SetupParams {
+            operation: SetupOperation::Doctor,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&doctor).expect("setup doctor has no required fields");
+
+        let explicit_status = SetupParams {
+            operation: SetupOperation::Status,
+            status: Some(SetupStatusParams::default()),
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&explicit_status).expect("explicit empty status payload accepted");
+    }
+
+    #[test]
+    fn setup_payloadless_status_keeps_mismatches_fail_closed() {
+        let mismatched_extra = SetupParams {
+            operation: SetupOperation::Status,
+            status: None,
+            doctor: Some(SetupStatusParams::default()),
+            repair: None,
+        };
+        validate_setup_params(&mismatched_extra)
+            .expect_err("mismatched setup payload still rejected");
+
+        let repair_missing_payload = SetupParams {
+            operation: SetupOperation::Repair,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&repair_missing_payload)
+            .expect_err("setup repair still requires its payload");
+
+        let repair_ok = SetupParams {
+            operation: SetupOperation::Repair,
+            status: None,
+            doctor: None,
+            repair: Some(SetupRepairParams {
+                reason: "issue1493 regression".to_owned(),
+            }),
+        };
+        validate_setup_params(&repair_ok).expect("setup repair payload still accepted");
+    }
 }

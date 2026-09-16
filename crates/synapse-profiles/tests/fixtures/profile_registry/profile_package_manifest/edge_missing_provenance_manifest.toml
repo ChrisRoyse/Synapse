@@ -1,0 +1,55 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.luanti.missing_provenance"
+package_version = "0.1.0"
+profile_id = "luanti.minetest"
+profile_version = "1.0.0"
+created_at = "2026-05-27T09:31:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Invalid fixture: source provenance is intentionally missing."
+
+[[targets]]
+target_id = "luanti.minetest"
+target_kind = "game"
+process_name = "luanti.exe"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+
+[assumptions.display]
+min_width = 1280
+min_height = 720
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software"]
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "operator_owned_test"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = false
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T09:31:00Z"
+summary = "Invalid missing-provenance fixture."
+
+[hashes]
+profile_toml_sha256 = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+package_sha256 = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/luanti.minetest.toml"

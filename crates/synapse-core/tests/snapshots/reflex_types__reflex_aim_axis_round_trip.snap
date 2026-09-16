@@ -1,0 +1,5 @@
+---
+source: crates/synapse-core/tests/reflex_types.rs
+expression: "round_trip(\"ReflexAimAxis\", \"snapshot\", ReflexAimAxis::YOnly)?"
+---
+"y_only"

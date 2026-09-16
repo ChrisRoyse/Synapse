@@ -3,7 +3,7 @@ use synapse_core::error_codes;
 use synapse_perception::{ObservationAssembler, ObserveInclude};
 use tokio::io::AsyncWrite;
 
-use crate::m1::{M1ObservationSnapshot, SharedM1State, current_input_from_snapshot, mcp_error};
+use crate::m1::{SharedM1State, current_input, mcp_error};
 
 use super::{ReplayRecordLine, ReplayTarget, serializer::write_json_line};
 
@@ -17,31 +17,21 @@ pub(super) async fn write_observation<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let snapshot = {
+    let input = {
         let state = m1_state.lock().map_err(|_err| {
             mcp_error(
                 error_codes::OBSERVE_INTERNAL,
                 "M1 service state lock poisoned",
             )
         })?;
-        M1ObservationSnapshot::from_state(&state)
-    };
-    let depth = include.max_subtree_depth;
-    let input =
-        match tokio::task::spawn_blocking(move || current_input_from_snapshot(&snapshot, depth))
-            .await
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::OBSERVE_INTERNAL,
-                    format!("replay observation blocking perception gather task failed: {error}"),
-                )
-            })? {
+        match current_input(&state, include.max_subtree_depth) {
             Ok(input) => input,
             Err(error) if is_no_perception_error(&error) => {
                 return Ok(ObservationWrite::skipped());
             }
             Err(error) => return Err(error),
-        };
+        }
+    };
     let observation = match assembler
         .assemble(include, input)
         .map_err(|error| mcp_error(error.code(), error.to_string()))

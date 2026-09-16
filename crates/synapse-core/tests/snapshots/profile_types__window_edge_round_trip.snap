@@ -1,0 +1,5 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"WindowEdge\", \"snapshot\", WindowEdge::BottomLeft)?"
+---
+"bottom_left"

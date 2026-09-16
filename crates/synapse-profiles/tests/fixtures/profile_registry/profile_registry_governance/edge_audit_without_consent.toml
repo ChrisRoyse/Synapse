@@ -1,0 +1,22 @@
+schema_version = 1
+kind = "audit_contribution_bundle"
+bundle_id = "audit.synthetic.edge.no_consent"
+license_spdx = "CC-BY-4.0"
+operator_consent_id = ""
+redaction_policy_id = "redaction.synthetic.aggregate-v1"
+created_at = "2026-05-27T00:35:00Z"
+raw_data_included = false
+redacted = true
+export_allowed = true
+
+data_classes = ["profile_quality_summary"]
+
+[source]
+source_profile_package_id = "profile.synthetic.governance"
+source_profile_package_version = "0.1.0"
+source_quality_snapshot_key = "profile_quality/v1/synthetic.governance"
+
+[expected_policy]
+outcome = "reject"
+reason_code = "missing_operator_consent"
+allowed_to_export = false

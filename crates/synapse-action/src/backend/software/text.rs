@@ -11,38 +11,19 @@ use super::{
 };
 use crate::ActionError;
 use crate::backend::text_dispatch::{TextDispatchInput, text_dispatch_plan};
-use crate::foreground_fence::EmissionSite;
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_type_text"))]
 pub(super) fn type_text(text: &str, dynamics: &KeystrokeDynamics) -> Result<(), ActionError> {
     type_text_with_sender(text, dynamics, send_text_input)
 }
 
-/// Types a planned string, one OS emission per UTF-16 unit.
-///
-/// The plan sleeps a sampled inter-keystroke interval between steps, so this
-/// loop spans real time — seconds for a long string. Each `sender` call reaches
-/// `send_input_batch`, which re-reads the live foreground immediately before
-/// its `SendInput`. The emission position (`unit_index`/`unit_total`) is
-/// threaded down so a refusal names the exact character the sequence stopped
-/// at, and the caller can re-issue only the undelivered remainder (#2057).
-///
-/// Because that timeline routinely outruns any default lease TTL, every unit
-/// that has *already* cleared the fence heartbeats the holder's own input lease
-/// (#2065). The heartbeat is bounded by the budget armed at the MCP layer and
-/// cannot revive a lapsed or preempted lease, so a legitimately long string runs
-/// to completion while a genuinely lost lease still refuses at the very next
-/// emission boundary.
 fn type_text_with_sender(
     text: &str,
     dynamics: &KeystrokeDynamics,
-    mut sender: impl FnMut(TextDispatchInput, EmissionSite) -> Result<(), ActionError>,
+    mut sender: impl FnMut(TextDispatchInput) -> Result<(), ActionError>,
 ) -> Result<(), ActionError> {
     let release_epoch = crate::hotkey::operator_release_epoch();
-    let plan = text_dispatch_plan(text, dynamics);
-    let unit_total = plan.iter().map(|step| step.inputs.len()).sum::<usize>();
-    let mut unit_index = 0_usize;
-    for (step_index, step) in plan.into_iter().enumerate() {
+    for (step_index, step) in text_dispatch_plan(text, dynamics).into_iter().enumerate() {
         if sleep_ms_since(step.iki_ms_before, release_epoch) {
             return Err(operator_release_error(
                 "delay",
@@ -59,18 +40,7 @@ fn type_text_with_sender(
                 Some(input_index),
                 step.iki_ms_before,
             )?;
-            sender(
-                input,
-                EmissionSite::delivery("type_text_unit")
-                    .at(unit_index)
-                    .of(unit_total),
-            )?;
-            unit_index += 1;
-            // This unit passed the per-emission fence, so the lease was held and
-            // the bound window still owned the foreground at the OS call. Re-arm
-            // that same lease inside its armed ceiling so the *next* unit is not
-            // refused merely because the string is long (#2065).
-            crate::lease::heartbeat_emission_budget();
+            sender(input)?;
             thread::yield_now();
             ensure_operator_release_not_requested(
                 release_epoch,
@@ -119,28 +89,80 @@ fn operator_release_error(
     }
 }
 
-fn send_text_input(input: TextDispatchInput, site: EmissionSite) -> Result<(), ActionError> {
+fn send_text_input(input: TextDispatchInput) -> Result<(), ActionError> {
     match input {
-        TextDispatchInput::UnicodeUnit(unit) => send_unicode_unit(unit, site),
-        TextDispatchInput::VirtualKey(vkey) => send_virtual_key(VIRTUAL_KEY(vkey), site),
+        TextDispatchInput::UnicodeUnit(unit) => send_unicode_unit(unit),
+        TextDispatchInput::VirtualKey(vkey) => {
+            send_virtual_key(VIRTUAL_KEY(vkey), "text virtual key")
+        }
     }
 }
 
-/// One UTF-16 unit is a self-contained down+up pair in a single `SendInput`
-/// batch, so the pair is one indivisible delivery: it can never be split by
-/// the fence into a stranded key-down.
-fn send_unicode_unit(unit: u16, site: EmissionSite) -> Result<(), ActionError> {
+fn send_unicode_unit(unit: u16) -> Result<(), ActionError> {
     let inputs = [
         keyboard_input(unit, KEYEVENTF_UNICODE),
         keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
     ];
-    send_input_batch(&inputs, site)
+    send_input_batch(&inputs, "unicode text character")
 }
 
-fn send_virtual_key(vkey: VIRTUAL_KEY, site: EmissionSite) -> Result<(), ActionError> {
+fn send_virtual_key(vkey: VIRTUAL_KEY, detail: &'static str) -> Result<(), ActionError> {
     let inputs = [
         virtual_keyboard_input(vkey, KEYBD_EVENT_FLAGS(0)),
         virtual_keyboard_input(vkey, KEYEVENTF_KEYUP),
     ];
-    send_input_batch(&inputs, site)
+    send_input_batch(&inputs, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use synapse_core::KeystrokeDynamics;
+    use synapse_core::error_codes;
+
+    use super::*;
+
+    static HOTKEY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn type_text_abort_observes_release_between_characters() {
+        let _guard = HOTKEY_TEST_LOCK.lock().expect("hotkey test lock poisoned");
+        let mut sent = Vec::new();
+        let error = type_text_with_sender("abc", &KeystrokeDynamics::Burst, |input| {
+            sent.push(input);
+            if sent.len() == 1 {
+                crate::hotkey::request_release_interrupt();
+            }
+            Ok(())
+        })
+        .expect_err("operator release must abort remaining text");
+
+        assert_eq!(error.code(), error_codes::SAFETY_OPERATOR_HOTKEY_FIRED);
+        assert_eq!(sent, [TextDispatchInput::UnicodeUnit(u16::from(b'a'))]);
+        assert!(error.detail().contains("stage=after_input"));
+        assert!(error.detail().contains("step_index=0"));
+        assert!(error.detail().contains("input_index=0"));
+    }
+
+    #[test]
+    fn type_text_ignores_release_epoch_from_previous_action() {
+        let _guard = HOTKEY_TEST_LOCK.lock().expect("hotkey test lock poisoned");
+        crate::hotkey::request_release_interrupt();
+        let mut sent = Vec::new();
+
+        type_text_with_sender("ab", &KeystrokeDynamics::Burst, |input| {
+            sent.push(input);
+            Ok(())
+        })
+        .expect("stale release epoch from before type_text start must not abort");
+
+        assert_eq!(
+            sent,
+            [
+                TextDispatchInput::UnicodeUnit(u16::from(b'a')),
+                TextDispatchInput::UnicodeUnit(u16::from(b'b')),
+            ]
+        );
+    }
 }

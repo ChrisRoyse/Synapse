@@ -8,41 +8,29 @@ pub mod routines;
 pub mod types;
 pub mod win32_hwnd;
 
-pub use filter::{CompiledDataPredicate, CompiledEventFilter};
-
-pub use defaults::{
-    DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION, SYNAPSE_DAEMON_JOB_CPU_RATE,
-    SYNAPSE_OWNED_TREE_CPU_RATE, SYNAPSE_OWNED_TREE_HARD_LIMIT_BYTES,
-    SYNAPSE_PROCESS_HARD_LIMIT_BYTES,
-};
+pub use defaults::{DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION};
 pub use types::{
     AGENT_EVENT_MAX_ID_CHARS, AGENT_EVENT_MAX_REASON_CHARS, AGENT_EVENT_RECORD_VERSION,
     AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS,
     AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AGENT_TRANSCRIPT_RECORD_VERSION, AccessibleNode,
     AccessibleQuery, AccessibleQueryScope, AccessibleSubtree, Action, AgentEndState,
     AgentEventKind, AgentEventRecord, AgentTranscriptRecord, AimCurve, AimNaturalParams, AimStyle,
-    AimTarget, AudioContext, AudioCue, AudioEvent, AudioTranscription, Backend, BillableUsage,
-    BrowserDefaultActionSemantics, ButtonAction, CalyxHotPathBoundaryHealth,
-    CalyxMathDispatchOperation, CalyxMathProbeTopKEntry, CalyxMathResidentL2GatherProbe,
-    CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement, CalyxTuningKnobStatus,
+    AimTarget, AudioContext, AudioCue, AudioEvent, Backend, BillableUsage, ButtonAction,
     CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus, ChromeBridgeDetail,
-    ClipboardSummary, ComboInput, ComboStep, CompiledHudParser, CostBreakdown, CostOutcome,
+    ClipboardSummary, ComboInput, ComboStep, CostBreakdown, CostOutcome,
     DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate, DetectedEntity, Detection, DetectionBatch,
     DirectionEstimate, EVENT_FILTER_MAX_DEPTH, ElementId, ElementIdParseError, ElementIdParts,
     EntityId, Event, EventExtension, EventFilter, EventFilterValidationError, EventRef,
     EventSource, EventSummary, FocusedElement, ForbiddenRawDataKind, ForegroundContext, FsEvent,
     FsEventKind, GamepadController, GamepadReport, GenAiAttributes, GenAiOperationName, Health,
     HudExtractor, HudField, HudFieldError, HudFieldSpec, HudParser, HudReading, HudReadings,
-    HudRegion, HudValue, HumanizeParams, INPUT_PROVENANCE_SCHEMA_VERSION, InputBackendCapability,
-    InputBackendDiagnostics, InputDeliveryOrigin, InputForegroundProvenance,
-    InputForegroundSnapshot, InputProvenance, InputTargetIdentity, InputTargetKind, Key, KeyCode,
-    KeystrokeDynamics, KeystrokeNaturalParams, MODEL_PRICE_MAX_ID_CHARS, MODEL_PRICE_VERSION,
-    ModelPrice, MouseButton, MouseTarget, Observation, ObservationCaptureConfig,
-    ObservationCaptureTarget, ObservationDiagnostics, ObservationElementsPage,
-    ObservationPersistedRow, OcrBackend, OcrCapturedTarget, OcrConfidenceSource, OcrResult,
-    OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, PROFILE_SCHEMA_VERSION, PadButton, PadId, PathPoint,
-    PathSpec, PerceptionDetectionHealth, PerceptionMode, PhysicalDeviceOrigin, Point,
-    ProcessQosHealth, Profile, ProfileBackends, ProfileCapture, ProfileCaptureTarget,
+    HudRegion, HudValue, HumanizeParams, InputBackendCapability, InputBackendDiagnostics, Key,
+    KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MODEL_PRICE_MAX_ID_CHARS,
+    MODEL_PRICE_VERSION, ModelPrice, MouseButton, MouseTarget, Observation,
+    ObservationCaptureConfig, ObservationCaptureTarget, ObservationDiagnostics,
+    ObservationElementsPage, OcrBackend, OcrConfidenceSource, OcrResult, OcrWord,
+    PERCEIVED_TEXT_UNTRUSTED_NOTICE, PROFILE_SCHEMA_VERSION, PadButton, PadId, PathPoint, PathSpec,
+    PerceptionMode, Point, Profile, ProfileBackends, ProfileCapture, ProfileCaptureTarget,
     ProfileDetection, ProfileId, ProfileMatch, ProfileOcr, ProfileUseScope, RealityAudit,
     RealityBaseline, RealityBaselineStatus, RealityDelta, RealityDeltaConflict,
     RealityDeltaValidationError, RealityDriftItem, RealityDriftStatus, RealitySourceSurface,
@@ -53,7 +41,7 @@ pub use types::{
     StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession,
     StrokeMotionModel, StrokeTiming, SubscriptionId, SubsystemHealth, SuspectedInjectionAnnotation,
     SuspectedInjectionSpan, TranscriptModelUsage, TranscriptParseStatus, TranscriptRole,
-    TranscriptSource, TranscriptToolCall, TranscriptUsage, Trigger, UiaPattern, UsageWriterHealth,
-    VelocityProfile, WebPerceptionPath, WindowEdge, default_hud_confidence_threshold, element_id,
-    entity_id, new_reflex_id, new_session_id, new_subscription_id,
+    TranscriptSource, TranscriptToolCall, TranscriptUsage, Trigger, UiaPattern, VelocityProfile,
+    WebPerceptionPath, WindowEdge, default_hud_confidence_threshold, element_id, entity_id,
+    new_reflex_id, new_session_id, new_subscription_id,
 };

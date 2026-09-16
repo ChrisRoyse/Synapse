@@ -1,31 +1,22 @@
 mod action_combo_bridge;
 pub mod audit;
-mod audit_migration;
-pub mod audit_offload;
-mod audit_projection;
 mod audit_state;
-pub(crate) mod audit_timestamp;
 pub mod bus;
 pub mod conflict;
 mod dispatch;
-mod durable_state;
 pub mod error;
-pub mod hot_path;
 pub mod kinds;
 mod lifecycle;
 mod listing;
-pub mod lowered;
-pub mod process_topology;
 mod runtime;
 pub mod scheduler;
 mod storage;
 
+#[cfg(test)]
+mod tests;
+
 pub use action_combo_bridge::install_action_combo_scheduler;
 pub use audit::write_audit;
-pub use audit_offload::{
-    REFLEX_AUDIT_QUEUE_CAPACITY, REFLEX_AUDIT_QUEUE_OVERFLOW, ReflexAuditQueueSnapshot,
-    ReflexAuditSink,
-};
 pub use bus::{
     DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EVENTS_DROPPED_METRIC, EventBus,
     EventBusError, EventBusResult, PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,
@@ -35,12 +26,7 @@ pub use dispatch::{
     REFLEX_ACTION_DENIED_STEP_STATUS, REFLEX_ACTION_PERMISSION_DENIED_KIND, ReflexActionGate,
     ReflexActionGateHandle, ReflexActionPermissionDenied,
 };
-pub use durable_state::ReflexActivation;
 pub use error::{ReflexError, ReflexResult};
-pub use hot_path::{
-    HOT_PATH_BOUNDARY_VIOLATION_CODE, HotPathViolation, HotTickThreadScope, enter_hot_tick_thread,
-    run_hot_tick_thread,
-};
 pub use kinds::aim_track::{
     AimTrackContext, AimTrackController, AimTrackOutput, AimTrackParams, AimTrackTarget,
     AimTrackTargetSnapshot, AimTrackTargetSource, AimTrackTargetSourceHandle, DEFAULT_EMA_ALPHA,
@@ -66,10 +52,6 @@ pub use kinds::path_follow::{
     MAX_PATH_FOLLOW_SAMPLES, PathFollowContext, PathFollowController, PathFollowOutput,
     PathFollowParams, PathFollowPhase, REFLEX_PATH_FOLLOW_COMPLETED_KIND,
     REFLEX_PATH_FOLLOW_TICK_KIND,
-};
-pub use lowered::{
-    LOWERED_REFRESH_INTERVAL, LoweredFeedSnapshot, LoweredGuardThresholdFeed, LoweredRefresher,
-    REFLEX_LOWERED_ARTIFACT_NO_VAULT, REFLEX_LOWERED_REFRESHER_SPAWN_FAILED,
 };
 pub use runtime::ReflexRuntime;
 pub use scheduler::{

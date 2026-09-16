@@ -22,11 +22,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{
-    BrowserDefaultActionSemantics, InputDeliveryOrigin, InputProvenance, error_codes,
-};
-
-use super::input_provenance::{InputProvenanceContext, InputProvenanceSpec};
+use synapse_core::error_codes;
 
 const TOOL: &str = "browser_set_value";
 const FORM_TOOL: &str = "browser_form";
@@ -149,7 +145,6 @@ pub struct BrowserSetValueResponse {
     pub independent_readback_sha256: String,
     pub status: String,
     pub elapsed_ms: u32,
-    pub input_provenance: InputProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -247,7 +242,6 @@ pub struct BrowserFillFormResponse {
     pub failed_fields: u32,
     pub skipped_fields: u32,
     pub fields: Vec<BrowserFillFormFieldOutcome>,
-    pub input_provenance: Vec<InputProvenance>,
     pub elapsed_ms: u32,
 }
 
@@ -269,8 +263,6 @@ pub struct BrowserFillFormFieldOutcome {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_provenance: Option<InputProvenance>,
 }
 
 #[tool_router(router = browser_field_tool_router, vis = "pub(super)")]
@@ -537,8 +529,6 @@ impl SynapseService {
             ));
         }
         let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
-        let provenance_context =
-            InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id)?;
 
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_set_value_before_bridge_field_replace",
@@ -647,18 +637,12 @@ impl SynapseService {
         let before_len = char_len(&before_value);
         let after_len = char_len(&after_value);
         let changed = before_value != after_value;
-        let source_of_truth = SOURCE_OF_TRUTH;
-        let input_provenance = provenance_context.finish(InputProvenanceSpec {
-            delivery_origin: InputDeliveryOrigin::DomDispatch,
-            expected_dom_event_is_trusted: Some(false),
-            browser_default_actions:
-                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-            backend: &result.readback_backend,
-            transport: "chrome_tabs_extension+chrome.scripting",
-            protocol_method: Some("native_value_setter+dispatchEvent(input,change)"),
-            required_foreground: false,
-            per_emission_fence_verified: false,
-        })?;
+        let trusted_text_backend = result.readback_backend.contains("chrome.debugger.Input");
+        let source_of_truth = if trusted_text_backend {
+            "chrome.debugger.Input text dispatch + chrome.scripting editable readback + separate chrome.tabs active-element readback"
+        } else {
+            SOURCE_OF_TRUTH
+        };
 
         tracing::info!(
             code = "BROWSER_SET_VALUE_READBACK",
@@ -669,6 +653,7 @@ impl SynapseService {
             match_count = result.match_count,
             tag_name = %result.tag_name,
             readback_backend = %result.readback_backend,
+            trusted_text_backend,
             before_len,
             after_len,
             requested_len,
@@ -697,7 +682,6 @@ impl SynapseService {
             independent_readback_sha256: text_signature(&independent),
             status: "verified_state".to_owned(),
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-            input_provenance,
         })
     }
 
@@ -735,20 +719,6 @@ impl SynapseService {
         let failed_fields = attempted_fields.saturating_sub(succeeded_fields);
         let skipped_fields = total_fields.saturating_sub(attempted_fields);
         let ok = failed_fields == 0 && skipped_fields == 0;
-        let input_provenance = outcomes
-            .iter()
-            .filter_map(|outcome| outcome.input_provenance.clone())
-            .collect::<Vec<_>>();
-        if outcomes
-            .iter()
-            .any(|outcome| outcome.ok && outcome.input_provenance.is_none())
-        {
-            return Err(super::input_provenance::input_provenance_error(
-                "browser_fill_form_success",
-                "a successful field outcome omitted input_provenance",
-                None,
-            ));
-        }
         let status = if ok {
             "verified_state"
         } else if params.continue_on_error {
@@ -788,7 +758,6 @@ impl SynapseService {
             failed_fields,
             skipped_fields,
             fields: outcomes,
-            input_provenance,
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         })
     }
@@ -828,14 +797,7 @@ impl SynapseService {
                     .await
                 {
                     Ok(result) => {
-                        let provenance = result.input_provenance.clone();
-                        fill_form_success(
-                            index_u32,
-                            field,
-                            "browser_set_value",
-                            json!(result),
-                            provenance,
-                        )
+                        fill_form_success(index_u32, field, "browser_set_value", json!(result))
                     }
                     Err(error) => {
                         fill_form_error_data(index_u32, field, "browser_set_value", error)
@@ -852,7 +814,6 @@ impl SynapseService {
                 };
                 let action = if checked { "check" } else { "uncheck" };
                 self.browser_fill_form_dom_action(
-                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -872,7 +833,6 @@ impl SynapseService {
                     );
                 }
                 self.browser_fill_form_dom_action(
-                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -911,7 +871,6 @@ impl SynapseService {
                     );
                 }
                 self.browser_fill_form_dom_action(
-                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -927,7 +886,6 @@ impl SynapseService {
 
     async fn browser_fill_form_dom_action(
         &self,
-        session_id: &str,
         index: u32,
         field: &BrowserFillFormField,
         window_hwnd: i64,
@@ -936,13 +894,6 @@ impl SynapseService {
         options: Option<&Value>,
         wait_timeout_ms: u64,
     ) -> BrowserFillFormFieldOutcome {
-        let provenance_context =
-            match InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id) {
-                Ok(context) => context,
-                Err(error) => {
-                    return fill_form_error_data(index, field, "input_provenance", error);
-                }
-            };
         let option = field.option.as_deref().or(field.value.as_deref());
         if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_fill_form_before_bridge_dom_action",
@@ -970,14 +921,9 @@ impl SynapseService {
                 modifiers: None,
                 position_x: None,
                 position_y: None,
-                scroll_delta_x: None,
-                scroll_delta_y: None,
                 wait_timeout_ms,
                 auto_wait: false,
                 auto_wait_timeout_ms: 0,
-                // browser_fill_form never bypasses actionability: a form field
-                // that is not actionable is a real failure the caller must see.
-                force: false,
                 suppress_page_text: false,
             },
         )
@@ -989,57 +935,7 @@ impl SynapseService {
                 ) {
                     return fill_form_error_data(index, field, "operator_panic_boundary", error);
                 }
-                if let Err(error) =
-                    super::input_provenance::reject_legacy_input_provenance_fragments(
-                        &result,
-                        "browser_fill_form_legacy_input_provenance_fragment",
-                        Some(provenance_context.target()),
-                    )
-                {
-                    return fill_form_error_data(index, field, "input_provenance", error);
-                }
-                let (delivery_origin, default_actions, method) = match action {
-                    "check" | "uncheck" => (
-                        InputDeliveryOrigin::HtmlActivationMethod,
-                        BrowserDefaultActionSemantics::HtmlActivationBehavior,
-                        "HTMLElement.click",
-                    ),
-                    "select" => (
-                        InputDeliveryOrigin::DomDispatch,
-                        BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-                        "selectedOptions mutation+dispatchEvent(input,change)",
-                    ),
-                    _ => {
-                        let error = super::input_provenance::input_provenance_error(
-                            "browser_fill_form_dom_action",
-                            format!("unclassified successful DOM action {action:?}"),
-                            None,
-                        );
-                        return fill_form_error_data(index, field, "input_provenance", error);
-                    }
-                };
-                let provenance = match provenance_context.finish(InputProvenanceSpec {
-                    delivery_origin,
-                    expected_dom_event_is_trusted: Some(false),
-                    browser_default_actions: default_actions,
-                    backend: "chrome.scripting.executeScript",
-                    transport: "chrome_tabs_extension+chrome.scripting",
-                    protocol_method: Some(method),
-                    required_foreground: false,
-                    per_emission_fence_verified: false,
-                }) {
-                    Ok(provenance) => provenance,
-                    Err(error) => {
-                        return fill_form_error_data(index, field, "input_provenance", error);
-                    }
-                };
-                fill_form_success(
-                    index,
-                    field,
-                    "chrome_debugger_bridge.domAction",
-                    result,
-                    provenance,
-                )
+                fill_form_success(index, field, "chrome_debugger_bridge.domAction", result)
             }
             Err(error) => {
                 fill_form_bridge_error(index, field, "chrome_debugger_bridge.domAction", error)
@@ -1269,7 +1165,6 @@ fn fill_form_success(
     field: &BrowserFillFormField,
     delegated_tool: &str,
     result: Value,
-    input_provenance: InputProvenance,
 ) -> BrowserFillFormFieldOutcome {
     BrowserFillFormFieldOutcome {
         index,
@@ -1282,7 +1177,6 @@ fn fill_form_success(
         error_code: None,
         error_message: None,
         result: Some(result),
-        input_provenance: Some(input_provenance),
     }
 }
 
@@ -1302,7 +1196,6 @@ fn invalid_fill_form_field(
         error_code: Some(error_codes::TOOL_PARAMS_INVALID.to_owned()),
         error_message: Some(message.to_owned()),
         result: None,
-        input_provenance: None,
     }
 }
 
@@ -1330,7 +1223,6 @@ fn fill_form_error_data(
         error_code: Some(error_code),
         error_message: Some(error.message.to_string()),
         result: None,
-        input_provenance: None,
     }
 }
 
@@ -1351,7 +1243,6 @@ fn fill_form_bridge_error(
         error_code: Some(error.code().to_owned()),
         error_message: Some(error.detail().to_owned()),
         result: None,
-        input_provenance: None,
     }
 }
 
@@ -1466,4 +1357,229 @@ fn postcondition_error(
             },
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1551: top-level cdp_target_id/window_hwnd on the browser_form envelope are
+    // accepted and alias the nested spec's target, resolving the SAME target as
+    // the equivalent nested-spec form.
+    #[test]
+    fn browser_form_top_level_target_aliases_nested_spec_1551() {
+        // Top-level cdp_target_id, no nested target.
+        let mut top_level: BrowserFormParams = serde_json::from_value(json!({
+            "operation": "set_value",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "set_value": { "text": "x", "selector": "#q" },
+        }))
+        .expect("top-level cdp_target_id must deserialize under deny_unknown_fields");
+        // Equivalent nested-only form.
+        let nested: BrowserFormParams = serde_json::from_value(json!({
+            "operation": "set_value",
+            "set_value": { "text": "x", "selector": "#q", "cdp_target_id": "TARGET-1551-ABC" },
+        }))
+        .expect("nested cdp_target_id must deserialize");
+        let top_cdp = top_level.cdp_target_id.clone();
+        let top_hwnd = top_level.window_hwnd;
+        let spec = top_level
+            .set_value
+            .as_mut()
+            .expect("set_value spec present");
+        println!("readback=before cdp_target_id={:?}", spec.cdp_target_id);
+        merge_top_level_target(
+            FORM_TOOL,
+            "set_value",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after cdp_target_id={:?}", spec.cdp_target_id);
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1551-ABC"));
+        assert_eq!(
+            spec.cdp_target_id,
+            nested.set_value.expect("nested spec").cdp_target_id
+        );
+
+        // Top-level window_hwnd (0x1234) aliases the nested spec's window_hwnd.
+        let mut top_hwnd_params: BrowserFormParams = serde_json::from_value(json!({
+            "operation": "set_value",
+            "window_hwnd": 0x1234,
+            "set_value": { "text": "x", "selector": "#q" },
+        }))
+        .expect("top-level window_hwnd must deserialize");
+        let t_cdp = top_hwnd_params.cdp_target_id.clone();
+        let t_hwnd = top_hwnd_params.window_hwnd;
+        let spec = top_hwnd_params
+            .set_value
+            .as_mut()
+            .expect("set_value spec present");
+        println!("readback=before window_hwnd={:?}", spec.window_hwnd);
+        merge_top_level_target(
+            FORM_TOOL,
+            "set_value",
+            t_cdp.as_deref(),
+            t_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after window_hwnd={:?}", spec.window_hwnd);
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    #[test]
+    fn browser_form_conflicting_top_level_target_fails_closed_1551() {
+        let mut params: BrowserFormParams = serde_json::from_value(json!({
+            "operation": "set_value",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "set_value": { "text": "x", "selector": "#q", "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations must deserialize");
+        let top_cdp = params.cdp_target_id.clone();
+        let top_hwnd = params.window_hwnd;
+        let spec = params.set_value.as_mut().expect("set_value spec present");
+        let err = merge_top_level_target(
+            FORM_TOOL,
+            "set_value",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    #[test]
+    fn browser_form_still_rejects_unknown_fields_1551() {
+        let err = serde_json::from_value::<BrowserFormParams>(json!({
+            "operation": "set_value",
+            "set_value": { "text": "x", "selector": "#q" },
+            "bogus_1551": true,
+        }))
+        .expect_err("deny_unknown_fields must still reject a genuinely unknown field");
+        println!("readback=unknown_rejected err={err}");
+    }
+
+    fn params(
+        selector: Option<&str>,
+        element_id: Option<&str>,
+        active: bool,
+    ) -> BrowserSetValueParams {
+        BrowserSetValueParams {
+            text: "x".to_owned(),
+            selector: selector.map(str::to_owned),
+            element_id: element_id.map(str::to_owned),
+            active_element: active,
+            cdp_target_id: None,
+            window_hwnd: None,
+        }
+    }
+
+    #[test]
+    fn locator_requires_exactly_one() {
+        assert!(matches!(
+            validate_locator(&params(Some("#q"), None, false)),
+            Ok(Locator::Selector(_))
+        ));
+        assert!(matches!(
+            validate_locator(&params(None, Some("chrome-tab:1:frame:0:path:0.1"), false)),
+            Ok(Locator::ElementId(_))
+        ));
+        assert!(matches!(
+            validate_locator(&params(None, None, true)),
+            Ok(Locator::ActiveElement)
+        ));
+        // both
+        let err = validate_locator(&params(Some("#q"), None, true)).expect_err("both must fail");
+        assert!(err.message.contains("exactly one"));
+        let err = validate_locator(&params(
+            Some("#q"),
+            Some("chrome-tab:1:frame:0:path:0.1"),
+            false,
+        ))
+        .expect_err("selector plus element_id must fail");
+        assert!(err.message.contains("exactly one"));
+        let err = validate_locator(&params(None, Some("plain-dom-id"), false))
+            .expect_err("plain DOM id must not be accepted as bridge element id");
+        assert!(err.message.contains("normal Chrome bridge id"));
+        // neither
+        let err = validate_locator(&params(None, None, false)).expect_err("neither must fail");
+        assert!(err.message.contains("selector"));
+        // empty selector
+        let err = validate_locator(&params(Some("  "), None, false)).expect_err("empty must fail");
+        assert!(err.message.contains("selector"));
+    }
+
+    #[test]
+    fn normalize_strips_trailing_newline_and_crlf() {
+        assert_eq!(normalize("a\r\nb"), "a\nb");
+        assert_eq!(normalize("a\n"), "a");
+        assert!(value_matches("composer\n", "composer"));
+        assert!(value_matches("", ""));
+        assert!(!value_matches("leftover", ""));
+    }
+
+    fn fill_params(fields: Vec<BrowserFillFormField>) -> BrowserFillFormParams {
+        BrowserFillFormParams {
+            fields,
+            continue_on_error: false,
+            cdp_target_id: None,
+            window_hwnd: None,
+            wait_timeout_ms: None,
+        }
+    }
+
+    fn text_field(selector: &str, text: &str) -> BrowserFillFormField {
+        BrowserFillFormField {
+            name: None,
+            selector: selector.to_owned(),
+            field_type: BrowserFillFormFieldType::Text,
+            value: None,
+            text: Some(text.to_owned()),
+            checked: None,
+            option: None,
+            option_label: None,
+            option_index: None,
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fill_form_validates_field_count_and_timeout() {
+        let err = validate_fill_form_params(&fill_params(Vec::new()))
+            .expect_err("empty form fill must fail");
+        assert!(err.message.contains("at least one field"));
+
+        let mut params = fill_params(vec![text_field("#name", "Ada")]);
+        params.wait_timeout_ms = Some(49);
+        let err = validate_fill_form_params(&params).expect_err("low timeout must fail");
+        assert!(err.message.contains("wait_timeout_ms"));
+
+        params.wait_timeout_ms = Some(50);
+        validate_fill_form_params(&params).expect("boundary timeout should pass");
+    }
+
+    #[test]
+    fn fill_form_invalid_field_outcome_is_per_field() {
+        let field = text_field("   ", "Ada");
+        let outcome = invalid_fill_form_field(2, &field, "selector must be non-empty");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.index, 2);
+        assert_eq!(
+            outcome.error_code.as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(outcome.error_message.unwrap().contains("selector"));
+    }
 }

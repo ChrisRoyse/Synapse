@@ -1,0 +1,18 @@
+schema_version = 1
+kind = "registry_contribution_submission"
+source_id = "registry.synthetic.local-fixture"
+contribution_id = "contrib.synthetic.audit.2026-05-27"
+source_bundle_id = "audit.synthetic.governance.2026-05-27"
+operator_consent_id = "consent.synthetic.2026-05-27"
+redaction_policy_id = "redaction.synthetic.aggregate-v1"
+license_spdx = "CC-BY-4.0"
+submission_status = "queued"
+moderation_queue_id = "modq.synthetic.0001"
+submitted_at = "2026-05-27T01:02:00Z"
+service_receipt_digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+[data_classes]
+profile_quality_summary = true
+action_outcome_counts = true
+compatibility_flags = true
+raw_sensitive_data = false

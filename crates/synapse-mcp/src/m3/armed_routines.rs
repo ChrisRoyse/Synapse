@@ -14,7 +14,6 @@ use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use synapse_calyx::SynapseCalyxReadinessSnapshot;
 use synapse_core::error_codes;
 use synapse_core::intent::IntentCandidate;
 use synapse_core::types::{RoutineDowClass, RoutineLifecycle, RoutineRecord};
@@ -26,10 +25,7 @@ use super::episodes::{hex_encode, key_after, local_day_start, next_local_day_sta
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::profile_authoring::load_routine_automation_record;
-use super::routines::{
-    RoutineNextOccurrenceStatus, load_routine_record, load_state_row,
-    predict_routine_next_occurrence, validate_routine_id_param,
-};
+use super::routines::{load_routine_record, load_state_row, validate_routine_id_param};
 
 const ARMED_ROUTINE_PREFIX: &str = "armed_routine/v1/";
 const ARMED_ROUTINE_RUN_PREFIX: &str = "armed_routine_run/v1/";
@@ -43,8 +39,6 @@ const MAX_FAILURE_THRESHOLD: u32 = 20;
 const MIN_SCHEDULE_WINDOW_MINUTES: u32 = 5;
 const MAX_SCAN_ROWS: usize = 200_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
-const MIN_ARM_PERIODIC_CONFIDENCE: f32 = 0.6;
-const MIN_ARM_GROUNDED_CONFIDENCE: f32 = 0.05;
 
 pub const ARMED_ROUTINE_SOURCE_OF_TRUTH: &str = "CF_KV armed_routine/v1, armed_routine_due/v1/schedule, armed_routine_due_by_id/v1/schedule, and armed_routine_run/v1 rows plus CF_ROUTINES/CF_ROUTINE_STATE joins and plan_execution/v1 rows";
 
@@ -340,53 +334,23 @@ pub fn arm_routine(
             ),
         ));
     }
-    let Some(routine) = load_routine_record(db.as_ref(), routine_id)? else {
+    let Some(_routine) = load_routine_record(db.as_ref(), routine_id)? else {
         return Err(invalid(format!(
             "ROUTINE_NOT_MINED: routine_id {routine_id} is not in CF_ROUTINES; run routine_mine before arming"
         )));
     };
-    if let Err(error) = validate_autonomy_eligibility(db, &routine, config) {
-        append_autonomy_decision_required(
-            db,
-            &routine,
-            config,
-            "refused",
-            Some(error_codes::ROUTINE_AUTONOMY_NOT_READY),
-            Some(&error.message),
-        )?;
-        return Err(error);
-    }
     let Some(automation) = load_routine_automation_record(db, routine_id)? else {
-        let detail = format!(
+        return Err(invalid(format!(
             "ROUTINE_AUTOMATION_NOT_INSTALLED: routine_id {routine_id} has no routine_automation row; run routine_automate and accept the profile-authoring candidate before arming"
-        );
-        append_autonomy_decision_required(
-            db,
-            &routine,
-            config,
-            "refused",
-            Some("ROUTINE_AUTOMATION_NOT_INSTALLED"),
-            Some(&detail),
-        )?;
-        return Err(invalid(detail));
+        )));
     };
     if automation.state != "installed" || automation.plan_ref.trim().is_empty() {
-        let detail = format!(
+        return Err(invalid(format!(
             "ROUTINE_AUTOMATION_NOT_INSTALLED: routine_id {routine_id} automation state is {:?}, plan_ref={:?}; accept the profile-authoring candidate before arming",
             automation.state, automation.plan_ref
-        );
-        append_autonomy_decision_required(
-            db,
-            &routine,
-            config,
-            "refused",
-            Some("ROUTINE_AUTOMATION_NOT_INSTALLED"),
-            Some(&detail),
-        )?;
-        return Err(invalid(detail));
+        )));
     }
 
-    append_autonomy_decision_required(db, &routine, config, "allowed", None, None)?;
     let now = now_ts_ns();
     let existing = load_armed_routine_record(db, routine_id)?;
     let mut record = existing.unwrap_or_else(|| ArmedRoutineRecord {
@@ -433,156 +397,6 @@ pub fn arm_routine(
     read_armed_required(db, routine_id)
 }
 
-fn append_autonomy_decision_required(
-    db: &Arc<Db>,
-    routine: &RoutineRecord,
-    config: ArmRoutineConfig,
-    outcome: &str,
-    code: Option<&str>,
-    detail: Option<&str>,
-) -> Result<synapse_calyx::SynapseCalyxAutonomyDecisionReadback, ErrorData> {
-    db.append_autonomy_decision(
-        &routine.routine_id,
-        &json!({
-            "outcome": outcome,
-            "error_code_sha256": code.map(sha256_text),
-            "detail_sha256": detail.map(sha256_text),
-            "schedule_enabled": config.schedule_enabled,
-            "intent_enabled": config.intent_enabled,
-            "failure_threshold": config.failure_threshold,
-            "routine": {
-                "confidence": routine.confidence,
-                "support_days": routine.support_days,
-                "opportunity_days": routine.opportunity_days,
-                "occurrence_count": routine.occurrence_count,
-                "mined_at_ns": routine.ts_ns,
-            },
-        }),
-    )
-    .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "AUTONOMY_DECISION_LEDGER_APPEND_FAILED: routine_id={} outcome={outcome}: {error}; remediation: repair the Calyx Ledger append path and verify_chain before retrying; no autonomy decision was released or applied",
-                routine.routine_id
-            ),
-        )
-    })
-}
-
-fn sha256_text(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    hex_encode(&hasher.finalize())
-}
-
-fn validate_autonomy_eligibility(
-    db: &Arc<Db>,
-    routine: &RoutineRecord,
-    config: ArmRoutineConfig,
-) -> Result<(), ErrorData> {
-    let state = load_state_row(db, &routine.routine_id)?.ok_or_else(|| {
-        autonomy_not_ready(
-            &routine.routine_id,
-            "identity_lock_absent",
-            "confirm the currently mined routine identity before arming",
-        )
-    })?;
-    if state.lifecycle != RoutineLifecycle::Confirmed {
-        return Err(autonomy_not_ready(
-            &routine.routine_id,
-            "lifecycle_not_confirmed",
-            "confirm the currently mined routine before arming",
-        ));
-    }
-    let identity = state.identity_lock.as_ref().ok_or_else(|| {
-        autonomy_not_ready(
-            &routine.routine_id,
-            "identity_lock_absent",
-            "confirm the currently mined routine identity before arming",
-        )
-    })?;
-    if identity.canonical_sha256 != identity.last_observed_sha256 {
-        return Err(autonomy_not_ready(
-            &routine.routine_id,
-            "identity_lock_mismatch",
-            "inspect the changed routine evidence and explicitly confirm the intended identity",
-        ));
-    }
-
-    let readiness_value = db
-        .oracle_readiness()
-        .map_err(|error| mcp_error(error.code(), format!(
-            "ROUTINE_AUTONOMY_READINESS_READ_FAILED: routine_id={} could not read the persisted action-domain readiness snapshot: {error}; remediation: repair the Calyx readiness row and remeasure readiness",
-            routine.routine_id
-        )))?
-        .ok_or_else(|| autonomy_not_ready(
-            &routine.routine_id,
-            "readiness_snapshot_absent",
-            "run storage intelligence oracle_readiness and resolve every failed tier before arming",
-        ))?;
-    let readiness: SynapseCalyxReadinessSnapshot = serde_json::from_value(readiness_value)
-        .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, format!(
-            "ROUTINE_AUTONOMY_READINESS_DECODE_FAILED: routine_id={} readiness snapshot schema is invalid: {error}; remediation: quarantine the corrupt Anneal row and remeasure readiness",
-            routine.routine_id
-        )))?;
-    if !readiness.report.overall {
-        let predicate = readiness.report.failing_tier.map_or_else(
-            || "readiness_unknown".to_owned(),
-            |tier| format!("readiness_{tier}"),
-        );
-        let remediation = readiness
-            .report
-            .cheapest_fix
-            .as_deref()
-            .unwrap_or("remeasure readiness and resolve every failed tier before arming");
-        return Err(autonomy_not_ready(
-            &routine.routine_id,
-            &predicate,
-            remediation,
-        ));
-    }
-
-    if config.schedule_enabled {
-        let prediction = predict_routine_next_occurrence(db, routine)?;
-        if prediction.status != RoutineNextOccurrenceStatus::Predicted {
-            return Err(autonomy_not_ready(
-                &routine.routine_id,
-                "schedule_prediction_insufficient",
-                prediction.remediation.as_deref().unwrap_or(
-                    "collect at least three grounded routine occurrences and rerun routine_mine",
-                ),
-            ));
-        }
-        let periodic = prediction.periodic_confidence.unwrap_or(0.0);
-        let grounded = prediction.confidence.unwrap_or(0.0);
-        if periodic < MIN_ARM_PERIODIC_CONFIDENCE {
-            return Err(autonomy_not_ready(
-                &routine.routine_id,
-                "periodic_confidence_below_floor",
-                "collect more regular grounded occurrences before enabling schedule autonomy",
-            ));
-        }
-        if grounded < MIN_ARM_GROUNDED_CONFIDENCE {
-            return Err(autonomy_not_ready(
-                &routine.routine_id,
-                "grounded_confidence_below_floor",
-                "collect more supported regular occurrences before enabling schedule autonomy",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn autonomy_not_ready(routine_id: &str, predicate: &str, remediation: &str) -> ErrorData {
-    mcp_error(
-        error_codes::ROUTINE_AUTONOMY_NOT_READY,
-        format!(
-            "routine_id={routine_id} cannot be armed: failing_predicate={predicate}; remediation: {remediation}"
-        ),
-    )
-}
-
 pub fn disarm_routine(
     db: &Arc<Db>,
     routine_id: &str,
@@ -621,18 +435,23 @@ pub fn load_armed_routine_record(
 ) -> Result<Option<ArmedRoutineRecord>, ErrorData> {
     validate_routine_id_param("routine_inspect", routine_id)?;
     let key = armed_routine_key(routine_id);
-    match db
-        .get_cf(cf::CF_KV, key.as_bytes())
-        .map_err(storage_error)?
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+        .map_err(storage_error)?;
+    match rows
+        .into_iter()
+        .find(|(row_key, _value)| row_key == key.as_bytes())
     {
-        Some(value) => decode_json::<ArmedRoutineRecord>(&value)
-            .map(Some)
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!("ARMED_ROUTINE_ROW_DECODE_FAILED for {routine_id}: {error}"),
-                )
-            }),
+        Some((_key, value)) => {
+            decode_json::<ArmedRoutineRecord>(&value)
+                .map(Some)
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!("ARMED_ROUTINE_ROW_DECODE_FAILED for {routine_id}: {error}"),
+                    )
+                })
+        }
         None => Ok(None),
     }
 }
@@ -763,7 +582,7 @@ fn evaluate_armed_record_due(
     if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
         && matches!(
             state.lifecycle,
-            RoutineLifecycle::Disabled | RoutineLifecycle::Archived | RoutineLifecycle::Quarantined
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
         )
     {
         skipped.push(skip(&record.routine_id, "routine_lifecycle_disabled"));
@@ -1108,15 +927,21 @@ fn load_exact_cf_value(
     key: &[u8],
     context: &'static str,
 ) -> Result<Option<Vec<u8>>, ErrorData> {
-    db.get_cf(cf_name, key).map_err(|error| {
-        mcp_error(
-            error.code(),
+    let rows = db.scan_cf_prefix(cf_name, key).map_err(storage_error)?;
+    let mut exact_values = rows
+        .into_iter()
+        .filter_map(|(row_key, value)| (row_key == key).then_some(value))
+        .collect::<Vec<_>>();
+    if exact_values.len() > 1 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
             format!(
-                "ARMED_ROUTINE_EXACT_KEY_READ_FAILED: {context} key {} in {cf_name}: {error}",
+                "ARMED_ROUTINE_EXACT_KEY_DUPLICATE: {context} key {} appeared more than once in {cf_name}",
                 String::from_utf8_lossy(key)
             ),
-        )
-    })
+        ));
+    }
+    Ok(exact_values.pop())
 }
 
 fn load_routine_record_with_raw(
@@ -1427,7 +1252,7 @@ fn build_schedule_due_index_record(
     if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
         && matches!(
             state.lifecycle,
-            RoutineLifecycle::Disabled | RoutineLifecycle::Archived | RoutineLifecycle::Quarantined
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
         )
     {
         return Ok(None);
@@ -1899,11 +1724,14 @@ fn write_armed_and_run_records(
 
 fn load_armed_run(db: &Arc<Db>, run_id: &str) -> Result<Option<ArmedRoutineRunRecord>, ErrorData> {
     let key = armed_run_key(run_id);
-    match db
-        .get_cf(cf::CF_KV, key.as_bytes())
-        .map_err(storage_error)?
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+        .map_err(storage_error)?;
+    match rows
+        .into_iter()
+        .find(|(row_key, _value)| row_key == key.as_bytes())
     {
-        Some(value) => decode_json::<ArmedRoutineRunRecord>(&value)
+        Some((_key, value)) => decode_json::<ArmedRoutineRunRecord>(&value)
             .map(Some)
             .map_err(|error| {
                 mcp_error(
@@ -1947,4 +1775,395 @@ fn invalid(detail: impl Into<String>) -> ErrorData {
 
 fn internal(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synapse_core::SCHEMA_VERSION;
+    use synapse_core::types::{
+        RoutineGranularity, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
+        RoutineTransition,
+    };
+    use synapse_storage::routines as routine_codec;
+
+    use crate::m3::profile_authoring::RoutineAutomationRecord;
+
+    #[test]
+    fn tick_params_enforce_canonical_browser_hwnd_before_plan_execution() {
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let params = ArmedRoutineTickParams {
+                browser_window_hwnd: Some(invalid),
+                ..ArmedRoutineTickParams::default()
+            };
+            let error = validate_tick_params(&params)
+                .expect_err("noncanonical browser HWND must fail before plan execution");
+            let data = error.data.as_ref().expect("structured HWND error data");
+            assert_eq!(
+                data.get("field").and_then(serde_json::Value::as_str),
+                Some("browser_window_hwnd")
+            );
+        }
+
+        let params = ArmedRoutineTickParams {
+            browser_window_hwnd: Some(i64::from(u32::MAX)),
+            ..ArmedRoutineTickParams::default()
+        };
+        validate_tick_params(&params).expect("u32::MAX is a canonical HWND wire value");
+    }
+
+    fn temp_db() -> (tempfile::TempDir, Arc<Db>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Db::open(dir.path(), SCHEMA_VERSION).expect("open db"));
+        (dir, db)
+    }
+
+    fn routine(now: u64) -> RoutineRecord {
+        RoutineRecord {
+            record_version: 1,
+            ts_ns: now,
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            granularity: RoutineGranularity::App,
+            steps: vec![RoutineStep {
+                app: "notepad.exe".to_owned(),
+                document: None,
+            }],
+            dow_class: RoutineDowClass::Daily,
+            mean_minute_of_day: minute_of_day(now),
+            tolerance_minutes: 0,
+            schedule_label: "daily".to_owned(),
+            support_days: 3,
+            occurrence_count: 3,
+            opportunity_days: 3,
+            confidence: 0.8,
+            window_start_ns: 0,
+            window_end_ns: now,
+            active_days_in_window: 3,
+            first_seen_day_start_ns: local_day_start(now).expect("day"),
+            last_seen_day_start_ns: local_day_start(now).expect("day"),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn minute_of_day(ts_ns: u64) -> u32 {
+        let day = local_day_start(ts_ns).expect("day");
+        u32::try_from(ts_ns.saturating_sub(day) / 60_000_000_000).unwrap()
+    }
+
+    fn write_routine(db: &Arc<Db>, routine: &RoutineRecord) {
+        let key = routine_codec::routine_key(&routine.routine_id).expect("key");
+        let value = encode_json(routine).expect("encode routine");
+        db.put_batch_pressure_bypass(cf::CF_ROUTINES, [(key, value)])
+            .expect("write routine");
+    }
+
+    fn write_state(db: &Arc<Db>, routine_id: &str, lifecycle: RoutineLifecycle) {
+        let now = now_ts_ns();
+        let state = RoutineStateRecord {
+            record_version: 2,
+            routine_id: routine_id.to_owned(),
+            lifecycle,
+            label: None,
+            created_ts_ns: now,
+            updated_ts_ns: now,
+            last_mined_ts_ns: Some(now),
+            present_in_last_mine: true,
+            transitions: vec![RoutineTransition {
+                ts_ns: now,
+                action: RoutineStateAction::Discovered,
+                from: None,
+                to: lifecycle,
+                by: "test".to_owned(),
+                label_before: None,
+                label_after: None,
+                note: None,
+            }],
+            transitions_truncated: 0,
+            confidence_history: Vec::new(),
+            confidence_history_truncated: 0,
+            feedback_events: Vec::new(),
+            feedback_events_truncated: 0,
+            accept_count: 0,
+            decline_count: 0,
+            ignore_count: 0,
+            abandon_count: 0,
+            consecutive_declines: 0,
+            cooldown_level: 0,
+            cooldown_until_ts_ns: None,
+        };
+        let key = routine_codec::routine_state_key(routine_id).expect("state key");
+        let value = encode_json(&state).expect("encode state");
+        db.put_batch_pressure_bypass(cf::CF_ROUTINE_STATE, [(key, value)])
+            .expect("write state");
+    }
+
+    fn write_automation(db: &Arc<Db>, routine_id: &str) {
+        let record = RoutineAutomationRecord {
+            schema_version: 1,
+            row_kind: "routine_automation".to_owned(),
+            routine_id: routine_id.to_owned(),
+            profile_id: "profile.test".to_owned(),
+            candidate_id: "routine-auto.test".to_owned(),
+            candidate_row_key: "profile_authoring_candidate/v1/routine-auto.test".to_owned(),
+            plan_ref: format!("plan/v1/{routine_id}"),
+            state: "installed".to_owned(),
+            generated_at_ns: 1,
+            updated_at_ns: 2,
+            installed_at_ns: Some(2),
+            rejected_at_ns: None,
+            plan_fully_deterministic: true,
+            total_steps: 1,
+            deterministic_steps: 1,
+            agent_task_steps: 0,
+        };
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(
+                format!("routine_automation/v1/{routine_id}").into_bytes(),
+                encode_json(&record).expect("automation"),
+            )],
+        )
+        .expect("write automation");
+    }
+
+    fn setup_armed_schedule(db: &Arc<Db>, now: u64) -> ArmedRoutineRecord {
+        let routine = routine(now);
+        write_routine(db, &routine);
+        write_state(db, &routine.routine_id, RoutineLifecycle::Confirmed);
+        write_automation(db, &routine.routine_id);
+        arm_routine(
+            db,
+            &routine.routine_id,
+            ArmRoutineConfig::from_optional(Some(true), Some(false), Some(2)),
+            "test-session",
+            None,
+        )
+        .expect("arm")
+    }
+
+    fn delete_schedule_due_indexes(db: &Arc<Db>, routine_id: &str) {
+        if let Some(index) = load_schedule_due_by_id_index(db, routine_id).expect("load by-id") {
+            db.mutate_batch_pressure_bypass(
+                cf::CF_KV,
+                [
+                    schedule_due_by_id_index_key(routine_id),
+                    schedule_due_index_key(routine_id, index.due_ts_ns),
+                ],
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+            )
+            .expect("delete indexes");
+        }
+    }
+
+    #[test]
+    fn arm_writes_schedule_due_index_with_primary_hash_readback() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+
+        let index = load_schedule_due_by_id_index(&db, &armed.routine_id)
+            .expect("load by-id index")
+            .expect("index exists");
+        assert_eq!(index.routine_id, armed.routine_id);
+        assert_eq!(
+            index.primary_key_hex,
+            hex_encode(armed_routine_key(&armed.routine_id).as_bytes())
+        );
+
+        let due_key = schedule_due_index_key(&armed.routine_id, index.due_ts_ns);
+        let due_value = load_exact_cf_value(&db, cf::CF_KV, &due_key, "test due index")
+            .expect("read due index")
+            .expect("due index exists");
+        let due_index = decode_schedule_due_index(&due_key, &due_value, "test due index")
+            .expect("decode due index");
+        assert_eq!(due_index, index);
+    }
+
+    #[test]
+    fn schedule_tick_does_not_scan_unindexed_armed_primary_rows() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        delete_schedule_due_indexes(&db, &armed.routine_id);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let (_now, evaluated, due, skipped) = due_armed_runs(&db, &params).expect("due");
+        assert_eq!(evaluated, 0);
+        assert!(due.is_empty());
+        assert!(skipped.is_empty());
+        assert!(
+            load_armed_routine_record(&db, &armed.routine_id)
+                .expect("load primary")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn schedule_tick_rejects_dangling_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        let primary_key = armed_routine_key(&armed.routine_id).into_bytes();
+        db.mutate_batch_pressure_bypass(cf::CF_KV, [primary_key], Vec::<(Vec<u8>, Vec<u8>)>::new())
+            .expect("delete primary only");
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let error = due_armed_runs(&db, &params).expect_err("dangling index must fail");
+        assert!(error.message.contains("ARMED_ROUTINE_DUE_INDEX_DANGLING"));
+    }
+
+    #[test]
+    fn schedule_tick_rejects_stale_routine_hash_in_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        let mut changed_routine = load_routine_record(db.as_ref(), &armed.routine_id)
+            .expect("load routine")
+            .expect("routine exists");
+        changed_routine.mean_minute_of_day = (changed_routine.mean_minute_of_day + 30) % 1440;
+        write_routine(&db, &changed_routine);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let error = due_armed_runs(&db, &params).expect_err("stale routine hash must fail");
+        assert!(
+            error
+                .message
+                .contains("ARMED_ROUTINE_DUE_INDEX_ROUTINE_HASH_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn schedule_tick_repairs_archived_routine_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        assert!(
+            load_schedule_due_by_id_index(&db, &armed.routine_id)
+                .expect("load index")
+                .is_some()
+        );
+        write_state(&db, &armed.routine_id, RoutineLifecycle::Archived);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let (_now, evaluated, due, skipped) = due_armed_runs(&db, &params).expect("due");
+        assert_eq!(evaluated, 1);
+        assert!(due.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "routine_lifecycle_disabled");
+        assert!(
+            load_schedule_due_by_id_index(&db, &armed.routine_id)
+                .expect("load repaired index")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn arm_requires_installed_automation_and_reads_back() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let routine = routine(now);
+        write_routine(&db, &routine);
+        write_state(&db, &routine.routine_id, RoutineLifecycle::Confirmed);
+
+        let missing = arm_routine(
+            &db,
+            &routine.routine_id,
+            ArmRoutineConfig::from_optional(None, None, None),
+            "test-session",
+            None,
+        )
+        .expect_err("automation missing");
+        assert!(missing.message.contains("ROUTINE_AUTOMATION_NOT_INSTALLED"));
+
+        write_automation(&db, &routine.routine_id);
+        let armed = arm_routine(
+            &db,
+            &routine.routine_id,
+            ArmRoutineConfig::from_optional(Some(true), Some(false), Some(2)),
+            "test-session",
+            Some("operator armed".to_owned()),
+        )
+        .expect("arm");
+        println!(
+            "readback=armed_routine routine_id={} enabled={} threshold={}",
+            armed.routine_id, armed.enabled, armed.failure_threshold
+        );
+        assert!(armed.enabled);
+        assert!(armed.schedule_enabled);
+        assert!(!armed.intent_enabled);
+        assert_eq!(armed.failure_threshold, 2);
+        assert_eq!(
+            load_armed_routine_record(&db, &routine.routine_id)
+                .expect("load")
+                .expect("row"),
+            armed
+        );
+    }
+
+    #[test]
+    fn schedule_due_claims_once_and_failure_threshold_disarms() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let routine = routine(now);
+        write_routine(&db, &routine);
+        write_state(&db, &routine.routine_id, RoutineLifecycle::Confirmed);
+        write_automation(&db, &routine.routine_id);
+        let armed = arm_routine(
+            &db,
+            &routine.routine_id,
+            ArmRoutineConfig::from_optional(Some(true), Some(false), Some(1)),
+            "test-session",
+            None,
+        )
+        .expect("arm");
+        assert!(armed.enabled);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let (_now, evaluated, due, skipped) = due_armed_runs(&db, &params).expect("due");
+        assert_eq!(evaluated, 1);
+        assert!(skipped.is_empty());
+        assert_eq!(due.len(), 1);
+        let started = claim_armed_run(&db, &due[0], now).expect("claim");
+        let duplicate = due_armed_runs(&db, &params).expect("due after claim").2;
+        assert!(duplicate.is_empty());
+
+        let completed = complete_armed_run(
+            &db,
+            started,
+            ArmedRoutineRunStatus::Failed,
+            None,
+            Some("px1-test".to_owned()),
+            None,
+            Some("TEST_FAILURE".to_owned()),
+            Some("failed".to_owned()),
+            json!({ "test": true }),
+        )
+        .expect("complete");
+        assert!(completed.disarmed_after_failure);
+        let armed = load_armed_routine_record(&db, &routine.routine_id)
+            .expect("load")
+            .expect("armed");
+        assert!(!armed.enabled);
+        assert_eq!(armed.consecutive_failures, 1);
+    }
 }

@@ -37,17 +37,10 @@ use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 use synapse_storage::{cf, decode_json};
 
-use crate::m1::mcp_error_with_remediation;
 use crate::m3::local_models::{
     LocalModelApiShape, LocalModelProbeParams, LocalModelRegistryRow, ResolvedApiKey,
 };
-use crate::m4::{
-    ActLaunchOutput, ActLaunchOutputArtifactReadback, ActLaunchOutputLaunchReadback,
-    ActRunShellExecutionMode, LaunchProcessExitObservation, LaunchTerminalCapture,
-    launch_process_terminal_history_row, launch_process_terminal_history_row_key,
-    run_shell_precondition_snapshot, run_shell_start_precondition_snapshot,
-    shell_precondition_resource_refusal,
-};
+use crate::m4::ActRunShellExecutionMode;
 
 use super::{
     m1_tools::validate_target_window,
@@ -66,142 +59,16 @@ pub(crate) const AGENT_SPAWN_MANIFEST_FILENAME: &str = "spawn-manifest.json";
 pub(crate) const AGENT_SPAWN_MANIFEST_VERSION: u32 = 1;
 const CODEX_APP_SERVER_RUNNER_SCRIPT: &str = include_str!("../codex_app_server_runner.ps1");
 const SHELL_FACADE_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\Synapse\\shell-jobs + %LOCALAPPDATA%\\Synapse\\shell-sessions + daemon-tool-events.jsonl";
-const PROCESS_FACADE_SOURCE_OF_TRUTH: &str = "live OS process table + CF_PROCESS_HISTORY + %LOCALAPPDATA%\\Synapse\\process-output\\sha256 + %TEMP%\\synapse-cdp-profiles\\.ownership";
+const PROCESS_FACADE_SOURCE_OF_TRUTH: &str = "live OS process table + CF_PROCESS_HISTORY";
 const PROCESS_LIST_DEFAULT_LIMIT: usize = 100;
 const PROCESS_LIST_MAX_LIMIT: usize = 1000;
 const PROCESS_HISTORY_DEFAULT_LIMIT: usize = 20;
 const PROCESS_HISTORY_MAX_LIMIT: usize = 200;
-const PROCESS_HISTORY_MAX_SCAN_ROWS: usize = 10_000;
-
-const ACTION_CAUSAL_ORACLE_REFUSED: &str = "SYNAPSE_CALYX_ACTION_CAUSAL_ORACLE_REFUSED";
-
-fn storage_error_with_remediation(error: &synapse_storage::StorageError) -> ErrorData {
-    error.remediation().map_or_else(
-        || mcp_error(error.code(), error.to_string()),
-        |remediation| mcp_error_with_remediation(error.code(), error.to_string(), remediation),
-    )
-}
-
-fn readiness_drift_disarms_autonomy(code: &str) -> bool {
-    matches!(
-        code,
-        "SYNAPSE_CALYX_READINESS_PUBLICATION_SOURCE_MOVED"
-            | "SYNAPSE_CALYX_READINESS_SOURCE_FRONTIER_MOVED"
-            | "SYNAPSE_CALYX_READINESS_EVIDENCE_STALE"
-            | "SYNAPSE_CALYX_READINESS_EVIDENCE_CORPUS_MOVED"
-            | "SYNAPSE_CALYX_READINESS_CAUSAL_REGISTRY_MOVED"
-            | "SYNAPSE_CALYX_READINESS_EVIDENCE_GUARD_REBOUND"
-    )
-}
-
-/// Applies the typed causal Oracle only after a canonical command-audit intent
-/// has been physically measured. `admitted=true, enforced=false` means the
-/// honesty gate is not ready and the pre-existing operator/allowlist boundary
-/// remains authoritative; it is never represented as a causal prediction.
-fn shell_causal_oracle_decision(
-    service: &SynapseService,
-    tool: &'static str,
-    intent: &super::command_audit::CommandAuditRowReadback,
-) -> Result<(Value, bool), ErrorData> {
-    let query_cx_id = intent.constellation_cx_id.as_deref().ok_or_else(|| {
-        mcp_error_with_remediation(
-            "SYNAPSE_CALYX_ACTION_CAUSAL_QUERY_ID_ABSENT",
-            format!(
-                "canonical {tool} intent row {} has no measured Calyx constellation identity",
-                intent.key_hex
-            ),
-            "preserve the action row and repair command-audit constellation publication; never reconstruct a causal query from a tool name or audit id",
-        )
-    })?;
-    let db = service.m3_storage()?;
-    let readiness = match db.oracle_readiness() {
-        Ok(value) => value,
-        Err(error) if readiness_drift_disarms_autonomy(error.code()) => {
-            return Ok((
-                json!({
-                    "schema": "synapse.action.causal_oracle_enforcement.v1",
-                    "query_cx_id": query_cx_id,
-                    "enforced": false,
-                    "admitted": true,
-                    "authority": "operator_and_allowlist",
-                    "readiness": "stale_not_armed",
-                    "code": error.code(),
-                    "detail": error.to_string(),
-                    "remediation": error.remediation(),
-                }),
-                true,
-            ));
-        }
-        Err(error) => return Err(storage_error_with_remediation(&error)),
-    };
-    let Some(readiness) = readiness else {
-        return Ok((
-            json!({
-                "schema": "synapse.action.causal_oracle_enforcement.v1",
-                "query_cx_id": query_cx_id,
-                "enforced": false,
-                "admitted": true,
-                "authority": "operator_and_allowlist",
-                "readiness": "absent_not_armed",
-                "remediation": "measure the compact causal Registry, validate grounded action evidence, calibrate the Guard, and persist readiness before enabling causal autonomy",
-            }),
-            true,
-        ));
-    };
-    let ready = readiness
-        .pointer("/report/overall")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            mcp_error_with_remediation(
-                "SYNAPSE_CALYX_ACTION_READINESS_SHAPE_INVALID",
-                "persisted action readiness has no Boolean report.overall verdict",
-                "quarantine the malformed readiness row and rerun oracle_validate plus oracle_readiness",
-            )
-        })?;
-    if !ready {
-        return Ok((
-            json!({
-                "schema": "synapse.action.causal_oracle_enforcement.v1",
-                "query_cx_id": query_cx_id,
-                "enforced": false,
-                "admitted": true,
-                "authority": "operator_and_allowlist",
-                "readiness": "not_ready_not_armed",
-                "readiness_row_revision_sha256": readiness.get("row_revision_sha256"),
-                "remediation": "follow the persisted readiness tier deficits; no causal prediction was requested or inferred",
-            }),
-            true,
-        ));
-    }
-    let prediction = db
-        .oracle_predict_action(query_cx_id)
-        .map_err(|error| storage_error_with_remediation(&error))?;
-    let admitted = prediction
-        .get("predicted_outcome")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            mcp_error_with_remediation(
-                "SYNAPSE_CALYX_ACTION_CAUSAL_PREDICTION_SHAPE_INVALID",
-                "typed action Oracle returned no Boolean predicted_outcome",
-                "preserve the Answer ledger and repair the typed Oracle response contract before retrying the action",
-            )
-        })?;
-    Ok((
-        json!({
-            "schema": "synapse.action.causal_oracle_enforcement.v1",
-            "query_cx_id": query_cx_id,
-            "enforced": true,
-            "admitted": admitted,
-            "authority": "typed_causal_oracle",
-            "readiness": "ready",
-            "prediction": prediction,
-        }),
-        admitted,
-    ))
-}
 
 mod agent_spawn;
 mod facade;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub(crate) use self::agent_spawn::agent_spawn_root_dir;
@@ -220,13 +87,16 @@ fn build_spawn_manifest(
 ) -> Result<Value, ErrorData> {
     let agent_kind = params.effective_cli()?;
     let effective_working_dir = working_dir.display().to_string();
-    let mut manifest = json!({
+    Ok(json!({
         "version": AGENT_SPAWN_MANIFEST_VERSION,
         "spawn_id": spawn_id,
         "cli": agent_kind.as_str(),
         "kind": agent_kind.as_str(),
+        "model": params.model_for_spawn_manifest(agent_kind),
+        "model_ref": params.local_model_ref(),
         "working_dir": effective_working_dir,
         "effective_working_dir": effective_working_dir,
+        "requested_working_dir": params.working_dir.as_deref(),
         "require_approval_gate": params.require_approval_gate,
         "approval_gate_effective": params.require_approval_gate && agent_kind.uses_approval_gate(),
         "local_model_autonomous_tool_calls": agent_kind.is_local_model(),
@@ -236,46 +106,17 @@ fn build_spawn_manifest(
             .prompt
             .as_deref()
             .is_some_and(|prompt| !prompt.trim().is_empty()),
+        // Spawn-template provenance (#909): the exact template version + config
+        // hash this spawn was rendered from, or null for a direct spawn. The
+        // manifest is the physical source of truth for run reproducibility.
+        "template_id": params.template_id.as_deref(),
+        "template_version": params.template_version,
+        "template_config_hash": params.template_config_hash.as_deref(),
         "created_unix_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
-    });
-    let object = manifest.as_object_mut().ok_or_else(|| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_spawn_agent internal error: spawn manifest literal was not an object",
-        )
-    })?;
-    if let Some(model) = params.model_for_spawn_manifest(agent_kind) {
-        object.insert("model".to_owned(), json!(model));
-    }
-    if let Some(model_ref) = params.local_model_ref() {
-        object.insert("model_ref".to_owned(), json!(model_ref));
-    }
-    if let Some(requested_working_dir) = params.working_dir.as_deref() {
-        object.insert(
-            "requested_working_dir".to_owned(),
-            json!(requested_working_dir),
-        );
-    }
-    // Spawn-template provenance (#909): the exact template version + config
-    // hash this spawn was rendered from. Absent fields are omitted, never
-    // serialized as null; the manifest is the physical source of truth for run
-    // reproducibility and its consumers reject present-but-invalid values.
-    if let Some(template_id) = params.template_id.as_deref() {
-        object.insert("template_id".to_owned(), json!(template_id));
-    }
-    if let Some(template_version) = params.template_version {
-        object.insert("template_version".to_owned(), json!(template_version));
-    }
-    if let Some(template_config_hash) = params.template_config_hash.as_deref() {
-        object.insert(
-            "template_config_hash".to_owned(),
-            json!(template_config_hash),
-        );
-    }
-    Ok(manifest)
+    }))
 }
 const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
@@ -832,7 +673,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows; cdp_profile_status reads the physical profile tree, external ownership ledger, and process identities; cdp_profile_repair is maintenance-gated and deletes only an exact revision-matched unowned orphan."
+        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows for launch readback."
     )]
     pub async fn process(
         &self,
@@ -856,8 +697,6 @@ impl SynapseService {
                     launch: None,
                     processes: Some(response),
                     history: None,
-                    cdp_profile_status: None,
-                    cdp_profile_repair: None,
                 }))
             }
             ProcessOperation::Launch => {
@@ -881,8 +720,6 @@ impl SynapseService {
                     launch: Some(response),
                     processes: None,
                     history: None,
-                    cdp_profile_status: None,
-                    cdp_profile_repair: None,
                 }))
             }
             ProcessOperation::History => {
@@ -893,42 +730,6 @@ impl SynapseService {
                     launch: None,
                     processes: None,
                     history: Some(response),
-                    cdp_profile_status: None,
-                    cdp_profile_repair: None,
-                }))
-            }
-            ProcessOperation::CdpProfileStatus => {
-                let token = process_cdp_profile_status_token(&params)?;
-                let response = crate::m4::cdp_profile_status(token.as_deref());
-                Ok(Json(ProcessFacadeResponse {
-                    operation,
-                    source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    launch: None,
-                    processes: None,
-                    history: None,
-                    cdp_profile_status: Some(response),
-                    cdp_profile_repair: None,
-                }))
-            }
-            ProcessOperation::CdpProfileRepair => {
-                let (token, revision) = process_cdp_profile_repair_params(&params)?;
-                crate::server::operational_facades::policy::require_maintenance_profile(
-                    self,
-                    &request_context,
-                    "process",
-                    "cdp_profile_repair",
-                    &token,
-                    PROCESS_FACADE_SOURCE_OF_TRUTH,
-                )?;
-                let response = crate::m4::repair_unowned_cdp_profile(&token, &revision)?;
-                Ok(Json(ProcessFacadeResponse {
-                    operation,
-                    source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    launch: None,
-                    processes: None,
-                    history: None,
-                    cdp_profile_status: None,
-                    cdp_profile_repair: Some(response),
                 }))
             }
         }
@@ -959,233 +760,23 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_params_for_context(raw_params, &shell_context)?;
-        let command_payload = run_shell_request_details(
-            &self.m4_config,
-            &params,
-            self.m4_config.run_shell_inline_await_limit_ms(),
-        );
-        let preconditions = match run_shell_precondition_snapshot(&params, Some(&shell_context)) {
-            Ok(preconditions) => preconditions,
-            Err(error) => {
-                // A probe refusal is itself a measured pre-trigger cause. It
-                // cannot populate resource counters that were never observed,
-                // but the exact typed failure must still join the command and
-                // outcome in the physical action log.
-                let command_before = json!({
-                    "source_of_truth": "durable shell registry/log files or inline child process",
-                    "session_id": &session_id,
-                    "execution_mode": params.execution_mode.as_str(),
-                    "precondition_measurement": {
-                        "status": "error",
-                        "error": super::command_audit::command_audit_error_from_error_data(&error),
-                        "process_created": false,
-                        "missing_counters_imputed": false,
-                    },
-                });
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "act_run_shell",
-                        "shell_run",
-                        Some(session_id.clone()),
-                        Some(session_id.clone()),
-                        command_payload.clone(),
-                        command_before.clone(),
-                        json!({
-                            "source_of_truth": "durable shell registry/log files or inline child process",
-                            "process_created": false,
-                        }),
-                        "error",
-                    )
-                    .with_error(super::command_audit::command_audit_error_from_error_data(
-                        &error,
-                    )),
-                )?;
-                self.audit_action_denied_with_details_for_session(
-                    "act_run_shell_precondition_snapshot",
-                    &error,
-                    &command_before,
-                    &session_id,
-                );
-                return Err(error);
-            }
-        };
-        let mut command_before = json!({
+        let command_payload =
+            run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms());
+        let command_before = json!({
             "source_of_truth": "durable shell registry/log files or inline child process",
             "session_id": &session_id,
             "execution_mode": params.execution_mode.as_str(),
-            "preconditions": preconditions,
         });
-        let intent_audit =
-            self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
-                "act_run_shell",
-                "shell_run",
-                Some(session_id.clone()),
-                Some(session_id.clone()),
-                command_payload.clone(),
-                command_before.clone(),
-                Value::Null,
-                "pending",
-            ))?;
-        let (causal_oracle, oracle_admitted) = match shell_causal_oracle_decision(
-            self,
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "act_run_shell",
-            &intent_audit,
-        ) {
-            Ok(decision) => decision,
-            Err(error) => {
-                let causal_oracle = json!({
-                    "schema": "synapse.action.causal_oracle_enforcement.v1",
-                    "query_cx_id": intent_audit.constellation_cx_id,
-                    "enforced": true,
-                    "admitted": false,
-                    "authority": "typed_causal_oracle",
-                    "evaluation_error": {
-                        "message": error.message.to_string(),
-                        "data": error.data,
-                    },
-                    "external_action_attempted": false,
-                });
-                command_before
-                    .as_object_mut()
-                    .ok_or_else(|| {
-                        mcp_error(
-                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                            "act_run_shell command-before evidence is not an object",
-                        )
-                    })?
-                    .insert("causal_oracle".to_owned(), causal_oracle.clone());
-                self.command_audit_final(
-                        super::command_audit::CommandAuditInput::mcp(
-                            "act_run_shell",
-                            "shell_run",
-                            Some(session_id.clone()),
-                            Some(session_id.clone()),
-                            command_payload.clone(),
-                            command_before.clone(),
-                            json!({
-                                "source_of_truth": "durable shell registry/log files or inline child process",
-                                "process_created": false,
-                                "causal_oracle": causal_oracle,
-                            }),
-                            "causal_refused_unobserved",
-                        )
-                        .with_error(
-                            super::command_audit::command_audit_error_from_error_data(&error),
-                        ),
-                    )?;
-                self.audit_action_refused_unobserved_with_details_for_session(
-                    "act_run_shell_causal_oracle",
-                    &error,
-                    &command_before,
-                    &session_id,
-                )?;
-                return Err(error);
-            }
-        };
-        command_before
-            .as_object_mut()
-            .ok_or_else(|| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    "act_run_shell command-before evidence is not an object",
-                )
-            })?
-            .insert("causal_oracle".to_owned(), causal_oracle.clone());
-        if !oracle_admitted {
-            let error = mcp_error_with_remediation(
-                ACTION_CAUSAL_ORACLE_REFUSED,
-                format!(
-                    "typed causal Oracle predicts failure for canonical intent constellation {:?}; no process was created",
-                    intent_audit.constellation_cx_id
-                ),
-                "inspect the prediction's grounded source CxIds and pre-trigger causes; change the request or collect a corrected grounded outcome before retrying",
-            );
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_run_shell",
-                    "shell_run",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload.clone(),
-                    command_before.clone(),
-                    json!({
-                        "source_of_truth": "durable shell registry/log files or inline child process",
-                        "process_created": false,
-                        "causal_oracle": causal_oracle,
-                    }),
-                    "causal_refused_unobserved",
-                )
-                .with_error(super::command_audit::command_audit_error_from_error_data(
-                    &error,
-                )),
-            )?;
-            self.audit_action_refused_unobserved_with_details_for_session(
-                "act_run_shell_causal_oracle",
-                &error,
-                &command_before,
-                &session_id,
-            )?;
-            return Err(error);
-        }
-        let resource_refusal = match shell_precondition_resource_refusal(&preconditions) {
-            Ok(refusal) => refusal,
-            Err(error) => {
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "act_run_shell",
-                        "shell_run",
-                        Some(session_id.clone()),
-                        Some(session_id.clone()),
-                        command_payload.clone(),
-                        command_before.clone(),
-                        json!({
-                            "source_of_truth": "durable shell registry/log files or inline child process",
-                            "process_created": false,
-                            "resource_snapshot_contract_valid": false,
-                        }),
-                        "error",
-                    )
-                    .with_error(super::command_audit::command_audit_error_from_error_data(
-                        &error,
-                    )),
-                )?;
-                self.audit_action_denied_with_details_for_session(
-                    "act_run_shell_resource_snapshot_contract",
-                    &error,
-                    &command_before,
-                    &session_id,
-                );
-                return Err(error);
-            }
-        };
-        if let Some(error) = resource_refusal {
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_run_shell",
-                    "shell_run",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload.clone(),
-                    command_before.clone(),
-                    json!({
-                        "source_of_truth": "durable shell registry/log files or inline child process",
-                        "process_created": false,
-                        "resource_snapshot_persisted_before_refusal": true,
-                    }),
-                    "error",
-                )
-                .with_error(super::command_audit::command_audit_error_from_error_data(
-                    &error,
-                )),
-            )?;
-            self.audit_action_denied_with_details_for_session(
-                "act_run_shell",
-                &error,
-                &command_before,
-                &session_id,
-            );
-            return Err(error);
-        }
+            "shell_run",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell",
             &command_payload,
@@ -1287,225 +878,22 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_start_params_for_context(raw_params, &shell_context)?;
-        let command_payload = run_shell_start_request_details(&self.m4_config, &params);
-        let preconditions = match run_shell_start_precondition_snapshot(
-            &params,
-            Some(&shell_context),
-        ) {
-            Ok(preconditions) => preconditions,
-            Err(error) => {
-                let command_before = json!({
-                    "source_of_truth": "durable shell registry/log files/process table",
-                    "session_id": &session_id,
-                    "job_id": &params.job_id,
-                    "precondition_measurement": {
-                        "status": "error",
-                        "error": super::command_audit::command_audit_error_from_error_data(&error),
-                        "process_created": false,
-                        "missing_counters_imputed": false,
-                    },
-                });
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "act_run_shell_start",
-                        "shell_spawn",
-                        Some(session_id.clone()),
-                        Some(session_id.clone()),
-                        command_payload.clone(),
-                        command_before.clone(),
-                        json!({
-                            "source_of_truth": "durable shell registry/log files/process table",
-                            "process_created": false,
-                        }),
-                        "error",
-                    )
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&error),
-                    ),
-                )?;
-                self.audit_action_denied_with_details_for_session(
-                    "act_run_shell_start_precondition_snapshot",
-                    &error,
-                    &command_before,
-                    &session_id,
-                );
-                return Err(error);
-            }
-        };
-        let mut command_before = json!({
+        let command_payload = run_shell_start_request_details(&params);
+        let command_before = json!({
             "source_of_truth": "durable shell registry/log files/process table",
             "session_id": &session_id,
             "job_id": &params.job_id,
-            "preconditions": preconditions,
         });
-        let intent_audit =
-            self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
-                "act_run_shell_start",
-                "shell_spawn",
-                Some(session_id.clone()),
-                Some(session_id.clone()),
-                command_payload.clone(),
-                command_before.clone(),
-                Value::Null,
-                "pending",
-            ))?;
-        let (causal_oracle, oracle_admitted) =
-            match shell_causal_oracle_decision(self, "act_run_shell_start", &intent_audit) {
-                Ok(decision) => decision,
-                Err(error) => {
-                    let causal_oracle = json!({
-                        "schema": "synapse.action.causal_oracle_enforcement.v1",
-                        "query_cx_id": intent_audit.constellation_cx_id,
-                        "enforced": true,
-                        "admitted": false,
-                        "authority": "typed_causal_oracle",
-                        "evaluation_error": {
-                            "message": error.message.to_string(),
-                            "data": error.data,
-                        },
-                        "external_action_attempted": false,
-                    });
-                    command_before
-                        .as_object_mut()
-                        .ok_or_else(|| {
-                            mcp_error(
-                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                                "act_run_shell_start command-before evidence is not an object",
-                            )
-                        })?
-                        .insert("causal_oracle".to_owned(), causal_oracle.clone());
-                    self.command_audit_final(
-                        super::command_audit::CommandAuditInput::mcp(
-                            "act_run_shell_start",
-                            "shell_spawn",
-                            Some(session_id.clone()),
-                            Some(session_id.clone()),
-                            command_payload.clone(),
-                            command_before.clone(),
-                            json!({
-                                "source_of_truth": "durable shell registry/log files/process table",
-                                "process_created": false,
-                                "causal_oracle": causal_oracle,
-                            }),
-                            "causal_refused_unobserved",
-                        )
-                        .with_error(
-                            super::command_audit::command_audit_error_from_error_data(&error),
-                        ),
-                    )?;
-                    self.audit_action_refused_unobserved_with_details_for_session(
-                        "act_run_shell_start_causal_oracle",
-                        &error,
-                        &command_before,
-                        &session_id,
-                    )?;
-                    return Err(error);
-                }
-            };
-        command_before
-            .as_object_mut()
-            .ok_or_else(|| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    "act_run_shell_start command-before evidence is not an object",
-                )
-            })?
-            .insert("causal_oracle".to_owned(), causal_oracle.clone());
-        if !oracle_admitted {
-            let error = mcp_error_with_remediation(
-                ACTION_CAUSAL_ORACLE_REFUSED,
-                format!(
-                    "typed causal Oracle predicts failure for canonical intent constellation {:?}; no process was created",
-                    intent_audit.constellation_cx_id
-                ),
-                "inspect the prediction's grounded source CxIds and pre-trigger causes; change the request or collect a corrected grounded outcome before retrying",
-            );
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_run_shell_start",
-                    "shell_spawn",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload.clone(),
-                    command_before.clone(),
-                    json!({
-                        "source_of_truth": "durable shell registry/log files/process table",
-                        "process_created": false,
-                        "causal_oracle": causal_oracle,
-                    }),
-                    "causal_refused_unobserved",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&error),
-                ),
-            )?;
-            self.audit_action_refused_unobserved_with_details_for_session(
-                "act_run_shell_start_causal_oracle",
-                &error,
-                &command_before,
-                &session_id,
-            )?;
-            return Err(error);
-        }
-        let resource_refusal = match shell_precondition_resource_refusal(&preconditions) {
-            Ok(refusal) => refusal,
-            Err(error) => {
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "act_run_shell_start",
-                        "shell_spawn",
-                        Some(session_id.clone()),
-                        Some(session_id.clone()),
-                        command_payload.clone(),
-                        command_before.clone(),
-                        json!({
-                            "source_of_truth": "durable shell registry/log files/process table",
-                            "process_created": false,
-                            "resource_snapshot_contract_valid": false,
-                        }),
-                        "error",
-                    )
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&error),
-                    ),
-                )?;
-                self.audit_action_denied_with_details_for_session(
-                    "act_run_shell_start_resource_snapshot_contract",
-                    &error,
-                    &command_before,
-                    &session_id,
-                );
-                return Err(error);
-            }
-        };
-        if let Some(error) = resource_refusal {
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_run_shell_start",
-                    "shell_spawn",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload.clone(),
-                    command_before.clone(),
-                    json!({
-                        "source_of_truth": "durable shell registry/log files/process table",
-                        "process_created": false,
-                        "resource_snapshot_persisted_before_refusal": true,
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&error),
-                ),
-            )?;
-            self.audit_action_denied_with_details_for_session(
-                "act_run_shell_start",
-                &error,
-                &command_before,
-                &session_id,
-            );
-            return Err(error);
-        }
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act_run_shell_start",
+            "shell_spawn",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell_start",
             &command_payload,
@@ -1991,12 +1379,7 @@ impl SynapseService {
                 let response = outcome.response.clone();
                 if let Err(error) = boundary("act_launch_after_low_level_launch") {
                     let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
-                    let cdp_cleanup = outcome
-                        .cdp_resource
-                        .take()
-                        .map(crate::m4::cleanup_launched_cdp_resource);
-                    let cleanup_verified = cleanup.remaining_process_ids.is_empty()
-                        && cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
+                    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
                     let drain = if cleanup_verified {
                         None
                     } else {
@@ -2013,29 +1396,24 @@ impl SynapseService {
                             "source_of_truth": "exact launched process tree + separate process-table readback",
                             "pid": response.pid,
                             "termination": cleanup,
-                            "cdp_cleanup": cdp_cleanup,
                             "cleanup_verified": cleanup_verified,
                             "drain": drain,
                         }),
                     ));
                 }
                 let process_job = if session_id.is_some() {
-                    match outcome.process_job.take() {
-                        Some(process_job) => Some(process_job),
-                        None => {
+                    match assign_owned_process_job(response.pid, "act_launch", None) {
+                        Ok(process_job) => Some(process_job),
+                        Err(error) => {
                             let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
-                            let cdp_cleanup = outcome
-                                .cdp_resource
-                                .take()
-                                .map(crate::m4::cleanup_launched_cdp_resource);
                             return Err(launch_lifecycle_tool_error(
-                                "act_launch spawned the process without the required pre-resume session Job Object; exact spawned PID cleanup was attempted",
+                                "act_launch spawned the process but failed to assign a session process job; exact spawned PID cleanup was attempted",
                                 json!({
                                     "code": error_codes::TOOL_INTERNAL_ERROR,
-                                    "reason": "pre_resume_process_job_missing",
+                                    "reason": "process_job_assign_failed",
                                     "pid": response.pid,
+                                    "source_error": error.message,
                                     "cleanup": cleanup,
-                                    "cdp_cleanup": cdp_cleanup,
                                 }),
                             ));
                         }
@@ -2043,14 +1421,8 @@ impl SynapseService {
                 } else {
                     None
                 };
-                if let Err(error) =
-                    record_launch_process_history(self, &params, &response, session_id.as_deref())
-                {
+                if let Err(error) = record_launch_process_history(self, &params, &response) {
                     let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
-                    let cdp_cleanup = outcome
-                        .cdp_resource
-                        .take()
-                        .map(crate::m4::cleanup_launched_cdp_resource);
                     return Err(launch_lifecycle_tool_error(
                         "act_launch spawned the process but failed to record process history; exact spawned PID cleanup was attempted",
                         json!({
@@ -2059,47 +1431,22 @@ impl SynapseService {
                             "pid": response.pid,
                             "source_error": error.message,
                             "cleanup": cleanup,
-                            "cdp_cleanup": cdp_cleanup,
                         }),
                     ));
                 }
-                let terminal_capture_control = outcome
-                    .terminal_capture
-                    .as_ref()
-                    .map(|capture| capture.control.clone());
-                let terminal_history_key = response.output.terminal_history_key.clone();
-                let cdp_exit_monitor_resource = outcome.cdp_resource.clone();
                 if let (Some(session_id), Some(process_job)) = (session_id.clone(), process_job) {
-                    if let Err((error, mut rejected_resource)) = self
-                        .register_session_process_resource_recoverable(
-                            super::session_lifecycle::SessionProcessResource::new(
-                                session_id.clone(),
-                                "act_launch",
-                                response.pid,
-                                None,
-                                params.target.clone(),
-                                process_job,
-                            )
-                            .with_desktop_lease(outcome.desktop_lease.take())
-                            .with_terminal_capture(terminal_capture_control, terminal_history_key)
-                            .with_cdp_resource(outcome.cdp_resource.take()),
+                    if let Err(error) = self.register_session_process_resource(
+                        super::session_lifecycle::SessionProcessResource::new(
+                            session_id,
+                            "act_launch",
+                            response.pid,
+                            None,
+                            params.target.clone(),
+                            process_job,
                         )
-                    {
+                        .with_desktop_lease(outcome.desktop_lease.take()),
+                    ) {
                         let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
-                        let cdp_cleanup = rejected_resource
-                            .cdp_resource
-                            .take()
-                            .map(crate::m4::cleanup_launched_cdp_resource);
-                        drop(rejected_resource.process_job.take());
-                        if let Some(capture) = outcome.terminal_capture.take() {
-                            spawn_launch_terminal_monitor(
-                                self.clone(),
-                                params.clone(),
-                                response.clone(),
-                                Some(session_id),
-                                capture,
-                            );
-                        }
                         return Err(launch_lifecycle_tool_error(
                             "act_launch spawned the process but failed to register the session process resource; exact spawned PID cleanup was attempted",
                             json!({
@@ -2108,22 +1455,9 @@ impl SynapseService {
                                 "pid": response.pid,
                                 "source_error": error.message,
                                 "cleanup": cleanup,
-                                "cdp_cleanup": cdp_cleanup,
                             }),
                         ));
                     }
-                }
-                if let Some(resource) = cdp_exit_monitor_resource {
-                    crate::m4::spawn_launched_cdp_exit_monitor(resource);
-                }
-                if let Some(capture) = outcome.terminal_capture.take() {
-                    spawn_launch_terminal_monitor(
-                        self.clone(),
-                        params.clone(),
-                        response.clone(),
-                        session_id.clone(),
-                        capture,
-                    );
                 }
                 Ok(response)
             }
@@ -2174,19 +1508,9 @@ fn record_launch_process_history(
     service: &SynapseService,
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
-    session_id: Option<&str>,
 ) -> Result<(), ErrorData> {
-    let row = launch_process_history_row(params, response, session_id)?;
+    let row = launch_process_history_row(params, response)?;
     let row_key = launch_process_history_row_key(response);
-    record_and_verify_process_history_row(service, row_key, row, "process_start")
-}
-
-fn record_and_verify_process_history_row(
-    service: &SynapseService,
-    row_key: Vec<u8>,
-    row: Vec<u8>,
-    row_kind: &'static str,
-) -> Result<(), ErrorData> {
     let runtime = service.reflex_runtime()?;
     let runtime = runtime.lock().map_err(|_error| {
         mcp_error(
@@ -2195,211 +1519,8 @@ fn record_and_verify_process_history_row(
         )
     })?;
     runtime
-        .storage_put_process_history_rows(vec![(row_key.clone(), row.clone())])
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let readback = runtime
-        .storage_cf_prefix_rows(cf::CF_PROCESS_HISTORY, &row_key, 2)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    if readback
-        .iter()
-        .any(|(key, value)| key == &row_key && value == &row)
-    {
-        return Ok(());
-    }
-    Err(mcp_error(
-        error_codes::STORAGE_READ_FAILED,
-        format!(
-            "act_launch {row_kind} process history independent readback mismatch for key={} readback_rows={}",
-            String::from_utf8_lossy(&row_key),
-            readback.len()
-        ),
-    ))
-}
-
-fn record_launch_terminal_history(
-    service: &SynapseService,
-    params: &ActLaunchParams,
-    response: &ActLaunchResponse,
-    session_id: Option<&str>,
-    exit: &LaunchProcessExitObservation,
-    status: &str,
-    stdout: Option<&ActLaunchOutputArtifactReadback>,
-    stderr: Option<&ActLaunchOutputArtifactReadback>,
-    termination_cause: Option<&str>,
-    error_message: Option<&str>,
-) -> Result<(), ErrorData> {
-    let row = launch_process_terminal_history_row(
-        params,
-        response,
-        session_id,
-        exit,
-        status,
-        stdout,
-        stderr,
-        termination_cause,
-        error_message,
-    )?;
-    record_and_verify_process_history_row(
-        service,
-        launch_process_terminal_history_row_key(response),
-        row,
-        "process_terminal",
-    )
-}
-
-fn launch_output_task_failure(
-    stream: &'static str,
-    detail: String,
-) -> ActLaunchOutputArtifactReadback {
-    ActLaunchOutputArtifactReadback {
-        state: "task_failed".to_owned(),
-        observed_bytes: 0,
-        observed_sha256: String::new(),
-        captured_bytes: 0,
-        captured_sha256: String::new(),
-        truncated: true,
-        preview_bytes: 0,
-        preview_base64: String::new(),
-        utf8_preview: None,
-        artifact_path: None,
-        artifact_verified: false,
-        error_message: Some(format!("{stream} capture task failed: {detail}")),
-    }
-}
-
-fn record_launch_monitor_failure(
-    response: &ActLaunchResponse,
-    stage: &'static str,
-    error: &ErrorData,
-) {
-    synapse_action::record_operator_panic_safety_incident();
-    tracing::error!(
-        code = "M4_ACT_LAUNCH_TERMINAL_PERSIST_FAILED",
-        launch_id = %response.launch_id,
-        pid = response.pid,
-        process_creation_time_100ns = ?response.process_creation_time_100ns,
-        stage,
-        error_message = %error.message,
-        error_data = ?error.data,
-        terminal_history_key = ?response.output.terminal_history_key,
-        "act_launch exact terminal observation could not be durably persisted and independently read back"
-    );
-}
-
-fn spawn_launch_terminal_monitor(
-    service: SynapseService,
-    params: ActLaunchParams,
-    response: ActLaunchResponse,
-    session_id: Option<String>,
-    capture: LaunchTerminalCapture,
-) {
-    tokio::spawn(async move {
-        let LaunchTerminalCapture {
-            control,
-            process_wait,
-            stdout,
-            stderr,
-        } = capture;
-        let exit = match process_wait.await {
-            Ok(exit) => exit,
-            Err(error) => LaunchProcessExitObservation {
-                status: "unevaluable".to_owned(),
-                exit_code: None,
-                process_creation_time_100ns: response
-                    .process_creation_time_100ns
-                    .unwrap_or_default(),
-                process_exit_time_100ns: None,
-                completed_at_unix_ms: None,
-                error_message: Some(format!("exact process waiter task failed: {error}")),
-            },
-        };
-        let pending_status = if exit.status == "observed" {
-            "exited_output_pending"
-        } else {
-            "unevaluable"
-        };
-        let pending_termination_cause = control.termination_cause().ok().flatten();
-        if let Err(error) = record_launch_terminal_history(
-            &service,
-            &params,
-            &response,
-            session_id.as_deref(),
-            &exit,
-            pending_status,
-            None,
-            None,
-            pending_termination_cause.as_deref(),
-            exit.error_message.as_deref(),
-        ) {
-            record_launch_monitor_failure(&response, "pending_terminal_write", &error);
-        }
-
-        let (stdout_join, stderr_join) = tokio::join!(stdout, stderr);
-        let stdout = stdout_join
-            .unwrap_or_else(|error| launch_output_task_failure("stdout", error.to_string()));
-        let stderr = stderr_join
-            .unwrap_or_else(|error| launch_output_task_failure("stderr", error.to_string()));
-        let output_fault = stdout.state != "complete" || stderr.state != "complete";
-        let mut errors = Vec::new();
-        let termination_cause = control.termination_cause().unwrap_or_else(|error| {
-            errors.push(error);
-            None
-        });
-        let status = if exit.status != "observed" {
-            "unevaluable"
-        } else if output_fault {
-            "output_fault"
-        } else if let Some(cause) = termination_cause.as_deref() {
-            cause
-        } else if exit.exit_code == Some(0) {
-            "exit_zero"
-        } else {
-            "exit_nonzero"
-        };
-        if let Some(error) = exit.error_message.as_deref() {
-            errors.push(error.to_owned());
-        }
-        if let Some(error) = stdout.error_message.as_deref() {
-            errors.push(error.to_owned());
-        }
-        if let Some(error) = stderr.error_message.as_deref() {
-            errors.push(error.to_owned());
-        }
-        let error_message = (!errors.is_empty()).then(|| errors.join("; "));
-        if let Err(error) = record_launch_terminal_history(
-            &service,
-            &params,
-            &response,
-            session_id.as_deref(),
-            &exit,
-            status,
-            Some(&stdout),
-            Some(&stderr),
-            termination_cause.as_deref(),
-            error_message.as_deref(),
-        ) {
-            record_launch_monitor_failure(&response, "final_terminal_write", &error);
-            return;
-        }
-        tracing::info!(
-            code = "M4_ACT_LAUNCH_TERMINAL_RECORDED",
-            launch_id = %response.launch_id,
-            pid = response.pid,
-            process_creation_time_100ns = ?response.process_creation_time_100ns,
-            status,
-            exit_code = ?exit.exit_code,
-            stdout_observed_bytes = stdout.observed_bytes,
-            stdout_captured_bytes = stdout.captured_bytes,
-            stdout_truncated = stdout.truncated,
-            stdout_sha256 = %stdout.captured_sha256,
-            stderr_observed_bytes = stderr.observed_bytes,
-            stderr_captured_bytes = stderr.captured_bytes,
-            stderr_truncated = stderr.truncated,
-            stderr_sha256 = %stderr.captured_sha256,
-            terminal_history_key = ?response.output.terminal_history_key,
-            "readback=CF_PROCESS_HISTORY+content_addressed_process_output after=terminal_verified"
-        );
-    });
+        .storage_put_process_history_rows(vec![(row_key, row)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
 }
 
 fn launch_agent_spawn_with_terminal_capture(
@@ -2449,12 +1570,8 @@ fn launch_agent_spawn_with_terminal_capture(
         status_path = %spawned.artifacts.status_path.display(),
         "act_spawn_agent launched wrapper in an owned PTY"
     );
-    let process_creation_time_100ns =
-        synapse_action::capture_process_parentage(spawned.process_id).child_start_time_100ns;
     Ok(ActLaunchResponse {
-        launch_id: format!("agent_spawn/{spawn_id}"),
         pid: spawned.process_id,
-        process_creation_time_100ns,
         hwnd: None,
         window_owner_pid: None,
         reused_existing_window: false,
@@ -2466,20 +1583,7 @@ fn launch_agent_spawn_with_terminal_capture(
         cdp_user_data_dir: None,
         cdp_verified_url: None,
         cdp_verified_title: None,
-        cdp_verified_target_id: None,
-        cdp_registration_id: None,
-        cdp_browser_id: None,
-        cdp_browser_websocket_url: None,
-        cdp_listener_pid: None,
-        cdp_listener_process_creation_time_100ns: None,
-        cdp_profile_ownership: None,
         desktop: None,
-        output: ActLaunchOutputLaunchReadback {
-            mode: "owned_conpty_capture".to_owned(),
-            terminal_observation: "external_agent_capture".to_owned(),
-            max_bytes_per_stream: None,
-            terminal_history_key: None,
-        },
     })
 }
 
@@ -3200,7 +2304,6 @@ impl SynapseService {
             force_renderer_accessibility: None,
             windows_console_window_state: Some(LaunchWindowState::Hidden),
             desktop: None,
-            output: None,
         };
 
         timing.mark_prelaunch_done();
@@ -3291,12 +2394,7 @@ impl SynapseService {
                 ));
             }
         };
-        if let Err(error) = record_launch_process_history(
-            self,
-            &launch_params,
-            &launch_response,
-            started_by_session_id.as_deref(),
-        ) {
+        if let Err(error) = record_launch_process_history(self, &launch_params, &launch_response) {
             let cleanup = crate::m4::terminate_owned_process_tree(launch_response.pid);
             let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
                 &files,
@@ -3330,7 +2428,7 @@ impl SynapseService {
         timing.mark_session_wait_started();
         let session_wait_deadline =
             agent_spawn_wait_deadline_from(Instant::now(), params.wait_timeout_ms)?;
-        let matched = match await_agent_spawn_phase_under_operator_panic_guard(
+        let mut matched = match await_agent_spawn_phase_under_operator_panic_guard(
             in_flight,
             "while_waiting_for_spawned_agent_session",
             self.wait_for_spawned_agent_session(
@@ -3414,7 +2512,9 @@ impl SynapseService {
                 &params,
                 agent_kind,
                 &spawn_id,
-                &matched,
+                &mut matched,
+                &before_session_ids,
+                launched_at_unix_ms,
                 launch_response.pid,
                 &files,
                 task_wait_deadline,
@@ -3655,7 +2755,6 @@ impl SynapseService {
             spawn_id,
             cli: agent_kind,
             kind: agent_kind,
-            model: params.model.clone(),
             model_ref: local_model_row
                 .as_ref()
                 .map(|row| row.name.clone())
@@ -3887,11 +2986,18 @@ impl SynapseService {
                         "data": error.data,
                     })
                 })?;
+            let mut matched_session = None;
             let session_count = candidates.len();
             let mut sessions_json = Vec::new();
             let mut readiness_reason_counts: BTreeMap<String, u64> = BTreeMap::new();
             let mut candidate_readiness = Vec::new();
             let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
+            let mut explicit_task_session_match = None;
+            let mut ready_candidates = Vec::new();
+            // Sessions that are a new + in-window + CLI match for this spawn but
+            // have not (yet) issued a daemon MCP tool call. They are identified
+            // as ours; we bind one only with independent proof of task progress.
+            let mut lenient_candidates: Vec<String> = Vec::new();
             for candidate in &candidates {
                 let readiness = spawn_session_candidate_readiness_from_read(
                     &candidate.registry,
@@ -3907,11 +3013,26 @@ impl SynapseService {
                     .unwrap_or("unknown")
                     .to_owned();
                 *readiness_reason_counts.entry(reason.clone()).or_default() += 1;
+                if reason == "tool_call_not_observed" {
+                    lenient_candidates.push(candidate.registry.session_id.clone());
+                }
                 if explicit_task_session_id.as_deref()
                     == Some(candidate.registry.session_id.as_str())
-                    && readiness.get("ready").and_then(Value::as_bool) == Some(true)
+                    && spawn_session_identity_matches_from_read(
+                        &candidate.registry,
+                        agent_kind,
+                        before_session_ids,
+                        launched_at_unix_ms,
+                    )
                 {
-                    return Ok(MatchedSpawnSession {
+                    explicit_task_session_match = Some(MatchedSpawnSession {
+                        session_id: candidate.registry.session_id.clone(),
+                        registered_at_unix_ms: unix_time_ms_now(),
+                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
+                    });
+                }
+                if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
+                    ready_candidates.push(MatchedSpawnSession {
                         session_id: candidate.registry.session_id.clone(),
                         registered_at_unix_ms: unix_time_ms_now(),
                         agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
@@ -3933,22 +3054,60 @@ impl SynapseService {
                 }
             }
             last_observed = json!({
-                "reason": if explicit_task_session_id.is_some() {
-                    "task_start_session_not_ready"
-                } else {
-                    "task_start_artifact_not_observed"
-                },
+                "reason": "candidate_not_ready",
                 "session_count": session_count,
                 "sessions_recorded": sessions_json.len(),
                 "readiness_reason_counts": readiness_reason_counts,
                 "candidate_readiness_recorded": candidate_readiness.len(),
                 "candidate_readiness": candidate_readiness,
                 "explicit_task_session_id": explicit_task_session_id.clone(),
+                "ready_candidate_count": ready_candidates.len(),
                 "sessions": sessions_json,
                 "readiness_files": agent_spawn_readiness_file_readback(files),
-                "identity_model": "exact spawn-bound task-start artifact session_id + live session registry identity; temporal/kind/tool-call candidates are diagnostic only",
-                "read_model": "task-started.json + session registry + per-session logical foreground target only; skips full session_list attached process/window scan",
+                "read_model": "session_registry + per-session logical foreground target only; skips full session_list attached process/window scan",
             });
+
+            if let Some(matched) = explicit_task_session_match {
+                return Ok(matched);
+            }
+            if explicit_task_session_id.is_none() && ready_candidates.len() == 1 {
+                matched_session = ready_candidates.pop();
+            }
+            if let Some(matched) = matched_session {
+                return Ok(matched);
+            }
+
+            // Robust fallback for the agent-cooperative readiness protocol: a
+            // session that registered, matches this spawn's CLI, and started in
+            // the launch window is ours even if it never issued a daemon MCP
+            // tool call (codex drives its own app-server tools; any agent may
+            // skip the injected ceremony). Bind it only when the daemon
+            // INDEPENDENTLY observes the task is underway, and only when the
+            // candidate is unambiguous — fan_out disambiguates via the agent's
+            // self-named session in the task-start artifact.
+            if !lenient_candidates.is_empty()
+                && agent_spawn_observed_task_progress(files, agent_kind).is_some()
+            {
+                let bind = if lenient_candidates.len() == 1 {
+                    Some(lenient_candidates[0].clone())
+                } else {
+                    read_json_file_lossy(&files.task_started_path)
+                        .and_then(|value| {
+                            value
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .filter(|session_id| lenient_candidates.contains(session_id))
+                };
+                if let Some(session_id) = bind {
+                    return Ok(MatchedSpawnSession {
+                        session_id,
+                        registered_at_unix_ms: unix_time_ms_now(),
+                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
+                    });
+                }
+            }
 
             if process_has_exited(launcher_pid) {
                 return Err(json!({
@@ -3971,7 +3130,9 @@ impl SynapseService {
         params: &ActSpawnAgentParams,
         agent_kind: ActSpawnAgentCli,
         spawn_id: &str,
-        matched: &MatchedSpawnSession,
+        matched: &mut MatchedSpawnSession,
+        before_session_ids: &BTreeSet<String>,
+        launched_at_unix_ms: u64,
         launcher_pid: u32,
         files: &AgentSpawnFiles,
         deadline: Instant,
@@ -3984,14 +3145,44 @@ impl SynapseService {
             if let Err(liveness_error) =
                 self.require_spawned_agent_session_live(&matched.session_id, files, agent_kind)
             {
-                return Err(json!({
-                    "reason": "task_start_artifact_session_not_live",
-                    "matched_session_id": matched.session_id,
-                    "task_started_path": files.task_started_path.display().to_string(),
-                    "session_liveness_error": liveness_error,
-                    "readiness_files": agent_spawn_readiness_file_readback(files),
-                    "observed_task_progress": agent_spawn_observed_task_progress(files, agent_kind),
-                }));
+                match self.rebind_spawned_agent_session_for_task_start(
+                    params,
+                    agent_kind,
+                    spawn_id,
+                    before_session_ids,
+                    launched_at_unix_ms,
+                    launcher_pid,
+                    files,
+                    &liveness_error,
+                )? {
+                    Some(rebound) => {
+                        *matched = rebound;
+                    }
+                    None => {
+                        last_observed = json!({
+                            "reason": "matched_session_not_live_waiting_for_replacement",
+                            "matched_session_id": matched.session_id,
+                            "task_started_path": files.task_started_path.display().to_string(),
+                            "session_liveness_error": liveness_error,
+                            "readiness_files": agent_spawn_readiness_file_readback(files),
+                            "observed_task_progress": agent_spawn_observed_task_progress(files, agent_kind),
+                        });
+                        if process_has_exited(launcher_pid) {
+                            return Err(json!({
+                                "reason": "launcher_process_exited_after_matched_session_closed",
+                                "launcher_process_id": launcher_pid,
+                                "task_started_path": files.task_started_path.display().to_string(),
+                                "completion_status": read_json_file_lossy(&files.completion_status_path),
+                                "stdout_tail": tail_file_lossy(&files.stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "stderr_tail": tail_file_lossy(&files.stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "final_message_tail": tail_file_lossy(&files.final_message_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "last_observed": last_observed,
+                            }));
+                        }
+                        sleep_agent_spawn_poll(deadline).await;
+                        continue;
+                    }
+                }
             }
             match read_agent_spawn_task_start_artifact(
                 files, params, agent_kind, spawn_id, matched,
@@ -4034,6 +3225,105 @@ impl SynapseService {
             "reason": "task_start_artifact_timeout",
             "task_started_path": files.task_started_path.display().to_string(),
             "last_observed": last_observed,
+        }))
+    }
+
+    fn rebind_spawned_agent_session_for_task_start(
+        &self,
+        params: &ActSpawnAgentParams,
+        agent_kind: ActSpawnAgentCli,
+        spawn_id: &str,
+        before_session_ids: &BTreeSet<String>,
+        launched_at_unix_ms: u64,
+        launcher_pid: u32,
+        files: &AgentSpawnFiles,
+        liveness_error: &serde_json::Value,
+    ) -> Result<Option<MatchedSpawnSession>, serde_json::Value> {
+        let candidates = self
+            .spawn_session_candidates_for_readiness(params.target.is_some())
+            .map_err(|error| {
+                json!({
+                    "reason": "spawn_rebind_candidate_read_failed",
+                    "error": error.message,
+                    "data": error.data,
+                    "session_liveness_error": liveness_error,
+                })
+            })?;
+        let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
+        let observed_task_progress = agent_spawn_observed_task_progress(files, agent_kind);
+        let mut ready_candidates = Vec::new();
+        let mut lenient_candidates = Vec::new();
+        let mut candidate_readiness = Vec::new();
+        for candidate in &candidates {
+            let readiness = spawn_session_candidate_readiness_from_read(
+                &candidate.registry,
+                candidate.active_target.as_ref(),
+                agent_kind,
+                params.target.as_ref(),
+                before_session_ids,
+                launched_at_unix_ms,
+            );
+            let reason = readiness
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if candidate_readiness.len() < AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT
+                && reason != "session_existed_before_spawn"
+            {
+                candidate_readiness.push(json!({
+                    "session_id": candidate.registry.session_id,
+                    "started_at_unix_ms": candidate.registry.started_at_unix_ms,
+                    "last_action": candidate.registry.last_action,
+                    "active_target": candidate.active_target,
+                    "readiness": readiness.clone(),
+                }));
+            }
+            if explicit_task_session_id.as_deref() == Some(candidate.registry.session_id.as_str())
+                && spawn_session_identity_matches_from_read(
+                    &candidate.registry,
+                    agent_kind,
+                    before_session_ids,
+                    launched_at_unix_ms,
+                )
+            {
+                return Ok(Some(MatchedSpawnSession {
+                    session_id: candidate.registry.session_id.clone(),
+                    registered_at_unix_ms: unix_time_ms_now(),
+                    agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
+                }));
+            }
+            if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
+                ready_candidates.push(candidate.registry.session_id.clone());
+            } else if reason == "tool_call_not_observed" && observed_task_progress.is_some() {
+                lenient_candidates.push(candidate.registry.session_id.clone());
+            }
+        }
+
+        let bind = if ready_candidates.len() == 1 {
+            Some(ready_candidates[0].clone())
+        } else if ready_candidates.is_empty() && lenient_candidates.len() == 1 {
+            Some(lenient_candidates[0].clone())
+        } else if ready_candidates.len() + lenient_candidates.len() > 1 {
+            return Err(json!({
+                "reason": "spawn_rebind_ambiguous",
+                "explicit_task_session_id": explicit_task_session_id,
+                "ready_candidate_count": ready_candidates.len(),
+                "lenient_candidate_count": lenient_candidates.len(),
+                "ready_candidates": ready_candidates,
+                "lenient_candidates": lenient_candidates,
+                "candidate_readiness": candidate_readiness,
+                "session_liveness_error": liveness_error,
+                "readiness_files": agent_spawn_readiness_file_readback(files),
+                "observed_task_progress": observed_task_progress,
+            }));
+        } else {
+            None
+        };
+
+        Ok(bind.map(|session_id| MatchedSpawnSession {
+            session_id,
+            registered_at_unix_ms: unix_time_ms_now(),
+            agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
         }))
     }
 

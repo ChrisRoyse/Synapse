@@ -1,0 +1,20 @@
+schema_version = 1
+kind = "profile_package_revocation"
+revocation_id = "revocation.synthetic.governance.2026-05-27"
+package_id = "profile.synthetic.governance"
+package_version = "0.1.0"
+profile_id = "synthetic.governance"
+profile_version = "1.0.0"
+revoked = true
+reason_code = "operator_revoked"
+reason = "Synthetic revocation fixture for issue #470 manual FSV."
+effective_at = "2026-05-27T00:15:00Z"
+scope = ["install", "activation", "promotion", "export"]
+local_behavior = "quarantine_package_and_refuse_new_activations"
+retention_behavior = "keep_prior_audit_rows_until_retention_expiry_with_package_id"
+replacement_package_id = ""
+replacement_package_version = ""
+
+[attribution]
+revoked_by = "Synapse Agent <synthetic@example.invalid>"
+notice = "Synthetic tombstone proving revoked packages remain explainable."

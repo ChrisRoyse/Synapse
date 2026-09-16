@@ -92,6 +92,11 @@ pub const EVENT_FILTER_MAX_DEPTH: u32 = 8;
 
 impl EventFilter {
     #[must_use]
+    pub fn matches(&self, event: &Event) -> bool {
+        crate::filter::matches_event_filter(self, event)
+    }
+
+    #[must_use]
     pub fn is_trivially_always_true(&self) -> bool {
         match self {
             Self::All => true,
@@ -208,6 +213,13 @@ pub enum DataPredicate {
     Regex { pattern: String },
     InSet { values: Vec<serde_json::Value> },
     Exists,
+}
+
+impl DataPredicate {
+    #[must_use]
+    pub fn matches(&self, value: Option<&serde_json::Value>) -> bool {
+        crate::filter::matches_data_predicate(self, value)
+    }
 }
 
 fn validate_data_filter(

@@ -1,0 +1,13 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"ProfileMatch\", \"snapshot\", full_profile_match())?"
+---
+{
+  "exe": "javaw.exe",
+  "title_regex": "Minecraft\\* [0-9]",
+  "steam_appid": 12345,
+  "window_class": "LWJGL",
+  "process_args": [
+    "--demo"
+  ]
+}

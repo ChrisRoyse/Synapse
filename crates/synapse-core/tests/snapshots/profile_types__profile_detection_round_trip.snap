@@ -1,0 +1,13 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"ProfileDetection\", \"snapshot\", full_detection())?"
+---
+{
+  "model_id": "yolov10n_general",
+  "classes_of_interest": [
+    "player",
+    "creeper"
+  ],
+  "confidence_threshold": 0.45,
+  "max_detections": 32
+}

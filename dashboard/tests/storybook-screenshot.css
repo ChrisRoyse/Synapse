@@ -1,0 +1,14 @@
+*,
+*::before,
+*::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+  caret-color: transparent !important;
+}
+
+[data-testid="volatile-time"],
+[aria-live="polite"] {
+  visibility: hidden !important;
+}

@@ -1,5 +1,6 @@
 use std::{collections::HashSet, time::Duration};
 
+use chrono::Utc;
 use serde_json::{Value, json};
 use synapse_core::{
     Action, ButtonAction, Event, Point, ReflexAimAxis, ReflexButtonTarget, ReflexState,
@@ -27,6 +28,7 @@ use crate::{
         },
     },
     scheduler::ScheduledReflexDriver,
+    write_audit,
 };
 
 pub(super) fn step_stateful_controllers(
@@ -430,7 +432,7 @@ fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
     ReflexActionDispatchContext::new(
         runtime.action_handle.clone(),
         runtime.action_gate.clone(),
-        runtime.denied_terminal_audits.clone(),
+        runtime.audit_db.clone(),
         runtime.audit_context.clone(),
         runtime.tick_index,
     )
@@ -640,10 +642,7 @@ fn write_path_follow_tick_audit(
     if records.is_empty() {
         return;
     }
-    let Some(sink) = runtime.audit_sink.as_deref() else {
-        return;
-    };
-    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_PATH_FOLLOW_TICK_KIND) else {
+    let Some(db) = runtime.audit_db.as_deref() else {
         return;
     };
     let steps = records
@@ -664,7 +663,7 @@ fn write_path_follow_tick_audit(
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.to_owned(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -679,7 +678,15 @@ fn write_path_follow_tick_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    sink.enqueue(audit);
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_path_follow",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "path_follow dispatch audit write failed"
+        );
+    }
 }
 
 fn warn_stateful_dispatch_blocked(index: usize, error: &ReflexError) {
@@ -712,18 +719,14 @@ fn write_aim_track_correction_audit(
     smoothed_delta: (f64, f64),
     snapshot: &AimTrackTargetSnapshot,
 ) {
-    let Some(sink) = runtime.audit_sink.as_deref() else {
-        return;
-    };
-    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_AIM_TRACK_CORRECTION_KIND)
-    else {
+    let Some(db) = runtime.audit_db.as_deref() else {
         return;
     };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.to_owned(),
-        ts_ns,
+        ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -747,7 +750,15 @@ fn write_aim_track_correction_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    sink.enqueue(audit);
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_aim_track",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "aim_track correction audit write failed"
+        );
+    }
 }
 
 fn aim_track_params_value(params: &AimTrackParams) -> Value {
@@ -833,4 +844,11 @@ const fn aim_axis_value(axis: ReflexAimAxis) -> &'static str {
         ReflexAimAxis::XOnly => "x_only",
         ReflexAimAxis::YOnly => "y_only",
     }
+}
+
+fn now_ts_ns() -> u64 {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default()
 }

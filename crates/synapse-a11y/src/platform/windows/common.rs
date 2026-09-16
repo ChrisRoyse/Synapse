@@ -21,17 +21,13 @@ use windows::Win32::{
     System::{
         Com::{
             APTTYPE, APTTYPE_MAINSTA, APTTYPE_MTA, APTTYPE_NA, APTTYPE_STA, APTTYPEQUALIFIER,
-            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoGetApartmentType,
-            CoInitializeEx, CoUninitialize,
+            COINIT_MULTITHREADED, CoGetApartmentType, CoInitializeEx, CoUninitialize,
         },
         Threading::GetCurrentThreadId,
     },
-    UI::{
-        Accessibility::{CUIAutomation8, IUIAutomation, IUIAutomation2},
-        WindowsAndMessaging::EnumThreadWindows,
-    },
+    UI::WindowsAndMessaging::EnumThreadWindows,
 };
-use windows::core::{BOOL, Interface};
+use windows::core::BOOL;
 
 use crate::{
     A11yError, A11yResult, ComApartmentKind, ElementSearchScope, UiaWorkerReadback,
@@ -125,7 +121,7 @@ fn uia_worker_thread(
         return;
     }
 
-    let automation = match create_background_safe_automation() {
+    let automation = match UIAutomation::new_direct().map_err(map_uia_error) {
         Ok(automation) => automation,
         Err(err) => {
             let _ = ready.send(Err(err));
@@ -146,68 +142,6 @@ fn uia_worker_thread(
     unsafe {
         CoUninitialize();
     }
-}
-
-/// Creates the Windows 8+ UI Automation client coclass that actually exposes
-/// `IUIAutomation2`, then configures its background-safety invariant before
-/// wrapping the base interface used by the `uiautomation` crate.
-///
-/// `uiautomation::UIAutomation::new_direct` instantiates the legacy
-/// `CUIAutomation` coclass. That coclass exposes only `IUIAutomation`, so a
-/// later `QueryInterface<IUIAutomation2>` fails with `E_NOINTERFACE` even on a
-/// current Windows host. `CUIAutomation8` is the documented implementation of
-/// `IUIAutomation2`; both interface views below refer to the same COM object.
-fn create_background_safe_automation() -> A11yResult<UIAutomation> {
-    let automation: IUIAutomation = unsafe {
-        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
-    }
-    .map_err(|error| {
-        A11yError::internal(format!(
-            "code=A11Y_UIA_MODERN_CLIENT_CREATE_FAILED operation=CoCreateInstance(CUIAutomation8) expected=IUIAutomation actual={error} remediation=repair or update Windows UI Automation; Synapse requires the Windows 8+ client coclass so background actions can disable implicit focus changes"
-        ))
-    })?;
-    let automation = UIAutomation::from(automation);
-    configure_background_safe_automation(&automation)?;
-    Ok(automation)
-}
-
-/// Disables UI Automation's implicit focus changes for action patterns.
-///
-/// `IUIAutomation2::AutoSetFocus` defaults to true, which lets background
-/// `Invoke` and `ValuePattern::SetValue` calls seize the human's real Windows
-/// foreground. Synapse owns one process-wide UIA client, so configure the
-/// invariant once before the worker advertises readiness and read it back from
-/// the COM object itself. An older/incompatible provider is not a reason to
-/// retain the disruptive default: worker startup fails with exact remediation.
-fn configure_background_safe_automation(automation: &UIAutomation) -> A11yResult<()> {
-    let automation2: IUIAutomation2 = automation.as_ref().cast().map_err(|error| {
-        A11yError::internal(format!(
-            "code=A11Y_UIA_AUTO_SET_FOCUS_UNAVAILABLE operation=IUIAutomation::QueryInterface<IUIAutomation2> expected=IUIAutomation2 actual={error} remediation=repair or update Windows UI Automation; Synapse refuses background actions while implicit focus stealing cannot be disabled"
-        ))
-    })?;
-    unsafe { automation2.SetAutoSetFocus(false) }.map_err(|error| {
-        A11yError::internal(format!(
-            "code=A11Y_UIA_AUTO_SET_FOCUS_SET_FAILED operation=IUIAutomation2::SetAutoSetFocus expected=false actual=error:{error} remediation=repair Windows UI Automation; Synapse refuses background actions while the disruptive default remains enabled"
-        ))
-    })?;
-    let auto_set_focus = unsafe { automation2.AutoSetFocus() }.map_err(|error| {
-        A11yError::internal(format!(
-            "code=A11Y_UIA_AUTO_SET_FOCUS_READBACK_FAILED operation=IUIAutomation2::AutoSetFocus expected=false actual=error:{error} remediation=repair Windows UI Automation; Synapse could not prove background actions preserve the human foreground"
-        ))
-    })?;
-    if auto_set_focus.as_bool() {
-        return Err(A11yError::internal(
-            "code=A11Y_UIA_AUTO_SET_FOCUS_POSTCONDITION_FAILED operation=IUIAutomation2::AutoSetFocus expected=false actual=true remediation=repair Windows UI Automation; Synapse refuses background actions because implicit focus stealing is still enabled",
-        ));
-    }
-    tracing::info!(
-        code = "A11Y_UIA_AUTO_SET_FOCUS_DISABLED",
-        auto_set_focus = false,
-        source_of_truth =
-            "IUIAutomation2::AutoSetFocus read immediately after SetAutoSetFocus(false)",
-        "UI Automation action patterns configured to preserve the human foreground"
-    );
-    Ok(())
 }
 
 pub(super) fn with_automation<T: Send + 'static>(
@@ -737,4 +671,64 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn map_uia_error(err: uiautomation::Error) -> A11yError {
     A11yError::internal(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_worker(timed_out: bool) -> ProcessUiaWorker {
+        let (tx, _rx) = mpsc::channel::<UiaJob>();
+        ProcessUiaWorker {
+            tx,
+            timed_out: Arc::new(AtomicBool::new(timed_out)),
+            job_lock: Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn acquire_job_slot_reports_busy_instead_of_queueing() {
+        let worker = dummy_worker(false);
+        let _held = worker
+            .job_lock
+            .lock()
+            .unwrap_or_else(|error| panic!("test worker lock poisoned: {error}"));
+
+        let result = acquire_job_slot(
+            &worker,
+            "test_busy",
+            Duration::from_millis(1),
+            Instant::now(),
+        );
+
+        let Err(error) = result else {
+            panic!("busy worker should reject the second queued job");
+        };
+        assert_eq!(
+            error.code(),
+            synapse_core::error_codes::A11Y_UIA_WORKER_TIMEOUT
+        );
+        assert!(error.to_string().contains("phase=worker_busy"));
+    }
+
+    #[test]
+    fn acquire_job_slot_reports_unavailable_after_timeout_flag() {
+        let worker = dummy_worker(true);
+
+        let result = acquire_job_slot(
+            &worker,
+            "test_timeout",
+            Duration::from_millis(100),
+            Instant::now(),
+        );
+
+        let Err(error) = result else {
+            panic!("timed-out worker should reject new jobs");
+        };
+        assert_eq!(
+            error.code(),
+            synapse_core::error_codes::A11Y_UIA_WORKER_TIMEOUT
+        );
+        assert!(error.to_string().contains("phase=worker_unavailable"));
+    }
 }

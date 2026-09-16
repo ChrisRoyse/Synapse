@@ -7,19 +7,16 @@ use super::{
         AgentSteerResponse, AgentSuspendResponse,
     },
     agent_mailbox::{
-        AgentInboxParams, AgentInboxResponse, AgentMailboxRepairParams, AgentMailboxRepairResponse,
-        AgentReceiptsParams, AgentReceiptsResponse, AgentSendBroadcastParams,
-        AgentSendBroadcastResponse, AgentSendParams, AgentSendResponse, AgentWaitParams,
-        AgentWaitResponse,
+        AgentInboxParams, AgentInboxResponse, AgentReceiptsParams, AgentReceiptsResponse,
+        AgentSendBroadcastParams, AgentSendBroadcastResponse, AgentSendParams, AgentSendResponse,
+        AgentWaitParams, AgentWaitResponse,
     },
     agent_query::{AgentQueryParams, AgentQueryResponse},
     agent_stats::{AgentStatsParams, AgentStatsResponse},
     agent_tasks::{
         EmptyParams, TaskCancelParams, TaskClaimParams, TaskCreateParams, TaskDispatchOnceParams,
         TaskDispatchOnceResponse, TaskGetResponse, TaskIdParams, TaskListParams, TaskListResponse,
-        TaskMutationResponse, TaskNextParams, TaskNextResponse, TaskQueueStateRepairParams,
-        TaskQueueStateRepairResponse, TaskReconcileResponse, TaskRowRepairParams,
-        TaskRowRepairResponse, TaskSequenceRepairParams, TaskSequenceRepairResponse,
+        TaskMutationResponse, TaskNextParams, TaskNextResponse, TaskReconcileResponse,
         TaskUpdateParams,
     },
     agent_templates::{
@@ -27,24 +24,18 @@ use super::{
         AgentTemplateGetResponse, AgentTemplateListParams, AgentTemplateListResponse,
         AgentTemplatePutParams, AgentTemplatePutResponse,
     },
-    tool,
-    tool_profiles::ToolProfileKind,
-    tool_router,
+    tool, tool_router,
 };
 
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 use synapse_core::error_codes;
-use synapse_storage::{RevisionGuard, cf, constellations, decode_json};
 
 const AGENT_TOOL: &str = "agent";
 const TASK_TOOL: &str = "task";
-const AGENT_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox rows/durable queue state/template rows";
-const TASK_SOURCE_OF_TRUTH: &str =
-    "CF_KV agent task rows + guarded enqueue watermark + agent task event/readback rows";
+const AGENT_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox/template rows";
+const TASK_SOURCE_OF_TRUTH: &str = "CF_KV agent task rows + agent task event/readback rows";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,7 +47,6 @@ pub enum AgentOperation {
     Wait,
     Broadcast,
     Receipts,
-    MailboxRepair,
     Stats,
     TemplatePut,
     TemplateGet,
@@ -69,7 +59,6 @@ pub enum AgentOperation {
     Pause,
     Resume,
     Respawn,
-    RecommendTools,
 }
 
 impl AgentOperation {
@@ -82,7 +71,6 @@ impl AgentOperation {
             Self::Wait => "wait",
             Self::Broadcast => "broadcast",
             Self::Receipts => "receipts",
-            Self::MailboxRepair => "mailbox_repair",
             Self::Stats => "stats",
             Self::TemplatePut => "template_put",
             Self::TemplateGet => "template_get",
@@ -95,7 +83,6 @@ impl AgentOperation {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Respawn => "respawn",
-            Self::RecommendTools => "recommend_tools",
         }
     }
 }
@@ -118,8 +105,6 @@ pub struct AgentParams {
     pub broadcast: Option<AgentSendBroadcastParams>,
     #[serde(default)]
     pub receipts: Option<AgentReceiptsParams>,
-    #[serde(default)]
-    pub mailbox_repair: Option<AgentMailboxRepairParams>,
     #[serde(default)]
     pub stats: Option<AgentStatsParams>,
     #[serde(default)]
@@ -144,8 +129,6 @@ pub struct AgentParams {
     pub resume: Option<AgentPauseParams>,
     #[serde(default)]
     pub respawn: Option<AgentRespawnParams>,
-    #[serde(default)]
-    pub recommend_tools: Option<AgentToolRecommendParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -168,8 +151,6 @@ pub struct AgentResponse {
     pub broadcast: Option<AgentSendBroadcastResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipts: Option<AgentReceiptsResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mailbox_repair: Option<AgentMailboxRepairResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<AgentStatsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,48 +175,6 @@ pub struct AgentResponse {
     pub resume: Option<AgentSuspendResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub respawn: Option<AgentRespawnResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommend_tools: Option<AgentToolRecommendResponse>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentToolRecommendParams {
-    pub task_class: String,
-    #[schemars(range(min = 1, max = 100000))]
-    pub min_evidence: usize,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentToolEvidence {
-    pub tool: String,
-    pub successes: u64,
-    pub failures: u64,
-    pub evidence_count: u64,
-    pub expected_success: f64,
-    pub success_ci95_low: f64,
-    pub success_ci95_high: f64,
-    pub outcome_information_bits: f64,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentToolRecommendResponse {
-    pub task_class: String,
-    pub grounding: String,
-    pub evidence_count: u64,
-    pub task_attempts_considered: u64,
-    pub recommended_tools: Vec<String>,
-    pub discouraged_tools: Vec<String>,
-    pub tools: Vec<AgentToolEvidence>,
-    pub failure_mode_arrows: Vec<Value>,
-    pub failure_mode_arrow_grounding: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub causal_map_context: Option<Value>,
-    pub decision_id: String,
-    pub decision_row_key: String,
-    pub decision_row_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -249,9 +188,6 @@ pub enum TaskOperation {
     List,
     Next,
     Reconcile,
-    RepairSequence,
-    RepairQueueState,
-    RepairRow,
     DispatchOnce,
 }
 
@@ -266,9 +202,6 @@ impl TaskOperation {
             Self::List => "list",
             Self::Next => "next",
             Self::Reconcile => "reconcile",
-            Self::RepairSequence => "repair_sequence",
-            Self::RepairQueueState => "repair_queue_state",
-            Self::RepairRow => "repair_row",
             Self::DispatchOnce => "dispatch_once",
         }
     }
@@ -294,12 +227,6 @@ pub struct TaskParams {
     pub next: Option<TaskNextParams>,
     #[serde(default)]
     pub reconcile: Option<EmptyParams>,
-    #[serde(default)]
-    pub repair_sequence: Option<TaskSequenceRepairParams>,
-    #[serde(default)]
-    pub repair_queue_state: Option<TaskQueueStateRepairParams>,
-    #[serde(default)]
-    pub repair_row: Option<TaskRowRepairParams>,
     #[serde(default)]
     pub dispatch_once: Option<TaskDispatchOnceParams>,
 }
@@ -327,19 +254,13 @@ pub struct TaskResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile: Option<TaskReconcileResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_sequence: Option<TaskSequenceRepairResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_queue_state: Option<TaskQueueStateRepairResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_row: Option<TaskRowRepairResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_once: Option<TaskDispatchOnceResponse>,
 }
 
 #[tool_router(router = agent_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback. mailbox_repair is an explicit break-glass/full-capability-only guarded metadata repair; normal mailbox use fails closed on corrupt or drifted queue state."
+        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback."
     )]
     pub async fn agent(
         &self,
@@ -534,41 +455,6 @@ impl SynapseService {
                         response.this_session_id, response.returned_count, response.deleted_count
                     ),
                     |out| out.receipts = Some(response),
-                )))
-            }
-            AgentOperation::MailboxRepair => {
-                let spec = params
-                    .0
-                    .mailbox_repair
-                    .ok_or_else(|| missing_agent_spec("mailbox_repair"))?;
-                let source_id = spec.recipient_session_id.clone();
-                require_queue_repair_profile(
-                    self,
-                    &request_context,
-                    AGENT_TOOL,
-                    operation.as_str(),
-                    &source_id,
-                    AGENT_SOURCE_OF_TRUTH,
-                )?;
-                let response = self.mailbox_repair_state_impl(spec).map_err(|error| {
-                    agent_delegate_error(
-                        operation,
-                        source_id,
-                        error,
-                        "inspect the raw global/recipient state rows and supply monotonic floors from the last known-good physical readback",
-                    )
-                })?;
-                Ok(Json(agent_response(
-                    operation,
-                    format!(
-                        "CF_KV mailbox state repaired global_seq={} recipient={} count={} generation={} committed_seq={}",
-                        response.repaired_global_sequence,
-                        response.recipient_session_id,
-                        response.repaired_recipient_count,
-                        response.repaired_recipient_generation,
-                        response.committed_seq
-                    ),
-                    |out| out.mailbox_repair = Some(response),
                 )))
             }
             AgentOperation::Stats => {
@@ -886,44 +772,11 @@ impl SynapseService {
                     |out| out.respawn = Some(response),
                 )))
             }
-            AgentOperation::RecommendTools => {
-                let spec = params
-                    .0
-                    .recommend_tools
-                    .ok_or_else(|| missing_agent_spec("recommend_tools"))?;
-                self.require_m3_permissions(
-                    AGENT_TOOL,
-                    &crate::m3::permissions::required([
-                        crate::m3::permissions::Permission::ReadStorage,
-                        crate::m3::permissions::Permission::WriteStorage,
-                    ]),
-                )?;
-                let db = self.m3_storage()?;
-                let response = recommend_tools(&db, &spec.task_class, spec.min_evidence)?;
-                self.audit_action_ok_with_details_for_request(
-                    "steering_tool_recommend",
-                    &serde_json::to_value(&response).map_err(|error| {
-                        crate::m1::mcp_error(
-                            error_codes::TOOL_INTERNAL_ERROR,
-                            format!("STEERING_TOOL_DECISION_AUDIT_ENCODE_FAILED: {error}"),
-                        )
-                    })?,
-                    &request_context,
-                )?;
-                Ok(Json(agent_response(
-                    operation,
-                    format!(
-                        "CF_AGENT_EVENTS outcomes={} grounding={} decision_row={}",
-                        response.evidence_count, response.grounding, response.decision_row_key
-                    ),
-                    |out| out.recommend_tools = Some(response),
-                )))
-            }
         }
     }
 
     #[tool(
-        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return physical task/coordination readback from the real implementation. repair_sequence, repair_queue_state, and repair_row are explicit break-glass/full-capability-only revision-guarded recovery operations; normal queue use fails closed on malformed or drifted state."
+        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation."
     )]
     pub async fn task(
         &self,
@@ -1118,107 +971,6 @@ impl SynapseService {
                     |out| out.reconcile = Some(response),
                 )))
             }
-            TaskOperation::RepairSequence => {
-                let spec = params
-                    .0
-                    .repair_sequence
-                    .ok_or_else(|| missing_task_spec("repair_sequence"))?;
-                require_queue_repair_profile(
-                    self,
-                    &request_context,
-                    TASK_TOOL,
-                    operation.as_str(),
-                    TASK_SEQUENCE_KEY_SOURCE_ID,
-                    TASK_SOURCE_OF_TRUTH,
-                )?;
-                let response = self
-                    .task_repair_sequence_impl(spec)
-                    .map_err(|error| {
-                        task_delegate_error(
-                            operation,
-                            "sequence_watermark",
-                            error,
-                            "inspect the raw watermark and task rows, then supply a monotonic floor from the last known-good physical readback",
-                        )
-                    })?;
-                Ok(Json(task_response(
-                    operation,
-                    format!(
-                        "CF_KV task sequence repaired={} observed_max={} committed_seq={}",
-                        response.repaired_sequence,
-                        response.observed_max_task_sequence,
-                        response.committed_seq
-                    ),
-                    |out| out.repair_sequence = Some(response),
-                )))
-            }
-            TaskOperation::RepairQueueState => {
-                let spec = params
-                    .0
-                    .repair_queue_state
-                    .ok_or_else(|| missing_task_spec("repair_queue_state"))?;
-                require_queue_repair_profile(
-                    self,
-                    &request_context,
-                    TASK_TOOL,
-                    operation.as_str(),
-                    "agent-task/v2/meta/queue_state",
-                    TASK_SOURCE_OF_TRUTH,
-                )?;
-                let response = self
-                    .task_repair_queue_state_impl(spec)
-                    .map_err(|error| {
-                        task_delegate_error(
-                            operation,
-                            "queue_state",
-                            error,
-                            "inspect the raw queue-state revision and task rows, then supply that exact revision and a monotonic generation floor",
-                        )
-                    })?;
-                Ok(Json(task_response(
-                    operation,
-                    format!(
-                        "CF_KV task queue state repaired={} observed_max={} committed_seq={:?}",
-                        response.repaired_generation,
-                        response.observed_max_task_generation,
-                        response.committed_seq
-                    ),
-                    |out| out.repair_queue_state = Some(response),
-                )))
-            }
-            TaskOperation::RepairRow => {
-                let spec = params
-                    .0
-                    .repair_row
-                    .ok_or_else(|| missing_task_spec("repair_row"))?;
-                let source_id = spec.task_id.clone();
-                require_queue_repair_profile(
-                    self,
-                    &request_context,
-                    TASK_TOOL,
-                    operation.as_str(),
-                    source_id.as_str(),
-                    TASK_SOURCE_OF_TRUTH,
-                )?;
-                let response = self.task_repair_row_impl(spec).map_err(|error| {
-                    task_delegate_error(
-                        operation,
-                        source_id,
-                        error,
-                        "inspect the exact raw row revision plus queue/watermark state and provide a complete invariant-valid replacement",
-                    )
-                })?;
-                Ok(Json(task_response(
-                    operation,
-                    format!(
-                        "CF_KV task row repaired task_id={} generation={} committed_seq={:?}",
-                        response.task.task_id,
-                        response.task.mutation_generation,
-                        response.committed_seq
-                    ),
-                    |out| out.repair_row = Some(response),
-                )))
-            }
             TaskOperation::DispatchOnce => {
                 let spec = params
                     .0
@@ -1254,42 +1006,6 @@ impl SynapseService {
     }
 }
 
-const TASK_SEQUENCE_KEY_SOURCE_ID: &str = "agent-task/v1/meta/last_enqueue_seq";
-
-fn require_queue_repair_profile(
-    service: &SynapseService,
-    request_context: &RequestContext<RoleServer>,
-    tool_name: &'static str,
-    operation: &'static str,
-    source_id: &str,
-    source_of_truth: &'static str,
-) -> Result<(), ErrorData> {
-    let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
-    let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
-    if matches!(
-        snapshot.profile,
-        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
-    ) {
-        return Ok(());
-    }
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{tool_name} operation={operation} is not allowed for profile {}",
-            snapshot.profile.as_str()
-        ),
-        Some(json!({
-            "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
-            "tool": tool_name,
-            "operation": operation,
-            "source_id": source_id,
-            "profile": snapshot.profile.as_str(),
-            "source_of_truth": source_of_truth,
-            "remediation": "switch to an explicit break_glass or full_capability profile with operator intent before repairing durable queue metadata",
-        })),
-    ))
-}
-
 fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
     validate_exact_operation_spec(
         AGENT_TOOL,
@@ -1302,7 +1018,6 @@ fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
             ("wait", params.wait.is_some()),
             ("broadcast", params.broadcast.is_some()),
             ("receipts", params.receipts.is_some()),
-            ("mailbox_repair", params.mailbox_repair.is_some()),
             ("stats", params.stats.is_some()),
             ("template_put", params.template_put.is_some()),
             ("template_get", params.template_get.is_some()),
@@ -1315,7 +1030,6 @@ fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
             ("pause", params.pause.is_some()),
             ("resume", params.resume.is_some()),
             ("respawn", params.respawn.is_some()),
-            ("recommend_tools", params.recommend_tools.is_some()),
         ],
     )
 }
@@ -1333,9 +1047,6 @@ fn validate_task_facade_params(params: &TaskParams) -> Result<(), ErrorData> {
             ("list", params.list.is_some()),
             ("next", params.next.is_some()),
             ("reconcile", params.reconcile.is_some()),
-            ("repair_sequence", params.repair_sequence.is_some()),
-            ("repair_queue_state", params.repair_queue_state.is_some()),
-            ("repair_row", params.repair_row.is_some()),
             ("dispatch_once", params.dispatch_once.is_some()),
         ],
     )
@@ -1493,7 +1204,6 @@ fn agent_response(
         wait: None,
         broadcast: None,
         receipts: None,
-        mailbox_repair: None,
         stats: None,
         template_put: None,
         template_get: None,
@@ -1506,581 +1216,9 @@ fn agent_response(
         pause: None,
         resume: None,
         respawn: None,
-        recommend_tools: None,
     };
     populate(&mut response);
     response
-}
-
-#[derive(Default)]
-struct ToolOutcomeCounts {
-    success: u64,
-    failure: u64,
-}
-
-struct SteeringCausalEvidence {
-    arrows: Vec<Value>,
-    grounding: String,
-    context: Option<Value>,
-}
-
-fn steering_causal_evidence(
-    db: &synapse_storage::Db,
-    task_class: &str,
-    counts: &BTreeMap<String, ToolOutcomeCounts>,
-) -> Result<SteeringCausalEvidence, ErrorData> {
-    const MAX_FAILURE_MODE_ARROWS: usize = 256;
-    let window_ns = i64::try_from(
-        synapse_storage::derived_state::CAUSAL_MAP_WINDOW.as_nanos(),
-    )
-    .map_err(|_| {
-        crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "STEERING_CAUSAL_MAP_WINDOW_OVERFLOW: configured causal-map window does not fit signed nanoseconds; remediation=repair the derived-state causal-map window contract",
-        )
-    })?;
-    let mut params =
-        synapse_calyx::SynapseCalyxTemporalParams::new(constellations::SYN_MCP_USAGE_PANEL_VERSION);
-    params.max_records = synapse_storage::derived_state::CAUSAL_MAP_MAX_RECORDS;
-    // Causal-map pointers are normalized by bounded window span, not wall-clock
-    // endpoints. The independent reader follows the latest pointer and validates
-    // the artifact against its own exact closed source window.
-    params.since_ts_ns = Some(0);
-    params.until_ts_ns = Some(window_ns);
-    params.group_key = Some("mcp_usage_tool".to_owned());
-    params.bin_seconds = synapse_storage::derived_state::CAUSAL_MAP_BIN_SECONDS;
-    params.max_lag = synapse_storage::derived_state::CAUSAL_MAP_MAX_LAG;
-
-    let report = match db.read_temporal_causal_map_intelligence(
-        &params,
-        synapse_storage::derived_state::CAUSAL_MAP_FDR_ALPHA,
-    ) {
-        Ok(report) => report,
-        Err(error) if error.code() == "SYNAPSE_CALYX_CAUSAL_MAP_NOT_BUILT" => {
-            let target_id = format!(
-                "{}:{}",
-                constellations::SYN_MCP_USAGE_PANEL_NAME,
-                "mcp_usage_tool"
-            );
-            let maintenance_action = synapse_storage::derived_state::derived_state_readback()
-                .last_causal_map_actions
-                .get(&target_id)
-                .cloned();
-            tracing::warn!(
-                code = "STEERING_CAUSAL_MAP_NOT_BUILT",
-                task_class,
-                target_id,
-                maintenance_action = ?maintenance_action,
-                detail = %error,
-                "tool steering has no physically published causal-map generation; the decision remains explicitly provisional"
-            );
-            return Ok(SteeringCausalEvidence {
-                arrows: Vec::new(),
-                grounding: "provisional_causal_map_not_built".to_owned(),
-                context: Some(json!({
-                    "schema": "synapse.steering.causal_map_context.v1",
-                    "status": "not_built",
-                    "panel_name": constellations::SYN_MCP_USAGE_PANEL_NAME,
-                    "panel_version": constellations::SYN_MCP_USAGE_PANEL_VERSION,
-                    "group_key": "mcp_usage_tool",
-                    "maintenance_target": target_id,
-                    "maintenance_action": maintenance_action,
-                    "error": {
-                        "code": error.code(),
-                        "message": error.to_string(),
-                        "remediation": error.remediation(),
-                    },
-                    "structural_effect_identified": false,
-                })),
-            });
-        }
-        Err(error) => {
-            return Err(crate::m1::mcp_error(
-                error.code(),
-                format!(
-                    "STEERING_CAUSAL_MAP_READ_FAILED: task_class={task_class} detail={error}; remediation={}",
-                    error.remediation().unwrap_or(
-                        "preserve the Graph pointer/artifact and repair the exact causal-map read failure"
-                    )
-                ),
-            ));
-        }
-    };
-    if !report.physical_readback_matches
-        || !report.pointer_readback_matches
-        || !report.artifact.all_requested_records_loaded
-        || !report.artifact.all_stream_pairs_enumerated
-        || report.artifact.structural_effect_identified
-        || report.artifact.evidence_class != "observational_predictive"
-    {
-        return Err(crate::m1::mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            "STEERING_CAUSAL_MAP_CONTRACT_INVALID: the persisted map lacks complete physical readback/pair coverage or misstates observational evidence as a structural effect; remediation=preserve and rebuild the exact Graph causal-map generation",
-        ));
-    }
-
-    // Agent transcripts preserve the client-qualified tool name
-    // (`mcp__synapse__agent`), while MCP usage records persist the daemon route
-    // (`agent`). Join those identities explicitly; unrelated local tools such
-    // as PowerShell have no MCP-usage stream and are never coerced into one.
-    let mut causal_counts: BTreeMap<String, ToolOutcomeCounts> = BTreeMap::new();
-    for stream in &report.artifact.streams {
-        for (observed_tool, outcome) in counts {
-            if steering_tool_matches_route(observed_tool, &stream.name) {
-                let aggregate = causal_counts.entry(stream.name.clone()).or_default();
-                aggregate.success = aggregate.success.saturating_add(outcome.success);
-                aggregate.failure = aggregate.failure.saturating_add(outcome.failure);
-            }
-        }
-    }
-    let failed_tools = causal_counts
-        .iter()
-        .filter(|(_, outcome)| outcome.failure > 0)
-        .map(|(tool, _)| tool.as_str())
-        .collect::<BTreeSet<_>>();
-    let relevant_pairs = report
-        .artifact
-        .pairs
-        .iter()
-        .filter(|pair| {
-            failed_tools.contains(pair.group_a.as_str())
-                || failed_tools.contains(pair.group_b.as_str())
-        })
-        .collect::<Vec<_>>();
-    if relevant_pairs.len() > MAX_FAILURE_MODE_ARROWS {
-        return Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "STEERING_CAUSAL_ARROW_LIMIT_EXCEEDED: {} complete relevant pairs exceed declared response limit {MAX_FAILURE_MODE_ARROWS}; remediation=raise the explicit response budget after measuring payload cost, never truncate causal evidence",
-                relevant_pairs.len()
-            ),
-        ));
-    }
-    let arrows = relevant_pairs
-        .iter()
-        .map(|pair| {
-            json!({
-                "schema": "synapse.steering.failure_mode_arrow.v2",
-                "task_class": task_class,
-                "scope": "global_mcp_usage_rolling_window_with_task_class_outcome_overlay",
-                "group_a": pair.group_a,
-                "group_b": pair.group_b,
-                "events_a": pair.events_a,
-                "events_b": pair.events_b,
-                "task_class_outcomes_a": steering_tool_outcome_json(causal_counts.get(&pair.group_a)),
-                "task_class_outcomes_b": steering_tool_outcome_json(causal_counts.get(&pair.group_b)),
-                "transfer_entropy": pair.transfer_entropy,
-                "granger_a_to_b": pair.granger_a_to_b,
-                "granger_b_to_a": pair.granger_b_to_a,
-                "signed_lag_correlation": pair.cross_correlation,
-                "convergent_cross_mapping": pair.convergent_cross_mapping,
-                "temporal_cross_k": pair.temporal_cross_k,
-                "evidence_class": report.artifact.evidence_class,
-                "structural_effect_identified": false,
-                "interpretation": "observed temporal association involving a tool with task-class failures; this does not identify the tool as a structural cause of failure",
-            })
-        })
-        .collect::<Vec<_>>();
-    let relevant_fdr_families = report
-        .artifact
-        .fdr_families
-        .iter()
-        .map(|family| {
-            let decisions = family
-                .decisions
-                .iter()
-                .filter(|decision| {
-                    relevant_pairs.iter().any(|pair| {
-                        steering_hypothesis_matches_pair(
-                            &decision.hypothesis,
-                            &pair.group_a,
-                            &pair.group_b,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "name": family.name,
-                "method": family.method,
-                "assumptions": family.assumptions,
-                "alpha": family.alpha,
-                "complete_family_hypotheses_tested": family.hypotheses_tested,
-                "relevant_decisions": decisions,
-            })
-        })
-        .collect::<Vec<_>>();
-    let grounding = if failed_tools.is_empty() {
-        "observational_causal_map_present_no_task_class_failures"
-    } else if arrows.is_empty() {
-        "observational_causal_map_present_no_matching_failure_pairs"
-    } else {
-        "observational_predictive_causal_map"
-    };
-    let context = json!({
-        "schema": "synapse.steering.causal_map_context.v1",
-        "status": "physically_verified",
-        "panel_name": constellations::SYN_MCP_USAGE_PANEL_NAME,
-        "panel_version": report.artifact.panel_version,
-        "group_key": report.artifact.group_key,
-        "pair_scope": report.artifact.pair_scope,
-        "window": {
-            "since_ts_ns": report.artifact.since_ts_ns,
-            "until_ts_ns": report.artifact.until_ts_ns,
-            "bin_seconds": report.artifact.bin_seconds,
-            "max_lag": report.artifact.max_lag,
-            "source_records": report.artifact.source_records,
-            "source_fingerprint_sha256": report.artifact.source_fingerprint_sha256,
-        },
-        "coverage": {
-            "streams": report.artifact.streams,
-            "expected_pair_count": report.artifact.expected_pair_count,
-            "all_requested_records_loaded": report.artifact.all_requested_records_loaded,
-            "all_stream_pairs_enumerated": report.artifact.all_stream_pairs_enumerated,
-            "resource_accounting": report.artifact.resource_accounting,
-        },
-        "global_estimators": {
-            "pc_stable_skeleton": report.artifact.pc_stable_skeleton,
-            "partial_correlation_network": report.artifact.partial_correlation_network,
-            "hawkes_branching_graph": report.artifact.hawkes_branching_graph,
-        },
-        "bh_fdr_families": relevant_fdr_families,
-        "evidence_class": report.artifact.evidence_class,
-        "structural_effect_identified": report.artifact.structural_effect_identified,
-        "structural_identification_reason": report.artifact.structural_identification_reason,
-        "identification_requirements": report.artifact.identification_requirements,
-        "physical_source_of_truth": {
-            "column_family": "Graph",
-            "artifact_key_hex": report.graph_key_hex,
-            "artifact_sha256": report.graph_value_sha256,
-            "pointer_key_hex": report.pointer_key_hex,
-            "pointer_sha256": report.pointer_value_sha256,
-            "physical_readback_matches": report.physical_readback_matches,
-            "pointer_readback_matches": report.pointer_readback_matches,
-        },
-    });
-    Ok(SteeringCausalEvidence {
-        arrows,
-        grounding: grounding.to_owned(),
-        context: Some(context),
-    })
-}
-
-fn steering_tool_outcome_json(outcome: Option<&ToolOutcomeCounts>) -> Value {
-    outcome.map_or_else(
-        || json!({ "observed_in_task_class": false, "successes": 0, "failures": 0 }),
-        |outcome| {
-            json!({
-                "observed_in_task_class": true,
-                "successes": outcome.success,
-                "failures": outcome.failure,
-            })
-        },
-    )
-}
-
-fn steering_tool_matches_route(observed_tool: &str, route: &str) -> bool {
-    observed_tool == route
-        || observed_tool
-            .strip_prefix("mcp__synapse__")
-            .is_some_and(|name| name == route)
-}
-
-fn steering_hypothesis_matches_pair(hypothesis: &str, group_a: &str, group_b: &str) -> bool {
-    [
-        format!("{group_a}->{group_b}@"),
-        format!("{group_b}->{group_a}@"),
-        format!("{group_a}<->{group_b}@"),
-        format!("{group_b}<->{group_a}@"),
-        format!("{group_a}<->{group_b}|"),
-        format!("{group_b}<->{group_a}|"),
-    ]
-    .iter()
-    .any(|prefix| hypothesis.starts_with(prefix))
-}
-
-fn recommend_tools(
-    db: &synapse_storage::Db,
-    task_class: &str,
-    min_evidence: usize,
-) -> Result<AgentToolRecommendResponse, ErrorData> {
-    const MAX_EVENT_ROWS: usize = 2_000_000;
-    const PAGE_ROWS: usize = 8_192;
-    let task_class = task_class.trim();
-    if task_class.is_empty() || min_evidence == 0 || min_evidence > 100_000 {
-        return Err(crate::m1::mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "agent recommend_tools requires a nonblank task_class and min_evidence in 1..=100000",
-        ));
-    }
-    let tasks = SynapseService::read_all_tasks(db)?;
-    let mut spawn_ids = BTreeSet::new();
-    let mut task_attempts_considered = 0_u64;
-    for task in tasks.iter().filter(|task| task.template_id == task_class) {
-        for attempt in &task.attempts {
-            if !matches!(
-                attempt.outcome,
-                super::agent_tasks::AttemptOutcome::Succeeded
-                    | super::agent_tasks::AttemptOutcome::Failed
-            ) {
-                continue;
-            }
-            if let Some(spawn_id) = attempt.spawn_id.as_deref() {
-                spawn_ids.insert(spawn_id.to_owned());
-                task_attempts_considered = task_attempts_considered.saturating_add(1);
-            }
-        }
-    }
-
-    let mut counts: BTreeMap<String, ToolOutcomeCounts> = BTreeMap::new();
-    let mut scanned = 0_usize;
-    let mut start = Vec::new();
-    while !spawn_ids.is_empty() {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_AGENT_EVENTS, &start, PAGE_ROWS)
-            .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        for (key, value) in &rows {
-            scanned = scanned.saturating_add(1);
-            if scanned > MAX_EVENT_ROWS {
-                return Err(crate::m1::mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "STEERING_TOOL_EVENT_SCAN_BUDGET_EXHAUSTED: scanned more than {MAX_EVENT_ROWS} CF_AGENT_EVENTS rows; remediation=add a task-class tool-outcome aggregate before retrying this corpus"
-                    ),
-                ));
-            }
-            let event: synapse_core::AgentEventRecord = decode_json(value).map_err(|error| {
-                crate::m1::mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "STEERING_TOOL_EVENT_ROW_INVALID: key_hex={} detail={error}; remediation=repair or quarantine the corrupt CF_AGENT_EVENTS row",
-                        constellations::hex_encode(key)
-                    ),
-                )
-            })?;
-            if event.kind != synapse_core::AgentEventKind::ToolCallFinished
-                || !event
-                    .spawn_id
-                    .as_deref()
-                    .is_some_and(|spawn_id| spawn_ids.contains(spawn_id))
-            {
-                continue;
-            }
-            let tool = event
-                .attributes
-                .tool_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|tool| !tool.is_empty())
-                .ok_or_else(|| {
-                    crate::m1::mcp_error(
-                        error_codes::STORAGE_READ_FAILED,
-                        format!(
-                            "STEERING_TOOL_NAME_ABSENT: terminal tool event key_hex={} has no tool name; remediation=repair agent-event ingestion before measuring tool outcomes",
-                            constellations::hex_encode(key)
-                        ),
-                    )
-                })?;
-            let failed = super::agent_events::tool_call_error_present(&event);
-            let cell = counts.entry(tool.to_owned()).or_default();
-            if failed {
-                cell.failure = cell.failure.saturating_add(1);
-            } else {
-                cell.success = cell.success.saturating_add(1);
-            }
-        }
-        if !more {
-            break;
-        }
-        let Some((last, _)) = rows.last() else { break };
-        start = last.clone();
-        start.push(0);
-    }
-
-    let total_success = counts.values().map(|cell| cell.success).sum::<u64>();
-    let total_failure = counts.values().map(|cell| cell.failure).sum::<u64>();
-    let total = total_success.saturating_add(total_failure);
-    let mut tools = counts
-        .iter()
-        .map(|(tool, cell)| {
-            let n = cell.success.saturating_add(cell.failure);
-            let (low, high) = steering_wilson_interval(cell.success, n);
-            AgentToolEvidence {
-                tool: tool.clone(),
-                successes: cell.success,
-                failures: cell.failure,
-                evidence_count: n,
-                expected_success: (cell.success as f64 + 1.0) / (n as f64 + 2.0),
-                success_ci95_low: low,
-                success_ci95_high: high,
-                outcome_information_bits: steering_indicator_mi(
-                    cell.success,
-                    cell.failure,
-                    total_success,
-                    total_failure,
-                ),
-            }
-        })
-        .collect::<Vec<_>>();
-    tools.sort_by(|left, right| {
-        right
-            .expected_success
-            .total_cmp(&left.expected_success)
-            .then_with(|| right.evidence_count.cmp(&left.evidence_count))
-            .then_with(|| left.tool.cmp(&right.tool))
-    });
-    let grounding = if total as usize >= min_evidence && tools.len() >= 2 {
-        "grounded"
-    } else {
-        "provisional_insufficient_evidence"
-    };
-    let recommended_tools = tools
-        .iter()
-        .filter(|tool| tool.evidence_count as usize >= min_evidence && tool.success_ci95_low >= 0.5)
-        .map(|tool| tool.tool.clone())
-        .collect::<Vec<_>>();
-    let discouraged_tools = tools
-        .iter()
-        .filter(|tool| tool.evidence_count as usize >= min_evidence && tool.success_ci95_high < 0.5)
-        .map(|tool| tool.tool.clone())
-        .collect::<Vec<_>>();
-    let causal_evidence = steering_causal_evidence(db, task_class, &counts)?;
-    let observed_ns = super::agent_events::unix_time_ns_now();
-    let seed = serde_json::to_vec(&(
-        &task_class,
-        observed_ns,
-        &tools,
-        &causal_evidence.arrows,
-        &causal_evidence.context,
-    ))
-    .map_err(|error| {
-        crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("STEERING_TOOL_DECISION_ENCODE_FAILED: {error}"),
-        )
-    })?;
-    let decision_id = steering_sha256(&seed);
-    let decision_row_key = format!("steering/v1/decision/tool/{observed_ns}/{decision_id}");
-    let row = serde_json::to_vec(&json!({
-        "schema": "synapse.steering.tool_decision.v1",
-        "decision_id": decision_id,
-        "observed_unix_ns": observed_ns,
-        "task_class": task_class,
-        "grounding": grounding,
-        "evidence_count": total,
-        "task_attempts_considered": task_attempts_considered,
-        "recommended_tools": recommended_tools,
-        "discouraged_tools": discouraged_tools,
-        "tools": tools,
-        "failure_mode_arrows": causal_evidence.arrows,
-        "failure_mode_arrow_grounding": causal_evidence.grounding,
-        "causal_map_context": causal_evidence.context,
-    }))
-    .map_err(|error| {
-        crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("STEERING_TOOL_DECISION_ENCODE_FAILED: {error}"),
-        )
-    })?;
-    let mutation = db
-        .mutate_batch_if_revisions_pressure_bypass(
-            cf::CF_KV,
-            [RevisionGuard::new(decision_row_key.as_bytes(), None)],
-            std::iter::empty::<Vec<u8>>(),
-            [(decision_row_key.as_bytes(), row.as_slice())],
-        )
-        .map_err(|error| {
-            crate::m1::mcp_error(
-                error.code(),
-                format!("STEERING_TOOL_DECISION_COMMIT_FAILED: {error}"),
-            )
-        })?;
-    if !mutation.applied {
-        return Err(crate::m1::mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            "STEERING_TOOL_DECISION_ID_COLLISION: append-only decision key already exists",
-        ));
-    }
-    let readback = db
-        .get_cf(cf::CF_KV, decision_row_key.as_bytes())
-        .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
-    if readback.as_deref() != Some(row.as_slice()) {
-        return Err(crate::m1::mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            "STEERING_TOOL_DECISION_READBACK_MISMATCH: committed bytes differ from the requested decision",
-        ));
-    }
-    Ok(AgentToolRecommendResponse {
-        task_class: task_class.to_owned(),
-        grounding: grounding.to_owned(),
-        evidence_count: total,
-        task_attempts_considered,
-        recommended_tools,
-        discouraged_tools,
-        tools,
-        failure_mode_arrows: causal_evidence.arrows,
-        failure_mode_arrow_grounding: causal_evidence.grounding,
-        causal_map_context: causal_evidence.context,
-        decision_id,
-        decision_row_key,
-        decision_row_sha256: steering_sha256(&row),
-    })
-}
-
-fn steering_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
-fn steering_wilson_interval(success: u64, total: u64) -> (f64, f64) {
-    if total == 0 {
-        return (0.0, 1.0);
-    }
-    let n = total as f64;
-    let p = success as f64 / n;
-    let z = 1.959_963_984_540_054_f64;
-    let denominator = 1.0 + z * z / n;
-    let center = (p + z * z / (2.0 * n)) / denominator;
-    let half = z * ((p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt()) / denominator;
-    ((center - half).max(0.0), (center + half).min(1.0))
-}
-
-fn steering_indicator_mi(ms: u64, mf: u64, total_s: u64, total_f: u64) -> f64 {
-    let total = total_s.saturating_add(total_f);
-    if total == 0 {
-        return 0.0;
-    }
-    let cells = [
-        (ms, ms.saturating_add(mf), total_s),
-        (mf, ms.saturating_add(mf), total_f),
-        (
-            total_s.saturating_sub(ms),
-            total.saturating_sub(ms.saturating_add(mf)),
-            total_s,
-        ),
-        (
-            total_f.saturating_sub(mf),
-            total.saturating_sub(ms.saturating_add(mf)),
-            total_f,
-        ),
-    ];
-    cells
-        .into_iter()
-        .filter(|(joint, row, col)| *joint > 0 && *row > 0 && *col > 0)
-        .map(|(joint, row, col)| {
-            let pxy = joint as f64 / total as f64;
-            pxy * ((joint as f64 * total as f64) / (row as f64 * col as f64)).log2()
-        })
-        .sum::<f64>()
-        .max(0.0)
 }
 
 fn task_response(
@@ -2103,9 +1241,6 @@ fn task_response(
         list: None,
         next: None,
         reconcile: None,
-        repair_sequence: None,
-        repair_queue_state: None,
-        repair_row: None,
         dispatch_once: None,
     };
     populate(&mut response);
@@ -2158,4 +1293,102 @@ fn task_row_readback(action: &'static str, response: &TaskMutationResponse) -> S
         "CF_KV task {action} row={} bytes={} task_id={}",
         response.written_row.row_key, response.written_row.value_len_bytes, response.task.task_id
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_agent_params(operation: AgentOperation) -> AgentParams {
+        AgentParams {
+            operation,
+            spawn: None,
+            query: None,
+            send: None,
+            inbox: None,
+            wait: None,
+            broadcast: None,
+            receipts: None,
+            stats: None,
+            template_put: None,
+            template_get: None,
+            template_list: None,
+            template_delete: None,
+            task_started: None,
+            interrupt: None,
+            kill: None,
+            steer: None,
+            pause: None,
+            resume: None,
+            respawn: None,
+        }
+    }
+
+    fn empty_task_params(operation: TaskOperation) -> TaskParams {
+        TaskParams {
+            operation,
+            create: None,
+            get: None,
+            update: None,
+            claim: None,
+            cancel: None,
+            list: None,
+            next: None,
+            reconcile: None,
+            dispatch_once: None,
+        }
+    }
+
+    #[test]
+    fn agent_facade_params_require_exact_matching_spec() {
+        let missing = validate_agent_facade_params(&empty_agent_params(AgentOperation::Query))
+            .expect_err("missing query spec should fail");
+        assert!(
+            missing
+                .message
+                .to_string()
+                .contains("requires a matching query spec"),
+            "{missing:?}"
+        );
+
+        let mut extra = empty_agent_params(AgentOperation::Stats);
+        extra.stats = Some(AgentStatsParams {
+            since_ns: None,
+            until_ns: None,
+            spawn_id: None,
+            session_id: None,
+            group_by: None,
+        });
+        extra.inbox = Some(AgentInboxParams {
+            drain: false,
+            max_messages: 1,
+            kinds: Vec::new(),
+        });
+        let error =
+            validate_agent_facade_params(&extra).expect_err("multiple operation specs should fail");
+        assert!(
+            error
+                .message
+                .to_string()
+                .contains("received invalid operation specs"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn task_facade_params_require_exact_matching_spec() {
+        let missing = validate_task_facade_params(&empty_task_params(TaskOperation::Get))
+            .expect_err("missing get spec should fail");
+        assert!(
+            missing
+                .message
+                .to_string()
+                .contains("requires a matching get spec"),
+            "{missing:?}"
+        );
+
+        let mut valid = empty_task_params(TaskOperation::Reconcile);
+        valid.reconcile = Some(EmptyParams {});
+        validate_task_facade_params(&valid).expect("matching reconcile spec should pass");
+    }
 }

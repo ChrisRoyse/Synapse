@@ -11,8 +11,10 @@ use crossbeam::channel::{self, Receiver, Sender, TrySendError};
 use crate::{
     CAPTURE_CHANNEL_CAPACITY, CaptureBackend, CaptureBackendPreference, CaptureConfig,
     CaptureError, CaptureStats, CaptureTarget, CapturedFrame, FRAMES_DROPPED_METRIC,
-    MAX_CAPTURE_INTERVAL_MS, MIN_CAPTURE_INTERVAL_MS, ResolvedCaptureTarget,
-    dpi::current_thread_priority, platform,
+    ResolvedCaptureTarget,
+    backend::{backend_after_fallback, should_fallback_to_dxgi},
+    dpi::current_thread_priority,
+    platform,
 };
 
 #[derive(Debug)]
@@ -145,8 +147,14 @@ pub fn register_capture_metrics() {
 pub fn resolve_capture_target(
     config: &CaptureConfig,
 ) -> Result<ResolvedCaptureTarget, CaptureError> {
-    validate_cpu_capture_policy(config)?;
     let backend = config.selected_backend();
+    if matches!(backend, CaptureBackend::DxgiDuplication)
+        && matches!(config.target, CaptureTarget::Window { .. })
+    {
+        return Err(CaptureError::TargetInvalid {
+            detail: "DXGI duplication supports monitor targets only".to_owned(),
+        });
+    }
     validate_target(&config.target)?;
     Ok(ResolvedCaptureTarget {
         target: config.target.clone(),
@@ -172,25 +180,10 @@ pub fn spawn_capture_loop(config: CaptureConfig) -> Result<CaptureHandle, Captur
         stop: stop.clone(),
         stats: stats.clone(),
     };
-    stats.set_effective_backend(CaptureBackend::GdiBitBlt);
-    let first_frame = platform::capture_gdi_frame(&config, 0)?;
-    push_frame(&ctx, first_frame)?;
     let thread_config = config.clone();
-    let thread_stats = stats.clone();
     let join = thread::Builder::new()
         .name("synapse-capture".to_owned())
-        .spawn(move || {
-            let result = run_capture_thread(thread_config, ctx);
-            if let Err(error) = &result {
-                tracing::error!(
-                    code = error.code(),
-                    error = %error,
-                    "CPU/GDI capture worker terminated with an error"
-                );
-            }
-            thread_stats.record_worker_result(&result);
-            result
-        })
+        .spawn(move || run_capture_thread(thread_config, ctx))
         .map_err(|err| CaptureError::ThreadFailed {
             detail: err.to_string(),
         })?;
@@ -221,57 +214,37 @@ fn run_capture_thread(
 ) -> Result<(), CaptureError> {
     platform::set_capture_thread_priority()?;
     ctx.stats.set_thread_priority(current_thread_priority());
-    ctx.stats.set_effective_backend(CaptureBackend::GdiBitBlt);
-    platform::run_gdi_capture(config, ctx)
-}
-
-fn validate_cpu_capture_policy(config: &CaptureConfig) -> Result<(), CaptureError> {
     match config.backend_preference {
-        CaptureBackendPreference::GdiBitBlt => {}
+        CaptureBackendPreference::Auto => {
+            ctx.stats
+                .set_effective_backend(CaptureBackend::GraphicsCaptureApi);
+            match platform::run_graphics_capture(config.clone(), ctx.clone()) {
+                Ok(()) => Ok(()),
+                Err(err) if should_fallback_to_dxgi(config.backend_preference, &err) => {
+                    ctx.stats
+                        .set_effective_backend(CaptureBackend::DxgiDuplication);
+                    tracing::warn!(
+                        code = "CAPTURE_GRAPHICS_API_UNSUPPORTED",
+                        fallback_backend = ?backend_after_fallback(config.backend_preference, &err),
+                        error = %err,
+                        "graphics capture unsupported; falling back to dxgi duplication"
+                    );
+                    platform::run_dxgi_capture(config, ctx)
+                }
+                Err(err) => Err(err),
+            }
+        }
         CaptureBackendPreference::GraphicsCaptureApi => {
-            return Err(CaptureError::UnsupportedSemantics {
-                detail: "Windows.Graphics.Capture is disabled by Synapse's no-explicit-GPU-API policy; use backend=gdi_bitblt (GDI may still be driver/compositor accelerated)"
-                    .to_owned(),
-            });
+            ctx.stats
+                .set_effective_backend(CaptureBackend::GraphicsCaptureApi);
+            platform::run_graphics_capture(config, ctx)
         }
         CaptureBackendPreference::DxgiDuplication => {
-            return Err(CaptureError::UnsupportedSemantics {
-                detail: "DXGI Desktop Duplication is disabled by Synapse's no-explicit-GPU-API policy; unset SYNAPSE_CAPTURE_FORCE_DXGI and use backend=gdi_bitblt"
-                    .to_owned(),
-            });
-        }
-        CaptureBackendPreference::InvalidEnvironment => {
-            return Err(CaptureError::UnsupportedSemantics {
-                detail: "SYNAPSE_CAPTURE_FORCE_DXGI has an invalid value; accepted values are true/false, 1/0, yes/no, and GPU capture remains prohibited"
-                    .to_owned(),
-            });
+            ctx.stats
+                .set_effective_backend(CaptureBackend::DxgiDuplication);
+            platform::run_dxgi_capture(config, ctx)
         }
     }
-    if config.secondary_windows {
-        return Err(CaptureError::UnsupportedSemantics {
-            detail: "secondary_windows=true is a Windows.Graphics.Capture composition semantic unavailable to CPU/GDI BitBlt; request secondary_windows=false"
-                .to_owned(),
-        });
-    }
-    if config.dirty_region_only {
-        return Err(CaptureError::UnsupportedSemantics {
-            detail: "dirty_region_only=true requires GPU-backed capture metadata and is unavailable to CPU/GDI BitBlt; request dirty_region_only=false"
-                .to_owned(),
-        });
-    }
-    if !(MIN_CAPTURE_INTERVAL_MS..=MAX_CAPTURE_INTERVAL_MS).contains(&config.min_update_interval_ms)
-    {
-        return Err(CaptureError::UnsupportedSemantics {
-            detail: format!(
-                "min_update_interval_ms={} is outside the CPU/GDI policy range {}..={}; use the default {} ms for low background CPU",
-                config.min_update_interval_ms,
-                MIN_CAPTURE_INTERVAL_MS,
-                MAX_CAPTURE_INTERVAL_MS,
-                crate::DEFAULT_CAPTURE_INTERVAL_MS
-            ),
-        });
-    }
-    Ok(())
 }
 // Only the real Windows capture loop pushes frames; off Windows capture fails
 // loudly before any frame is produced.

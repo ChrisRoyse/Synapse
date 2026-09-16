@@ -22,10 +22,10 @@ The `synapse-mcp` binary is the Synapse daemon: a Model Context Protocol (MCP) s
 
 The server runs in one of two transport modes:
 
-- **stdio** (`--mode stdio`, default) — an embedded full daemon speaking JSON-RPC over stdin/stdout via `rmcp::transport::stdio()`. This is a complete daemon: it opens the configured storage backend and owns its own input lease and session registries.
+- **stdio** (`--mode stdio`, default) — an embedded full daemon speaking JSON-RPC over stdin/stdout via `rmcp::transport::stdio()`. This is a complete daemon: it opens RocksDB and owns its own input lease and session registries.
 - **HTTP / SSE** (`--mode http`) — an axum HTTP server (default bind `127.0.0.1:7700`) exposing the rmcp Streamable HTTP transport at `/mcp`, plus a separate daemon-owned SSE event channel at `/events`, a `/health` endpoint, dashboard routes, and Chrome native-host bridge routes.
 
-Because a daemon owns a process-global input lease and a single storage directory, **only one daemon may own a given DB path at a time** (enforced via `single_instance.rs`, section 5). Stdio-only clients that need to reach the shared HTTP daemon use the thin `--mode connect` bridge rather than spawning a second daemon.
+Because a daemon owns a process-global input lease and a single RocksDB directory, **only one daemon may own a given DB path at a time** (enforced via `single_instance.rs`, section 5). Stdio-only clients that need to reach the shared HTTP daemon use the thin `--mode connect` bridge rather than spawning a second daemon.
 
 The MCP server identifies itself (`get_info`, `server/handler.rs`) as:
 
@@ -38,7 +38,7 @@ The MCP server identifies itself (`get_info`, `server/handler.rs`) as:
 
 ## 2. Entry Point Trace
 
-`main()` (`main.rs`) builds a multi-threaded Tokio runtime, calls `run()`, and applies a 5-second `shutdown_timeout`. Top-level errors are recorded into the daemon-lifecycle ledger via `daemon_lifecycle::record_top_level_error` when lifecycle state has been configured and exit with code 1. Errors before lifecycle configuration emit only their primary cause; the expected absence of a ledger is not reported as a secondary fault.
+`main()` (`main.rs`) builds a multi-threaded Tokio runtime, calls `run()`, and applies a 5-second `shutdown_timeout`. Top-level errors are recorded into the daemon-lifecycle ledger via `daemon_lifecycle::record_top_level_error` and exit with code 1.
 
 `run()` dispatch order:
 
@@ -69,8 +69,7 @@ The `Mode` enum (`main.rs`) selects behavior. There are no clap subcommands; mod
 | `--mode` | `SYNAPSE_MODE` | `stdio` | Transport / sub-process mode |
 | `--bind` | `SYNAPSE_BIND` | `127.0.0.1:7700` | HTTP bind address |
 | `--allow-non-loopback` | `SYNAPSE_ALLOW_NON_LOOPBACK` | false | Permit non-loopback HTTP bind |
-| `--db` | `SYNAPSE_DB` | `%LOCALAPPDATA%\synapse\db` | Storage directory |
-| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `calyx` | `synapse_storage::Db` backend; `calyx` is the only accepted value |
+| `--db` | `SYNAPSE_DB` | `%LOCALAPPDATA%\synapse\db` | RocksDB directory |
 | `--profile-dir` | `SYNAPSE_PROFILE_DIR` | — | App profile directory |
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | `info` | Tracing level |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | false | Disable M3 reflex runtime |
@@ -123,7 +122,7 @@ The tool surface is organized into four milestone layers (`m1`/`m2`/`m3`/`m4`), 
 
 ### M3 — Memory / Reflexes
 
-`M3ServiceConfig` fields: `db_path`, `storage_backend`, `profile_dir`, `reflex_disabled`, `bind`, `bearer_token` (from `SYNAPSE_BEARER_TOKEN`), `max_subscriptions`, `enable_audio`, `allow_unknown_profile`, `allowed_permissions`, `reflex_force_degraded`, `storage_pressure_free_bytes_sample`. `default_db_path()` → `%LOCALAPPDATA%\synapse\db`. `M3State` adds the shared storage handle, profile/reflex runtimes, `SseState`, activity recorder, audio runtime, intent tracker, and audit-session maps. M3 exposes the largest tool surface (~58 tool stubs).
+`M3ServiceConfig` fields: `db_path`, `profile_dir`, `reflex_disabled`, `bind`, `bearer_token` (from `SYNAPSE_BEARER_TOKEN`), `max_subscriptions`, `enable_audio`, `allow_unknown_profile`, `allowed_permissions`, `reflex_force_degraded`, `storage_pressure_free_bytes_sample`. `default_db_path()` → `%LOCALAPPDATA%\synapse\db`. `M3State` adds the shared RocksDB handle, profile/reflex runtimes, `SseState`, activity recorder, audio runtime, intent tracker, and audit-session maps. M3 exposes the largest tool surface (~58 tool stubs).
 
 ### M4 — Effector
 
@@ -147,14 +146,14 @@ The stdio transport wraps stdin in `CancelOnEofRead<R>`, an `AsyncRead` adapter.
 
 ### 4.2 HTTP server (`http/transport.rs`, axum)
 
-HTTP startup begins with `http::preflight_bind(bind, allow_non_loopback)` in `main::run` immediately after CLI decoding, before telemetry, process QoS, DPI, action recovery/input release/watchdog, storage, lifecycle, or transport initialization. The validated `SocketAddr` is then passed to `http::serve`; no downstream layer reparses it. Rejections write one structured, code-bearing stderr diagnostic because the logging subsystem has deliberately not been initialized. Startup (exit codes in parentheses):
+`http::serve(bind, allow_non_loopback, m2_config, m3_config, m4_config)` startup (exit codes in parentheses):
 
-1. Parse `bind` into a `SocketAddr`; invalid syntax → `HTTP_BIND_ADDRESS_INVALID`, exit **2**.
+1. Parse `bind` into a `SocketAddr`.
 2. **Loopback enforcement** — non-loopback bind without `--allow-non-loopback` → `HTTP_BIND_NON_LOOPBACK_REFUSED`, exit **2** (checked before the lock).
 3. `SingleInstanceGuard::acquire` — `AlreadyRunning` → `MCP_DAEMON_ALREADY_RUNNING`, exit **3**.
 4. `daemon_lifecycle::configure(mode="http", ...)` + panic hook.
 5. `TcpListener::bind`, create shutdown/connection-closed cancellation tokens, build `SseState`.
-6. Eager storage backend open (failure → exit **4**, distinguishing lock contention, `STORAGE_OPEN_FAILED`, `STORAGE_BACKEND_INVALID_CONFIG`, and `STORAGE_BACKEND_UNIMPLEMENTED`) and eager activity-recorder start (failure → exit **4**).
+6. Eager RocksDB open (failure → exit **4**, distinguishing `STORAGE_LOCK_CONTENDED` vs `STORAGE_OPEN_FAILED`) and eager activity-recorder start (failure → exit **4**).
 7. Spawn background tasks (routine miner, intent detector, armed-routine runner, transcript ingester, ambient-agent discovery) and the operator hotkey.
 8. Build the axum `Router`, then `axum::serve(...).with_graceful_shutdown(...)`, racing server completion against the shutdown signal.
 
@@ -193,7 +192,7 @@ The axum router merges two groups:
 - Header **`Mcp-Session-Id`** identifies a session; exposed to handlers via task-local `CURRENT_MCP_SESSION_ID` (`current_mcp_session_id()`).
 - Backed by rmcp `LocalSessionManager` with `keep_alive` from `SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS` (default 86400 s / 24 h).
 - `require_mcp_session` middleware (acts only on `/mcp*`): POST without a session id is allowed only if the body is a JSON-RPC `initialize`; GET/DELETE without a session → `404`. Request body cap `MAX_MCP_REQUEST_BYTES = 1 MiB` (`413` on overflow). Terminated sessions allow idempotent DELETE, else `404 UnknownOrExpired`.
-- **Persistent session store** (`SynapseMcpSessionStore`): a custom rmcp `SessionStore` persisting wrapped `PersistedMcpSessionState` rows in the Calyx-backed `CF_KV`, TTL = `keep_alive`. It also drives the session registry and journals `session_initialized`/`session_restored`/`exited` agent events.
+- **Persistent session store** (`SynapseMcpSessionStore`): a custom rmcp `SessionStore` persisting wrapped `PersistedMcpSessionState` rows in RocksDB `CF_KV`, TTL = `keep_alive`. It also drives the session registry and journals `session_initialized`/`session_restored`/`exited` agent events.
 
 ### 4.5 SSE (`http/sse.rs` + `http/sse/*`)
 
@@ -211,7 +210,7 @@ The daemon-owned `/events` channel is distinct from the rmcp `/mcp` GET stream.
 
 ### 5.1 Single-instance lock (`single_instance.rs`)
 
-`SingleInstanceGuard::acquire(db_path)` takes an **OS advisory exclusive file lock** (`fs2`) on `<db>/daemon.lock`, acquired *before* storage opens so a duplicate launch fails fast naming the holder PID instead of surfacing a storage lock error later. The holder PID is stored in a separate unlocked sidecar `<db>/daemon.pid` (on Windows the exclusive lock is a mandatory whole-file lock, so the PID must live outside it). Dropping the guard releases the lock and removes the PID file; the OS also releases the lock if the process dies. Both stdio and HTTP modes acquire it; the **canonical daemon binds port 7700** and owns this lock. The lock is scoped per-DB-path, so daemons on different `--db` paths coexist.
+`SingleInstanceGuard::acquire(db_path)` takes an **OS advisory exclusive file lock** (`fs2`) on `<db>/daemon.lock`, acquired *before* RocksDB opens so a duplicate launch fails fast naming the holder PID instead of dying on a cryptic RocksDB `LOCK` error. The holder PID is stored in a separate unlocked sidecar `<db>/daemon.pid` (on Windows the exclusive lock is a mandatory whole-file lock, so the PID must live outside it). Dropping the guard releases the lock and removes the PID file; the OS also releases the lock if the process dies. Both stdio and HTTP modes acquire it; the **canonical daemon binds port 7700** and owns this lock. The lock is scoped per-DB-path, so daemons on different `--db` paths coexist.
 
 ### 5.2 Daemon lifecycle ledger (`daemon_lifecycle.rs`)
 
@@ -245,7 +244,7 @@ A process-global ledger written to four files under the DB directory: `daemon-ru
 
 ### 5.9 Approval-protocol child (`approval_protocol.rs`)
 
-`--mode approval-protocol` handles the Windows `synapse-approval://` URI scheme fired by actionable approval-toast buttons. It parses the activation token, validates that `bind` is loopback, and forwards a `GET` to the daemon's `/approval/activate` endpoint (the durable Calyx approval row is validated there). `ensure_protocol_handler_registered` registers the URL-protocol handler under `HKCU\Software\Classes\synapse-approval`.
+`--mode approval-protocol` handles the Windows `synapse-approval://` URI scheme fired by actionable approval-toast buttons. It parses the activation token, validates that `bind` is loopback, and forwards a `GET` to the daemon's `/approval/activate` endpoint (the durable RocksDB approval row is validated there). `ensure_protocol_handler_registered` registers the URL-protocol handler under `HKCU\Software\Classes\synapse-approval`.
 
 ### 5.10 Chrome debugger bridge (`chrome_debugger_bridge.rs`)
 
@@ -277,7 +276,7 @@ Advisory, in-memory ownership leases over targets (`window:0x{hwnd}` or `cdp:0x{
 
 ### 6.6 Secret crypto (`secret_crypto.rs`)
 
-At-rest protection for cloud-model API keys / tokens before they touch the Calyx vault, using **Windows DPAPI (CurrentUser scope)** — `CryptProtectData`/`CryptUnprotectData` with secondary entropy `b"synapse/local-model-api-key/v1"`. Ciphertext is bound to the Windows account; `unprotect` fails loudly on foreign/tampered bytes; non-Windows builds `bail!` rather than persisting plaintext.
+At-rest protection for cloud-model API keys / tokens before they touch RocksDB, using **Windows DPAPI (CurrentUser scope)** — `CryptProtectData`/`CryptUnprotectData` with secondary entropy `b"synapse/local-model-api-key/v1"`. Ciphertext is bound to the Windows account; `unprotect` fails loudly on foreign/tampered bytes; non-Windows builds `bail!` rather than persisting plaintext.
 
 ### 6.7 Escalation (`server/escalation/mod.rs`)
 
@@ -309,7 +308,7 @@ Despite the module name, this implements the single high-level computer-use verb
 
 ### 7.6 Tool profiles (`server/tool_profiles.rs`)
 
-Per-session durable tool-profile gating (Calyx-backed `CF_SESSIONS`, key `mcp/tool-profile/v1/<session_id>`). Every scoped production HTTP `ToolProfileKind` (`NormalAgent`, `BrowserControl`, `BrowserDebugger`, `BreakGlass`, and trusted-agent `FullCapability`) advertises the same stable <=40 public facade names; profiles change operation-level authority behind those facades, never expose raw implementation tools. Trusted unscoped stdio (no session id) intentionally retains the full raw admin surface, as does an explicit `SYNAPSE_DEBUG_TOOLS=1` diagnostic launch; neither exception describes scoped HTTP clients. `admit_tool_call_for_profile` denies hidden/stale raw HTTP calls with `TOOL_PROFILE_POLICY_DENIED` and a public `capability_route`. A scoped transition to `BreakGlass`/`FullCapability` requires `confirm_break_glass=true`, a reason, **and** current foreground-input lease ownership. Real foreground HTTP work uses `act operation=foreground`: the complete request is registered in a daemon `TaskTracker`, takes a keyed per-session authority gate before any profile/lease snapshot, and retains that gate through exact rollback, separate Source-of-Truth readbacks, and durable final audit. Dropping the caller's join handle detaches rather than cancels the tracked task. Panics are caught while the rollback guard is live; guard `Drop` performs only bounded in-memory revocation and drains fail-closed, never storage/schema/audit work. The dedicated physical `operator_panic_epoch` is the higher-authority boundary: generic release-all does not advance it, and once it advances the transaction never restores its agent lease snapshot, keeps any operator lease owner intact, deletes the guarded session's durable lease row, and returns `SAFETY_OPERATOR_HOTKEY_FIRED` with cleanup evidence.
+Per-session durable tool-profile gating (RocksDB `CF_SESSIONS`, key `mcp/tool-profile/v1/<session_id>`). Every scoped production HTTP `ToolProfileKind` (`NormalAgent`, `BrowserControl`, `BrowserDebugger`, `BreakGlass`, and trusted-agent `FullCapability`) advertises the same stable <=40 public facade names; profiles change operation-level authority behind those facades, never expose raw implementation tools. Trusted unscoped stdio (no session id) intentionally retains the full raw admin surface, as does an explicit `SYNAPSE_DEBUG_TOOLS=1` diagnostic launch; neither exception describes scoped HTTP clients. `admit_tool_call_for_profile` denies hidden/stale raw HTTP calls with `TOOL_PROFILE_POLICY_DENIED` and a public `capability_route`. A scoped transition to `BreakGlass`/`FullCapability` requires `confirm_break_glass=true`, a reason, **and** current foreground-input lease ownership. Real foreground HTTP work uses `act operation=foreground`: the complete request is registered in a daemon `TaskTracker`, takes a keyed per-session authority gate before any profile/lease snapshot, and retains that gate through exact rollback, separate Source-of-Truth readbacks, and durable final audit. Dropping the caller's join handle detaches rather than cancels the tracked task. Panics are caught while the rollback guard is live; guard `Drop` performs only bounded in-memory revocation and drains fail-closed, never RocksDB/schema/audit work. The dedicated physical `operator_panic_epoch` is the higher-authority boundary: generic release-all does not advance it, and once it advances the transaction never restores its agent lease snapshot, keeps any operator lease owner intact, deletes the guarded session's durable lease row, and returns `SAFETY_OPERATOR_HOTKEY_FIRED` with cleanup evidence.
 
 ---
 
@@ -317,8 +316,8 @@ Per-session durable tool-profile gating (Calyx-backed `CF_SESSIONS`, key `mcp/to
 
 ### 8.1 Health (`server/health.rs`)
 
-The `health` tool / `GET /health` returns a `Health` payload: `ok` (true iff no subsystem is `"error"`), `version`, `build` (git SHA or `"dev"`), `pid`, `uptime_s`, `tool_count`, `tool_surface_sha256`, `tool_names`, and a `subsystems` map. Subsystems aggregated: `storage` (storage backend, CF sizes + disk-pressure level + schema version), `reflex` (active/sample counts, tick jitter, degraded/disabled), `profiles`, `perception`, `action` (emitter availability, recording, operator-hotkey label, allow_shell/launch counts, input-lease owner/expiry, backend-resolution policy), `audio`, `chrome_bridge`, `http` (bind addr, active sessions, SSE subscriber count; `disabled` in stdio), `daemon_drain`, and `daemon_lifecycle`. `tool_surface_sha256` is a deterministic SHA-256 of the session-profile-gated, canonically key-sorted tool list, for drift detection.
+The `health` tool / `GET /health` returns a `Health` payload: `ok` (true iff no subsystem is `"error"`), `version`, `build` (git SHA or `"dev"`), `pid`, `uptime_s`, `tool_count`, `tool_surface_sha256`, `tool_names`, and a `subsystems` map. Subsystems aggregated: `storage` (RocksDB CF sizes + disk-pressure level + schema version), `reflex` (active/sample counts, tick jitter, degraded/disabled), `profiles`, `perception`, `action` (emitter availability, recording, operator-hotkey label, allow_shell/launch counts, input-lease owner/expiry, backend-resolution policy), `audio`, `chrome_bridge`, `http` (bind addr, active sessions, SSE subscriber count; `disabled` in stdio), `daemon_drain`, and `daemon_lifecycle`. `tool_surface_sha256` is a deterministic SHA-256 of the session-profile-gated, canonically key-sorted tool list, for drift detection.
 
 ### 8.2 Doctor
 
-See section 5.8 — `--mode doctor` / `--kill-stray` is the operational triage that proves which process owns the storage lock and removes the rest.
+See section 5.8 — `--mode doctor` / `--kill-stray` is the operational triage that proves which process owns the RocksDB lock and removes the rest.

@@ -11,7 +11,7 @@ See [01_system_overview.md](01_system_overview.md) for the architectural narrati
 Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, `license-file = "LICENSE.md"`.
 
 **`[workspace] members`** (14 crates):
-`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-overlay`.
+`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay`.
 
 **`default-members`:** `synapse-mcp`, `synapse-overlay` (the two shipped binaries).
 
@@ -22,8 +22,8 @@ Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `ru
 | Async runtime | `tokio` (full), `tokio-util`, `tokio-tungstenite`, `futures-util` |
 | MCP / HTTP | `rmcp` 1.7 (server, stdio, streamable-http, macros, schemars), `axum` 0.8 (ws), `hyper`, `tower`, `reqwest` |
 | Serialization | `serde`, `serde_json`, `toml`, `schemars`, `base64` |
-| Storage | Calyx vault, `calyx-aster`, `fs2` |
-| Windows platform | `windows` 0.62 (Win32 Foundation/UI/GDI/DWM/Media OCR/etc.), `uiautomation` 0.25 |
+| Storage | `rocksdb` 0.24 (lz4, zstd, multi-threaded-cf), `fs2` |
+| Windows platform | `windows` 0.62 (Win32 Foundation/UI/Graphics/Media OCR/etc.), `windows-capture`, `uiautomation` 0.25 |
 | Browser/CDP | `chromiumoxide` 0.9 |
 | Input/HID | `enigo`, `vigem-client`, `arboard` (clipboard), `x11rb` (non-Windows) |
 | ML / audio | `ort` 2.0-rc (ONNX Runtime), `wasapi` |
@@ -70,10 +70,10 @@ crates/synapse-core/src/types/stored.rs          # StoredEvent/Observation/Sessi
 crates/synapse-core/src/types/timeline.rs        # timeline actor/entry types
 crates/synapse-core/src/types/web_perception.rs  # WebPerceptionPath / CDP perception types
 ```
-Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
+Tests: `tests/*.rs` — proptest + insta snapshot coverage for action, profile, reflex, stored, reality, timeline, ocr, path, event-filter, error-code-literal types.
 
 ### crates/synapse-storage
-Calyx vault persistence: logical column-family collections, direct writes, GC, disk-pressure shedding. Depends on `synapse-core`, `synapse-telemetry`, `synapse-calyx`, and vendored Calyx crates.
+RocksDB persistence: column families, batched writes, GC, disk-pressure shedding. Depends on `synapse-core`, `synapse-telemetry`.
 
 ```
 crates/synapse-storage/src/lib.rs            # Db handle: open, put/delete batch, scan/compact, GC + pressure spawn
@@ -89,13 +89,10 @@ crates/synapse-storage/src/routines.rs       # routine CF read/write helpers
 crates/synapse-storage/src/agent_events.rs   # agent-event CF read/write helpers
 crates/synapse-storage/src/agent_transcripts.rs # agent-transcript CF read/write helpers
 crates/synapse-storage/src/error.rs          # StorageError / StorageResult
-crates/synapse-storage/build.rs              # build script (storage codec guard)
-crates/synapse-reflex/src/audit_migration.rs # exact one-time repair for legacy retention-corrupted reflex audit rows
-calyx/crates/calyx-aster/src/sst/reader_cache.rs # bounded checksum-verified process-wide immutable SST reader cache
-calyx/crates/calyx-aster/src/vault/grounded_observation.rs # atomic source + constellation + anchor + ledger publication
+crates/synapse-storage/src/{batch,compaction,gc,open,pressure}_tests.rs # in-crate unit tests
+crates/synapse-storage/build.rs              # build script (rocksdb link config)
 ```
-`examples/dump_cf.rs` dumps a column family for manual inspection. The
-repository carries no automated test or benchmark targets; see AGENTS.md D1.
+`examples/dump_cf.rs` dumps a column family; `benches/batch_throughput.rs` write-throughput bench.
 
 ### crates/synapse-a11y
 Windows UI Automation + Chrome DevTools Protocol (CDP) accessibility. `#![allow(unsafe_code)]`. Depends on `synapse-core`.
@@ -129,15 +126,14 @@ crates/synapse-a11y/src/platform/windows/resolve.rs  # element resolution from p
 crates/synapse-a11y/src/platform/windows/snapshot.rs # UIA subtree walk -> snapshot
 crates/synapse-a11y/src/platform/windows/window.rs   # HWND enumeration / foreground
 ```
-`examples/cdp_*_probe.rs` (7) operator diagnostics. Automated `tests/` and
-`benches/` targets were removed repo-wide by D1 policy.
+`examples/cdp_*_probe.rs` (7) manual CDP probes; `benches/uia_snapshot_depth2_60elem.rs`; `tests/uwp_snapshot_regression.rs`.
 
 ### crates/synapse-capture
-Windows visible-surface screen/window capture through GDI `BitBlt`, owned BGRA buffers, DPI, and coordinate mapping. It deliberately has no WGC/DXGI fallback; GDI may still be accelerated internally by Windows or the display driver. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.
+Screen/window capture (Windows Graphics Capture + DXGI fallback), DPI, coordinate mapping. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.
 
 ```
 crates/synapse-capture/src/lib.rs            # crate root; CaptureController, capture-loop spawn, target resolve
-crates/synapse-capture/src/backend.rs        # GDI backend policy + typed refusal of explicit-GPU requests
+crates/synapse-capture/src/backend.rs        # CaptureBackend preference + DXGI fallback decision
 crates/synapse-capture/src/bitmap.rs         # screen_region_to_bgra_bitmap + WinRT SoftwareBitmap helpers
 crates/synapse-capture/src/config.rs         # CaptureConfig / CaptureTarget / ResolvedCaptureTarget
 crates/synapse-capture/src/controller.rs     # capture loop controller + metrics registration
@@ -145,16 +141,17 @@ crates/synapse-capture/src/coords.rs         # coordinate transforms
 crates/synapse-capture/src/dpi.rs            # DPI awareness init + scaling
 crates/synapse-capture/src/error.rs          # capture errors
 crates/synapse-capture/src/frame.rs          # captured frame buffer type
-crates/synapse-capture/src/stats.rs          # frame/readback stats + terminal worker state
+crates/synapse-capture/src/stats.rs          # CaptureStats, thread-priority knobs
 crates/synapse-capture/src/platform/mod.rs           # platform dispatch
 crates/synapse-capture/src/platform/non_windows.rs   # off-Windows stub
-crates/synapse-capture/src/platform/windows/bitmap.rs   # GDI BitBlt/explicit bounded-worker PrintWindow bitmap paths
-crates/synapse-capture/src/platform/windows/capture.rs  # demand-driven GDI frame loop
+crates/synapse-capture/src/platform/windows/bitmap.rs   # Windows bitmap conversion
+crates/synapse-capture/src/platform/windows/capture.rs  # WGC / DXGI frame grab
 crates/synapse-capture/src/platform/windows/common.rs   # shared Win32 helpers
 crates/synapse-capture/src/platform/windows/coords.rs   # window-to-screen coordinate math
 crates/synapse-capture/src/platform/windows/dpi.rs      # per-monitor DPI
-crates/synapse-capture/src/platform/windows/target.rs   # visible-window/monitor target validation
+crates/synapse-capture/src/platform/windows/target.rs   # HWND/monitor capture target
 ```
+`benches/capture_loop.rs`.
 
 ### crates/synapse-perception
 Assembles observations from capture + a11y + OCR + object detection + HUD/template reads. Depends on `synapse-a11y`, `synapse-capture`, `synapse-core`.
@@ -185,7 +182,7 @@ crates/synapse-audio/src/stt.rs        # WhisperTinyStt model load + transcribe
 crates/synapse-audio/src/stt/window.rs # STT audio-window framing
 crates/synapse-audio/src/error.rs      # audio errors
 ```
-Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
+Tests: direction, ring_detectors, stt, runtime_scaffold.
 
 ### crates/synapse-action
 Input emission: software (enigo), ViGEm gamepad, recording backends; humanized curves, leases, safety. `#![allow(unsafe_code)]`. Depends on `synapse-core`.
@@ -291,21 +288,21 @@ crates/synapse-profiles/src/package/types.rs      # package manifest type defini
 crates/synapse-profiles/src/package/digest.rs     # manifest digest computation
 crates/synapse-profiles/src/package/validation.rs # package permission/signature validation
 ```
-Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
+Tests: package_manifest, parse_bundled, runtime_refresh.
 
 ### crates/synapse-models
-ONNX model registry, download, verification (sha256), and ORT CPU-session loading. The installed daemon has no CUDA or DirectML execution provider. Depends on `synapse-core`.
+ONNX model registry, download, verification (sha256), ORT session loading (DirectML EP). Depends on `synapse-core`.
 
 ```
 crates/synapse-models/src/lib.rs       # Detector trait, DetectionFrame/DetectOpts, registry exports
 crates/synapse-models/src/registry.rs   # registered models (RT-DETRv2-S COCO), class map, defaults
 crates/synapse-models/src/download.rs   # ModelDescriptor + model download/dir resolution
 crates/synapse-models/src/session.rs    # ModelLoader / ORT session factory + LoadedModel
-crates/synapse-models/src/ep.rs         # CPU default/provider; typed CUDA refusal unless separately feature-compiled
+crates/synapse-models/src/ep.rs         # execution-provider order (DirectML/CPU)
 crates/synapse-models/src/verify.rs     # sha256_file / digest normalization
 crates/synapse-models/src/error.rs      # model errors
 ```
-Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
+Test: model_loader.
 
 ### crates/synapse-telemetry
 Tracing/log init (JSON file + console), log-dir GC, metrics registration, panic hook. Depends on `synapse-core`.
@@ -314,7 +311,16 @@ Tracing/log init (JSON file + console), log-dir GC, metrics registration, panic 
 crates/synapse-telemetry/src/lib.rs      # init_tracing, TelemetryGuard, log GC worker, panic hook
 crates/synapse-telemetry/src/metrics.rs   # M3 metric registration helpers
 ```
-Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
+Tests: file_sink, periodic_gc, periodic_gc_size_cap.
+
+### crates/synapse-test-utils
+Shared test helpers. Depends on `synapse-core`.
+
+```
+crates/synapse-test-utils/src/lib.rs              # crate root
+crates/synapse-test-utils/src/fixtures.rs          # test fixtures
+crates/synapse-test-utils/src/stdio_mcp_client.rs  # stdio MCP client harness for integration tests
+```
 
 ### crates/synapse-overlay
 System-tray companion binary (Windows). `#![allow(unsafe_op_in_unsafe_fn)]`. Depends on `synapse-core`, `synapse-telemetry`.
@@ -523,7 +529,7 @@ crates/synapse-mcp/src/server/browser_storage.rs      # cookies/storage tool
 ```
 M4 cdp tools (`cdp_open_tab`, etc.) live in m1/server modules above.
 
-Examples: `examples/dump_action_log.rs`, `dump_agent_events.rs`, `dump_agent_transcripts.rs`. Automated integration tests were removed by policy; manual FSV is the behavioral gate.
+Examples: `examples/dump_action_log.rs`, `dump_agent_events.rs`, `dump_agent_transcripts.rs`. ~60 integration `tests/*.rs` (m0–m5 gates, tool-list assertions, multi-agent capability matrix, lifecycle).
 
 ---
 
@@ -547,6 +553,7 @@ synapse-a11y       -> synapse-core
 synapse-models     -> synapse-core
 synapse-profiles   -> synapse-core
 synapse-telemetry  -> synapse-core
+synapse-test-utils -> synapse-core
 synapse-core       -> (none — root)
 ```
 
@@ -554,7 +561,7 @@ synapse-core       -> (none — root)
 |---|---|---|
 | synapse-core | — | shared types/IDs/error codes (root) |
 | synapse-telemetry | core | tracing/log init, metrics |
-| synapse-storage | core, telemetry, calyx | Calyx vault persistence |
+| synapse-storage | core, telemetry | RocksDB persistence |
 | synapse-a11y | core | UIA + CDP accessibility |
 | synapse-capture | core, telemetry | screen/window capture |
 | synapse-action | core | input emission, leases, safety |
@@ -564,6 +571,7 @@ synapse-core       -> (none — root)
 | synapse-audio | core, models | loopback + STT |
 | synapse-reflex | action, core, storage | reactive automation engine |
 | synapse-mcp | all above | the daemon / MCP server (sink) |
+| synapse-test-utils | core | test harness |
 | synapse-overlay | core, telemetry | tray companion binary |
 
 ---
@@ -606,7 +614,6 @@ Chrome MV3 extension "Synapse Chrome Bridge" (v0.1.1, min Chrome 125). Controls 
 ### `scripts/` — operational PowerShell / shell / Python
 ```
 synapse-setup.ps1                    # Windows setup: build/install daemon, deploy profiles, gen token, register auto-start HTTP daemon, wire MCP clients (idempotent)
-synapse-codex-doctor.ps1             # shell-runnable Codex/Synapse MCP doctor; writes restart handoffs for no-facade and stale-schema Codex sessions
 synapse-install.sh                   # WSL-side installer entry (controlling body is the Windows synapse-mcp.exe HTTP daemon)
 install-synapse-chrome-debugger.ps1  # install/register Chrome native host + debugger extension; self-heal removal of blockers
 add-defender-exclusions.ps1          # add Defender real-time-scan exclusions for the Rust build tree (major build-speed win)
@@ -621,10 +628,8 @@ manual_mcp_stdio_probe.py            # manual MCP-over-stdio probe (launches syn
 swarm.py                             # run a local-model agent swarm against a live daemon (operational probe)
 ```
 
-### Automated test surface
-
-There is no workspace-level or per-crate automated test/benchmark surface.
-Behavioral acceptance is manual FSV under AGENTS.md D1.
+### `tests/` (workspace-level)
+Only `tests/fixtures/` (e.g. `fixtures/audio/`) — shared test fixture assets consumed by crate integration tests. No workspace-level `.rs` integration suites; integration tests live per-crate under `crates/*/tests/`.
 
 ---
 

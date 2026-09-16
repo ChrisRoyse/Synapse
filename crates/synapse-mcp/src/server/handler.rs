@@ -14,21 +14,6 @@ use synapse_core::error_codes;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-/// Budget for the four pre-work captures every tool call performs. The
-/// prologue is pure overhead from a caller's perspective: it runs before the
-/// requested tool does anything. A quiet log is the evidence it is in budget.
-/// Budget above which the per-call prologue split is reported, in
-/// **microseconds**.
-///
-/// This was 10 whole milliseconds against timings taken with
-/// `Duration::as_millis()`. Once #1936 cut per-call overhead from 42 ms to
-/// ~14 ms, every individual prologue capture rounded to `0` and the total never
-/// reached the threshold, so the instrument built to attribute the prologue
-/// reported nothing at all — it could no longer resolve the quantity it exists
-/// to measure (#1945). Microseconds, at a budget of 1 ms, keep it able to see
-/// the thing it is watching.
-const TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US: u128 = 1_000;
-
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynapseService {
     async fn call_tool(
@@ -37,23 +22,7 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
-        // Entry marker: the only fixed point that separates transport/rmcp time
-        // from in-handler time. Without it the interval between a response and
-        // the next call's first durable lifecycle event is unattributable, and
-        // that interval is the largest single component of tool-call latency.
-        tracing::info!(
-            code = "MCP_TOOL_CALL_ENTERED",
-            tool = %tool_name,
-            "call_tool entered"
-        );
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
-        // #1800: stamp request activity so idle-abandoned sessions become
-        // reapable before shutdown. Only refreshes an existing live row.
-        if let Some(session_id) = mcp_session_id.as_deref() {
-            self.record_session_request_activity(session_id, &tool_name);
-        }
-        let argument_shape =
-            super::mcp_usage::argument_shape_from_arguments(request.arguments.as_ref());
         let operation = tool_operation_from_arguments(&tool_name, request.arguments.as_ref());
         let lifecycle_guard = self.begin_daemon_lifecycle_tool_call(
             &tool_name,
@@ -63,15 +32,9 @@ impl ServerHandler for SynapseService {
         if let Some(session_id) = mcp_session_id.as_deref()
             && let Err(error) = self.reject_terminated_session_tool_call(&tool_name, session_id)
         {
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                self,
-                finished,
-                argument_shape,
-                error,
-            )?;
             return Err(error);
         }
         if let Err(error) = self.admit_tool_call_for_profile(&tool_name, mcp_session_id.as_deref())
@@ -79,18 +42,10 @@ impl ServerHandler for SynapseService {
             // Terminalize lifecycle ownership before the best-effort peer
             // notification. The peer await is transport-owned and may be
             // cancelled if the caller disconnects.
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                self,
-                finished,
-                argument_shape,
-                error,
-            )?;
-            let attestation_reinitialization =
-                tool_surface_attestation_reinitialization_code(&error).map(str::to_owned);
-            if tool_list_refresh_required(&error) {
+            if profile_policy_denied(&error) {
                 match context.peer.notify_tool_list_changed().await {
                     Ok(()) => {
                         tracing::info!(
@@ -111,62 +66,14 @@ impl ServerHandler for SynapseService {
                     }
                 }
             }
-            if let (Some(session_id), Some(reason_code)) =
-                (mcp_session_id.as_deref(), attestation_reinitialization)
-            {
-                let lifecycle = self.session_lifecycle_state().map_err(|teardown_error| {
-                    tool_surface_reinitialization_failed(
-                        &tool_name,
-                        session_id,
-                        &reason_code,
-                        &error,
-                        &teardown_error,
-                    )
-                })?;
-                match lifecycle.teardown_session(session_id, &reason_code).await {
-                    Ok(report) => {
-                        tracing::warn!(
-                            code = "MCP_TOOL_SURFACE_SESSION_REINITIALIZATION_REQUIRED",
-                            tool = %tool_name,
-                            session_id,
-                            root_cause_code = %reason_code,
-                            report = ?report,
-                            "terminated an unrefreshable MCP session so the client must initialize and list tools again"
-                        );
-                    }
-                    Err(teardown_error) => {
-                        tracing::error!(
-                            code = error_codes::MCP_TOOL_SURFACE_REINITIALIZATION_FAILED,
-                            tool = %tool_name,
-                            session_id,
-                            root_cause_code = %reason_code,
-                            teardown_error = ?teardown_error,
-                            "failed to fully reclaim a stale tool-surface session"
-                        );
-                        return Err(tool_surface_reinitialization_failed(
-                            &tool_name,
-                            session_id,
-                            &reason_code,
-                            &error,
-                            &teardown_error,
-                        ));
-                    }
-                }
-            }
             return Err(error);
         }
         let shutdown_cancel = match self.shutdown_cancel_token() {
             Ok(shutdown_cancel) => shutdown_cancel,
             Err(error) => {
-                let finished = lifecycle_guard
+                lifecycle_guard
                     .finish_error(error_snapshot(&error))
                     .map_err(lifecycle_mcp_error)?;
-                let error = super::mcp_usage::record_error_and_attach_steering(
-                    self,
-                    finished,
-                    argument_shape,
-                    error,
-                )?;
                 return Err(error);
             }
         };
@@ -182,15 +89,9 @@ impl ServerHandler for SynapseService {
             };
             let error =
                 daemon_restarting_mcp_error(&tool_name, mcp_session_id.as_deref(), snapshot);
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                self,
-                finished,
-                argument_shape,
-                error,
-            )?;
             return Err(error);
         }
         let operator_panic_boundary =
@@ -206,10 +107,8 @@ impl ServerHandler for SynapseService {
         let child_service = self.clone();
         let child_tool_name = tool_name.clone();
         let child_mcp_session_id = mcp_session_id.clone();
-        let child_argument_shape = argument_shape.clone();
         let (result_sender, mut result_receiver) = oneshot::channel();
         let authority_completion = match self.spawn_cooperative_authority_transaction(
-            super::AuthorityTransactionDescriptor::new(tool_name.clone(), mcp_session_id.clone()),
             move |supervisor_cancellation| async move {
                 let lifecycle_guard = child_lifecycle_owner
                     .lock()
@@ -256,11 +155,9 @@ impl ServerHandler for SynapseService {
                                 )
                                 .await;
                                 let result = finish_routed_tool_call(
-                                    &child_service,
                                     lifecycle_guard,
                                     &child_tool_name,
                                     child_mcp_session_id.as_deref(),
-                                    child_argument_shape,
                                     execution,
                                 );
                                 if result_sender.send(result).is_err() {
@@ -293,15 +190,9 @@ impl ServerHandler for SynapseService {
                         "failed_supervisor_admission_take",
                     ));
                 };
-                let finished = lifecycle_guard
+                lifecycle_guard
                     .finish_error(error_snapshot(&error))
                     .map_err(lifecycle_mcp_error)?;
-                let error = super::mcp_usage::record_error_and_attach_steering(
-                    self,
-                    finished,
-                    argument_shape,
-                    error,
-                )?;
                 return Err(error);
             }
         };
@@ -338,25 +229,10 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
-        let _authority_gate = if let Some(session_id) = mcp_session_id.as_deref() {
-            let gate = self.lock_session_authority(session_id).await?;
-            self.reject_terminated_session_tool_call("tools/list", session_id)?;
-            Some(gate)
-        } else {
-            None
-        };
         // Normalize schemas before they reach the client, then apply the
         // session's durable tool profile. The policy gate in `call_tool` uses
         // the same profile row so hand-written calls cannot bypass discovery.
         let tools = self.tools_for_session_profile(mcp_session_id.as_deref())?;
-        if let Some(session_id) = mcp_session_id.as_deref() {
-            // The 2025-11-25 Streamable-HTTP transport binds tools/list and
-            // later tools/call requests with Mcp-Session-Id. Persist the exact
-            // sanitized response surface before returning it. A 2026-07-28
-            // stateless transport must use a different request-scoped design;
-            // this row never claims to cover that future protocol boundary.
-            self.persist_session_tool_surface_attestation(session_id, &tools, "client_tools_list")?;
-        }
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,
@@ -474,53 +350,33 @@ where
 }
 
 fn finish_routed_tool_call(
-    service: &SynapseService,
     lifecycle_guard: crate::daemon_lifecycle::ToolCallGuard,
     tool_name: &str,
     mcp_session_id: Option<&str>,
-    argument_shape: super::mcp_usage::McpArgumentShape,
     execution: RoutedToolExecution<Result<CallToolResult, ErrorData>>,
 ) -> Result<CallToolResult, ErrorData> {
     match execution {
-        RoutedToolExecution::Completed(Ok(mut result)) => {
+        RoutedToolExecution::Completed(Ok(result)) => {
             let effective_target = effective_target_from_tool_result(&result);
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_ok_with_effective_target(effective_target)
                 .map_err(lifecycle_mcp_error)?;
-            super::mcp_usage::record_success_and_attach_steering(
-                service,
-                finished,
-                argument_shape,
-                &mut result,
-            )?;
             Ok(result)
         }
         RoutedToolExecution::Completed(Err(error)) => {
             let error = normalize_tool_error(tool_name, error);
             let error_snapshot = error_snapshot(&error);
             let effective_target = effective_target_from_error_snapshot(&error_snapshot);
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_error_with_effective_target(error_snapshot, effective_target)
                 .map_err(lifecycle_mcp_error)?;
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                service,
-                finished,
-                argument_shape,
-                error,
-            )?;
             Err(error)
         }
         RoutedToolExecution::CancelledBeforeMutation(reason) => {
             let error = routed_call_cancelled_mcp_error(tool_name, mcp_session_id, reason);
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                service,
-                finished,
-                argument_shape,
-                error,
-            )?;
             Err(error)
         }
         RoutedToolExecution::Panicked(panic_message) => {
@@ -529,17 +385,10 @@ fn finish_routed_tool_call(
                 "tool": tool_name,
                 "mcp_session_id": mcp_session_id,
             });
-            let finished = lifecycle_guard
+            lifecycle_guard
                 .finish_panic(panic)
                 .map_err(lifecycle_mcp_error)?;
-            let error = tool_panic_mcp_error(tool_name, mcp_session_id);
-            let error = super::mcp_usage::record_error_and_attach_steering(
-                service,
-                finished,
-                argument_shape,
-                error,
-            )?;
-            Err(error)
+            Err(tool_panic_mcp_error(tool_name, mcp_session_id))
         }
     }
 }
@@ -556,7 +405,7 @@ impl SynapseService {
                 "terminated-session registry lock poisoned while admitting MCP tool call",
             )
         })?;
-        if !terminated.contains_key(session_id) {
+        if !terminated.contains(session_id) {
             return Ok(());
         }
         tracing::warn!(
@@ -584,12 +433,6 @@ impl SynapseService {
         operation: Option<String>,
         mcp_session_id: Option<&str>,
     ) -> Result<crate::daemon_lifecycle::ToolCallGuard, ErrorData> {
-        // Each of the four captures below runs before the tool does any work,
-        // on every call. #1936 measured this prologue at ~27ms -- the single
-        // largest component of tool-call latency -- so the split is reported
-        // rather than inferred. `foreground` in particular is a live Win32/UIA
-        // query, which is cross-process and not bounded by anything we own.
-        let prologue_started = std::time::Instant::now();
         let (audit_context, audit_context_read_error) = match self.current_action_audit_context() {
             Ok(context) => (
                 Some(serde_json::to_value(context).map_err(|error| {
@@ -601,8 +444,6 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let audit_context_us = prologue_started.elapsed().as_micros();
-        let foreground_started = std::time::Instant::now();
         let (foreground, foreground_read_error) = match self.current_audit_foreground() {
             Ok(foreground) => (
                 Some(serde_json::to_value(foreground).map_err(|error| {
@@ -614,15 +455,11 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let foreground_us = foreground_started.elapsed().as_micros();
-        let session_target_started = std::time::Instant::now();
         let (session_target, session_target_read_error) = match self.session_target(mcp_session_id)
         {
             Ok(target) => (target.as_ref().map(session_target_value), None),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let session_target_us = session_target_started.elapsed().as_micros();
-        let tool_profile_started = std::time::Instant::now();
         let (profile, tool_surface_sha256, tool_profile_read_error) =
             match self.tool_profile_snapshot(mcp_session_id) {
                 Ok(snapshot) => (
@@ -632,29 +469,12 @@ impl SynapseService {
                 ),
                 Err(error) => (None, None, Some(error_snapshot(&error))),
             };
-        let tool_profile_us = tool_profile_started.elapsed().as_micros();
-        let prologue_total_us = prologue_started.elapsed().as_micros();
-        if prologue_total_us >= TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US {
-            tracing::info!(
-                code = "MCP_TOOL_CALL_PROLOGUE_SLOW",
-                tool = tool_name,
-                audit_context_us = audit_context_us as u64,
-                foreground_us = foreground_us as u64,
-                session_target_us = session_target_us as u64,
-                tool_profile_us = tool_profile_us as u64,
-                total_us = prologue_total_us as u64,
-                threshold_us = TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US as u64,
-                "tool-call prologue captures exceeded their per-call latency budget"
-            );
-        }
-        let lifecycle_facade =
-            super::tool_profiles::lifecycle_facade_name(tool_name).unwrap_or("unknown");
         let route_id = operation
             .as_deref()
-            .map(|operation| format!("{lifecycle_facade}.{operation}"))
-            .or_else(|| Some(lifecycle_facade.to_owned()));
+            .map(|operation| format!("{tool_name}.{operation}"))
+            .or_else(|| Some(tool_name.to_owned()));
         crate::daemon_lifecycle::begin_tool_call(crate::daemon_lifecycle::ToolCallStart {
-            tool: lifecycle_facade.to_owned(),
+            tool: tool_name.to_owned(),
             operation,
             route_id,
             profile,
@@ -682,12 +502,7 @@ fn tool_operation_from_arguments(
         .map(str::trim)
         .filter(|operation| !operation.is_empty())
     {
-        let operation = operation.to_ascii_lowercase();
-        return Some(
-            super::tool_profiles::lifecycle_facade_operation(tool_name, &operation)
-                .unwrap_or("invalid")
-                .to_owned(),
-        );
+        return Some(operation.to_ascii_lowercase());
     }
     match tool_name {
         "shell" => Some("run".to_owned()),
@@ -697,29 +512,10 @@ fn tool_operation_from_arguments(
         "profile" => Some("status".to_owned()),
         "telemetry" => Some("status".to_owned()),
         "storage" => Some("summary".to_owned()),
-        _ => super::tool_profiles::lifecycle_single_operation(tool_name).map(str::to_owned),
+        _ => None,
     }
 }
 
-/// Gives the rmcp-generated failures a Synapse-shaped `data.code`.
-///
-/// **Scope, and why it is narrow (#2074).** This is a last-resort labeller for
-/// errors *rmcp itself* raised — the router's "tool not found" and the
-/// `deny_unknown_fields` deserialize dead-ends — which are the only failures on
-/// this surface with nothing better to say than "your parameters are wrong".
-/// The guard is deliberately structural (`data.is_none()` plus the JSON-RPC
-/// code) and never reads the message, because a normalizer that classified by
-/// message text would be doing exactly the string-parsing that having a
-/// `data.code` exists to remove.
-///
-/// The consequence is a standing obligation on every tool path: **a refusal that
-/// knows its own cause must carry it in `data`**, via
-/// [`crate::m1::mcp_error`] / [`crate::m1::mcp_error_with_remediation`] or an
-/// equivalent structured error. A raw `ErrorData::invalid_params(msg, None)`
-/// reaching here is relabelled `TOOL_PARAMS_INVALID` whatever its message says —
-/// which is how `observe` came to report a daemon-side
-/// `DETECTION_MODEL_NOT_LOADED` profile fault as a caller parameter error. That
-/// is fixed where such errors are built, not here.
 fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
     if error.data.is_none() && error.message == "tool not found" {
         return mcp_error(
@@ -901,58 +697,13 @@ fn parse_hwnd_literal(value: &str) -> Option<i64> {
         .or_else(|| value.parse::<i64>().ok())
 }
 
-fn tool_list_refresh_required(error: &ErrorData) -> bool {
-    matches!(
-        error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(Value::as_str),
-        Some(
-            error_codes::TOOL_PROFILE_POLICY_DENIED
-                | error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING
-                | error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE
-        )
-    )
-}
-
-fn tool_surface_attestation_reinitialization_code(error: &ErrorData) -> Option<&str> {
-    match error
+fn profile_policy_denied(error: &ErrorData) -> bool {
+    error
         .data
         .as_ref()
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
-    {
-        Some(
-            code @ (error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING
-            | error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE),
-        ) => Some(code),
-        _ => None,
-    }
-}
-
-fn tool_surface_reinitialization_failed(
-    tool_name: &str,
-    session_id: &str,
-    root_cause_code: &str,
-    attestation_error: &ErrorData,
-    teardown_error: &ErrorData,
-) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "MCP session {session_id:?} has an untrusted tool surface and could not be fully terminated"
-        ),
-        Some(json!({
-            "code": error_codes::MCP_TOOL_SURFACE_REINITIALIZATION_FAILED,
-            "tool": tool_name,
-            "session_id": session_id,
-            "root_cause_code": root_cause_code,
-            "attestation_error": error_snapshot(attestation_error),
-            "teardown_error": error_snapshot(teardown_error),
-            "remediation": "inspect the named session teardown failure and physical resource readbacks; do not admit another tool call until cleanup succeeds and the client initializes a new session then issues tools/list",
-        })),
-    )
+        == Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
 }
 
 fn daemon_restarting_mcp_error(
@@ -1071,4 +822,287 @@ fn tool_panic_mcp_error(tool_name: &str, mcp_session_id: Option<&str>) -> ErrorD
             "daemon_lifecycle": crate::daemon_lifecycle::diagnostic_value(),
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RoutedFutureDropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for RoutedFutureDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_read_caller_drop_cancels_before_mutation_and_drops_exact_future() {
+        let boundary = super::super::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+            "synthetic_routed_read",
+            Some("session-test"),
+        );
+        let future_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future_drop_probe = std::sync::Arc::clone(&future_dropped);
+        let (mut result_sender, result_receiver) = oneshot::channel::<()>();
+        drop(result_receiver);
+
+        let (execution, late_mutation_error) =
+            super::super::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+                .scope(boundary, async move {
+                    let routed_read = async move {
+                        let _drop_probe = RoutedFutureDropProbe(future_drop_probe);
+                        std::future::pending::<()>().await;
+                    };
+                    let execution = await_routed_tool_call(
+                        routed_read,
+                        &mut result_sender,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                    let late_mutation_error =
+                        super::super::operator_panic_boundary::ensure_mcp_mutation(
+                            "synthetic_late_mutation",
+                        )
+                        .expect_err("caller cancellation must close later mutation admission");
+                    (execution, late_mutation_error)
+                })
+                .await;
+
+        assert!(matches!(
+            execution,
+            RoutedToolExecution::CancelledBeforeMutation("caller_result_receiver_closed")
+        ));
+        assert!(
+            future_dropped.load(std::sync::atomic::Ordering::Acquire),
+            "pre-mutation caller cancellation must synchronously drop the exact routed future"
+        );
+        assert_eq!(
+            late_mutation_error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail_code")),
+            Some(&json!("MCP_ROUTED_CALL_CANCELLED_BEFORE_MUTATION"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_mutation_survives_caller_drop_and_supervisor_drain_until_terminal() {
+        synapse_action::isolate_interrupt_epochs_for_test();
+        let baseline = super::super::operator_panic_boundary::mcp_mutation_activity_snapshot()
+            .unwrap_or_else(|error| panic!("read baseline MCP mutation activity: {error}"));
+        let service = SynapseService::new();
+        let boundary = super::super::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+            "synthetic_routed_mutation",
+            Some("session-test"),
+        );
+        let release = CancellationToken::new();
+        let child_release = release.clone();
+        let terminal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_terminal = std::sync::Arc::clone(&terminal);
+        let (armed_sender, armed_receiver) = oneshot::channel();
+        let (drain_observed_sender, drain_observed_receiver) = oneshot::channel();
+        let (result_sender, result_receiver) = oneshot::channel::<()>();
+
+        let caller = service
+            .spawn_cooperative_authority_transaction(move |supervisor_cancellation| async move {
+                let route_cancellation = supervisor_cancellation.clone();
+                let routed_mutation = async move {
+                    super::super::operator_panic_boundary::ensure_mcp_mutation(
+                        "synthetic_physical_mutation",
+                    )?;
+                    let _armed = armed_sender.send(());
+                    route_cancellation.cancelled().await;
+                    let _drain_observed = drain_observed_sender.send(());
+                    child_release.cancelled().await;
+                    Ok::<(), ErrorData>(())
+                };
+                let mut result_sender = result_sender;
+                let execution = super::super::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+                    .scope(boundary, async move {
+                        await_routed_tool_call(
+                            routed_mutation,
+                            &mut result_sender,
+                            supervisor_cancellation,
+                        )
+                        .await
+                    })
+                    .await;
+                assert!(matches!(execution, RoutedToolExecution::Completed(Ok(()))));
+                child_terminal.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .unwrap_or_else(|error| panic!("spawn routed mutation owner: {error:?}"));
+
+        armed_receiver
+            .await
+            .unwrap_or_else(|error| panic!("routed mutation did not reserve ownership: {error}"));
+        let armed = super::super::operator_panic_boundary::mcp_mutation_activity_snapshot()
+            .unwrap_or_else(|error| panic!("read armed MCP mutation activity: {error}"));
+        assert_eq!(armed.in_flight, baseline.in_flight + 1);
+
+        // Model both transport cancellation and the handler future being
+        // dropped. Neither owns the routed mutation after reservation.
+        drop(result_receiver);
+        drop(caller);
+        let drain_service = service.clone();
+        let drain = tokio::spawn(async move { drain_service.drain_authority_finalizers().await });
+        drain_observed_receiver
+            .await
+            .unwrap_or_else(|error| panic!("routed mutation did not observe drain: {error}"));
+        tokio::task::yield_now().await;
+        assert!(
+            !terminal.load(std::sync::atomic::Ordering::Acquire),
+            "armed routed mutation must not publish terminal state before its exact owner finishes"
+        );
+        assert!(
+            !drain.is_finished(),
+            "daemon drain must retain an armed routed mutation owner"
+        );
+        assert_eq!(
+            super::super::operator_panic_boundary::mcp_mutation_activity_snapshot()
+                .unwrap_or_else(|error| panic!("read retained MCP mutation activity: {error}"))
+                .in_flight,
+            baseline.in_flight + 1
+        );
+
+        release.cancel();
+        let readback = drain
+            .await
+            .unwrap_or_else(|error| panic!("join authority drain: {error}"))
+            .unwrap_or_else(|error| panic!("drain routed mutation owner: {error}"));
+        assert!(terminal.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(readback.registered_tasks_before, 1);
+        assert_eq!(readback.cancellation_signals_sent, 1);
+        assert_eq!(readback.abort_requests_sent, 0);
+        assert_eq!(readback.registered_tasks_after, 0);
+        assert_eq!(readback.tracked_tasks_after, 0);
+        assert!(readback.safe_to_unlock());
+        assert_eq!(
+            super::super::operator_panic_boundary::mcp_mutation_activity_snapshot()
+                .unwrap_or_else(|error| panic!("read terminal MCP mutation activity: {error}"))
+                .in_flight,
+            baseline.in_flight
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_drain_cancels_unarmed_routed_read_after_caller_drop() {
+        let service = SynapseService::new();
+        let boundary = super::super::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+            "synthetic_supervised_read",
+            Some("session-test"),
+        );
+        let future_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future_drop_probe = std::sync::Arc::clone(&future_dropped);
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (terminal_sender, terminal_receiver) = oneshot::channel();
+        let (result_sender, result_receiver) = oneshot::channel::<()>();
+        let caller = service
+            .spawn_cooperative_authority_transaction(move |supervisor_cancellation| async move {
+                let routed_read = async move {
+                    let _drop_probe = RoutedFutureDropProbe(future_drop_probe);
+                    let _started = started_sender.send(());
+                    std::future::pending::<()>().await;
+                };
+                let mut result_sender = result_sender;
+                let execution = super::super::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+                    .scope(boundary, async move {
+                        await_routed_tool_call(
+                            routed_read,
+                            &mut result_sender,
+                            supervisor_cancellation,
+                        )
+                        .await
+                    })
+                    .await;
+                let reason = match execution {
+                    RoutedToolExecution::CancelledBeforeMutation(reason) => reason,
+                    RoutedToolExecution::Completed(()) => "unexpected_completion",
+                    RoutedToolExecution::Panicked(_) => "unexpected_panic",
+                };
+                let _terminal = terminal_sender.send(reason);
+            })
+            .unwrap_or_else(|error| panic!("spawn supervised routed read: {error:?}"));
+        started_receiver
+            .await
+            .unwrap_or_else(|error| panic!("supervised routed read did not start: {error}"));
+        drop(caller);
+
+        let readback = service
+            .drain_authority_finalizers()
+            .await
+            .unwrap_or_else(|error| panic!("drain supervised routed read: {error}"));
+        assert_eq!(
+            terminal_receiver
+                .await
+                .unwrap_or_else(|error| panic!("read routed terminal cause: {error}")),
+            "authority_supervisor_shutdown"
+        );
+        assert!(future_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(readback.registered_tasks_before, 1);
+        assert_eq!(readback.cancellation_signals_sent, 1);
+        assert!(readback.safe_to_unlock());
+        drop(result_receiver);
+    }
+
+    #[test]
+    fn extracts_effective_target_from_browser_dom_content_result() {
+        let result = CallToolResult::structured(json!({
+            "operation": "content",
+            "content": {
+                "window_hwnd": 47060598,
+                "cdp_target_id": "chrome-tab:600757323",
+                "html": "<html>large payload must not be copied into target metadata</html>"
+            }
+        }));
+
+        let target = effective_target_from_tool_result(&result).expect("effective target");
+        assert_eq!(target.get("kind").and_then(Value::as_str), Some("cdp"));
+        assert_eq!(
+            target.get("window_hwnd").and_then(Value::as_i64),
+            Some(47060598)
+        );
+        assert_eq!(
+            target.get("cdp_target_id").and_then(Value::as_str),
+            Some("chrome-tab:600757323")
+        );
+        assert_eq!(
+            target.get("source").and_then(Value::as_str),
+            Some("structured_content.content")
+        );
+        assert!(target.get("html").is_none());
+    }
+
+    #[test]
+    fn extracts_effective_target_from_error_source_id() {
+        let error = json!({
+            "data": {
+                "source_id": "window_hwnd=0x2ce1676;cdp_target_id=chrome-tab:600757326;query_len=9"
+            }
+        });
+
+        let target = effective_target_from_error_snapshot(&error).expect("effective target");
+        assert_eq!(
+            target.get("window_hwnd").and_then(Value::as_i64),
+            Some(47060598)
+        );
+        assert_eq!(
+            target.get("cdp_target_id").and_then(Value::as_str),
+            Some("chrome-tab:600757326")
+        );
+        assert_eq!(
+            target.get("source").and_then(Value::as_str),
+            Some("error.data.source_id")
+        );
+    }
+
+    #[test]
+    fn ignores_tool_result_without_target_metadata() {
+        let result = CallToolResult::structured(json!({
+            "ok": true,
+            "html": "<html>no target fields</html>"
+        }));
+
+        assert!(effective_target_from_tool_result(&result).is_none());
+    }
 }

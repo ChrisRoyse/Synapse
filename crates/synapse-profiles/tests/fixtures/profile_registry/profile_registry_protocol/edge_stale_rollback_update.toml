@@ -1,0 +1,18 @@
+schema_version = 1
+kind = "registry_update_metadata"
+source_id = "registry.synthetic.local-fixture"
+package_id = "profile.synthetic.governance"
+installed_version = "0.2.0"
+offered_version = "0.1.0"
+channel = "stable"
+snapshot_at = "2026-05-26T00:00:00Z"
+snapshot_expires_at = "2026-05-26T12:00:00Z"
+manifest_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+package_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+revoked = false
+
+[expected_policy]
+outcome = "reject"
+reason_code = "rollback_or_stale_update_metadata"
+allowed_to_stage = false
+allowed_to_activate = false

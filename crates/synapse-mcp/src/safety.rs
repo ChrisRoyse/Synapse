@@ -8,7 +8,7 @@ use synapse_action::{
     ActionError, OperatorHotkeyGuard, OperatorHotkeyShutdownReport, OperatorHotkeyStatus,
     RELEASE_ALL_HANDLE, set_operator_hotkey_status,
 };
-use synapse_core::{Action, error_codes};
+use synapse_core::error_codes;
 use tokio::runtime::Handle;
 
 use crate::m3::SharedM3State;
@@ -712,6 +712,253 @@ fn parse_bool_value(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalizer_accepts_intermediate_newer_tag_when_publication_outpaces_k1() {
+        assert!(operator_panic_tag_belongs_to_newer_published_wave(
+            10, 11, 12
+        ));
+        assert!(operator_panic_tag_belongs_to_newer_published_wave(
+            10, 12, 12
+        ));
+        assert!(!operator_panic_tag_belongs_to_newer_published_wave(
+            10, 10, 12
+        ));
+        assert!(!operator_panic_tag_belongs_to_newer_published_wave(
+            10, 9, 12
+        ));
+        assert!(!operator_panic_tag_belongs_to_newer_published_wave(
+            10, 13, 12
+        ));
+    }
+
+    #[test]
+    fn finalization_postcondition_requires_coherent_lease_and_live_newer_owner() {
+        let held_newer = synapse_action::LeaseSafetySnapshot {
+            status: synapse_action::LeaseStatus {
+                held: true,
+                owner_session_id: Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID.to_owned()),
+                acquired_at_ms_ago: Some(0),
+                renewed_at_ms_ago: Some(0),
+                ttl_ms: Some(synapse_action::OPERATOR_PREEMPT_LEASE_TTL_MS),
+                expires_in_ms: Some(synapse_action::OPERATOR_PREEMPT_LEASE_TTL_MS),
+            },
+            operator_panic_generation: Some(11),
+        };
+        let mut safety = synapse_action::OperatorPanicSafetyReadback {
+            epoch: 12,
+            publications_in_flight: 0,
+            outstanding_generations: 0,
+            outstanding_finalizations: 2,
+            accounting_incident: false,
+            pending: true,
+        };
+        assert!(operator_panic_finalization_postcondition(
+            10,
+            &held_newer,
+            &safety
+        ));
+
+        safety.outstanding_finalizations = 1;
+        assert!(!operator_panic_finalization_postcondition(
+            10,
+            &held_newer,
+            &safety
+        ));
+        let unheld = synapse_action::LeaseSafetySnapshot {
+            status: synapse_action::LeaseStatus::unheld(),
+            operator_panic_generation: None,
+        };
+        assert!(operator_panic_finalization_postcondition(
+            10, &unheld, &safety
+        ));
+    }
+
+    #[test]
+    fn browser_owner_reset_overlap_accepts_fresh_newer_closed_generation_not_stale_enable() {
+        let fresh_after_newer_k1 = synapse_a11y::CdpDurableBrowserMutationOwnersReadback {
+            enabled: false,
+            disable_sequence: 12,
+            fetch_interception_active_count: 0,
+            network_override_active_count: 0,
+            dialog_auto_policy_active_count: 0,
+            clock_active_count: 0,
+            init_script_active_count: 0,
+            unresolved_raw_cdp_evaluate_timeout_count: 0,
+            unresolved_raw_cdp_input_owner_count: 0,
+            persisted_cdp_mutation_owner_count: 0,
+            persisted_cdp_input_owner_count: 0,
+            persisted_cdp_evaluate_owner_count: 0,
+            persisted_cdp_init_script_effect_owner_count: 0,
+            registry_readback_failures: Vec::new(),
+            registry_readback_healthy: true,
+        };
+        assert!(browser_owner_gate_closed_for_newer_wave(
+            11,
+            &fresh_after_newer_k1
+        ));
+
+        let mut same_generation = fresh_after_newer_k1.clone();
+        same_generation.disable_sequence = 11;
+        assert!(!browser_owner_gate_closed_for_newer_wave(
+            11,
+            &same_generation
+        ));
+        let mut stale_enabled = fresh_after_newer_k1.clone();
+        stale_enabled.enabled = true;
+        assert!(!browser_owner_gate_closed_for_newer_wave(
+            11,
+            &stale_enabled
+        ));
+        let mut unhealthy = fresh_after_newer_k1;
+        unhealthy.registry_readback_healthy = false;
+        unhealthy
+            .registry_readback_failures
+            .push("synthetic poisoned registry".to_owned());
+        assert!(!browser_owner_gate_closed_for_newer_wave(11, &unhealthy));
+    }
+
+    #[test]
+    fn operator_hotkey_required_defaults_to_fail_closed() {
+        let required = parse_bool_value(REQUIRE_OPERATOR_HOTKEY_ENV, None, true)
+            .expect("missing require env should parse");
+
+        assert!(required);
+    }
+
+    #[test]
+    fn operator_hotkey_required_can_be_explicitly_relaxed() {
+        let required = parse_bool_value(
+            REQUIRE_OPERATOR_HOTKEY_ENV,
+            Some(std::borrow::Cow::Borrowed("0")),
+            true,
+        )
+        .expect("false require env should parse");
+
+        assert!(!required);
+    }
+
+    #[test]
+    fn operator_hotkey_disabled_defaults_to_false() {
+        let disabled = parse_bool_value(DISABLE_OPERATOR_HOTKEY_ENV, None, false)
+            .expect("missing disable env should parse");
+
+        assert!(!disabled);
+    }
+
+    fn synthetic_k2_owner_readback(
+        admission_closed: bool,
+        pending_spawn_task_ids: Vec<u64>,
+        task_owners: Vec<OperatorPanicK2TaskOwnerState>,
+    ) -> OperatorPanicK2TaskOwnerReadback {
+        OperatorPanicK2TaskOwnerReadback {
+            admission_closed,
+            pending_spawn_task_ids,
+            task_owners,
+            reservations_after_admission_close: 0,
+            tracking_failures: Vec::new(),
+            lock_poison_observed: false,
+        }
+    }
+
+    fn synthetic_clean_k2_drain_report() -> OperatorPanicK2TaskDrainReport {
+        OperatorPanicK2TaskDrainReport {
+            reason: "synthetic",
+            hotkey_spawn_source_quiescent: true,
+            owners_before: synthetic_k2_owner_readback(
+                false,
+                Vec::new(),
+                vec![OperatorPanicK2TaskOwnerState {
+                    task_id: 1,
+                    generation: 1,
+                    terminal: false,
+                }],
+            ),
+            panic_safety_before: synapse_action::OperatorPanicSafetyReadback {
+                epoch: 1,
+                publications_in_flight: 0,
+                outstanding_generations: 1,
+                outstanding_finalizations: 0,
+                accounting_incident: false,
+                pending: true,
+            },
+            tasks_observed: 1,
+            graceful_joined: 1,
+            abort_requests_sent: 0,
+            joined_after_abort: 0,
+            task_successes: 1,
+            retained_task_owner_ids: Vec::new(),
+            owners_after: synthetic_k2_owner_readback(true, Vec::new(), Vec::new()),
+            panic_safety_after: synapse_action::OperatorPanicSafetyReadback {
+                epoch: 1,
+                publications_in_flight: 0,
+                outstanding_generations: 0,
+                outstanding_finalizations: 0,
+                accounting_incident: false,
+                pending: false,
+            },
+            elapsed_ms: 1,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn k2_drain_verdict_requires_closed_empty_owner_readback() {
+        let clean = synthetic_clean_k2_drain_report();
+        assert!(clean.owners_quiescent());
+        clean.verdict().expect("closed empty tracker should pass");
+
+        let mut pending = clean.clone();
+        pending.owners_after.pending_spawn_task_ids.push(2);
+        assert!(!pending.owners_quiescent());
+        assert!(pending.verdict().is_err());
+
+        let mut retained = clean;
+        retained
+            .owners_after
+            .task_owners
+            .push(OperatorPanicK2TaskOwnerState {
+                task_id: 3,
+                generation: 3,
+                terminal: true,
+            });
+        retained.retained_task_owner_ids.push(3);
+        assert!(!retained.owners_quiescent());
+        assert!(retained.verdict().is_err());
+    }
+
+    #[test]
+    fn k2_drain_verdict_rejects_unaccounted_or_late_work() {
+        let mut unaccounted = synthetic_clean_k2_drain_report();
+        unaccounted.tasks_observed = 2;
+        assert!(unaccounted.verdict().is_err());
+
+        let mut late = synthetic_clean_k2_drain_report();
+        late.owners_after.reservations_after_admission_close = 1;
+        assert!(late.owners_quiescent());
+        assert!(late.verdict().is_err());
+
+        let mut live_hotkey_source = synthetic_clean_k2_drain_report();
+        live_hotkey_source.hotkey_spawn_source_quiescent = false;
+        assert!(!live_hotkey_source.owners_quiescent());
+        assert!(live_hotkey_source.verdict().is_err());
+
+        let mut orphaned_generation = synthetic_clean_k2_drain_report();
+        orphaned_generation
+            .panic_safety_after
+            .outstanding_generations = 1;
+        orphaned_generation.panic_safety_after.pending = true;
+        assert!(
+            !orphaned_generation.owners_quiescent(),
+            "an empty task tracker must not hide a published panic with no K2 owner"
+        );
+        assert!(orphaned_generation.verdict().is_err());
+    }
+}
+
 fn handle_operator_hotkey(
     service: &SynapseService,
     m3_state: &SharedM3State,
@@ -1138,145 +1385,6 @@ async fn reconcile_operator_panic_lease_finalization(
     }
 }
 
-/// Read the three independent Sources of Truth needed to recover a browser
-/// mutation gate stranded after the extension worker is replaced mid-K2.
-pub(crate) async fn operator_panic_browser_gate_status() -> Result<serde_json::Value, String> {
-    let safety = synapse_action::operator_panic_safety_readback();
-    let browser = synapse_a11y::durable_browser_mutation_owners_readback();
-    let extension = crate::chrome_debugger_bridge::operator_panic_readback()
-        .await
-        .map_err(|error| {
-            format!(
-                "extension owner readback failed: {}: {}",
-                error.code(),
-                error.detail()
-            )
-        })?;
-    Ok(serde_json::json!({
-        "source_of_truth": "synapse_action::operator_panic_safety_readback + synapse_a11y durable browser-owner registry + extension chrome.storage.local durable-owner ledger/live readback",
-        "operator_panic": safety,
-        "browser_owners": browser,
-        "extension_owners": extension,
-    }))
-}
-
-/// Explicit compare-and-swap recovery for a completed panic wave whose browser
-/// gates remained closed. Nothing is drained or discarded here: both owner
-/// registries must already be healthy and empty, and a newer panic generation
-/// makes either conditional enable refuse the stale request.
-pub(crate) async fn recover_operator_panic_browser_gates(
-    expected_operator_panic_epoch: u64,
-    expected_extension_disable_sequence: u64,
-    expected_browser_disable_sequence: u64,
-) -> Result<serde_json::Value, String> {
-    let safety_before = synapse_action::operator_panic_safety_readback();
-    if safety_before.pending || safety_before.epoch != expected_operator_panic_epoch {
-        return Err(format!(
-            "operator-panic generation is pending or changed: expected_epoch={expected_operator_panic_epoch} actual={safety_before:?}"
-        ));
-    }
-    let extension_before = crate::chrome_debugger_bridge::operator_panic_readback()
-        .await
-        .map_err(|error| {
-            format!(
-                "extension precondition readback failed: {}: {}",
-                error.code(),
-                error.detail()
-            )
-        })?;
-    let extension_healthy_empty = extension_before.disable_sequence
-        == expected_extension_disable_sequence
-        && extension_before.owner_continuity_healthy
-        && extension_before.active_after == Default::default();
-    if !extension_healthy_empty {
-        return Err(format!(
-            "extension gate is not healthy, empty, and at the exact generation: expected_disable_sequence={expected_extension_disable_sequence} readback={extension_before:?}"
-        ));
-    }
-    let browser_before = synapse_a11y::durable_browser_mutation_owners_readback();
-    if browser_before.disable_sequence != expected_browser_disable_sequence
-        || !browser_before.registry_readback_healthy
-        || !browser_before.registry_readback_failures.is_empty()
-        || browser_before.fetch_interception_active_count != 0
-        || browser_before.network_override_active_count != 0
-        || browser_before.dialog_auto_policy_active_count != 0
-        || browser_before.clock_active_count != 0
-        || browser_before.init_script_active_count != 0
-        || browser_before.persisted_cdp_mutation_owner_count != 0
-        || browser_before.unresolved_raw_cdp_evaluate_timeout_count != 0
-        || browser_before.unresolved_raw_cdp_input_owner_count != 0
-    {
-        return Err(format!(
-            "daemon browser gate is not a healthy empty exact-generation latch: expected_disable_sequence={expected_browser_disable_sequence} readback={browser_before:?}"
-        ));
-    }
-
-    let extension_enable = if extension_before.enabled {
-        None
-    } else {
-        Some(
-            crate::chrome_debugger_bridge::operator_panic_enable_if_unchanged(
-                expected_extension_disable_sequence,
-            )
-            .await
-            .map_err(|error| {
-                format!(
-                    "extension conditional enable failed: {}: {}",
-                    error.code(),
-                    error.detail()
-                )
-            })?,
-        )
-    };
-    let safety_mid = synapse_action::operator_panic_safety_readback();
-    if safety_mid.pending || safety_mid.epoch != expected_operator_panic_epoch {
-        return Err(format!(
-            "a newer panic wave crossed extension recovery; safety={safety_mid:?} extension_enable={extension_enable:?}"
-        ));
-    }
-    let browser_enable = if browser_before.enabled {
-        browser_before.clone()
-    } else {
-        synapse_a11y::durable_browser_mutation_owners_enable_if_unchanged(
-            expected_browser_disable_sequence,
-        )
-        .await
-    };
-    let safety_after = synapse_action::operator_panic_safety_readback();
-    let extension_after = crate::chrome_debugger_bridge::operator_panic_readback()
-        .await
-        .map_err(|error| {
-            format!(
-                "extension postcondition readback failed: {}: {}",
-                error.code(),
-                error.detail()
-            )
-        })?;
-    let browser_after = synapse_a11y::durable_browser_mutation_owners_readback();
-    if safety_after.pending
-        || safety_after.epoch != expected_operator_panic_epoch
-        || !extension_after.enabled
-        || extension_after.disable_sequence != expected_extension_disable_sequence
-        || !extension_after.owner_continuity_healthy
-        || extension_after.active_after != Default::default()
-        || !browser_after.enabled
-        || browser_after.disable_sequence != expected_browser_disable_sequence
-        || browser_enable != browser_after
-    {
-        return Err(format!(
-            "recovery did not reach an independently verified terminal state: safety={safety_after:?} extension_enable={extension_enable:?} extension_after={extension_after:?} browser_enable={browser_enable:?} browser_after={browser_after:?}"
-        ));
-    }
-    tracing::info!(
-        code = "MCP_OPERATOR_PANIC_EXPLICIT_BROWSER_GATE_RECOVERY_READBACK",
-        expected_operator_panic_epoch,
-        expected_extension_disable_sequence,
-        expected_browser_disable_sequence,
-        "explicit operator recovery reopened both healthy empty browser mutation gates"
-    );
-    operator_panic_browser_gate_status().await
-}
-
 fn chrome_extension_owner_closed_for_exact_wave(
     expected_disable_sequence: u64,
     readback: &crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback,
@@ -1502,97 +1610,32 @@ pub(crate) fn disable_reflexes(m3_state: &SharedM3State) -> DisableReport {
 /// Separate post-disable readback used by K2 after every request-wide physical
 /// mutation reservation has drained. A missing runtime is terminal because no
 /// reflex scheduler exists; lock failures stay fail-closed.
-enum OperatorPanicReflexReadbackAttempt {
-    Complete(Option<usize>),
-    Contended(&'static str),
-    Failed(&'static str),
-}
-
-fn operator_panic_reflex_active_count_readback_attempt(
+pub(crate) fn operator_panic_reflex_active_count_readback(
     m3_state: &SharedM3State,
-) -> OperatorPanicReflexReadbackAttempt {
+) -> Result<Option<usize>, String> {
     let runtime = match m3_state.try_lock() {
         Ok(state) => state.reflex_runtime.clone(),
         Err(std::sync::TryLockError::Poisoned(_error)) => {
-            return OperatorPanicReflexReadbackAttempt::Failed(
-                "M3 service state lock poisoned during K2 reflex readback",
-            );
+            return Err("M3 service state lock poisoned during K2 reflex readback".to_owned());
         }
         Err(std::sync::TryLockError::WouldBlock) => {
-            return OperatorPanicReflexReadbackAttempt::Contended(
-                "M3 service state lock contended during K2 reflex readback",
-            );
+            return Err("M3 service state lock contended during K2 reflex readback".to_owned());
         }
     };
     let Some(runtime) = runtime else {
-        return OperatorPanicReflexReadbackAttempt::Complete(None);
+        return Ok(None);
     };
-    match runtime.try_lock() {
-        Ok(runtime) => OperatorPanicReflexReadbackAttempt::Complete(Some(runtime.active_count())),
-        Err(std::sync::TryLockError::Poisoned(_error)) => {
-            OperatorPanicReflexReadbackAttempt::Failed(
-                "reflex runtime lock poisoned during K2 readback",
-            )
-        }
-        Err(std::sync::TryLockError::WouldBlock) => OperatorPanicReflexReadbackAttempt::Contended(
-            "reflex runtime lock contended during K2 readback",
-        ),
-    }
-}
-
-/// Repeats the K2 reflex readback only while an otherwise healthy lock is
-/// transiently contended. Poisoning and all non-contention failures remain
-/// immediate errors; the caller-provided deadline bounds the whole retry
-/// window.
-pub(crate) async fn operator_panic_reflex_active_count_readback_until(
-    m3_state: &SharedM3State,
-    deadline: Instant,
-) -> Result<Option<usize>, String> {
-    let started = Instant::now();
-    loop {
-        match operator_panic_reflex_active_count_readback_attempt(m3_state) {
-            OperatorPanicReflexReadbackAttempt::Complete(count) => return Ok(count),
-            OperatorPanicReflexReadbackAttempt::Contended(error) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(format!(
-                        "{error}; timed out after {} ms waiting for a stable K2 source-of-truth readback; remediation=inspect the M3/reflex lock owner and its operation before retrying operator-panic recovery",
-                        started.elapsed().as_millis()
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(1).min(deadline - now)).await;
+    runtime
+        .try_lock()
+        .map(|runtime| Some(runtime.active_count()))
+        .map_err(|error| match error {
+            std::sync::TryLockError::Poisoned(_error) => {
+                "reflex runtime lock poisoned during K2 readback".to_owned()
             }
-            OperatorPanicReflexReadbackAttempt::Failed(error) => return Err(error.to_owned()),
-        }
-    }
-}
-
-/// Repeats the K2 disable only when K1/K2 raced a short healthy lock holder.
-/// A durable disable error or poisoned lock is never retried or hidden.
-pub(crate) async fn disable_reflexes_until(
-    m3_state: &SharedM3State,
-    deadline: Instant,
-) -> DisableReport {
-    let started = Instant::now();
-    loop {
-        let report = disable_reflexes(m3_state);
-        if report.result != "contended" {
-            return report;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return DisableReport {
-                result: "error",
-                disabled_ids: Vec::new(),
-                error_code: Some(error_codes::TOOL_INTERNAL_ERROR),
-                detail: Some(format!(
-                    "reflex runtime lock remained contended for {} ms at the K2 final safety sweep; remediation=inspect the M3/reflex lock owner and its operation before retrying operator-panic recovery",
-                    started.elapsed().as_millis()
-                )),
-            };
-        }
-        tokio::time::sleep(Duration::from_millis(1).min(deadline - now)).await;
-    }
+            std::sync::TryLockError::WouldBlock => {
+                "reflex runtime lock contended during K2 readback".to_owned()
+            }
+        })
 }
 
 pub(crate) fn fire_release_all_with_handle(
@@ -1615,36 +1658,6 @@ pub(crate) fn fire_release_all_with_handle_timeout(
             result: "error",
             error_code: Some(error.code()),
             detail: Some(error.to_string()),
-        },
-    }
-}
-
-/// Awaits the action actor without blocking a Tokio worker. The actor and this
-/// caller share the same cooperative runtime in the daemon, so the synchronous
-/// panic-hook bridge above must never be used from an async K2 task.
-pub(crate) async fn fire_release_all_with_handle_until(
-    handle: &synapse_action::ActionHandle,
-    deadline: Instant,
-) -> ReleaseAllReport {
-    let now = Instant::now();
-    let timeout = deadline.saturating_duration_since(now);
-    match tokio::time::timeout(timeout, handle.execute(Action::ReleaseAll)).await {
-        Ok(Ok(())) => ReleaseAllReport {
-            result: "ok",
-            error_code: None,
-            detail: None,
-        },
-        Ok(Err(error)) => ReleaseAllReport {
-            result: "error",
-            error_code: Some(error.code()),
-            detail: Some(error.to_string()),
-        },
-        Err(_elapsed) => ReleaseAllReport {
-            result: "error",
-            error_code: Some(error_codes::ACTION_BACKEND_UNAVAILABLE),
-            detail: Some(format!(
-                "release_all async acknowledgement timed out after {timeout:?}; remediation=inspect the action safety channel and emitter task liveness"
-            )),
         },
     }
 }

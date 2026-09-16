@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Added the shared-daemon architecture so many agents can use Synapse at once
-  against one storage vault without leaked/duplicate instances: a single `--mode http`
+  against one RocksDB without leaked/duplicate instances: a single `--mode http`
   daemon owns the DB; stdio-only clients connect through a new `--mode connect`
   bridge (auto-spawns the daemon, parent-death watchdog); a single-instance
   guard (`<db>/daemon.lock` + `daemon.pid`) makes a duplicate daemon exit 3;

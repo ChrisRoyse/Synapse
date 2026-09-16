@@ -12,7 +12,6 @@ use std::{
         Arc, LazyLock, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 use chrono::Utc;
@@ -23,9 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_core::{DataPredicate, Event, EventFilter, EventSource, error_codes};
 use synapse_reflex::PublishReport;
-use synapse_storage::{Db, RevisionGuard, cf};
-use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+use synapse_storage::{Db, cf};
 
 use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error, session_registry::unix_time_ms_now,
@@ -55,32 +52,18 @@ const WORKSPACE_WAIT_TIMEOUT: &str = "WORKSPACE_WAIT_TIMEOUT";
 const WORKSPACE_SOURCE_OF_TRUTH: &str = "CF_KV workspace-blackboard exact row";
 /// Default blocking budget for `wait` when the caller omits `timeout_ms`.
 const DEFAULT_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 5_000;
-/// Lower/upper bounds for the async `wait` budget. Values outside the range fail
-/// closed (rejected, never silently clamped).
+/// Lower/upper bounds for the `wait` blocking budget. `wait` blocks a request
+/// thread with a bounded poll loop, so the ceiling is deliberately small; values
+/// outside the range fail closed (rejected, never silently clamped).
 const MIN_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 1;
 const MAX_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 60_000;
 /// Default and bounds for the `wait` poll cadence against CF_KV.
 const DEFAULT_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 50;
 const MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 1;
 const MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 5_000;
-/// One cancellable wait poll performs one exact CF_KV read on Tokio's blocking
-/// pool. Expired-row mutation is admitted separately and then retained through
-/// its guarded delete/readback; a normal read cannot retain the routed request
-/// indefinitely.
-const MAX_WORKSPACE_WAIT_STORAGE_POLL_MS: u64 = 1_000;
-const MAX_CONCURRENT_WORKSPACE_BLOCKING_OPERATIONS: usize = 32;
-/// Physical namespace scans are streamed in fixed pages. The response retains
-/// at most the public list limit; expired cleanup is committed per page.
-const WORKSPACE_SCAN_PAGE_ROWS: usize = 128;
 
 static NEXT_WORKSPACE_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static WORKSPACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static WORKSPACE_BLOCKING_OPERATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| {
-        Arc::new(tokio::sync::Semaphore::new(
-            MAX_CONCURRENT_WORKSPACE_BLOCKING_OPERATIONS,
-        ))
-    });
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -351,8 +334,6 @@ pub struct WorkspacePutResponse {
     pub updated_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub expired_rows_deleted_before: usize,
-    /// Compatibility field retained for response stability. Always zero:
-    /// authoritative corrupt rows now fail the operation explicitly.
     pub corrupt_rows_skipped_before: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_readback: Option<WorkspaceArtifactReadback>,
@@ -411,15 +392,8 @@ pub struct WorkspaceListResponse {
     pub prefix: String,
     pub values_included: bool,
     pub now_unix_ms: u64,
-    /// Exact Calyx generation used for every row in this multi-page list.
-    pub snapshot_seq: u64,
-    /// Retention-evaluation time frozen when the coherent scan was pinned.
-    pub snapshot_read_at_unix_ms: u64,
     pub scanned_rows: usize,
     pub expired_rows_deleted: usize,
-    /// Compatibility field retained for response stability. Always empty:
-    /// authoritative corrupt rows now return `STORAGE_CORRUPTED` with exact
-    /// physical key/revision diagnostics instead of a partial list.
     pub corrupt_rows_skipped: Vec<WorkspaceCorruptRow>,
     pub returned_count: usize,
     pub entries: Vec<WorkspaceEntry>,
@@ -523,57 +497,18 @@ struct DecodedWorkspaceRow {
 struct WorkspaceRawRow {
     key: Vec<u8>,
     encoded: Vec<u8>,
-    revision_sha256: [u8; 32],
 }
 
 #[derive(Default)]
 struct WorkspaceCleanupReport {
-    expired_rows_deleted: usize,
-}
-
-enum WorkspaceWaitPoll {
-    Present(Box<DecodedWorkspaceRow>),
-    Absent(WorkspaceAbsentReadback),
-    Expired(WorkspaceRawRow),
-}
-
-#[derive(Clone, Copy)]
-enum WorkspaceBlockingMode {
-    ReadOnly,
-    MutationCapable { stage: &'static str },
-}
-
-struct AbortBlockingTaskOnDrop<T> {
-    handle: tokio::task::JoinHandle<T>,
-}
-
-impl<T> AbortBlockingTaskOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self { handle }
-    }
-
-    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
-        &mut self.handle
-    }
-
-    fn abort(&self) {
-        self.handle.abort();
-    }
-}
-
-impl<T> Drop for AbortBlockingTaskOnDrop<T> {
-    fn drop(&mut self) {
-        // `spawn_blocking` work cannot be stopped after it begins, but aborting
-        // the handle prevents queued work from starting. A running closure
-        // retains its moved semaphore permit until physical completion.
-        self.handle.abort();
-    }
+    expired_keys: Vec<Vec<u8>>,
+    corrupt_rows: Vec<WorkspaceCorruptRow>,
 }
 
 #[tool_router(router = workspace_blackboard_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for run-scoped workspace blackboard operations in the <=40 public MCP surface. operation is one of get, put, list, subscribe, exists, delete, or wait. Exactly one matching operation spec is accepted. Mutating operations return CF_KV or subscription readback metadata; absent keys are reported as WORKSPACE_KEY_ABSENT instead of generic storage corruption/read failures. get.absent_ok=true (default false) turns tolerated absence into a SUCCESS with found=false and a CF_KV absent_readback proof instead of the WORKSPACE_KEY_ABSENT error, for expected-absence polling. wait asynchronously suspends until the key becomes present (returning the same entry/value readback as get), routed cancellation arrives, or its bounded timeout_ms elapses; every exact storage poll and concurrent poll count is bounded. list/cleanup page CF_KV and fail with STORAGE_CORRUPTED plus exact key/revision diagnostics rather than omitting an authoritative corrupt row."
+        description = "Facade for run-scoped workspace blackboard operations in the <=40 public MCP surface. operation is one of get, put, list, subscribe, exists, delete, or wait. Exactly one matching operation spec is accepted. Mutating operations return CF_KV or subscription readback metadata; absent keys are reported as WORKSPACE_KEY_ABSENT instead of generic storage corruption/read failures. get.absent_ok=true (default false) turns tolerated absence into a SUCCESS with found=false and a CF_KV absent_readback proof instead of the WORKSPACE_KEY_ABSENT error, for expected-absence polling. wait blocks until the key becomes present (returning the same entry/value readback as get) or its bounded timeout_ms elapses, in which case it fails with a typed WORKSPACE_WAIT_TIMEOUT error carrying key + waited_ms + poll_count."
     )]
     pub async fn workspace(
         &self,
@@ -590,17 +525,10 @@ impl SynapseService {
         let session_id = require_workspace_session_id(WORKSPACE_TOOL, &request_context)?;
         match params.0.operation {
             WorkspaceOperation::Get => {
-                let request = params.0.get.ok_or_else(|| missing_workspace_spec("get"))?;
-                let worker = self.clone();
-                let worker_session_id = session_id.clone();
-                let response = workspace_blocking_call(
-                    "get",
-                    WorkspaceBlockingMode::MutationCapable {
-                        stage: "workspace_get_expiry_cleanup_before_blocking_storage",
-                    },
-                    move || worker.workspace_get_impl(request, &worker_session_id),
-                )
-                .await?;
+                let response = self.workspace_get_impl(
+                    params.0.get.ok_or_else(|| missing_workspace_spec("get"))?,
+                    &session_id,
+                )?;
                 let readback = match response.storage_readback.as_ref() {
                     Some(storage_readback) => format!(
                         "CF_KV row={} bytes={} sha256={} found=true",
@@ -624,17 +552,10 @@ impl SynapseService {
                 )))
             }
             WorkspaceOperation::Put => {
-                let request = params.0.put.ok_or_else(|| missing_workspace_spec("put"))?;
-                let worker = self.clone();
-                let worker_session_id = session_id.clone();
-                let response = workspace_blocking_call(
-                    "put",
-                    WorkspaceBlockingMode::MutationCapable {
-                        stage: "workspace_put_before_blocking_storage",
-                    },
-                    move || worker.workspace_put_impl(request, &worker_session_id),
-                )
-                .await?;
+                let response = self.workspace_put_impl(
+                    params.0.put.ok_or_else(|| missing_workspace_spec("put"))?,
+                    &session_id,
+                )?;
                 Ok(Json(workspace_response(
                     WorkspaceOperation::Put,
                     format!(
@@ -649,20 +570,13 @@ impl SynapseService {
                 )))
             }
             WorkspaceOperation::List => {
-                let request = params
-                    .0
-                    .list
-                    .ok_or_else(|| missing_workspace_spec("list"))?;
-                let worker = self.clone();
-                let worker_session_id = session_id.clone();
-                let response = workspace_blocking_call(
-                    "list",
-                    WorkspaceBlockingMode::MutationCapable {
-                        stage: "workspace_list_expiry_cleanup_before_blocking_storage",
-                    },
-                    move || worker.workspace_list_impl(request, &worker_session_id),
-                )
-                .await?;
+                let response = self.workspace_list_impl(
+                    params
+                        .0
+                        .list
+                        .ok_or_else(|| missing_workspace_spec("list"))?,
+                    &session_id,
+                )?;
                 Ok(Json(workspace_response(
                     WorkspaceOperation::List,
                     format!(
@@ -696,17 +610,13 @@ impl SynapseService {
                 )))
             }
             WorkspaceOperation::Exists => {
-                let request = params
-                    .0
-                    .exists
-                    .ok_or_else(|| missing_workspace_spec("exists"))?;
-                let worker = self.clone();
-                let worker_session_id = session_id.clone();
-                let response =
-                    workspace_blocking_call("exists", WorkspaceBlockingMode::ReadOnly, move || {
-                        worker.workspace_exists_impl(request, &worker_session_id)
-                    })
-                    .await?;
+                let response = self.workspace_exists_impl(
+                    params
+                        .0
+                        .exists
+                        .ok_or_else(|| missing_workspace_spec("exists"))?,
+                    &session_id,
+                )?;
                 Ok(Json(workspace_response(
                     WorkspaceOperation::Exists,
                     format!(
@@ -720,20 +630,13 @@ impl SynapseService {
                 )))
             }
             WorkspaceOperation::Delete => {
-                let request = params
-                    .0
-                    .delete
-                    .ok_or_else(|| missing_workspace_spec("delete"))?;
-                let worker = self.clone();
-                let worker_session_id = session_id.clone();
-                let response = workspace_blocking_call(
-                    "delete",
-                    WorkspaceBlockingMode::MutationCapable {
-                        stage: "workspace_delete_before_blocking_storage",
-                    },
-                    move || worker.workspace_delete_impl(request, &worker_session_id),
-                )
-                .await?;
+                let response = self.workspace_delete_impl(
+                    params
+                        .0
+                        .delete
+                        .ok_or_else(|| missing_workspace_spec("delete"))?,
+                    &session_id,
+                )?;
                 Ok(Json(workspace_response(
                     WorkspaceOperation::Delete,
                     format!(
@@ -747,15 +650,13 @@ impl SynapseService {
                 )))
             }
             WorkspaceOperation::Wait => {
-                let response = self
-                    .workspace_wait_impl(
-                        params
-                            .0
-                            .wait
-                            .ok_or_else(|| missing_workspace_spec("wait"))?,
-                        &session_id,
-                    )
-                    .await?;
+                let response = self.workspace_wait_impl(
+                    params
+                        .0
+                        .wait
+                        .ok_or_else(|| missing_workspace_spec("wait"))?,
+                    &session_id,
+                )?;
                 Ok(Json(workspace_response(
                     WorkspaceOperation::Wait,
                     format!(
@@ -786,15 +687,7 @@ impl SynapseService {
             "tool.invocation kind=workspace_put"
         );
         let session_id = require_workspace_session_id("workspace_put", &request_context)?;
-        let worker = self.clone();
-        workspace_blocking_call(
-            "put",
-            WorkspaceBlockingMode::MutationCapable {
-                stage: "workspace_put_before_blocking_storage",
-            },
-            move || worker.workspace_put_impl(params.0, &session_id).map(Json),
-        )
-        .await
+        self.workspace_put_impl(params.0, &session_id).map(Json)
     }
 
     #[tool(
@@ -811,19 +704,11 @@ impl SynapseService {
             "tool.invocation kind=workspace_get"
         );
         let session_id = require_workspace_session_id("workspace_get", &request_context)?;
-        let worker = self.clone();
-        workspace_blocking_call(
-            "get",
-            WorkspaceBlockingMode::MutationCapable {
-                stage: "workspace_get_expiry_cleanup_before_blocking_storage",
-            },
-            move || worker.workspace_get_impl(params.0, &session_id).map(Json),
-        )
-        .await
+        self.workspace_get_impl(params.0, &session_id).map(Json)
     }
 
     #[tool(
-        description = "List run-scoped blackboard entries from durable CF_KV storage using candidate-bounded physical Calyx pages. Any authoritative corrupt row fails the operation with STORAGE_CORRUPTED plus exact key/revision diagnostics; corrupt rows are never omitted from a partial success."
+        description = "List run-scoped blackboard entries from durable CF_KV storage. Scans are isolated: one corrupt row is reported and skipped rather than breaking reads of other keys."
     )]
     pub async fn workspace_list(
         &self,
@@ -836,15 +721,7 @@ impl SynapseService {
             "tool.invocation kind=workspace_list"
         );
         let session_id = require_workspace_session_id("workspace_list", &request_context)?;
-        let worker = self.clone();
-        workspace_blocking_call(
-            "list",
-            WorkspaceBlockingMode::MutationCapable {
-                stage: "workspace_list_expiry_cleanup_before_blocking_storage",
-            },
-            move || worker.workspace_list_impl(params.0, &session_id).map(Json),
-        )
-        .await
+        self.workspace_list_impl(params.0, &session_id).map(Json)
     }
 
     #[tool(
@@ -940,6 +817,11 @@ impl SynapseService {
         let _write_guard = workspace_write_lock()?;
         let db = self.workspace_db()?;
         let cleanup = cleanup_expired_workspace_rows(&db, &run_id, now_unix_ms)?;
+        delete_workspace_rows(
+            &db,
+            cleanup.expired_keys.clone(),
+            "delete expired workspace rows",
+        )?;
 
         let row_key = workspace_row_key(&run_id, &key);
         let existing = read_workspace_row_optional(&db, &row_key, now_unix_ms)?;
@@ -972,8 +854,8 @@ impl SynapseService {
             "row_key": &row_key,
             "had_existing_row": existing.is_some(),
             "previous_version": previous_version,
-            "expired_rows_deleted_before": cleanup.expired_rows_deleted,
-            "corrupt_rows_skipped_before": 0,
+            "expired_rows_deleted_before": cleanup.expired_keys.len(),
+            "corrupt_rows_skipped_before": cleanup.corrupt_rows.len(),
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "workspace_put",
@@ -1046,8 +928,8 @@ impl SynapseService {
             value_sha256 = %storage_readback.value_sha256,
             event_matched = event_publish_report.matched,
             event_queued = event_publish_report.queued,
-            expired_rows_deleted_before = cleanup.expired_rows_deleted,
-            corrupt_rows_skipped_before = 0,
+            expired_rows_deleted_before = cleanup.expired_keys.len(),
+            corrupt_rows_skipped_before = cleanup.corrupt_rows.len(),
             "readback=workspace_blackboard edge=put_committed"
         );
 
@@ -1062,8 +944,8 @@ impl SynapseService {
             created_at_unix_ms,
             updated_at_unix_ms: now_unix_ms,
             expires_at_unix_ms: entry.expires_at_unix_ms,
-            expired_rows_deleted_before: cleanup.expired_rows_deleted,
-            corrupt_rows_skipped_before: 0,
+            expired_rows_deleted_before: cleanup.expired_keys.len(),
+            corrupt_rows_skipped_before: cleanup.corrupt_rows.len(),
             artifact_readback,
             storage_readback,
             event_publish_report,
@@ -1215,7 +1097,7 @@ impl SynapseService {
         })
     }
 
-    async fn workspace_wait_impl(
+    fn workspace_wait_impl(
         &self,
         params: WorkspaceWaitParams,
         session_id: &str,
@@ -1226,13 +1108,10 @@ impl SynapseService {
         validate_workspace_wait_timeout_ms(params.timeout_ms)?;
         validate_workspace_wait_poll_interval_ms(params.poll_interval_ms)?;
         let db = self.workspace_db()?;
-        let cancellation = workspace_request_cancellation_token()?;
         let row_key = workspace_row_key(&run_id, &key);
         let timeout_ms = params.timeout_ms;
         let poll_interval_ms = params.poll_interval_ms;
         let started_at_unix_ms = unix_time_ms_now();
-        let started_at = Instant::now();
-        let deadline = started_at + Duration::from_millis(timeout_ms);
         let deadline_unix_ms = started_at_unix_ms.saturating_add(timeout_ms);
         tracing::info!(
             code = "WORKSPACE_BLACKBOARD_WAIT_STARTED",
@@ -1249,25 +1128,10 @@ impl SynapseService {
         loop {
             poll_count = poll_count.saturating_add(1);
             let now_unix_ms = unix_time_ms_now();
-            let poll = workspace_wait_storage_poll(
-                Arc::clone(&db),
-                row_key.clone(),
-                now_unix_ms,
-                deadline,
-                &cancellation,
-                &run_id,
-                &key,
-                session_id,
-                started_at,
-                poll_count,
-            )
-            .await?;
-            match poll {
-                WorkspaceWaitPoll::Present(row) => {
-                    let row = *row;
+            if let Some(row) = read_workspace_row_optional(&db, &row_key, now_unix_ms)? {
+                if row.entry.expires_at_unix_ms > now_unix_ms {
                     let storage_readback = workspace_row_readback(&row);
-                    let waited_ms = monotonic_elapsed_ms(started_at);
-                    let resolved_at_unix_ms = unix_time_ms_now();
+                    let waited_ms = now_unix_ms.saturating_sub(started_at_unix_ms);
                     tracing::info!(
                         code = "WORKSPACE_BLACKBOARD_WAIT_RESOLVED",
                         run_id,
@@ -1285,7 +1149,7 @@ impl SynapseService {
                         run_id,
                         key,
                         found: true,
-                        now_unix_ms: resolved_at_unix_ms,
+                        now_unix_ms,
                         waited_ms,
                         poll_count,
                         timeout_ms,
@@ -1294,55 +1158,46 @@ impl SynapseService {
                         storage_readback,
                     });
                 }
-                WorkspaceWaitPoll::Absent(absent_readback) => {
-                    if Instant::now() >= deadline {
-                        let waited_ms = monotonic_elapsed_ms(started_at);
-                        tracing::warn!(
-                            code = WORKSPACE_WAIT_TIMEOUT,
-                            run_id,
-                            key,
-                            row_key,
-                            waiter_session_id = session_id,
-                            poll_count,
-                            waited_ms,
-                            timeout_ms,
-                            "readback=workspace_blackboard edge=wait_timeout"
-                        );
-                        return Err(workspace_wait_timeout_error(
-                            &run_id,
-                            &key,
-                            &row_key,
-                            timeout_ms,
-                            waited_ms,
-                            poll_count,
-                            &absent_readback,
-                        ));
-                    }
-                }
-                WorkspaceWaitPoll::Expired(_raw) => {
-                    return Err(mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        "workspace wait expired-row state escaped its guarded cleanup boundary",
-                    ));
-                }
+                // A physically present but expired row is not a resolution;
+                // delete it (source-of-truth cleanup) and keep polling.
+                delete_workspace_rows(
+                    &db,
+                    vec![row.key.clone()],
+                    "delete expired workspace row on wait",
+                )?;
             }
-            let next_poll =
-                (Instant::now() + Duration::from_millis(poll_interval_ms)).min(deadline);
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    return Err(workspace_wait_cancelled_error(
-                        &run_id,
-                        &key,
-                        &row_key,
-                        session_id,
-                        "poll_interval",
-                        monotonic_elapsed_ms(started_at),
-                        poll_count,
-                    ));
-                }
-                () = tokio::time::sleep_until(next_poll) => {}
+            let now_unix_ms = unix_time_ms_now();
+            if now_unix_ms >= deadline_unix_ms {
+                let waited_ms = now_unix_ms.saturating_sub(started_at_unix_ms);
+                let absent_readback = readback_absent_workspace_row(&db, &row_key)?;
+                tracing::warn!(
+                    code = WORKSPACE_WAIT_TIMEOUT,
+                    run_id,
+                    key,
+                    row_key,
+                    waiter_session_id = session_id,
+                    poll_count,
+                    waited_ms,
+                    timeout_ms,
+                    "readback=workspace_blackboard edge=wait_timeout"
+                );
+                return Err(workspace_wait_timeout_error(
+                    &run_id,
+                    &key,
+                    &row_key,
+                    timeout_ms,
+                    waited_ms,
+                    poll_count,
+                    &absent_readback,
+                ));
             }
+            // Sleep for the poll interval, but never past the deadline (shorten
+            // the final nap so the effective wait stays within one interval of
+            // the requested budget). now_unix_ms < deadline here, so remaining
+            // is always >= 1.
+            let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+            let sleep_ms = poll_interval_ms.min(remaining_ms).max(1);
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
     }
 
@@ -1366,15 +1221,18 @@ impl SynapseService {
             normalize_workspace_prefix(params.prefix.as_deref().unwrap_or_default(), true)?;
         validate_workspace_list_limit(params.limit)?;
         let db = self.workspace_db()?;
-        let scan = scan_workspace_run(
+        let scan = scan_workspace_run(&db, &run_id, now_unix_ms)?;
+        delete_workspace_rows(
             &db,
-            &run_id,
-            now_unix_ms,
-            Some(&prefix),
-            params.limit,
-            "workspace list",
+            scan.expired_keys.clone(),
+            "delete expired workspace rows on list",
         )?;
-        let mut rows = scan.rows;
+
+        let mut rows = scan
+            .rows
+            .into_iter()
+            .filter(|row| row.entry.key.starts_with(&prefix))
+            .collect::<Vec<_>>();
         rows.sort_by(|left, right| left.entry.key.cmp(&right.entry.key));
         if rows.len() > params.limit {
             rows.truncate(params.limit);
@@ -1403,11 +1261,9 @@ impl SynapseService {
             run_id,
             prefix,
             reader_session_id = session_id,
-            snapshot_seq = scan.snapshot_seq,
-            snapshot_read_at_unix_ms = scan.snapshot_read_at_unix_ms,
             scanned_rows = scan.scanned_rows,
-            expired_rows_deleted = scan.expired_rows_deleted,
-            corrupt_rows_skipped = 0,
+            expired_rows_deleted = scan.expired_keys.len(),
+            corrupt_rows_skipped = scan.corrupt_rows.len(),
             returned_count = entries.len(),
             "readback=workspace_blackboard edge=list_read"
         );
@@ -1418,11 +1274,9 @@ impl SynapseService {
             prefix,
             values_included: params.include_values,
             now_unix_ms,
-            snapshot_seq: scan.snapshot_seq,
-            snapshot_read_at_unix_ms: scan.snapshot_read_at_unix_ms,
             scanned_rows: scan.scanned_rows,
-            expired_rows_deleted: scan.expired_rows_deleted,
-            corrupt_rows_skipped: Vec::new(),
+            expired_rows_deleted: scan.expired_keys.len(),
+            corrupt_rows_skipped: scan.corrupt_rows,
             returned_count: entries.len(),
             entries,
             readback_rows,
@@ -1747,445 +1601,11 @@ impl SynapseService {
     }
 }
 
-fn workspace_request_cancellation_token() -> Result<CancellationToken, ErrorData> {
-    super::operator_panic_boundary::MCP_REQUEST_CANCELLATION
-        .try_with(Clone::clone)
-        .map_err(|_missing_task_local| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "workspace wait reached the MCP router without its request/daemon cancellation token",
-            )
-        })
-}
-
-async fn workspace_blocking_call<T, F>(
-    operation: &'static str,
-    mode: WorkspaceBlockingMode,
-    work: F,
-) -> Result<T, ErrorData>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, ErrorData> + Send + 'static,
-{
-    let cancellation = workspace_request_cancellation_token()?;
-    if cancellation.is_cancelled() {
-        return Err(workspace_operation_cancelled_error(
-            operation,
-            "before_blocking_capacity",
-        ));
-    }
-    let permit = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            return Err(workspace_operation_cancelled_error(
-                operation,
-                "waiting_for_blocking_capacity",
-            ));
-        }
-        acquired = Arc::clone(&WORKSPACE_BLOCKING_OPERATION_PERMITS).acquire_owned() => {
-            acquired.map_err(|_closed| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "workspace {operation} blocking-operation semaphore was unexpectedly closed"
-                    ),
-                )
-            })?
-        }
-    };
-    if cancellation.is_cancelled() {
-        return Err(workspace_operation_cancelled_error(
-            operation,
-            "before_blocking_dispatch",
-        ));
-    }
-    if let WorkspaceBlockingMode::MutationCapable { stage } = mode {
-        // Reserve routed ownership only after scarce blocking capacity exists
-        // and immediately before dispatch. Caller/daemon cancellation can
-        // still win before this point; after it, the outer routed authority
-        // retains this exact task through physical mutation and readback.
-        super::operator_panic_boundary::ensure_mcp_mutation(stage)?;
-    }
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    });
-    let join_error = |error: tokio::task::JoinError| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("workspace {operation} blocking storage task failed: {error}"),
-        )
-    };
-    match mode {
-        WorkspaceBlockingMode::MutationCapable { .. } => task.await.map_err(join_error)?,
-        WorkspaceBlockingMode::ReadOnly => {
-            let mut task = AbortBlockingTaskOnDrop::new(task);
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    task.abort();
-                    Err(workspace_operation_cancelled_error(
-                        operation,
-                        "during_blocking_storage",
-                    ))
-                }
-                joined = task.handle_mut() => joined.map_err(join_error)?,
-            }
-        }
-    }
-}
-
-fn monotonic_elapsed_ms(started_at: Instant) -> u64 {
-    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn workspace_wait_storage_poll(
-    db: Arc<Db>,
-    row_key: String,
-    now_unix_ms: u64,
-    wait_deadline: Instant,
-    cancellation: &CancellationToken,
-    run_id: &str,
-    key: &str,
-    session_id: &str,
-    started_at: Instant,
-    poll_count: u64,
-) -> Result<WorkspaceWaitPoll, ErrorData> {
-    if cancellation.is_cancelled() {
-        return Err(workspace_wait_cancelled_error(
-            run_id,
-            key,
-            &row_key,
-            session_id,
-            "before_storage_poll",
-            monotonic_elapsed_ms(started_at),
-            poll_count,
-        ));
-    }
-    let now = Instant::now();
-    let storage_ceiling = now + Duration::from_millis(MAX_WORKSPACE_WAIT_STORAGE_POLL_MS);
-    let poll_deadline = if wait_deadline > now {
-        wait_deadline.min(storage_ceiling)
-    } else {
-        storage_ceiling
-    };
-    let permit = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            return Err(workspace_wait_cancelled_error(
-                run_id,
-                key,
-                &row_key,
-                session_id,
-                "waiting_for_storage_poll_capacity",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ));
-        }
-        acquired = Arc::clone(&WORKSPACE_BLOCKING_OPERATION_PERMITS).acquire_owned() => {
-            acquired.map_err(|_closed| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "workspace wait storage-poll semaphore was unexpectedly closed",
-                )
-            })?
-        }
-        () = tokio::time::sleep_until(poll_deadline) => {
-            return Err(workspace_wait_storage_timeout_error(
-                run_id,
-                key,
-                &row_key,
-                session_id,
-                "waiting_for_poll_capacity",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ));
-        }
-    };
-    let blocking_db = Arc::clone(&db);
-    let blocking_row_key = row_key.clone();
-    let mut task = AbortBlockingTaskOnDrop::new(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        poll_workspace_wait_storage_sync(&blocking_db, &blocking_row_key, now_unix_ms)
-    }));
-    let poll = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            task.abort();
-            Err(workspace_wait_cancelled_error(
-                run_id,
-                key,
-                &row_key,
-                session_id,
-                "during_storage_poll",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ))
-        }
-        joined = task.handle_mut() => {
-            joined.map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "workspace wait bounded storage poll task failed: row_key={row_key:?} poll_count={poll_count}: {error}"
-                    ),
-                )
-            })?
-        }
-        () = tokio::time::sleep_until(poll_deadline) => {
-            task.abort();
-            Err(workspace_wait_storage_timeout_error(
-                run_id,
-                key,
-                &row_key,
-                session_id,
-                "executing_exact_poll",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ))
-        }
-    }?;
-    match poll {
-        WorkspaceWaitPoll::Expired(raw) => {
-            cleanup_expired_workspace_row_for_wait(
-                db,
-                raw,
-                wait_deadline,
-                cancellation,
-                run_id,
-                key,
-                session_id,
-                started_at,
-                poll_count,
-            )
-            .await
-        }
-        resolved => Ok(resolved),
-    }
-}
-
-fn poll_workspace_wait_storage_sync(
-    db: &Db,
-    row_key: &str,
-    now_unix_ms: u64,
-) -> Result<WorkspaceWaitPoll, ErrorData> {
-    let Some(raw) = read_workspace_raw_row_optional(db, row_key)? else {
-        return Ok(WorkspaceWaitPoll::Absent(workspace_absent_readback(
-            row_key,
-        )));
-    };
-    let row = decode_workspace_row(raw.key.clone(), raw.encoded.clone())
-        .map_err(|detail| workspace_corrupt_error(&raw, "workspace wait poll", detail))?;
-    if row.entry.expires_at_unix_ms > now_unix_ms {
-        return Ok(WorkspaceWaitPoll::Present(Box::new(row)));
-    }
-    Ok(WorkspaceWaitPoll::Expired(raw))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cleanup_expired_workspace_row_for_wait(
-    db: Arc<Db>,
-    raw: WorkspaceRawRow,
-    wait_deadline: Instant,
-    cancellation: &CancellationToken,
-    run_id: &str,
-    key: &str,
-    session_id: &str,
-    started_at: Instant,
-    poll_count: u64,
-) -> Result<WorkspaceWaitPoll, ErrorData> {
-    let row_key_display = String::from_utf8_lossy(&raw.key).to_string();
-    let now = Instant::now();
-    let capacity_deadline = if wait_deadline > now {
-        wait_deadline.min(now + Duration::from_millis(MAX_WORKSPACE_WAIT_STORAGE_POLL_MS))
-    } else {
-        now + Duration::from_millis(MAX_WORKSPACE_WAIT_STORAGE_POLL_MS)
-    };
-    let permit = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            return Err(workspace_wait_cancelled_error(
-                run_id,
-                key,
-                &row_key_display,
-                session_id,
-                "before_expired_cleanup_admission",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ));
-        }
-        acquired = Arc::clone(&WORKSPACE_BLOCKING_OPERATION_PERMITS).acquire_owned() => {
-            acquired.map_err(|_closed| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "workspace wait storage-poll semaphore closed before expired-row cleanup",
-                )
-            })?
-        }
-        () = tokio::time::sleep_until(capacity_deadline) => {
-            return Err(workspace_wait_storage_timeout_error(
-                run_id,
-                key,
-                &row_key_display,
-                session_id,
-                "waiting_for_expired_cleanup_capacity",
-                monotonic_elapsed_ms(started_at),
-                poll_count,
-            ));
-        }
-    };
-    if cancellation.is_cancelled() {
-        return Err(workspace_wait_cancelled_error(
-            run_id,
-            key,
-            &row_key_display,
-            session_id,
-            "before_expired_cleanup_mutation",
-            monotonic_elapsed_ms(started_at),
-            poll_count,
-        ));
-    }
-    super::operator_panic_boundary::ensure_mcp_mutation(
-        "workspace_wait_expired_row_guarded_cleanup",
-    )?;
-    let blocking_db = Arc::clone(&db);
-    let row_key = row_key_display;
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        cleanup_expired_workspace_row_for_wait_sync(&blocking_db, &raw)
-    });
-    // Mutation ownership is now armed. The routed request must retain this
-    // exact guarded delete/readback to terminal even if cancellation arrives;
-    // dropping a spawn_blocking handle cannot stop an already-running commit.
-    task.await.map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "workspace wait expired-row cleanup task failed after mutation admission: row_key={row_key:?}: {error}"
-            ),
-        )
-    })?
-}
-
-fn cleanup_expired_workspace_row_for_wait_sync(
-    db: &Db,
-    raw: &WorkspaceRawRow,
-) -> Result<WorkspaceWaitPoll, ErrorData> {
-    let row_key = String::from_utf8_lossy(&raw.key).to_string();
-    let deleted = delete_expired_workspace_row_for_wait(db, raw)?;
-    let Some(current) = read_workspace_raw_row_optional(db, &row_key)? else {
-        return Ok(WorkspaceWaitPoll::Absent(workspace_absent_readback(
-            &row_key,
-        )));
-    };
-    let current_row =
-        decode_workspace_row(current.key.clone(), current.encoded.clone()).map_err(|detail| {
-            workspace_corrupt_error(
-                &current,
-                "workspace wait expired-row cleanup readback",
-                detail,
-            )
-        })?;
-    let now_unix_ms = unix_time_ms_now();
-    if current_row.entry.expires_at_unix_ms > now_unix_ms {
-        return Ok(WorkspaceWaitPoll::Present(Box::new(current_row)));
-    }
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        "workspace wait expired-row cleanup did not converge to an absent or live exact row",
-        Some(json!({
-            "code": error_codes::STORAGE_WRITE_FAILED,
-            "detail_code": "WORKSPACE_WAIT_EXPIRED_CLEANUP_NOT_CONVERGED",
-            "row_key": &row_key,
-            "row_key_hex": hex_bytes(row_key.as_bytes()),
-            "guarded_delete_applied": deleted,
-            "current_revision_sha256": hex_bytes(&current.revision_sha256),
-            "current_value_sha256": hash_bytes(&current.encoded),
-            "current_expires_at_unix_ms": current_row.entry.expires_at_unix_ms,
-            "now_unix_ms": now_unix_ms,
-            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
-            "remediation": "inspect the exact CF_KV row and retry after the concurrent workspace writer or cleanup operation completes",
-        })),
-    ))
-}
-
-fn delete_expired_workspace_row_for_wait(
-    db: &Db,
-    raw: &WorkspaceRawRow,
-) -> Result<bool, ErrorData> {
-    let outcome = db
-        .mutate_batch_if_revisions_pressure_bypass(
-            cf::CF_KV,
-            [RevisionGuard::new(
-                raw.key.clone(),
-                Some(raw.revision_sha256),
-            )],
-            [raw.key.clone()],
-            std::iter::empty::<(Vec<u8>, Vec<u8>)>(),
-        )
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "workspace wait guarded expired-row cleanup failed: row_key_hex={} revision_sha256={}: {error}",
-                    hex_bytes(&raw.key),
-                    hex_bytes(&raw.revision_sha256)
-                ),
-            )
-        })?;
-    Ok(outcome.applied)
-}
-
-fn workspace_absent_readback(row_key: &str) -> WorkspaceAbsentReadback {
-    WorkspaceAbsentReadback {
-        cf_name: cf::CF_KV.to_owned(),
-        row_key: row_key.to_owned(),
-        exists: false,
-        exact_match_count: 0,
-    }
-}
-
 struct WorkspaceRunScan {
-    snapshot_seq: u64,
-    snapshot_read_at_unix_ms: u64,
     scanned_rows: usize,
-    expired_rows_deleted: usize,
+    expired_keys: Vec<Vec<u8>>,
+    corrupt_rows: Vec<WorkspaceCorruptRow>,
     rows: Vec<DecodedWorkspaceRow>,
-}
-
-fn finish_workspace_coherent_scan<T>(
-    db: &Db,
-    lease: &mut synapse_storage::CoherentScanLease,
-    operation: &'static str,
-    scan_result: Result<T, ErrorData>,
-) -> Result<T, ErrorData> {
-    let lease_id = lease.lease_id;
-    let snapshot_seq = lease.snapshot_seq;
-    let release_result = db.release_coherent_scan(lease);
-    match (scan_result, release_result) {
-        (Err(scan_error), Ok(_)) => Err(scan_error),
-        (Err(scan_error), Err(release_error)) => Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "{operation}: {}; additionally failed to release coherent workspace scan lease_id={lease_id} snapshot_seq={snapshot_seq}: {release_error}",
-                scan_error.message
-            ),
-        )),
-        (Ok(_), Err(release_error)) => Err(mcp_error(
-            release_error.code(),
-            format!(
-                "{operation}: failed to release coherent workspace scan lease_id={lease_id} snapshot_seq={snapshot_seq}: {release_error}"
-            ),
-        )),
-        (Ok(_), Ok(false)) => Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "{operation}: coherent workspace snapshot expired before release lease_id={lease_id} snapshot_seq={snapshot_seq}; repeat the bounded operation"
-            ),
-        )),
-        (Ok(value), Ok(true)) => Ok(value),
-    }
 }
 
 fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
@@ -2201,124 +1621,31 @@ fn scan_workspace_run(
     db: &Db,
     run_id: &str,
     now_unix_ms: u64,
-    result_prefix: Option<&str>,
-    result_limit: usize,
-    operation: &'static str,
 ) -> Result<WorkspaceRunScan, ErrorData> {
-    let prefix = workspace_run_prefix(run_id).into_bytes();
-    let mut lease = db
-        .pin_cf_physical_scan(cf::CF_KV, synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS)
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("{operation} could not pin a coherent workspace scan: {error}"),
-            )
-        })?;
-    let lease_id = lease.lease_id;
-    let snapshot_seq = lease.snapshot_seq;
-    let snapshot_read_at_unix_ms = lease.read_at_unix_ms;
-    let mut scanned_rows = 0_usize;
-    let mut expired_rows_deleted = 0_usize;
+    let prefix = workspace_run_prefix(run_id);
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let scanned_rows = rows.len();
+    let mut expired_keys = Vec::new();
+    let mut corrupt_rows = Vec::new();
     let mut decoded_rows = Vec::new();
-    let scan_result = (|| -> Result<(), ErrorData> {
-        loop {
-            let page = db
-                .scan_cf_physical_page_coherent(&mut lease, WORKSPACE_SCAN_PAGE_ROWS)
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "{operation} coherent physical workspace page read failed: lease_id={lease_id} snapshot_seq={snapshot_seq} page_rows={WORKSPACE_SCAN_PAGE_ROWS}: {error}"
-                        ),
-                    )
-                })?;
-            let page_snapshot_seq = page.snapshot_seq.ok_or_else(|| {
-                mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "{operation} coherent workspace page omitted its pinned snapshot sequence: lease_id={lease_id} expected_snapshot_seq={snapshot_seq}"
-                    ),
-                )
-            })?;
-            if page_snapshot_seq != snapshot_seq {
-                return Err(mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "{operation} coherent workspace page escaped its pinned generation: lease_id={lease_id} expected_snapshot_seq={snapshot_seq} actual_snapshot_seq={page_snapshot_seq}"
-                    ),
-                ));
-            }
-            let mut expired_rows = Vec::new();
-            for (key, scanned_value) in page.rows {
-                if !key.starts_with(&prefix) {
-                    continue;
-                }
-                scanned_rows = scanned_rows.saturating_add(1);
-                let snapshot_raw = WorkspaceRawRow {
-                    key: key.clone(),
-                    revision_sha256: Sha256::digest(&scanned_value).into(),
-                    encoded: scanned_value.clone(),
-                };
-                let row = decode_workspace_row(key.clone(), scanned_value.clone())
-                    .map_err(|detail| workspace_corrupt_error(&snapshot_raw, operation, detail))?;
-                if row.entry.expires_at_unix_ms <= now_unix_ms {
-                    if let Some(current) = read_workspace_raw_row_by_key(db, &key, operation)? {
-                        if current.encoded == scanned_value {
-                            expired_rows.push((row.key, current.revision_sha256));
-                        } else {
-                            tracing::debug!(
-                                code = "WORKSPACE_EXPIRED_CLEANUP_SNAPSHOT_SUPERSEDED",
-                                operation,
-                                lease_id,
-                                snapshot_seq,
-                                row_key_hex = %hex_bytes(&key),
-                                snapshot_value_sha256 = %hash_bytes(&scanned_value),
-                                current_value_sha256 = %hash_bytes(&current.encoded),
-                                current_revision_sha256 = %hex_bytes(&current.revision_sha256),
-                                "did not delete a workspace row superseded after the pinned list snapshot"
-                            );
-                        }
-                    }
-                } else if result_limit != 0
-                    && result_prefix.is_none_or(|prefix| row.entry.key.starts_with(prefix))
-                {
-                    decoded_rows.push(row);
-                }
-            }
-            // Physical Calyx order includes the encoded user-key length and is
-            // deliberately opaque. Retain the lexicographically smallest
-            // bounded logical result set from this one pinned generation so
-            // public ordering/limit semantics do not depend on physical layout.
-            if decoded_rows.len() > result_limit {
-                decoded_rows.sort_by(|left, right| left.entry.key.cmp(&right.entry.key));
-                decoded_rows.truncate(result_limit);
-            }
-            expired_rows_deleted = expired_rows_deleted.saturating_add(
-                delete_workspace_rows_if_revisions(db, expired_rows, operation)?,
-            );
-            if !page.more {
-                break;
-            }
+    for (key, encoded) in rows {
+        match decode_workspace_row(key.clone(), encoded.clone()) {
+            Ok(row) if row.entry.expires_at_unix_ms <= now_unix_ms => expired_keys.push(key),
+            Ok(row) => decoded_rows.push(row),
+            Err(error) => corrupt_rows.push(WorkspaceCorruptRow {
+                row_key: String::from_utf8_lossy(&key).to_string(),
+                value_len_bytes: encoded.len() as u64,
+                value_sha256: hash_bytes(&encoded),
+                error,
+            }),
         }
-        Ok(())
-    })();
-    finish_workspace_coherent_scan(db, &mut lease, operation, scan_result)?;
-    tracing::debug!(
-        code = "WORKSPACE_COHERENT_SCAN_COMPLETED",
-        operation,
-        run_id,
-        lease_id,
-        snapshot_seq,
-        snapshot_read_at_unix_ms,
-        scanned_rows,
-        expired_rows_deleted,
-        "workspace multi-page enumeration completed and released one pinned Calyx generation"
-    );
+    }
     Ok(WorkspaceRunScan {
-        snapshot_seq,
-        snapshot_read_at_unix_ms,
         scanned_rows,
-        expired_rows_deleted,
+        expired_keys,
+        corrupt_rows,
         rows: decoded_rows,
     })
 }
@@ -2328,16 +1655,10 @@ fn cleanup_expired_workspace_rows(
     run_id: &str,
     now_unix_ms: u64,
 ) -> Result<WorkspaceCleanupReport, ErrorData> {
-    let scan = scan_workspace_run(
-        db,
-        run_id,
-        now_unix_ms,
-        None,
-        0,
-        "workspace put expired-row cleanup",
-    )?;
+    let scan = scan_workspace_run(db, run_id, now_unix_ms)?;
     Ok(WorkspaceCleanupReport {
-        expired_rows_deleted: scan.expired_rows_deleted,
+        expired_keys: scan.expired_keys,
+        corrupt_rows: scan.corrupt_rows,
     })
 }
 
@@ -2349,43 +1670,21 @@ fn read_workspace_row_optional(
     let Some(row) = read_workspace_raw_row_optional(db, row_key)? else {
         return Ok(None);
     };
-    decode_workspace_row(row.key.clone(), row.encoded.clone())
+    decode_workspace_row(row.key, row.encoded)
         .map(Some)
-        .map_err(|detail| workspace_corrupt_error(&row, "workspace exact-row read", detail))
+        .map_err(|error| workspace_corrupt_error(row_key, error))
 }
 
 fn read_workspace_raw_row_optional(
     db: &Db,
     row_key: &str,
 ) -> Result<Option<WorkspaceRawRow>, ErrorData> {
-    read_workspace_raw_row_by_key(db, row_key.as_bytes(), "workspace exact-row read")
-}
-
-fn read_workspace_raw_row_by_key(
-    db: &Db,
-    key: &[u8],
-    operation: &'static str,
-) -> Result<Option<WorkspaceRawRow>, ErrorData> {
-    let Some(physical) = db.get_cf_revisioned(cf::CF_KV, key).map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "{operation} physical workspace point-read failed: row_key_hex={}: {error}",
-                hex_bytes(key)
-            ),
-        )
-    })?
-    else {
-        return Ok(None);
-    };
-    let Some(encoded) = physical.value else {
-        return Ok(None);
-    };
-    Ok(Some(WorkspaceRawRow {
-        key: key.to_vec(),
-        encoded,
-        revision_sha256: physical.revision_sha256,
-    }))
+    Ok(db
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .into_iter()
+        .find(|(key, _value)| key == row_key.as_bytes())
+        .map(|(key, encoded)| WorkspaceRawRow { key, encoded }))
 }
 
 fn decode_workspace_row(key: Vec<u8>, encoded: Vec<u8>) -> Result<DecodedWorkspaceRow, String> {
@@ -2409,32 +1708,6 @@ fn decode_workspace_row(key: Vec<u8>, encoded: Vec<u8>) -> Result<DecodedWorkspa
             "workspace row {row_key} has empty run_id or key fields"
         ));
     }
-    let expected_row_key = workspace_row_key(&entry.run_id, &entry.key);
-    if expected_row_key != row_key {
-        return Err(format!(
-            "workspace row identity does not derive from its payload: actual={row_key} expected={expected_row_key} run_id={:?} key={:?}",
-            entry.run_id, entry.key
-        ));
-    }
-    if entry.version == 0
-        || entry.ttl_ms == 0
-        || entry.ttl_ms > MAX_WORKSPACE_TTL_MS
-        || entry.updated_at_unix_ms < entry.created_at_unix_ms
-        || entry.expires_at_unix_ms != entry.updated_at_unix_ms.saturating_add(entry.ttl_ms)
-        || entry.writer_session_id.trim().is_empty()
-        || (entry.value.is_none() && entry.artifact.is_none())
-    {
-        return Err(format!(
-            "workspace row {row_key} violates payload invariants: version={} ttl_ms={} created_at={} updated_at={} expires_at={} writer_session_empty={} payload_empty={}",
-            entry.version,
-            entry.ttl_ms,
-            entry.created_at_unix_ms,
-            entry.updated_at_unix_ms,
-            entry.expires_at_unix_ms,
-            entry.writer_session_id.trim().is_empty(),
-            entry.value.is_none() && entry.artifact.is_none()
-        ));
-    }
     Ok(DecodedWorkspaceRow {
         key,
         encoded,
@@ -2444,8 +1717,10 @@ fn decode_workspace_row(key: Vec<u8>, encoded: Vec<u8>) -> Result<DecodedWorkspa
 
 fn readback_exact_workspace_row(db: &Db, row_key: &str) -> Result<WorkspaceRowReadback, ErrorData> {
     let stored = db
-        .get_cf(cf::CF_KV, row_key.as_bytes())
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .into_iter()
+        .find_map(|(key, value)| (key == row_key.as_bytes()).then_some(value))
         .ok_or_else(|| {
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
@@ -2464,15 +1739,17 @@ fn readback_absent_workspace_row(
     db: &Db,
     row_key: &str,
 ) -> Result<WorkspaceAbsentReadback, ErrorData> {
-    let exists = db
-        .get_cf(cf::CF_KV, row_key.as_bytes())
+    let exact_match_count = db
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        .is_some();
+        .into_iter()
+        .filter(|(key, _value)| key == row_key.as_bytes())
+        .count();
     Ok(WorkspaceAbsentReadback {
         cf_name: cf::CF_KV.to_owned(),
         row_key: row_key.to_owned(),
-        exists,
-        exact_match_count: usize::from(exists),
+        exists: exact_match_count > 0,
+        exact_match_count,
     })
 }
 
@@ -2504,66 +1781,6 @@ fn delete_workspace_rows(
     }
     db.delete_batch(cf::CF_KV, keys)
         .map_err(|error| mcp_error(error.code(), format!("{operation}: {error}")))
-}
-
-fn delete_workspace_rows_if_revisions(
-    db: &Db,
-    rows: Vec<(Vec<u8>, [u8; 32])>,
-    operation: &'static str,
-) -> Result<usize, ErrorData> {
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let guards = rows
-        .iter()
-        .map(|(key, revision)| RevisionGuard::new(key.clone(), Some(*revision)))
-        .collect::<Vec<_>>();
-    let deletes = rows
-        .iter()
-        .map(|(key, _revision)| key.clone())
-        .collect::<Vec<_>>();
-    let outcome = db
-        .mutate_batch_if_revisions_pressure_bypass(
-            cf::CF_KV,
-            guards,
-            deletes,
-            std::iter::empty::<(Vec<u8>, Vec<u8>)>(),
-        )
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "{operation} guarded expired-row cleanup failed for {} rows: {error}",
-                    rows.len()
-                ),
-            )
-        })?;
-    if !outcome.applied {
-        let conflict = outcome.conflict.as_ref();
-        return Err(ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "{operation} refused stale expired-row cleanup because an authoritative CF_KV revision changed"
-            ),
-            Some(json!({
-                "code": error_codes::STORAGE_WRITE_FAILED,
-                "detail_code": "WORKSPACE_EXPIRED_CLEANUP_REVISION_CONFLICT",
-                "operation": operation,
-                "row_count": rows.len(),
-                "conflict_guard_index": conflict.map(|value| value.guard_index),
-                "conflict_row_key_hex": conflict.map(|value| hex_bytes(&value.key)),
-                "expected_revision_sha256": conflict
-                    .and_then(|value| value.expected_revision_sha256)
-                    .map(|value| hex_bytes(&value)),
-                "actual_revision_sha256": conflict
-                    .and_then(|value| value.actual_revision_sha256)
-                    .map(|value| hex_bytes(&value)),
-                "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
-                "remediation": "retry the workspace operation so cleanup rereads the current exact row revision; no stale row was deleted",
-            })),
-        ));
-    }
-    Ok(rows.len())
 }
 
 fn workspace_write_lock() -> Result<MutexGuard<'static, ()>, ErrorData> {
@@ -2929,114 +2146,6 @@ fn workspace_wait_timeout_error(
     )
 }
 
-fn workspace_operation_cancelled_error(operation: &'static str, stage: &'static str) -> ErrorData {
-    tracing::info!(
-        code = "WORKSPACE_OPERATION_CANCELLED",
-        operation,
-        stage,
-        "workspace operation stopped at routed request/daemon cancellation before physical mutation admission"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!("workspace {operation} was cancelled during {stage}"),
-        Some(json!({
-            "code": error_codes::DAEMON_RESTARTING,
-            "detail_code": "WORKSPACE_OPERATION_CANCELLED",
-            "operation": operation,
-            "stage": stage,
-            "source_of_truth": "MCP_REQUEST_CANCELLATION + WORKSPACE_BLOCKING_OPERATION_PERMITS",
-            "remediation": "issue a new workspace request after routed authority is live; cancellation won before mutation admission, so no physical workspace mutation was dispatched. A read-only blocking call already running may finish while retaining its bounded semaphore permit, but its result is discarded",
-        })),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn workspace_wait_cancelled_error(
-    run_id: &str,
-    key: &str,
-    row_key: &str,
-    session_id: &str,
-    stage: &'static str,
-    waited_ms: u64,
-    poll_count: u64,
-) -> ErrorData {
-    tracing::info!(
-        code = "WORKSPACE_WAIT_CANCELLED",
-        run_id,
-        key,
-        row_key,
-        waiter_session_id = session_id,
-        stage,
-        waited_ms,
-        poll_count,
-        "workspace wait stopped at routed request/daemon cancellation"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "workspace blackboard wait for key {key:?} in run {run_id:?} was cancelled during {stage} after {waited_ms}ms"
-        ),
-        Some(json!({
-            "code": error_codes::DAEMON_RESTARTING,
-            "detail_code": "WORKSPACE_WAIT_CANCELLED",
-            "run_id": run_id,
-            "key": key,
-            "row_key": row_key,
-            "waiter_session_id": session_id,
-            "stage": stage,
-            "waited_ms": waited_ms,
-            "poll_count": poll_count,
-            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
-            "remediation": "after the daemon/request authority is live again, issue a new workspace wait; no new poll is scheduled after cancellation. An exact read or revision-guarded expired-row cleanup already running on Tokio's bounded blocking pool may finish, and its physical CF_KV result remains authoritative",
-        })),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn workspace_wait_storage_timeout_error(
-    run_id: &str,
-    key: &str,
-    row_key: &str,
-    session_id: &str,
-    stage: &'static str,
-    waited_ms: u64,
-    poll_count: u64,
-) -> ErrorData {
-    tracing::error!(
-        code = error_codes::STORAGE_READ_FAILED,
-        detail_code = "WORKSPACE_WAIT_STORAGE_POLL_TIMEOUT",
-        run_id,
-        key,
-        row_key,
-        waiter_session_id = session_id,
-        stage,
-        waited_ms,
-        poll_count,
-        storage_poll_timeout_ms = MAX_WORKSPACE_WAIT_STORAGE_POLL_MS,
-        "workspace wait exact CF_KV poll exceeded its bounded blocking budget"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "workspace blackboard wait bounded CF_KV poll exceeded its deadline during {stage} for key {key:?} in run {run_id:?}"
-        ),
-        Some(json!({
-            "code": error_codes::STORAGE_READ_FAILED,
-            "detail_code": "WORKSPACE_WAIT_STORAGE_POLL_TIMEOUT",
-            "run_id": run_id,
-            "key": key,
-            "row_key": row_key,
-            "waiter_session_id": session_id,
-            "stage": stage,
-            "waited_ms": waited_ms,
-            "poll_count": poll_count,
-            "storage_poll_timeout_ms": MAX_WORKSPACE_WAIT_STORAGE_POLL_MS,
-            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
-            "remediation": "inspect Calyx process/socket/disk health and the exact CF_KV row; do not treat this as key absence or retry until storage reads respond",
-        })),
-    )
-}
-
 fn workspace_version_conflict_error(
     run_id: &str,
     key: &str,
@@ -3256,34 +2365,15 @@ fn workspace_delete_guard_error(
     )
 }
 
-fn workspace_corrupt_error(
-    row: &WorkspaceRawRow,
-    operation: &'static str,
-    detail: String,
-) -> ErrorData {
-    let row_key = String::from_utf8_lossy(&row.key).to_string();
-    let row_key_utf8 = std::str::from_utf8(&row.key).ok();
-    let value_sha256 = hash_bytes(&row.encoded);
-    let revision_sha256 = hex_bytes(&row.revision_sha256);
+fn workspace_corrupt_error(row_key: &str, detail: String) -> ErrorData {
     ErrorData::new(
         ErrorCode(-32099),
-        format!(
-            "{operation} found an authoritative corrupt workspace blackboard row {row_key:?} at physical revision {revision_sha256}: {detail}"
-        ),
+        format!("workspace blackboard row {row_key} is corrupt: {detail}"),
         Some(json!({
             "code": error_codes::STORAGE_CORRUPTED,
-            "detail_code": "WORKSPACE_AUTHORITATIVE_ROW_CORRUPTED",
-            "operation": operation,
             "row_key": row_key,
-            "row_key_utf8": row_key_utf8,
-            "row_key_hex": hex_bytes(&row.key),
-            "physical_revision_sha256": revision_sha256,
-            "value_len_bytes": row.encoded.len(),
-            "value_sha256": value_sha256,
             "detail": detail,
-            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
-            "required_action": "inspect_and_repair_or_delete_exact_physical_row",
-            "remediation": "inspect CF_KV using row_key_hex and physical_revision_sha256; if the bytes are irreparable and row_key_utf8 is present, delete only that exact row through workspace operation=delete with raw_row_key and expected_corrupt_sha256 equal to value_sha256; otherwise use the storage repair surface for the exact binary key. Do not trust a partial list or retry a put until this row is resolved",
+            "source_of_truth": "CF_KV workspace-blackboard exact row",
         })),
     )
 }
@@ -3454,4 +2544,1101 @@ const fn default_true() -> bool {
 
 const fn default_false() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, path::Path};
+
+    use serde_json::json;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+
+    fn service_with_db(path: &Path) -> anyhow::Result<SynapseService> {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(8)
+                    .ok_or_else(|| anyhow::anyhow!("max subscriptions must be nonzero"))?,
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+    }
+
+    fn error_code(error: &rmcp::ErrorData) -> Option<&str> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+    }
+
+    fn error_detail_code(error: &rmcp::ErrorData) -> Option<&str> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("detail_code"))
+            .and_then(Value::as_str)
+    }
+
+    fn error_remediation(error: &rmcp::ErrorData) -> Option<&str> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("remediation"))
+            .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn put_records_command_audit_rows_readable_by_snapshot() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-audit".to_owned()),
+                key: "plans/next-step".to_owned(),
+                expected_version: None,
+                value: Some(json!({"known": "audit-happy"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-audit",
+            9_000,
+        )?;
+        assert_eq!(put.version, 1);
+
+        let snapshot = service.command_audit_snapshot()?;
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "workspace_put"
+                    && row.verb == "plan_edit"
+                    && row.phase == "intent"
+                    && row.actor_session_id.as_deref() == Some("session-audit")
+            }),
+            "workspace_put intent row should be projected from CF_ACTION_LOG"
+        );
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "workspace_put"
+                    && row.verb == "plan_edit"
+                    && row.phase == "final"
+                    && row.outcome == "ok"
+                    && row.actor_session_id.as_deref() == Some("session-audit")
+            }),
+            "workspace_put final row should be projected from CF_ACTION_LOG"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_fails_before_storage_write_when_command_audit_intent_fails() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        crate::server::command_audit::set_command_audit_force_fail_for_tests(true);
+        let result = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-audit-fail".to_owned()),
+                key: "plans/blocked".to_owned(),
+                expected_version: None,
+                value: Some(json!({"must_not_write": true})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-audit",
+            9_100,
+        );
+        crate::server::command_audit::set_command_audit_force_fail_for_tests(false);
+
+        let error = match result {
+            Ok(response) => anyhow::bail!("workspace_put unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(error_codes::TOOL_INTERNAL_ERROR));
+        assert!(error.message.contains("command audit forced failure"));
+
+        let db = service.workspace_db()?;
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, workspace_run_prefix("run-audit-fail").as_bytes())?
+                .is_empty(),
+            "workspace row must not exist when command audit intent write fails"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_and_get_round_trip_value_and_artifact_file_readback() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let artifact_path = temp.path().join("artifact.txt");
+        std::fs::write(&artifact_path, b"issue796-artifact-bytes")?;
+        let artifact_hash = sha256_file(&artifact_path)
+            .map_err(|error| anyhow::anyhow!("artifact hash failed: {error:?}"))?;
+        let service = service_with_db(temp.path())?;
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-796".to_owned()),
+                key: "findings/k1".to_owned(),
+                expected_version: None,
+                value: Some(json!({"known": 4, "marker": "ISSUE796"})),
+                artifact: Some(WorkspaceArtifactRef {
+                    handle: "artifact://issue796/screenshot".to_owned(),
+                    path: Some(artifact_path.display().to_string()),
+                    media_type: Some("text/plain".to_owned()),
+                    kind: Some("screenshot".to_owned()),
+                    sha256: Some(artifact_hash.clone()),
+                    bytes_len: Some(23),
+                }),
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            10_000,
+        )?;
+        assert_eq!(put.run_id, "run-796");
+        assert_eq!(put.version, 1);
+        assert_eq!(
+            put.artifact_readback
+                .as_ref()
+                .map(|row| row.sha256.as_str()),
+            Some(artifact_hash.as_str())
+        );
+
+        let get = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-796".to_owned()),
+                key: "findings/k1".to_owned(),
+                absent_ok: false,
+            },
+            "session-b",
+            10_001,
+        )?;
+        assert!(get.found);
+        let get_entry = get.entry.as_ref().expect("present get returns an entry");
+        assert_eq!(
+            get_entry.value,
+            Some(json!({"known": 4, "marker": "ISSUE796"}))
+        );
+        assert_eq!(
+            get_entry
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.handle.as_str()),
+            Some("artifact://issue796/screenshot")
+        );
+        assert_eq!(get.storage_readback.as_ref(), Some(&put.storage_readback));
+        assert!(get.absent_readback.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn list_skips_corrupt_row_without_breaking_good_reader() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-corrupt".to_owned()),
+                key: "findings/good".to_owned(),
+                expected_version: None,
+                value: Some(json!({"ok": true})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            20_000,
+        )?;
+        let db = service.workspace_db()?;
+        let corrupt_key = workspace_row_key("run-corrupt", "findings/bad");
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(corrupt_key.as_bytes().to_vec(), b"{not-json".to_vec())],
+        )?;
+
+        let list = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-corrupt".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: true,
+            },
+            "session-b",
+            20_001,
+        )?;
+        assert_eq!(list.scanned_rows, 2);
+        assert_eq!(list.returned_count, 1);
+        assert_eq!(list.entries[0].key, "findings/good");
+        assert_eq!(list.corrupt_rows_skipped.len(), 1);
+        assert_eq!(list.corrupt_rows_skipped[0].row_key, corrupt_key);
+        Ok(())
+    }
+
+    #[test]
+    fn subscribe_filter_matches_later_put_event() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let subscription = service.workspace_subscribe_impl(
+            WorkspaceSubscribeParams {
+                run_id: Some("run-sub".to_owned()),
+                prefix: "findings/".to_owned(),
+                snapshot_first: false,
+            },
+            "session-b",
+        )?;
+        assert_eq!(service.sse_state()?.active_subscription_count(), 1);
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-sub".to_owned()),
+                key: "findings/x".to_owned(),
+                expected_version: None,
+                value: Some(json!({"event": "expected"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            30_000,
+        )?;
+        assert_eq!(subscription.event_kind, WORKSPACE_PUT_EVENT_KIND);
+        assert_eq!(put.event_publish_report.matched, 1);
+        assert_eq!(put.event_publish_report.queued, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_rows_are_deleted_on_get_and_list() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-ttl".to_owned()),
+                key: "findings/old".to_owned(),
+                expected_version: None,
+                value: Some(json!({"ttl": 1})),
+                artifact: None,
+                ttl_ms: 1,
+            },
+            "session-a",
+            40_000,
+        )?;
+
+        let error = match service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-ttl".to_owned()),
+                key: "findings/old".to_owned(),
+                absent_ok: false,
+            },
+            "session-b",
+            40_002,
+        ) {
+            Ok(response) => anyhow::bail!("expired get unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(error_codes::STORAGE_READ_FAILED));
+        let db = service.workspace_db()?;
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, workspace_run_prefix("run-ttl").as_bytes())?
+                .is_empty()
+        );
+
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-ttl".to_owned()),
+                key: "findings/old-list".to_owned(),
+                expected_version: None,
+                value: Some(json!({"ttl": 1})),
+                artifact: None,
+                ttl_ms: 1,
+            },
+            "session-a",
+            50_000,
+        )?;
+        let list = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-ttl".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: true,
+            },
+            "session-b",
+            50_002,
+        )?;
+        assert_eq!(list.expired_rows_deleted, 1);
+        assert_eq!(list.returned_count, 0);
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, workspace_run_prefix("run-ttl").as_bytes())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_existing_key_requires_expected_version() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let first = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-cas".to_owned()),
+                key: "findings/shared".to_owned(),
+                expected_version: None,
+                value: Some(json!({"marker": "first"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            70_000,
+        )?;
+        assert_eq!(first.version, 1);
+        assert_eq!(first.previous_version, None);
+
+        let conflict = match service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-cas".to_owned()),
+                key: "findings/shared".to_owned(),
+                expected_version: None,
+                value: Some(json!({"marker": "blind-overwrite"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-b",
+            70_001,
+        ) {
+            Ok(response) => anyhow::bail!("blind overwrite unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&conflict),
+            Some(error_codes::STORAGE_WRITE_FAILED)
+        );
+        assert_eq!(
+            error_detail_code(&conflict),
+            Some("WORKSPACE_VERSION_CONFLICT")
+        );
+
+        let still_first = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-cas".to_owned()),
+                key: "findings/shared".to_owned(),
+                absent_ok: false,
+            },
+            "session-c",
+            70_002,
+        )?;
+        let still_first_entry = still_first.entry.as_ref().expect("present get entry");
+        assert_eq!(still_first_entry.value, Some(json!({"marker": "first"})));
+        assert_eq!(still_first_entry.version, 1);
+
+        let second = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-cas".to_owned()),
+                key: "findings/shared".to_owned(),
+                expected_version: Some(1),
+                value: Some(json!({"marker": "second"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-b",
+            70_003,
+        )?;
+        assert_eq!(second.version, 2);
+        assert_eq!(second.previous_version, Some(1));
+
+        let updated = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-cas".to_owned()),
+                key: "findings/shared".to_owned(),
+                absent_ok: false,
+            },
+            "session-c",
+            70_004,
+        )?;
+        let updated_entry = updated.entry.as_ref().expect("present get entry");
+        assert_eq!(updated_entry.value, Some(json!({"marker": "second"})));
+        assert_eq!(updated_entry.version, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn parameter_edges_fail_closed() -> anyhow::Result<()> {
+        assert!(normalize_workspace_key("").is_err());
+        assert!(normalize_workspace_key("bad\nkey").is_err());
+        assert!(validate_workspace_ttl_ms(0).is_err());
+        assert!(validate_workspace_ttl_ms(MAX_WORKSPACE_TTL_MS + 1).is_err());
+        assert!(validate_workspace_list_limit(0).is_err());
+        assert!(validate_workspace_list_limit(MAX_LIST_LIMIT + 1).is_err());
+        assert!(
+            validate_inline_value_size(Some(&json!({"blob": "x".repeat(MAX_INLINE_VALUE_BYTES)})))
+                .is_err()
+        );
+        assert!(normalize_sha256("not-a-digest".to_owned()).is_err());
+
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let error = match service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-edge".to_owned()),
+                key: "findings/no-payload".to_owned(),
+                expected_version: None,
+                value: None,
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            60_000,
+        ) {
+            Ok(response) => anyhow::bail!("payload-less put unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(error_codes::TOOL_PARAMS_INVALID));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_key_has_typed_absent_error() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let error = match service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-absent".to_owned()),
+                key: "missing/key".to_owned(),
+                absent_ok: false,
+            },
+            "session-a",
+            80_000,
+        ) {
+            Ok(response) => anyhow::bail!("absent get unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert!(
+            error_remediation(&error)
+                .is_some_and(|text| text.contains("workspace operation=exists"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_true_on_absent_key_is_success_found_false() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: the synthetic key has no CF_KV row.
+        let db = service.workspace_db()?;
+        let row_key = workspace_row_key("run-1552", "regression-1552-k1");
+        assert_eq!(
+            readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
+            0,
+            "precondition: key must be absent before the tolerant get"
+        );
+
+        let get = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                absent_ok: true,
+            },
+            "session-absent-ok",
+            120_000,
+        )?;
+
+        // after: tolerated absence is a SUCCESS, not the WORKSPACE_KEY_ABSENT error.
+        assert!(get.ok);
+        assert!(!get.found);
+        assert!(get.entry.is_none());
+        assert!(get.storage_readback.is_none());
+        let absent = get
+            .absent_readback
+            .as_ref()
+            .expect("absent_ok get must carry the CF_KV absent_readback proof");
+        assert!(!absent.exists);
+        assert_eq!(absent.exact_match_count, 0);
+        assert_eq!(absent.row_key, row_key);
+        println!(
+            "readback=absent_ok_get_absent found={} exists={} exact_match_count={} row_key={}",
+            get.found, absent.exists, absent.exact_match_count, absent.row_key
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_true_on_present_key_returns_value_found_true() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: publish the known synthetic value "2+2=4".
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                expected_version: None,
+                value: Some(json!("2+2=4")),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-writer",
+            130_000,
+        )?;
+
+        let get = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                absent_ok: true,
+            },
+            "session-reader",
+            130_001,
+        )?;
+
+        // after: a present key under absent_ok reads exactly like a normal get.
+        assert!(get.found);
+        let entry = get
+            .entry
+            .as_ref()
+            .expect("present absent_ok get must return the entry");
+        assert_eq!(entry.value, Some(json!("2+2=4")));
+        assert!(get.storage_readback.is_some());
+        assert!(get.absent_readback.is_none());
+        println!(
+            "readback=absent_ok_get_present found={} value={:?} sha256={:?}",
+            get.found,
+            entry.value,
+            get.storage_readback.as_ref().map(|row| &row.value_sha256)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_false_on_absent_key_still_errors() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // backward-compat: default fail-closed behavior is unchanged.
+        let error = match service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-missing".to_owned(),
+                absent_ok: false,
+            },
+            "session-fail-closed",
+            140_000,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("fail-closed absent get unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        println!(
+            "readback=absent_ok_false_error code={:?} detail_code={:?}",
+            error_code(&error),
+            error_detail_code(&error)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_resolves_when_key_present_found_true() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: publish the key against a real-clock timestamp so its TTL is in
+        // the real future (wait polls against the wall clock, unlike the
+        // synthetic-now *_impl_at helpers).
+        let put_now = unix_time_ms_now();
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                expected_version: None,
+                value: Some(json!("2+2=4")),
+                artifact: None,
+                ttl_ms: 600_000,
+            },
+            "session-writer",
+            put_now,
+        )?;
+
+        let wait = service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                timeout_ms: 1_000,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        )?;
+
+        // after: wait resolves immediately with the same readback as get.
+        assert!(wait.ok);
+        assert!(wait.found);
+        assert_eq!(wait.key, "regression-1552-k1");
+        assert_eq!(wait.entry.value, Some(json!("2+2=4")));
+        assert!(wait.poll_count >= 1);
+        println!(
+            "readback=wait_resolved found={} poll_count={} waited_ms={} value={:?} sha256={}",
+            wait.found,
+            wait.poll_count,
+            wait.waited_ms,
+            wait.entry.value,
+            wait.storage_readback.value_sha256
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_times_out_with_typed_error() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: the key is never written.
+        let db = service.workspace_db()?;
+        let row_key = workspace_row_key("run-1552", "regression-1552-never");
+        assert_eq!(
+            readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
+            0
+        );
+
+        let error = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-never".to_owned(),
+                timeout_ms: 5,
+                poll_interval_ms: 1,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wait on a never-written key unexpectedly resolved: {response:?}")
+            }
+            Err(error) => error,
+        };
+
+        // after: a typed timeout, not a generic storage error.
+        assert_eq!(error_code(&error), Some(WORKSPACE_WAIT_TIMEOUT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_WAIT_TIMEOUT));
+        let waited_ms = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("waited_ms"))
+            .and_then(Value::as_u64);
+        let poll_count = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("poll_count"))
+            .and_then(Value::as_u64);
+        assert!(
+            poll_count.is_some_and(|count| count >= 1),
+            "timeout payload must report at least one poll"
+        );
+        println!(
+            "readback=wait_timeout code={:?} waited_ms={:?} poll_count={:?}",
+            error_code(&error),
+            waited_ms,
+            poll_count
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_rejects_out_of_range_timeout() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let too_large = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                timeout_ms: MAX_WORKSPACE_WAIT_TIMEOUT_MS + 1,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => {
+                anyhow::bail!("over-max wait timeout unexpectedly accepted: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&too_large),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+
+        let zero = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "regression-1552-k1".to_owned(),
+                timeout_ms: 0,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => anyhow::bail!("zero wait timeout unexpectedly accepted: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&zero), Some(error_codes::TOOL_PARAMS_INVALID));
+        println!(
+            "readback=wait_reject over_max={:?} zero={:?}",
+            error_code(&too_large),
+            error_code(&zero)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_facade_put_get_exists_delete_round_trip() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+                expected_version: None,
+                value: Some(json!({"marker": "facade", "known": 4})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            90_000,
+        )?;
+        assert_eq!(put.version, 1);
+
+        let exists = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+            },
+            "session-b",
+            90_001,
+        )?;
+        assert!(exists.exists);
+        assert!(exists.physical_row_present);
+        assert_eq!(exists.state, WorkspaceExistenceState::Present);
+        assert_eq!(exists.current_version, Some(1));
+
+        let delete = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+                raw_row_key: None,
+                expected_version: Some(1),
+                expected_corrupt_sha256: None,
+            },
+            "session-c",
+            90_002,
+        )?;
+        assert_eq!(delete.deleted_version, Some(1));
+        assert!(delete.deleted_corrupt_row.is_none());
+        assert!(!delete.post_delete_readback.exists);
+        assert_eq!(delete.post_delete_readback.exact_match_count, 0);
+
+        let absent = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+            },
+            "session-d",
+            90_003,
+        )?;
+        assert!(!absent.exists);
+        assert_eq!(absent.state, WorkspaceExistenceState::Absent);
+        assert_eq!(
+            absent
+                .absent_readback
+                .as_ref()
+                .map(|readback| readback.exact_match_count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_delete_requires_current_expected_version() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+                expected_version: None,
+                value: Some(json!({"version": 1})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            100_000,
+        )?;
+
+        let conflict = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+                raw_row_key: None,
+                expected_version: Some(2),
+                expected_corrupt_sha256: None,
+            },
+            "session-b",
+            100_001,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wrong-version delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&conflict),
+            Some(error_codes::STORAGE_WRITE_FAILED)
+        );
+        assert_eq!(
+            error_detail_code(&conflict),
+            Some("WORKSPACE_VERSION_CONFLICT")
+        );
+
+        let still_present = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+            },
+            "session-c",
+            100_002,
+        )?;
+        assert!(still_present.exists);
+        assert_eq!(still_present.current_version, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_delete_corrupt_row_requires_exact_hash_guard() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let db = service.workspace_db()?;
+        let corrupt_key = workspace_row_key("run-delete-corrupt", "findings/bad");
+        let corrupt_value = b"{not-json".to_vec();
+        let corrupt_hash = hash_bytes(&corrupt_value);
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(corrupt_key.as_bytes().to_vec(), corrupt_value.clone())],
+        )?;
+
+        let listed = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: false,
+            },
+            "session-a",
+            110_000,
+        )?;
+        assert_eq!(listed.returned_count, 0);
+        assert_eq!(listed.corrupt_rows_skipped.len(), 1);
+        assert_eq!(listed.corrupt_rows_skipped[0].row_key, corrupt_key);
+        assert_eq!(listed.corrupt_rows_skipped[0].value_sha256, corrupt_hash);
+
+        let missing_guard = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: None,
+            },
+            "session-b",
+            110_001,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("unguarded corrupt delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&missing_guard),
+            Some(error_codes::STORAGE_CORRUPTED)
+        );
+        assert_eq!(
+            error_detail_code(&missing_guard),
+            Some("WORKSPACE_CORRUPT_ROW_REQUIRES_HASH_GUARD")
+        );
+        assert_eq!(
+            readback_exact_workspace_row(&db, &corrupt_key)?.value_sha256,
+            corrupt_hash
+        );
+
+        let wrong_hash = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: Some("sha256:0000".to_owned()),
+            },
+            "session-c",
+            110_002,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wrong-hash corrupt delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&wrong_hash),
+            Some(error_codes::STORAGE_WRITE_FAILED)
+        );
+        assert_eq!(
+            error_detail_code(&wrong_hash),
+            Some("WORKSPACE_CORRUPT_HASH_CONFLICT")
+        );
+        assert_eq!(
+            readback_exact_workspace_row(&db, &corrupt_key)?.value_sha256,
+            corrupt_hash
+        );
+
+        let deleted = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: Some(corrupt_hash.clone()),
+            },
+            "session-d",
+            110_003,
+        )?;
+        assert_eq!(deleted.deleted_version, None);
+        assert_eq!(
+            deleted
+                .deleted_corrupt_row
+                .as_ref()
+                .map(|row| row.value_sha256.as_str()),
+            Some(corrupt_hash.as_str())
+        );
+        assert!(!deleted.post_delete_readback.exists);
+        assert_eq!(
+            readback_absent_workspace_row(&db, &corrupt_key)?.exact_match_count,
+            0
+        );
+
+        let indexed_corrupt_key = format!(
+            "{}:00000000000000000000",
+            workspace_row_key("run-delete-corrupt", "findings/indexed")
+        );
+        let indexed_corrupt_value = b"{indexed-not-json".to_vec();
+        let indexed_corrupt_hash = hash_bytes(&indexed_corrupt_value);
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(
+                indexed_corrupt_key.as_bytes().to_vec(),
+                indexed_corrupt_value,
+            )],
+        )?;
+
+        let indexed_list = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: false,
+            },
+            "session-e",
+            110_004,
+        )?;
+        assert_eq!(indexed_list.corrupt_rows_skipped.len(), 1);
+        assert_eq!(
+            indexed_list.corrupt_rows_skipped[0].row_key,
+            indexed_corrupt_key
+        );
+        assert_eq!(
+            indexed_list.corrupt_rows_skipped[0].value_sha256,
+            indexed_corrupt_hash
+        );
+
+        let indexed_deleted = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/indexed".to_owned(),
+                raw_row_key: Some(indexed_corrupt_key.clone()),
+                expected_version: None,
+                expected_corrupt_sha256: Some(indexed_corrupt_hash.clone()),
+            },
+            "session-f",
+            110_005,
+        )?;
+        assert_eq!(indexed_deleted.deleted_version, None);
+        assert_eq!(
+            indexed_deleted
+                .deleted_corrupt_row
+                .as_ref()
+                .map(|row| row.value_sha256.as_str()),
+            Some(indexed_corrupt_hash.as_str())
+        );
+        assert_eq!(
+            readback_absent_workspace_row(&db, &indexed_corrupt_key)?.exact_match_count,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_facade_params_require_exact_matching_spec() {
+        let missing = validate_workspace_facade_params(&WorkspaceParams {
+            operation: WorkspaceOperation::Put,
+            get: Some(WorkspaceGetParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+                absent_ok: false,
+            }),
+            put: None,
+            list: None,
+            subscribe: None,
+            exists: None,
+            delete: None,
+            wait: None,
+        })
+        .expect_err("operation=put without put spec must fail");
+        assert_eq!(error_code(&missing), Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let extra = validate_workspace_facade_params(&WorkspaceParams {
+            operation: WorkspaceOperation::Get,
+            get: Some(WorkspaceGetParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+                absent_ok: false,
+            }),
+            put: Some(WorkspacePutParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+                expected_version: None,
+                value: Some(json!({"bad": true})),
+                artifact: None,
+                ttl_ms: 60_000,
+            }),
+            list: None,
+            subscribe: None,
+            exists: None,
+            delete: None,
+            wait: None,
+        })
+        .expect_err("multiple specs must fail");
+        assert_eq!(error_code(&extra), Some(error_codes::TOOL_PARAMS_INVALID));
+    }
 }

@@ -1,0 +1,33 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"EventExtension\", \"snapshot\", full_event_extension())?"
+---
+{
+  "name": "creeper_nearby",
+  "from_filter": {
+    "op": "and",
+    "args": [
+      {
+        "op": "kind",
+        "kind": "entity-appeared"
+      },
+      {
+        "op": "data",
+        "path": "/class_label",
+        "predicate": {
+          "op": "eq",
+          "value": "creeper"
+        }
+      },
+      {
+        "op": "data",
+        "path": "/bbox/w",
+        "predicate": {
+          "op": "gt",
+          "value": 80
+        }
+      }
+    ]
+  },
+  "emits_kind": "creeper-imminent"
+}

@@ -5,35 +5,31 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
-# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
-# makes this crate `private` for `cargo deny check licenses` (#1930).
-publish.workspace = true
 
 [features]
 default = []
 
 [dependencies]
-calyx-assay = { workspace = true }
-calyx-aster = { workspace = true }
-calyx-core = { workspace = true }
-calyx-mincut = { version = "0.1.0", path = "../../calyx/crates/calyx-mincut" }
-calyx-registry = { workspace = true }
+rocksdb = { workspace = true, features = ["lz4", "zstd", "multi-threaded-cf"] }
 fs2.workspace = true
-rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# `dump_cf` is a supported operator diagnostic example. Cargo has no
-# example-only dependency table, so its subscriber is an ordinary dependency;
-# unlike the deleted FSV drivers, the example remains part of the declared
-# diagnostic surface.
-tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+insta.workspace = true
+metrics.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "batch_throughput"
+harness = false
 
 [lints]
 workspace = true

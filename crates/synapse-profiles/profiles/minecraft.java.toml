@@ -1,0 +1,124 @@
+id = "minecraft.java"
+label = "Minecraft Java Edition"
+schema_version = 2
+use_scope = "single_player"
+mode = "pixel_only"
+mouse_velocity_profile_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "javaw.exe"
+title_regex = "Minecraft.*[0-9]+\\.[0-9]+"
+
+[[matches]]
+exe = "java.exe"
+title_regex = "Minecraft.*[0-9]+\\.[0-9]+"
+
+[capture]
+target = "foreground_window"
+min_update_interval_ms = 16
+cursor_visible = true
+
+[detection]
+model_id = "rtdetr_v2_s_coco_onnx"
+classes_of_interest = ["player", "zombie", "skeleton", "creeper", "villager"]
+confidence_threshold = 0.45
+max_detections = 32
+
+[ocr]
+default_backend = "winrt"
+
+[[hud]]
+name = "minecraft.hp_hearts"
+extractor = { kind = "template_match", templates = ["profiles/assets/minecraft.java/hearts/full.png", "profiles/assets/minecraft.java/hearts/half.png", "profiles/assets/minecraft.java/hearts/empty.png"] }
+parser = { kind = "number" }
+region = { kind = "anchored_to_edge", edge = "bottom_left", x_offset = 220, y_offset = -50, w = 180, h = 18 }
+
+[[hud]]
+name = "minecraft.hunger"
+extractor = { kind = "template_match", templates = ["profiles/assets/minecraft.java/hunger/full.png", "profiles/assets/minecraft.java/hunger/half.png", "profiles/assets/minecraft.java/hunger/empty.png"] }
+parser = { kind = "number" }
+region = { kind = "anchored_to_edge", edge = "bottom_right", x_offset = -400, y_offset = -50, w = 180, h = 18 }
+
+[[hud]]
+name = "minecraft.xp_level"
+extractor = { kind = "winrt_ocr" }
+parser = { kind = "bounded_integer", min = 0, max = 30, default_on_no_text = 0 }
+region = { kind = "anchored_to_edge", edge = "bottom_center", x_offset = -32, y_offset = -56, w = 64, h = 16 }
+
+[keymap]
+attack = "lmb"
+place = "rmb"
+inventory = "e"
+forward = "w"
+back = "s"
+left = "a"
+right = "d"
+jump = "space"
+sneak = "lshift"
+sprint = "ctrl"
+drop = "q"
+chat = "t"
+menu = "esc"
+hotbar1 = "1"
+hotbar2 = "2"
+hotbar3 = "3"
+hotbar4 = "4"
+hotbar5 = "5"
+hotbar6 = "6"
+hotbar7 = "7"
+hotbar8 = "8"
+hotbar9 = "9"
+
+[backends]
+default = "auto"
+keyboard_default = "auto"
+mouse_default = "auto"
+pad_default = "auto"
+
+[metadata]
+benchmark_id = "minecraft.java"
+"supported_use.local_world_only" = "true"
+"supported_use.single_player_only" = "true"
+"supported_use.operator_owned_world_required" = "true"
+"supported_use.remote_server_allowed" = "false"
+"supported_use.remote_server_policy" = "deny"
+"runtime.minecraft.configured_host_status" = "launcher_installed_sign_in_required_java_runtime_not_verified"
+"runtime.minecraft.launcher_path" = "C:\\Program Files (x86)\\Minecraft Launcher\\MinecraftLauncher.exe"
+"runtime.minecraft.evidence_policy" = "do_not_claim_real_minecraft_java_runtime_until_process_window_world_log_sot_readback"
+"runtime.minecraft.operator_boundary" = "microsoft_sign_in_and_java_license_required_before_javaw_world_log_sot_readback"
+"analogue.luanti.profile_id" = "luanti.minetest"
+"analogue.luanti.world_name" = "synapse_benchmark_mtg"
+"registry.family" = "profile-registry/audit-data"
+"registry.curated_seed" = "starter.v1"
+"registry.curated_status" = "shipped_curated_package"
+"registry.curated_tier" = "game.seed"
+"registry.curated_priority" = "p1"
+"registry.backlog_issue" = "#416,#482"
+"registry.default_detection_decision" = "#415,ADR-0010"
+"registry.quality_signal" = "profile_quality.minecraft.java"
+"registry.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,storage_inspect,profile_quality_refresh,minecraft_process_window_readback,minecraft_world_log_readback,luanti_analogue_readback"
+"registry.compatibility_target" = "minecraft.java"
+"registry.safe_default_backend_policy" = "auto; operator-owned local single-player worlds only; no remote server automation; no credential/payment/account changes; audit export requires explicit consent"
+"audit.tags" = "game:minecraft_java,moat:profile-audit,analogue:luanti"
+
+[[event_extensions]]
+name = "creeper_nearby"
+from_filter = { op = "and", args = [
+    { op = "source", source = "perception_detection" },
+    { op = "kind", kind = "entity_appeared" },
+    { op = "data", path = "/profile_id", predicate = { op = "eq", value = "minecraft.java" } },
+    { op = "data", path = "/class_label", predicate = { op = "eq", value = "creeper" } },
+    { op = "data", path = "/bbox/w", predicate = { op = "gt", value = 80 } }
+] }
+emits_kind = "minecraft.creeper_imminent"
+
+[[event_extensions]]
+name = "low_hp"
+from_filter = { op = "and", args = [
+    { op = "source", source = "perception_hud" },
+    { op = "kind", kind = "perception.hud_observed" },
+    { op = "data", path = "/profile_id", predicate = { op = "eq", value = "minecraft.java" } },
+    { op = "data", path = "/hud/minecraft.hp_hearts", predicate = { op = "le", value = 6 } }
+] }
+emits_kind = "minecraft.low_hp"

@@ -32,8 +32,6 @@ pub enum BrowserClockOperation {
     Status,
     /// Install the fake clock shim into the current and future page documents.
     Install,
-    /// Restore the exact page descriptors captured by install and remove future-document installation.
-    Uninstall,
     /// Set Date/time to `time_unix_ms` without firing timers.
     SetFixedTime,
     /// Advance fake time by `delta_ms`, firing due timers/intervals/RAF callbacks.
@@ -47,7 +45,6 @@ impl BrowserClockOperation {
         match self {
             Self::Status => "status",
             Self::Install => "install",
-            Self::Uninstall => "uninstall",
             Self::SetFixedTime => "setFixedTime",
             Self::FastForward => "fastForward",
             Self::PauseAt => "pauseAt",
@@ -60,7 +57,6 @@ impl From<BrowserClockOperation> for synapse_a11y::CdpClockOperation {
         match value {
             BrowserClockOperation::Status => Self::Status,
             BrowserClockOperation::Install => Self::Install,
-            BrowserClockOperation::Uninstall => Self::Uninstall,
             BrowserClockOperation::SetFixedTime => Self::SetFixedTime,
             BrowserClockOperation::FastForward => Self::FastForward,
             BrowserClockOperation::PauseAt => Self::PauseAt,
@@ -304,7 +300,7 @@ struct NormalizedBrowserPageEventsParams {
 #[tool_router(router = browser_clock_events_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script for current/future documents; the normal Chrome bridge uses one exact documentId-bound MAIN-world descriptor transaction for chrome-tab:* targets, refuses collisions, verifies every installed/restored descriptor, and reconciles ownership when navigation destroys the document. uninstall restores the captured descriptors and removes future-document installation; set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status is read-only and returns current ownership state without installing a controller. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script shim for current/future documents; the normal Chrome bridge uses a typed MAIN-world chrome.scripting shim for chrome-tab:* current-document targets. set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status returns current shim state. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_clock(
         &self,
@@ -362,7 +358,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Arm and read target-scoped page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Raw CDP returns Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots, and Target worker/service_worker/shared_worker snapshots. The debugger-free normal Chrome bridge serves only an explicitly requested page-only event kind from chrome.webNavigation/chrome.tabs; unfiltered or worker requests fail closed and require a session-owned raw-CDP target, because mutating host Worker constructors is not an observation boundary. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
+        description = "Arm and read target-scoped page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Raw CDP returns Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots, and Target worker/service_worker/shared_worker snapshots. The normal Chrome bridge supports chrome-tab:* current-profile targets through a per-tab chrome.webNavigation ring buffer plus a typed MAIN-world worker shim for current-document worker creation/termination readback. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
     )]
     pub async fn browser_page_events(
         &self,
@@ -586,7 +582,7 @@ impl SynapseService {
                     returned = result.returned,
                     page_count = result.pages.len(),
                     worker_count = result.workers.len(),
-                    "readback=chrome.webNavigation+chrome.tabs(page-only; workers require raw CDP) outcome=list_returned"
+                    "readback=chrome.webNavigation+chrome.scripting.executeScript(MAIN worker shim) outcome=list_returned"
                 );
                 return Ok(BrowserPageEventsResponse {
                     session_id: session_id.to_owned(),
@@ -743,10 +739,6 @@ fn validate_browser_clock_params(
         BrowserClockOperation::Status => {
             reject_field(params.time_unix_ms, "time_unix_ms", "status")?;
             reject_field(params.delta_ms, "delta_ms", "status")?;
-        }
-        BrowserClockOperation::Uninstall => {
-            reject_field(params.time_unix_ms, "time_unix_ms", "uninstall")?;
-            reject_field(params.delta_ms, "delta_ms", "uninstall")?;
         }
         BrowserClockOperation::Install => {
             reject_field(params.delta_ms, "delta_ms", "install")?;
@@ -1068,5 +1060,213 @@ fn browser_bridge_worker_snapshot(
         last_seen_seq: worker.last_seen_seq,
         first_seen_unix_ms: worker.first_seen_unix_ms,
         last_seen_unix_ms: worker.last_seen_unix_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock_params(operation: BrowserClockOperation) -> BrowserClockParams {
+        BrowserClockParams {
+            operation,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn browser_clock_validation_edges() {
+        let install = validate_browser_clock_params(&BrowserClockParams {
+            operation: BrowserClockOperation::Install,
+            time_unix_ms: Some(1_700_000_000_000),
+            ..Default::default()
+        })
+        .expect("install with time");
+        assert_eq!(install.operation, BrowserClockOperation::Install);
+
+        for error in [
+            validate_browser_clock_params(&BrowserClockParams {
+                operation: BrowserClockOperation::SetFixedTime,
+                ..Default::default()
+            })
+            .expect_err("set_fixed_time requires time"),
+            validate_browser_clock_params(&BrowserClockParams {
+                operation: BrowserClockOperation::FastForward,
+                time_unix_ms: Some(1),
+                delta_ms: Some(10),
+                ..Default::default()
+            })
+            .expect_err("fast_forward rejects time"),
+            validate_browser_clock_params(&BrowserClockParams {
+                operation: BrowserClockOperation::PauseAt,
+                time_unix_ms: Some(MAX_CLOCK_MS + 1),
+                ..Default::default()
+            })
+            .expect_err("oversized time rejected"),
+            validate_browser_clock_params(&BrowserClockParams {
+                operation: BrowserClockOperation::Status,
+                delta_ms: Some(1),
+                ..Default::default()
+            })
+            .expect_err("status rejects delta"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        assert!(
+            validate_browser_clock_params(&clock_params(BrowserClockOperation::Status)).is_ok()
+        );
+    }
+
+    #[test]
+    fn browser_page_events_validation_edges() {
+        let filters = validate_browser_page_events_params(&BrowserPageEventsParams {
+            limit: Some(MAX_PAGE_EVENT_LIMIT + 100),
+            event_kind: Some("Load".to_owned()),
+            worker_type: Some("SERVICE_WORKER".to_owned()),
+            ..Default::default()
+        })
+        .expect("filters");
+        assert_eq!(filters.limit, MAX_PAGE_EVENT_LIMIT);
+        assert_eq!(filters.event_kind.as_deref(), Some("load"));
+        assert_eq!(filters.worker_type.as_deref(), Some("service_worker"));
+
+        for error in [
+            validate_browser_page_events_params(&BrowserPageEventsParams {
+                event_kind: Some("navigation".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("unknown event rejected"),
+            validate_browser_page_events_params(&BrowserPageEventsParams {
+                event_kind: Some("page_created".to_owned()),
+                worker_type: Some("page".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("page is not a worker type"),
+            validate_browser_page_events_params(&BrowserPageEventsParams {
+                worker_type: Some("page".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("unknown worker type rejected"),
+            validate_browser_page_events_params(&BrowserPageEventsParams {
+                event_kind: Some("bad\0kind".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("nul rejected"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        let page_filter = validate_browser_page_events_params(&BrowserPageEventsParams {
+            event_kind: Some("PAGE_CREATED".to_owned()),
+            ..Default::default()
+        })
+        .expect("page events are supported");
+        assert_eq!(page_filter.event_kind.as_deref(), Some("page_created"));
+    }
+
+    #[test]
+    fn browser_page_events_maps_page_targets_as_adoptable() {
+        let page_event = browser_page_event_entry(
+            0x1234,
+            synapse_a11y::CdpPageEventEntry {
+                seq: 7,
+                event_kind: "page_created".to_owned(),
+                target_id: "root-page".to_owned(),
+                target_type: Some("page".to_owned()),
+                target_attached: Some(false),
+                page_target_id: Some("popup-page".to_owned()),
+                opener_id: Some("root-page".to_owned()),
+                opener_frame_id: None,
+                can_access_opener: Some(false),
+                browser_context_id: Some("context-1".to_owned()),
+                subtype: None,
+                worker_id: None,
+                worker_type: None,
+                worker_url: None,
+                frame_id: None,
+                parent_frame_id: None,
+                loader_id: None,
+                name: None,
+                url: Some("https://example.test/popup".to_owned()),
+                title: Some("Popup".to_owned()),
+                navigation_type: None,
+                timestamp_s: None,
+                observed_at_unix_ms: 10,
+            },
+        );
+        match page_event.adoptable_target {
+            Some(TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            }) => {
+                assert_eq!(window_hwnd, 0x1234);
+                assert_eq!(cdp_target_id, "popup-page");
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
+
+        let destroyed = browser_page_event_entry(
+            0x1234,
+            synapse_a11y::CdpPageEventEntry {
+                seq: 8,
+                event_kind: "page_destroyed".to_owned(),
+                target_id: "root-page".to_owned(),
+                target_type: Some("page".to_owned()),
+                target_attached: None,
+                page_target_id: Some("popup-page".to_owned()),
+                opener_id: None,
+                opener_frame_id: None,
+                can_access_opener: None,
+                browser_context_id: None,
+                subtype: None,
+                worker_id: None,
+                worker_type: None,
+                worker_url: None,
+                frame_id: None,
+                parent_frame_id: None,
+                loader_id: None,
+                name: None,
+                url: None,
+                title: None,
+                navigation_type: None,
+                timestamp_s: None,
+                observed_at_unix_ms: 11,
+            },
+        );
+        assert!(destroyed.adoptable_target.is_none());
+
+        let snapshot = browser_page_target_snapshot(
+            0x1234,
+            synapse_a11y::CdpPageTargetSnapshot {
+                target_id: "popup-page".to_owned(),
+                target_type: "page".to_owned(),
+                url: "https://example.test/popup".to_owned(),
+                title: "Popup".to_owned(),
+                opener_id: Some("root-page".to_owned()),
+                opener_frame_id: None,
+                can_access_opener: false,
+                browser_context_id: Some("context-1".to_owned()),
+                subtype: None,
+                attached: true,
+                destroyed: false,
+                first_seen_seq: 7,
+                last_seen_seq: 7,
+                first_seen_unix_ms: 10,
+                last_seen_unix_ms: 10,
+            },
+        );
+        assert!(snapshot.adoptable);
+        assert_eq!(snapshot.cdp_target_id, "popup-page");
     }
 }

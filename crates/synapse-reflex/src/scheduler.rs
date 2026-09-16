@@ -5,14 +5,9 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
-
 use chrono::Utc;
 use synapse_action::ActionHandle;
-use synapse_core::{
-    Action, CompiledEventFilter, EventFilter, ReflexId, ReflexLifetime, ReflexStatus,
-    StoredAuditContext,
-};
+use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime, StoredAuditContext};
 use synapse_storage::Db;
 
 use crate::{
@@ -30,12 +25,11 @@ use crate::{
 };
 pub use scheduler_handle::SchedulerHandle;
 use scheduler_loop::{
-    ReflexControl, RuntimeLifetimeFilter, RuntimeReflex, RuntimeSchedulerTrigger, RuntimeState,
-    aim_track_states, combo_states, hold_button_states, hold_move_states, lock_controls,
-    mark_reflex_action_denied, mark_reflex_active_if_starved, mark_reflex_combo_completed,
-    mark_reflex_error, mark_reflex_fired, mark_reflex_lifetime_expired,
-    mark_reflex_path_follow_completed, mark_reflex_starved, mark_reflex_track_lost,
-    path_follow_states, run_scheduler_thread, status_for_reflex_with_history,
+    ReflexControl, RuntimeReflex, RuntimeState, aim_track_states, combo_states, hold_button_states,
+    hold_move_states, lock_controls, mark_reflex_action_denied, mark_reflex_active_if_starved,
+    mark_reflex_combo_completed, mark_reflex_error, mark_reflex_fired,
+    mark_reflex_lifetime_expired, mark_reflex_path_follow_completed, mark_reflex_starved,
+    mark_reflex_track_lost, path_follow_states, run_scheduler_thread, status_for_reflex,
 };
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
@@ -43,15 +37,12 @@ pub const MAX_REFLEX_PRIORITY: u32 = 1000;
 pub const REFLEX_TICK_LATE_KIND: &str = "reflex_tick_late";
 pub const DEFAULT_SAMPLE_LIMIT: usize = 4096;
 pub const DEFAULT_REFLEX_PRIORITY: u32 = 100;
-pub const DEFAULT_DEADLINE_MISS_AUDIT_AFTER: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
     pub target_interval: Duration,
     pub fallback_interval: Duration,
     pub late_after: Duration,
-    pub deadline_miss_audit_after: u32,
-    pub severe_deadline_miss_after: Duration,
     pub sample_limit: usize,
     pub max_ticks: Option<u64>,
     pub force_degraded: bool,
@@ -60,14 +51,10 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         let target_interval = Duration::from_millis(1);
-        let fallback_interval = Duration::from_millis(2);
-        let late_after = target_interval.saturating_mul(2);
         Self {
             target_interval,
-            fallback_interval,
-            late_after,
-            deadline_miss_audit_after: DEFAULT_DEADLINE_MISS_AUDIT_AFTER,
-            severe_deadline_miss_after: fallback_interval.saturating_mul(4),
+            fallback_interval: Duration::from_millis(2),
+            late_after: target_interval.saturating_mul(2),
             sample_limit: DEFAULT_SAMPLE_LIMIT,
             max_ticks: None,
             force_degraded: false,
@@ -98,23 +85,11 @@ impl SchedulerConfig {
                 detail: "scheduler sample limit must be non-zero".to_owned(),
             });
         }
-        if self.deadline_miss_audit_after == 0 {
-            return Err(ReflexError::ParamsInvalid {
-                detail: "scheduler deadline-miss audit streak must be non-zero".to_owned(),
-            });
-        }
-        if self.severe_deadline_miss_after <= self.late_after {
-            return Err(ReflexError::ParamsInvalid {
-                detail: "scheduler severe deadline-miss threshold must exceed late_after"
-                    .to_owned(),
-            });
-        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledReflex {
     pub reflex_id: ReflexId,
     pub trigger: SchedulerTrigger,
@@ -267,8 +242,7 @@ impl ScheduledReflex {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "driver", content = "params", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScheduledReflexDriver {
     Actions,
     AimTrack(AimTrackParams),
@@ -278,8 +252,7 @@ pub enum ScheduledReflexDriver {
     PathFollow(PathFollowParams),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "trigger", content = "filter", rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchedulerTrigger {
     EveryTick,
     OnEvent(EventFilter),
@@ -309,7 +282,6 @@ pub struct TickSample {
     pub pulled_events: usize,
     pub dispatched_actions: usize,
     pub late: bool,
-    pub deadline_miss_streak: u32,
     pub degraded: bool,
 }
 
@@ -337,8 +309,6 @@ impl ReflexScheduler {
             None,
             None,
             None,
-            None,
-            false,
         )
     }
 
@@ -363,8 +333,6 @@ impl ReflexScheduler {
             None,
             Some(action_gate),
             None,
-            None,
-            false,
         )
     }
 
@@ -389,8 +357,6 @@ impl ReflexScheduler {
             None,
             None,
             None,
-            None,
-            false,
         )
     }
 
@@ -416,8 +382,6 @@ impl ReflexScheduler {
             audit_context,
             None,
             None,
-            None,
-            false,
         )
     }
 
@@ -444,8 +408,6 @@ impl ReflexScheduler {
             audit_context,
             Some(action_gate),
             None,
-            None,
-            false,
         )
     }
 
@@ -473,8 +435,6 @@ impl ReflexScheduler {
             audit_context,
             None,
             Some(aim_track_target_source),
-            None,
-            false,
         )
     }
 
@@ -504,41 +464,6 @@ impl ReflexScheduler {
             audit_context,
             Some(action_gate),
             Some(aim_track_target_source),
-            None,
-            false,
-        )
-    }
-
-    /// Replaces a running scheduler without rewriting retained reflex
-    /// lifecycle history. History is installed before the tick thread is
-    /// spawned, so no observer can see a fresh timestamp/counter window.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "scheduler replacement carries the explicit runtime dependencies plus the lifecycle history being preserved"
-    )]
-    pub(crate) fn spawn_replacement(
-        event_bus: EventBus,
-        action_handle: ActionHandle,
-        reflexes: Vec<ScheduledReflex>,
-        config: SchedulerConfig,
-        audit_db: Arc<Db>,
-        audit_context: Option<StoredAuditContext>,
-        action_gate: Option<ReflexActionGateHandle>,
-        aim_track_target_source: Option<AimTrackTargetSourceHandle>,
-        prior_statuses: &[ReflexStatus],
-        new_registration_at: chrono::DateTime<Utc>,
-    ) -> ReflexResult<SchedulerHandle> {
-        Self::spawn_inner(
-            event_bus,
-            action_handle,
-            reflexes,
-            config,
-            Some(audit_db),
-            audit_context,
-            action_gate,
-            aim_track_target_source,
-            Some((prior_statuses, new_registration_at)),
-            true,
         )
     }
 
@@ -552,47 +477,23 @@ impl ReflexScheduler {
         audit_context: Option<StoredAuditContext>,
         action_gate: Option<ReflexActionGateHandle>,
         aim_track_target_source: Option<AimTrackTargetSourceHandle>,
-        replacement_lifecycle: Option<(&[ReflexStatus], chrono::DateTime<Utc>)>,
-        start_prepared: bool,
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
-        let lowered_refresher = start_lowered_feed(audit_db.as_ref())?;
-        let lowered_feed = Arc::clone(lowered_refresher.feed());
-        // The scheduler thread is a hard-real-time 1 ms loop; it must never
-        // perform a vault write. Build the off-thread audit sink before the
-        // scheduler exists and refuse to start if its writer thread cannot be
-        // spawned, rather than degrading to on-tick writes (#1802).
-        let audit_sink = audit_db
-            .map(|db| {
-                crate::ReflexAuditSink::start(db, audit_context.clone())
-                    .map(Arc::new)
-                    .map_err(|error| ReflexError::ParamsInvalid {
-                        detail: format!(
-                            "reflex audit writer thread spawn failed: {error}; the scheduler refuses to start because reflex audit rows would otherwise be written synchronously on the high-resolution tick thread"
-                        ),
-                    })
-            })
-            .transpose()?;
         let subscription = event_bus
             .subscribe(EventFilter::All, Vec::new(), false)
             .map_err(|error| ReflexError::CapReached {
                 detail: format!("scheduler event subscription failed: {error}"),
             })?;
         let stop = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(AtomicBool::new(!start_prepared));
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(config.sample_limit)));
-        let (prior_statuses, new_registration_at) = replacement_lifecycle.map_or_else(
-            || (None, Utc::now()),
-            |(statuses, timestamp)| (Some(statuses), timestamp),
-        );
-        let statuses = Arc::new(Mutex::new(initial_statuses(
-            &reflexes,
-            prior_statuses,
-            new_registration_at,
-        )));
-        let pending_terminals = Arc::new(Mutex::new(vec![None; reflexes.len()]));
-        let denied_terminal_audits = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let registered_at = Utc::now();
+        let statuses = Arc::new(Mutex::new(
+            reflexes
+                .iter()
+                .map(|reflex| status_for_reflex(reflex, registered_at))
+                .collect::<Vec<_>>(),
+        ));
         let controls = Arc::new(Mutex::new(
             reflexes
                 .iter()
@@ -607,7 +508,22 @@ impl ReflexScheduler {
         let hold_button_states = hold_button_states(&reflexes)?;
         let combo_states = combo_states(&reflexes);
         let path_follow_states = path_follow_states(&reflexes)?;
-        let (reflexes, on_event_states, starvation_states) = runtime_reflex_state(reflexes)?;
+        let reflexes = reflexes
+            .into_iter()
+            .enumerate()
+            .map(|(registration_order, reflex)| RuntimeReflex {
+                registration_order,
+                reflex,
+            })
+            .collect::<Vec<_>>();
+        let on_event_states = reflexes
+            .iter()
+            .map(|_| OnEventState::default())
+            .collect::<Vec<_>>();
+        let starvation_states = reflexes
+            .iter()
+            .map(|_| crate::conflict::StarvationState::default())
+            .collect::<Vec<_>>();
 
         let runtime = RuntimeState {
             event_bus,
@@ -624,19 +540,14 @@ impl ReflexScheduler {
             aim_track_target_source,
             subscription,
             stop: Arc::clone(&stop),
-            start: Arc::clone(&start),
             samples: Arc::clone(&samples),
             controls: Arc::clone(&controls),
             statuses: Arc::clone(&statuses),
-            pending_terminals: Arc::clone(&pending_terminals),
-            denied_terminal_audits,
             config,
-            audit_sink: audit_sink.clone(),
+            audit_db,
             audit_context,
             action_gate,
-            lowered_guard_thresholds: Arc::clone(&lowered_feed),
             tick_index: 0,
-            deadline_miss_streak: 0,
             last_tick_late_signal: None,
         };
 
@@ -649,102 +560,12 @@ impl ReflexScheduler {
 
         Ok(SchedulerHandle {
             stop,
-            start,
             join: Some(join),
             samples,
             controls,
             statuses,
-            pending_terminals,
-            audit_sink,
-            lowered_refresher,
         })
     }
-}
-
-fn runtime_reflex_state(
-    reflexes: Vec<ScheduledReflex>,
-) -> ReflexResult<(
-    Vec<RuntimeReflex>,
-    Vec<OnEventState>,
-    Vec<crate::conflict::StarvationState>,
-)> {
-    let count = reflexes.len();
-    let reflexes = reflexes
-        .into_iter()
-        .enumerate()
-        .map(|(registration_order, reflex)| {
-            let trigger = match &reflex.trigger {
-                SchedulerTrigger::EveryTick => RuntimeSchedulerTrigger::EveryTick,
-                SchedulerTrigger::OnEvent(filter) => {
-                    RuntimeSchedulerTrigger::OnEvent(CompiledEventFilter::compile(filter).map_err(
-                        |error| ReflexError::FilterInvalid {
-                            detail: format!(
-                                "reflex {:?} trigger filter compilation failed: {error}",
-                                reflex.reflex_id
-                            ),
-                        },
-                    )?)
-                }
-            };
-            let lifetime_filter = match &reflex.lifetime {
-                ReflexLifetime::UntilEvent { filter } => RuntimeLifetimeFilter::UntilEvent(
-                    CompiledEventFilter::compile(filter).map_err(|error| {
-                        ReflexError::FilterInvalid {
-                            detail: format!(
-                                "reflex {:?} lifetime filter compilation failed: {error}",
-                                reflex.reflex_id
-                            ),
-                        }
-                    })?,
-                ),
-                ReflexLifetime::OneShot
-                | ReflexLifetime::Duration { .. }
-                | ReflexLifetime::UntilCancelled
-                | ReflexLifetime::UntilDeadline { .. } => RuntimeLifetimeFilter::NotEvent,
-            };
-            Ok(RuntimeReflex {
-                registration_order,
-                reflex,
-                trigger,
-                lifetime_filter,
-            })
-        })
-        .collect::<ReflexResult<Vec<_>>>()?;
-    Ok((
-        reflexes,
-        (0..count).map(|_| OnEventState::default()).collect(),
-        (0..count)
-            .map(|_| crate::conflict::StarvationState::default())
-            .collect(),
-    ))
-}
-
-fn initial_statuses(
-    reflexes: &[ScheduledReflex],
-    prior_statuses: Option<&[ReflexStatus]>,
-    registered_at: chrono::DateTime<Utc>,
-) -> Vec<ReflexStatus> {
-    let prior_statuses = prior_statuses.unwrap_or_default();
-    reflexes
-        .iter()
-        .map(|reflex| status_for_reflex_with_history(reflex, registered_at, prior_statuses))
-        .collect()
-}
-
-/// Builds the tick's frozen guard-threshold feed and starts its off-tick
-/// refresher (#1686).
-///
-/// Done on the cold construction path, before the tick thread exists, so the
-/// artifact's first read never happens under the hot-context tag. The lowered
-/// artifact lives under the vault directory, which is the storage handle's path;
-/// without a storage handle there is no vault and the feed says so rather than
-/// inventing one.
-fn start_lowered_feed(
-    audit_db: Option<&Arc<Db>>,
-) -> ReflexResult<crate::lowered::LoweredRefresher> {
-    let vault_dir = audit_db.map(|db| db.path.clone());
-    let feed = crate::lowered::LoweredGuardThresholdFeed::new(vault_dir.as_deref());
-    crate::lowered::LoweredRefresher::start(feed)
 }
 
 pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {

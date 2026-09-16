@@ -7,7 +7,6 @@ pub mod audit_export;
 pub mod audit_retention;
 pub mod demo_recording;
 pub mod episodes;
-pub(crate) mod grounding;
 pub mod hygiene;
 pub mod intent;
 pub mod intent_events;
@@ -27,6 +26,8 @@ pub mod routines;
 pub mod storage;
 pub mod subscribe;
 pub mod suggestions;
+#[cfg(test)]
+mod tests;
 pub mod timeline;
 pub mod timeline_control;
 use anyhow::{Context, Result, bail};
@@ -35,10 +36,7 @@ use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use synapse_action::ActionHandle;
@@ -49,10 +47,7 @@ use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
     install_action_combo_scheduler,
 };
-use synapse_storage::{
-    Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask, StorageBackendKind,
-    StorageError,
-};
+use synapse_storage::{Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask};
 use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
@@ -63,15 +58,10 @@ use self::timeline_control::RecorderControl;
 use crate::http::sse::SseState;
 
 const DB_ENV: &str = "SYNAPSE_DB";
-const STORAGE_BACKEND_ENV: &str = "SYNAPSE_STORAGE_BACKEND";
 const PROFILE_DIR_ENV: &str = "SYNAPSE_PROFILE_DIR";
 const REFLEX_DISABLED_ENV: &str = "SYNAPSE_REFLEX_DISABLED";
 const REFLEX_FORCE_DEGRADED_ENV: &str = "SYNAPSE_REFLEX_FORCE_DEGRADED";
 const STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV: &str = "SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE";
-const CALYX_VAULT_ENV: &str = "SYNAPSE_CALYX_VAULT";
-const CALYX_VAULT_DIR_ENV: &str = "SYNAPSE_CALYX_VAULT_DIR";
-const CALYX_CONFIG_ENV: &str = "SYNAPSE_CALYX_CONFIG";
-const CALYX_CONFIG_SHA256_ENV: &str = "SYNAPSE_CALYX_CONFIG_SHA256";
 const ENABLE_AUDIO_ENV: &str = "SYNAPSE_ENABLE_AUDIO";
 const ALLOW_UNKNOWN_PROFILE_ENV: &str = "SYNAPSE_ALLOW_UNKNOWN_PROFILE";
 const ALLOWED_PERMISSIONS_ENV: &str = "SYNAPSE_MCP_ALLOWED_PERMISSIONS";
@@ -82,55 +72,6 @@ const MAX_SUBSCRIPTIONS_ENV: &str = "SYNAPSE_MAX_SUBSCRIPTIONS";
 const DEFAULT_BIND: &str = "127.0.0.1:7700";
 pub type SharedM3State = Arc<Mutex<M3State>>;
 
-struct CalyxClosePhaseObserver {
-    stop: Arc<AtomicBool>,
-    worker: std::thread::JoinHandle<std::result::Result<(), String>>,
-}
-
-impl CalyxClosePhaseObserver {
-    fn spawn(reason: &'static str) -> std::io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_worker = Arc::clone(&stop);
-        let worker = std::thread::Builder::new()
-            .name("synapse-calyx-close-phase-observer".to_owned())
-            .spawn(move || {
-                let mut recorded_sequence = 0;
-                loop {
-                    if let Some(snapshot) = synapse_calyx::current_close_phase_snapshot()
-                        && snapshot.sequence > recorded_sequence
-                    {
-                        crate::daemon_lifecycle::record_exit_intent(reason, snapshot.phase)
-                            .map_err(|error| {
-                                format!(
-                                    "persist exact Calyx close phase={} transition={} sequence={}: {error:#}",
-                                    snapshot.phase, snapshot.transition, snapshot.sequence
-                                )
-                            })?;
-                        recorded_sequence = snapshot.sequence;
-                    }
-                    if stop_for_worker.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            })?;
-        Ok(Self { stop, worker })
-    }
-
-    fn finish(self) -> std::result::Result<(), String> {
-        self.stop.store(true, Ordering::Release);
-        self.worker.join().map_err(|panic| {
-            if let Some(message) = panic.downcast_ref::<&str>() {
-                format!("Calyx close-phase observer panicked: {message}")
-            } else if let Some(message) = panic.downcast_ref::<String>() {
-                format!("Calyx close-phase observer panicked: {message}")
-            } else {
-                "Calyx close-phase observer panicked with a non-string payload".to_owned()
-            }
-        })?
-    }
-}
-
 #[derive(Clone, Debug)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -138,7 +79,6 @@ impl CalyxClosePhaseObserver {
 )]
 pub struct M3ServiceConfig {
     pub db_path: Option<PathBuf>,
-    pub storage_backend: StorageBackendKind,
     pub profile_dir: Option<PathBuf>,
     pub reflex_disabled: bool,
     pub bind: String,
@@ -149,10 +89,6 @@ pub struct M3ServiceConfig {
     pub allowed_permissions: Option<String>,
     pub reflex_force_degraded: bool,
     pub storage_pressure_free_bytes_sample: Option<u64>,
-    pub calyx_vault: bool,
-    pub calyx_vault_dir: Option<PathBuf>,
-    pub calyx_config_path: Option<PathBuf>,
-    pub calyx_config_sha256: Option<String>,
 }
 
 impl M3ServiceConfig {
@@ -167,7 +103,6 @@ impl M3ServiceConfig {
     )]
     pub fn from_cli_parts(
         db_path: Option<PathBuf>,
-        storage_backend: StorageBackendKind,
         profile_dir: Option<PathBuf>,
         reflex_disabled: bool,
         bind: String,
@@ -180,7 +115,6 @@ impl M3ServiceConfig {
     ) -> Self {
         Self {
             db_path,
-            storage_backend,
             profile_dir,
             reflex_disabled,
             bind,
@@ -191,29 +125,19 @@ impl M3ServiceConfig {
             allowed_permissions,
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
-            calyx_vault: true,
-            calyx_vault_dir: None,
-            calyx_config_path: None,
-            calyx_config_sha256: None,
         }
     }
 
     pub fn from_env() -> Result<Self> {
-        let storage_backend_raw = std::env::var(STORAGE_BACKEND_ENV).ok();
         let reflex_disabled_raw = std::env::var(REFLEX_DISABLED_ENV).ok();
         let reflex_force_degraded_raw = std::env::var(REFLEX_FORCE_DEGRADED_ENV).ok();
         let storage_pressure_free_bytes_sample_raw =
             std::env::var(STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV).ok();
         let enable_audio_raw = std::env::var(ENABLE_AUDIO_ENV).ok();
         let allow_unknown_profile_raw = std::env::var(ALLOW_UNKNOWN_PROFILE_ENV).ok();
-        let calyx_vault_raw = std::env::var(CALYX_VAULT_ENV).ok();
         let max_subscriptions_raw = std::env::var(MAX_SUBSCRIPTIONS_ENV).ok();
         Ok(Self {
             db_path: std::env::var_os(DB_ENV).map(PathBuf::from),
-            storage_backend: storage_backend_raw.as_deref().map_or_else(
-                || Ok(StorageBackendKind::default()),
-                StorageBackendKind::parse_config,
-            )?,
             profile_dir: std::env::var_os(PROFILE_DIR_ENV).map(PathBuf::from),
             reflex_disabled: parse_bool_env(REFLEX_DISABLED_ENV, reflex_disabled_raw.as_deref())?,
             enable_audio: parse_bool_env(ENABLE_AUDIO_ENV, enable_audio_raw.as_deref())?,
@@ -232,12 +156,6 @@ impl M3ServiceConfig {
                 STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV,
                 storage_pressure_free_bytes_sample_raw.as_deref(),
             )?,
-            calyx_vault: calyx_vault_raw
-                .as_deref()
-                .map_or(Ok(true), |raw| parse_bool_env(CALYX_VAULT_ENV, Some(raw)))?,
-            calyx_vault_dir: std::env::var_os(CALYX_VAULT_DIR_ENV).map(PathBuf::from),
-            calyx_config_path: std::env::var_os(CALYX_CONFIG_ENV).map(PathBuf::from),
-            calyx_config_sha256: std::env::var(CALYX_CONFIG_SHA256_ENV).ok(),
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
             max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
@@ -257,11 +175,10 @@ pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_mins(15);
 /// yields reality-write capability and there was no usable opt-in. This overlay
 /// is that opt-in: when active (non-expired) it satisfies EXACTLY the
 /// reality-write permission set (`READ_STORAGE`/`WRITE_STORAGE`/`READ_EVENTS`)
-/// and is consulted only by explicit reality-write enforcement paths — it never
-/// widens authority for unrelated storage registries, secrets, or generic M3
-/// permissions. Expiry is authoritative from the monotonic `Instant` (mirrors
-/// the input-lease module), immune to wall-clock changes; `granted_at`/`expires_at`
-/// are wall-clock copies for human readback.
+/// and is consulted ONLY by the reality-write enforcement path — it never widens
+/// authority for any other tool or permission. Expiry is authoritative from the
+/// monotonic `Instant` (mirrors the input-lease module), immune to wall-clock
+/// changes; `granted_at`/`expires_at` are wall-clock copies for human readback.
 #[derive(Clone, Debug)]
 pub struct RealityWriteGrant {
     granted_by: String,
@@ -333,7 +250,6 @@ impl RealityWriteGrant {
 )]
 pub struct M3State {
     pub db_path: Option<PathBuf>,
-    pub storage_backend: StorageBackendKind,
     pub profile_dir: Option<PathBuf>,
     pub reflex_disabled: bool,
     pub bind: String,
@@ -355,24 +271,13 @@ pub struct M3State {
     pub allow_unknown_profile: bool,
     pub reflex_force_degraded: bool,
     pub storage_pressure_free_bytes_sample: Option<u64>,
-    pub calyx_vault_enabled: bool,
-    pub calyx_vault_config: Option<synapse_calyx::SynapseCalyxConfig>,
-    pub calyx_vault_status: synapse_calyx::SynapseCalyxVaultStatus,
-    /// Shared storage handle. Opened once (eagerly at daemon startup, or lazily
+    /// Shared RocksDB handle. Opened once (eagerly at daemon startup, or lazily
     /// on first reflex use) and reused by the reflex runtime so there is never
     /// a second open of the same path within this process.
     pub db: Option<Arc<Db>>,
     pub storage_gc_task: Option<GcTask>,
-    /// Checkpoint-only maintenance task (2026-07-23 cold-start fix): bounds
-    /// the crash-stranded WAL tail to ~30s of commits.
-    pub storage_checkpoint_task: Option<GcTask>,
-    /// Unattended derived-state maintainer (#1891, #1894): keeps the persisted
-    /// search generation inside its freshness budget and republishes the
-    /// measured lens-coverage readback that `health` raises.
-    pub storage_derived_state_task: Option<GcTask>,
     pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
-    pub storage_maintenance_unsupported: Option<String>,
     pub reflex_last_error: Option<String>,
     pub profile_last_error: Option<String>,
     pub audio_last_error: Option<String>,
@@ -395,160 +300,10 @@ pub struct M3State {
 
 #[derive(Clone, Debug, Default)]
 pub struct StorageMaintenanceReadback {
-    pub maintenance_supported: bool,
-    pub unsupported_reason: Option<String>,
     pub gc_task_running: bool,
-    pub checkpoint_task_running: bool,
     pub pressure_task_running: bool,
     pub gc_task: GcTaskReadback,
-    pub checkpoint_task: GcTaskReadback,
     pub pressure_probe: PressureProbeReadback,
-}
-
-#[derive(Clone, Debug)]
-pub struct StorageMaintenanceShutdownReadback {
-    pub reason: &'static str,
-    pub gc_owner_present: bool,
-    pub checkpoint_owner_present: bool,
-    pub pressure_owner_present: bool,
-    pub derived_state_owner_present: bool,
-    pub owners_quiescent: bool,
-    pub failures: Vec<String>,
-}
-
-impl StorageMaintenanceShutdownReadback {
-    #[must_use]
-    pub const fn owners_quiescent(&self) -> bool {
-        self.owners_quiescent
-    }
-
-    #[must_use]
-    pub fn owner_count(&self) -> usize {
-        usize::from(self.gc_owner_present)
-            + usize::from(self.checkpoint_owner_present)
-            + usize::from(self.pressure_owner_present)
-            + usize::from(self.derived_state_owner_present)
-    }
-
-    pub fn verdict(&self) -> Result<()> {
-        let owner_count = self.owner_count();
-        if !self.owners_quiescent || !self.failures.is_empty() {
-            bail!(
-                "storage maintenance shutdown failed before vault close: reason={} owner_count={} owners_quiescent={} failures={:?}",
-                self.reason,
-                owner_count,
-                self.owners_quiescent,
-                self.failures
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Stops every periodic storage producer and joins its exact task owner before
-/// the Calyx vault may be flushed or closed.
-///
-/// The task handles are removed atomically under the M3 state lock, then joined
-/// without retaining that lock. Each task's shutdown method waits through any
-/// already-started `spawn_blocking` closure, which Tokio cannot abort.
-pub async fn shutdown_storage_maintenance_tasks(
-    state: &SharedM3State,
-    reason: &'static str,
-) -> StorageMaintenanceShutdownReadback {
-    let (gc_task, checkpoint_task, pressure_task, derived_state_task) = match state.lock() {
-        Ok(mut state) => (
-            state.storage_gc_task.take(),
-            state.storage_checkpoint_task.take(),
-            state.storage_pressure_task.take(),
-            state.storage_derived_state_task.take(),
-        ),
-        Err(poisoned) => {
-            let detail = format!(
-                "M3 service state lock poisoned while taking storage-maintenance owners: {poisoned}"
-            );
-            drop(poisoned);
-            let readback = StorageMaintenanceShutdownReadback {
-                reason,
-                gc_owner_present: false,
-                checkpoint_owner_present: false,
-                pressure_owner_present: false,
-                derived_state_owner_present: false,
-                owners_quiescent: false,
-                failures: vec![detail],
-            };
-            tracing::error!(
-                code = "STORAGE_MAINTENANCE_SHUTDOWN_UNPROVEN",
-                readback = ?readback,
-                "could not take periodic storage-maintenance owners before vault close"
-            );
-            return readback;
-        }
-    };
-
-    let gc_owner_present = gc_task.is_some();
-    let checkpoint_owner_present = checkpoint_task.is_some();
-    let pressure_owner_present = pressure_task.is_some();
-    let derived_state_owner_present = derived_state_task.is_some();
-    let gc_shutdown = async move {
-        match gc_task {
-            Some(task) => task.shutdown("garbage_collection").await.err(),
-            None => None,
-        }
-    };
-    let checkpoint_shutdown = async move {
-        match checkpoint_task {
-            Some(task) => task.shutdown("checkpoint").await.err(),
-            None => None,
-        }
-    };
-    let pressure_shutdown = async move {
-        match pressure_task {
-            Some(task) => task.shutdown().await.err(),
-            None => None,
-        }
-    };
-    // The derived-state maintainer holds the vault through the same admitted
-    // blocking pass as GC, so it must be quiesced before the vault closes for
-    // exactly the same reason (#1891).
-    let derived_state_shutdown = async move {
-        match derived_state_task {
-            Some(task) => task.shutdown("derived_state").await.err(),
-            None => None,
-        }
-    };
-    let (gc_error, checkpoint_error, pressure_error, derived_state_error) = tokio::join!(
-        gc_shutdown,
-        checkpoint_shutdown,
-        pressure_shutdown,
-        derived_state_shutdown
-    );
-    let failures = [
-        gc_error.map(|error| format!("garbage_collection: {error}")),
-        checkpoint_error.map(|error| format!("checkpoint: {error}")),
-        pressure_error.map(|error| format!("disk_pressure: {error}")),
-        derived_state_error.map(|error| format!("derived_state: {error}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    // Every present JoinHandle was awaited above. A JoinError is a failed task,
-    // but is still terminal and therefore cannot mutate the vault after close.
-    let readback = StorageMaintenanceShutdownReadback {
-        reason,
-        gc_owner_present,
-        checkpoint_owner_present,
-        pressure_owner_present,
-        derived_state_owner_present,
-        owners_quiescent: true,
-        failures,
-    };
-    tracing::info!(
-        code = "STORAGE_MAINTENANCE_SHUTDOWN_READBACK",
-        owner_count = readback.owner_count(),
-        readback = ?readback,
-        "readback=periodic_storage_task_owners edge=shutdown before_vault_close"
-    );
-    readback
 }
 
 #[derive(Clone, Debug)]
@@ -582,40 +337,6 @@ pub fn shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
     )))
 }
 
-pub(crate) fn record_calyx_vault_status_event(
-    status: &synapse_calyx::SynapseCalyxVaultStatus,
-    event_status: &'static str,
-) -> Result<u64> {
-    let detail = serde_json::to_value(status).context("serialize Calyx vault status event")?;
-    crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
-        event_kind: "calyx_vault_lifecycle",
-        tool: "calyx_vault",
-        status: event_status,
-        mcp_session_id: None,
-        foreground: None,
-        foreground_read_error: None,
-        detail,
-    })
-    .context("record Calyx vault lifecycle status event")
-}
-
-pub(crate) fn record_calyx_vault_close_event(
-    readback: &synapse_calyx::SynapseCalyxVaultCloseReadback,
-    event_status: &'static str,
-) -> Result<u64> {
-    let detail = serde_json::to_value(readback).context("serialize Calyx vault close event")?;
-    crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
-        event_kind: "calyx_vault_lifecycle",
-        tool: "calyx_vault",
-        status: event_status,
-        mcp_session_id: None,
-        foreground: None,
-        foreground_read_error: None,
-        detail,
-    })
-    .context("record Calyx vault lifecycle close event")
-}
-
 impl M3State {
     pub fn from_config(config: M3ServiceConfig) -> Result<Self> {
         let sse_state = SseState::with_max_subscriptions(config.max_subscriptions);
@@ -637,7 +358,6 @@ impl M3State {
     ) -> Result<Self> {
         Self::from_parts_with_sse_state(
             config.db_path,
-            config.storage_backend,
             config.profile_dir,
             Some(bool_env_value(config.reflex_disabled)),
             config.bearer_token,
@@ -647,10 +367,6 @@ impl M3State {
             config.allowed_permissions.as_deref(),
             Some(bool_env_value(config.reflex_force_degraded)),
             config.storage_pressure_free_bytes_sample,
-            config.calyx_vault,
-            config.calyx_vault_dir,
-            config.calyx_config_path,
-            config.calyx_config_sha256,
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
@@ -661,7 +377,6 @@ impl M3State {
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts_with_sse_state(
         db_path: Option<PathBuf>,
-        storage_backend: StorageBackendKind,
         profile_dir: Option<PathBuf>,
         reflex_disabled: Option<&str>,
         bearer_token: Option<String>,
@@ -671,10 +386,6 @@ impl M3State {
         allowed_permissions: Option<&str>,
         reflex_force_degraded: Option<&str>,
         storage_pressure_free_bytes_sample: Option<u64>,
-        calyx_vault_enabled: bool,
-        calyx_vault_dir: Option<PathBuf>,
-        calyx_config_path: Option<PathBuf>,
-        calyx_config_sha256: Option<String>,
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
@@ -686,42 +397,6 @@ impl M3State {
         let reflex_force_degraded =
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
-        if !calyx_vault_enabled {
-            anyhow::bail!(
-                "SYNAPSE_CALYX_STORAGE_VAULT_REQUIRED: the sole supported storage backend is Calyx, so disabling its vault would disable storage; remove --no-calyx-vault/SYNAPSE_CALYX_VAULT=false"
-            );
-        }
-        let storage_vault_dir = db_path.clone().unwrap_or_else(default_db_path);
-        if let Some(requested) = calyx_vault_dir.as_ref() {
-            let requested = std::path::absolute(requested)?;
-            let storage = std::path::absolute(&storage_vault_dir)?;
-            if requested != storage {
-                anyhow::bail!(
-                    "SYNAPSE_CALYX_VAULT_PATH_CONFLICT: configured Calyx vault {} differs from the sole storage vault {}; set SYNAPSE_CALYX_VAULT_DIR/--calyx-vault-dir to the DB path or remove it",
-                    requested.display(),
-                    storage.display()
-                );
-            }
-        }
-        if calyx_config_path.is_some() != calyx_config_sha256.is_some() {
-            anyhow::bail!(
-                "SYNAPSE_CALYX_CONFIG_IDENTITY_INCOMPLETE: Calyx config path_present={} sha256_present={}; supply both --calyx-config/SYNAPSE_CALYX_CONFIG and --calyx-config-sha256/SYNAPSE_CALYX_CONFIG_SHA256, or omit both",
-                calyx_config_path.is_some(),
-                calyx_config_sha256.is_some()
-            );
-        }
-        let calyx_vault_config = Some(
-            synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path_with_expected_sha256(
-                Some(storage_vault_dir),
-                calyx_config_path,
-                calyx_config_sha256.as_deref(),
-            )?,
-        );
-        let calyx_vault_status = calyx_vault_config
-            .as_ref()
-            .map_or_else(synapse_calyx::SynapseCalyxVaultStatus::disabled, |config| {
-                synapse_calyx::SynapseCalyxVaultStatus::not_opened(Some(config))
-            });
         // #1559: record the config source so status/denial remediation can state
         // exactly how to opt into reality-write, and never imply that an absent
         // WRITE_STORAGE is present.
@@ -732,7 +407,6 @@ impl M3State {
         };
         Ok(Self {
             db_path,
-            storage_backend,
             profile_dir,
             reflex_disabled: parse_bool_env(REFLEX_DISABLED_ENV, reflex_disabled)?,
             bind: bind
@@ -749,16 +423,10 @@ impl M3State {
             allow_unknown_profile,
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
-            calyx_vault_enabled,
-            calyx_vault_config,
-            calyx_vault_status,
             db: None,
             storage_gc_task: None,
-            storage_checkpoint_task: None,
-            storage_derived_state_task: None,
             storage_pressure_task: None,
             storage_last_error: None,
-            storage_maintenance_unsupported: None,
             reflex_last_error: None,
             profile_last_error: None,
             audio_last_error: None,
@@ -860,7 +528,7 @@ impl M3State {
         Ok(runtime)
     }
 
-    /// Open the shared storage handle once and cache it; subsequent callers
+    /// Open the shared RocksDB handle once and cache it; subsequent callers
     /// (including the reflex runtime) reuse the same handle, so the path is
     /// never opened twice within this process. Called eagerly at daemon startup
     /// for fail-fast lock/schema detection, and lazily otherwise.
@@ -877,20 +545,7 @@ impl M3State {
             return Ok(Arc::clone(db));
         }
         let db_path = self.db_path.clone().unwrap_or_else(default_db_path);
-        let Some(calyx_config) = self.calyx_vault_config.clone() else {
-            let error = StorageError::OpenFailed {
-                path: db_path,
-                detail: "SYNAPSE_CALYX_CONFIG_MISSING: the sole Calyx storage backend has no configuration resolved from CLI/environment; restart with a valid storage/Calyx configuration".to_owned(),
-            };
-            self.storage_last_error = Some(error.to_string());
-            return Err(error);
-        };
-        match Db::open_with_resolved_calyx_config(
-            &db_path,
-            SCHEMA_VERSION,
-            self.storage_backend,
-            calyx_config,
-        ) {
+        match Db::open(&db_path, SCHEMA_VERSION) {
             Ok(db) => {
                 let db = Arc::new(db);
                 self.db = Some(Arc::clone(&db));
@@ -908,127 +563,6 @@ impl M3State {
         &mut self,
     ) -> std::result::Result<(), synapse_storage::StorageError> {
         let db = self.ensure_storage()?;
-        // Hot-path boundary (#1686). The admitted maintenance pass also lowers
-        // the guard-threshold hot set into the frozen artifact the reflex tick
-        // consumes, and it reads the vault through this handle. Register before
-        // the first pass can run so no pass is skipped for want of a source.
-        synapse_storage::maintenance::register_lowering_source(&db);
-        // Same discipline for the derived-state maintainer (#1891, #1894): the
-        // pass reads the vault through this handle, so registering it before the
-        // first tick is what keeps the search generation and the lens-coverage
-        // readback from being skipped for want of a source.
-        synapse_storage::derived_state::register_derived_state_source(&db);
-        let event_bus = self.sse_state.event_bus();
-        synapse_storage::derived_state::register_reactive_delivery_sink(move |finding| {
-            let event_seq = finding
-                .observed_seq
-                .checked_mul(u64::from(u16::MAX) + 1)
-                .and_then(|base| base.checked_add(u64::from(finding.slot)))
-                .ok_or_else(|| {
-                    format!(
-                        "reactive drift event sequence overflow for observed_seq={} slot={}; remediation=preserve the Reactive CF row and inspect vault sequence exhaustion",
-                        finding.observed_seq, finding.slot
-                    )
-                })?;
-            let data = serde_json::to_value(finding).map_err(|error| {
-                format!(
-                    "serialize committed Reactive CF drift finding for scheduled delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
-                )
-            })?;
-            let report = event_bus.publish(synapse_core::types::Event {
-                seq: event_seq,
-                at: chrono::Utc::now(),
-                source: synapse_core::types::EventSource::System,
-                kind: "calyx.reactive.drift".to_owned(),
-                data,
-                correlations: Vec::new(),
-            });
-            Ok(synapse_storage::derived_state::ReactiveDeliveryReadback {
-                matched: report.matched as u64,
-                queued: report.queued as u64,
-                dropped: report.dropped,
-            })
-        });
-        let region_event_bus = self.sse_state.event_bus();
-        synapse_storage::derived_state::register_region_delivery_sink(move |finding| {
-            let event_seq = finding
-                .observed_seq
-                .checked_mul(u64::from(u16::MAX) + 1)
-                .and_then(|base| base.checked_add(u64::from(u16::MAX)))
-                .ok_or_else(|| {
-                    format!(
-                        "reactive new-region event sequence overflow for observed_seq={}; remediation=preserve the Reactive CF row and inspect vault sequence exhaustion",
-                        finding.observed_seq
-                    )
-                })?;
-            let data = serde_json::to_value(finding).map_err(|error| {
-                format!(
-                    "serialize committed Reactive CF region finding for scheduled delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
-                )
-            })?;
-            let report = region_event_bus.publish(synapse_core::types::Event {
-                seq: event_seq,
-                at: chrono::Utc::now(),
-                source: synapse_core::types::EventSource::System,
-                kind: "calyx.reactive.new_region".to_owned(),
-                data,
-                correlations: Vec::new(),
-            });
-            Ok(synapse_storage::derived_state::ReactiveDeliveryReadback {
-                matched: report.matched as u64,
-                queued: report.queued as u64,
-                dropped: report.dropped,
-            })
-        });
-        let novelty_event_bus = self.sse_state.event_bus();
-        let novelty_db = Arc::clone(&db);
-        synapse_storage::derived_state::register_novelty_delivery_sink(move |finding| {
-            let quarantine_escalated = if finding.action == "quarantine" {
-                let readback = crate::server::escalation::ensure_guard_quarantine_escalation(
-                    &novelty_db,
-                    finding,
-                )
-                .map_err(|error| {
-                    format!(
-                        "persist Ward quarantine escalation for ledger_seq={}: {error:?}; remediation=inspect CF_KV escalation/audit/open-index rows and rerun maintenance",
-                        finding.ledger_seq
-                    )
-                })?;
-                tracing::info!(
-                    code = "WARD_QUARANTINE_ESCALATED",
-                    ledger_seq = finding.ledger_seq,
-                    escalation_id = %readback.escalation_id,
-                    approval_id = %readback.approval_id,
-                    anchor = %readback.anchor,
-                    "Ward quarantine is present in the durable escalation source of truth"
-                );
-                true
-            } else {
-                false
-            };
-            let data = serde_json::to_value(finding).map_err(|error| {
-                format!(
-                    "serialize committed Ward novelty finding for delivery: {error}; remediation=inspect the typed finding and preserve its Reactive row"
-                )
-            })?;
-            let report = novelty_event_bus.publish(synapse_core::types::Event {
-                seq: finding.ledger_seq,
-                at: chrono::Utc::now(),
-                source: synapse_core::types::EventSource::System,
-                kind: format!("calyx.reactive.{}", finding.action),
-                data,
-                correlations: Vec::new(),
-            });
-            Ok(synapse_storage::derived_state::NoveltyDeliveryReadback {
-                notification: synapse_storage::derived_state::ReactiveDeliveryReadback {
-                    matched: report.matched as u64,
-                    queued: report.queued as u64,
-                    dropped: report.dropped,
-                },
-                quarantine_escalated,
-            })
-        });
-        self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
             {
@@ -1061,217 +595,14 @@ impl M3State {
                 }
             }
         }
-        if self.storage_checkpoint_task.is_none() {
-            match db.spawn_checkpoint_task() {
-                Ok(task) => {
-                    self.storage_checkpoint_task = Some(task);
-                }
-                Err(error) => {
-                    self.storage_last_error =
-                        Some(format!("storage checkpoint task start: {error}"));
-                    return Err(error);
-                }
-            }
-        }
-        if self.storage_derived_state_task.is_none() {
-            match db.spawn_derived_state_task() {
-                Ok(task) => {
-                    self.storage_derived_state_task = Some(task);
-                }
-                Err(error) => {
-                    self.storage_last_error =
-                        Some(format!("storage derived-state task start: {error}"));
-                    return Err(error);
-                }
-            }
-        }
         self.storage_last_error = None;
         Ok(())
-    }
-
-    pub fn ensure_calyx_vault(
-        &mut self,
-    ) -> std::result::Result<synapse_calyx::SynapseCalyxVaultStatus, synapse_calyx::SynapseCalyxError>
-    {
-        if !self.calyx_vault_enabled {
-            self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::disabled();
-            return Ok(self.calyx_vault_status.clone());
-        }
-        let Some(config) = self.calyx_vault_config.as_ref() else {
-            let error = synapse_calyx::SynapseCalyxError::new(
-                "SYNAPSE_CALYX_CONFIG_MISSING",
-                "Calyx vault is enabled but no resolved vault configuration is present",
-                "restart with the Calyx storage DB path configured as the sole vault path",
-            );
-            self.calyx_vault_status =
-                synapse_calyx::SynapseCalyxVaultStatus::error(None, "error", &error);
-            return Err(error);
-        };
-        let config = config.clone();
-        let status = self
-            .ensure_storage()
-            .map_err(|error| storage_owned_calyx_error("open sole Calyx storage vault", &error))?
-            .calyx_vault_status()
-            .map_err(|error| {
-                storage_owned_calyx_error("read sole Calyx storage vault status", &error)
-            });
-        match status {
-            Ok(status) => {
-                self.calyx_vault_status = status.clone();
-                Ok(status)
-            }
-            Err(error) => {
-                self.calyx_vault_status =
-                    synapse_calyx::SynapseCalyxVaultStatus::error(Some(&config), "error", &error);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn close_calyx_vault_for_shutdown(
-        &mut self,
-        reason: &'static str,
-        expected_open: bool,
-    ) -> std::result::Result<
-        synapse_calyx::SynapseCalyxVaultCloseReadback,
-        synapse_calyx::SynapseCalyxError,
-    > {
-        if !self.calyx_vault_enabled {
-            self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::disabled();
-            return Ok(synapse_calyx::SynapseCalyxVaultCloseReadback::disabled(
-                reason,
-            ));
-        }
-        let Some(db) = self.db.as_ref() else {
-            if expected_open {
-                let error = synapse_calyx::SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_VAULT_MISSING_AT_SHUTDOWN",
-                    "the sole Calyx storage vault was expected during daemon shutdown but storage was not open",
-                    "inspect startup logs; the daemon must open the storage-owned vault before serving and retain the Db owner until shutdown",
-                );
-                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::error(
-                    self.calyx_vault_config.as_ref(),
-                    "error",
-                    &error,
-                );
-                return Err(error);
-            }
-            return Ok(synapse_calyx::SynapseCalyxVaultCloseReadback::not_open(
-                reason,
-                self.calyx_vault_config.as_ref(),
-            ));
-        };
-        // #2100, phase one of the two-phase exit record. This is the single
-        // funnel every drain (HTTP endpoint, stdio, OS shutdown) reaches before
-        // the vault close, and the close is the long part: on the deployment
-        // host its post-flush tail ran 63-87 s with no output, long enough for
-        // the deploy drain to escalate and kill the process before
-        // `ended_at_unix_ms` was ever written.
-        //
-        // Writing the marker HERE, immediately before the close begins, is what
-        // makes that kill distinguishable from a crash at the next boot. It is
-        // deliberately not fatal: failing the close because a forensic marker
-        // could not be written would destroy the very shutdown it exists to
-        // describe. The failure is reported instead.
-        if let Err(error) = crate::daemon_lifecycle::record_exit_intent(reason, "calyx_vault_close")
-        {
-            tracing::error!(
-                code = "MCP_DAEMON_LIFECYCLE_EXIT_INTENT_FAILED",
-                reason,
-                phase = "calyx_vault_close",
-                error = %error,
-                "could not record the phase-one shutdown marker before closing the Calyx vault; a \
-                 kill during this close will read as `dirty` rather than `interrupted_graceful` at \
-                 the next boot"
-            );
-        }
-        let phase_observer = CalyxClosePhaseObserver::spawn(reason).map_err(|error| {
-            synapse_calyx::SynapseCalyxError::new(
-                "SYNAPSE_CALYX_CLOSE_PHASE_OBSERVER_SPAWN_FAILED",
-                format!("spawn exact Calyx close-phase lifecycle observer: {error}"),
-                "repair local thread/process resources; shutdown cannot proceed without an exact phase witness",
-            )
-        })?;
-        let close_result = db
-            .close_calyx_vault_for_process_exit(reason)
-            .map_err(|error| {
-                storage_owned_calyx_error("flush and close sole Calyx storage vault", &error)
-            });
-        let observer_result = phase_observer.finish();
-        if let Err(error) = observer_result {
-            return Err(synapse_calyx::SynapseCalyxError::new(
-                "SYNAPSE_CALYX_CLOSE_PHASE_PERSIST_FAILED",
-                error,
-                "inspect daemon lifecycle storage and the exact close-phase record before restarting",
-            ));
-        }
-        match close_result {
-            Ok(readback) => {
-                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus {
-                    enabled: true,
-                    phase: "closed".to_owned(),
-                    open: false,
-                    latest_seq: readback.latest_seq,
-                    vault_dir: readback.vault_dir.clone(),
-                    lock_path: readback.lock_path.clone(),
-                    pid_path: readback.pid_path.clone(),
-                    ..self.calyx_vault_status.clone()
-                };
-                Ok(readback)
-            }
-            Err(error) => {
-                self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::error(
-                    self.calyx_vault_config.as_ref(),
-                    "error",
-                    &error,
-                );
-                Err(error)
-            }
-        }
-    }
-
-    pub fn calyx_vault_status(
-        &self,
-    ) -> std::result::Result<synapse_calyx::SynapseCalyxVaultStatus, synapse_calyx::SynapseCalyxError>
-    {
-        let Some(db) = self.db.as_ref() else {
-            return Ok(self.calyx_vault_status.clone());
-        };
-        db.calyx_vault_status().map_err(|error| {
-            storage_owned_calyx_error("read live Calyx vault status for health", &error)
-        })
-    }
-
-    pub fn oracle_readiness(&self) -> Option<Result<Option<serde_json::Value>, String>> {
-        let db = self.db.as_ref()?;
-        Some(db.oracle_readiness().map_err(|error| error.to_string()))
-    }
-
-    /// Read-only persisted-search-generation state, or the storage error that
-    /// prevented reading it (issue #1891).
-    ///
-    /// `None` means no storage handle is open at all — distinct from "the vault
-    /// is open and the generation is absent", which is a real reported state.
-    #[must_use]
-    pub fn calyx_search_generation_status(
-        &self,
-    ) -> Option<Result<synapse_calyx::SynapseCalyxSearchGenerationStatus, String>> {
-        let db = self.db.as_ref()?;
-        Some(
-            db.calyx_search_generation_status()
-                .map_err(|error| error.to_string()),
-        )
     }
 
     #[must_use]
     pub fn storage_maintenance_readback(&self) -> StorageMaintenanceReadback {
         let gc_task = self
             .storage_gc_task
-            .as_ref()
-            .map(GcTask::readback)
-            .unwrap_or_default();
-        let checkpoint_task = self
-            .storage_checkpoint_task
             .as_ref()
             .map(GcTask::readback)
             .unwrap_or_default();
@@ -1290,13 +621,9 @@ impl M3State {
                     })
             });
         StorageMaintenanceReadback {
-            maintenance_supported: self.storage_maintenance_unsupported.is_none(),
-            unsupported_reason: self.storage_maintenance_unsupported.clone(),
             gc_task_running: gc_task.running,
-            checkpoint_task_running: checkpoint_task.running,
             pressure_task_running,
             gc_task,
-            checkpoint_task,
             pressure_probe,
         }
     }
@@ -1584,17 +911,6 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 58] {
         intent::intent_current(),
         intent_events::intent_detect_tick(),
     ]
-}
-
-fn storage_owned_calyx_error(
-    operation: &str,
-    error: &impl std::fmt::Display,
-) -> synapse_calyx::SynapseCalyxError {
-    synapse_calyx::SynapseCalyxError::new(
-        "SYNAPSE_CALYX_STORAGE_VAULT_FAILED",
-        format!("{operation}: {error}"),
-        "inspect the storage-owned Calyx vault lock/PID, manifest, WAL, and the preceding structured storage error; repair that one vault and retry",
-    )
 }
 
 fn parse_bool_env(name: &str, value: Option<&str>) -> Result<bool> {

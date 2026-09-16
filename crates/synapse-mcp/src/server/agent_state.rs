@@ -23,9 +23,7 @@
 //! - `working`/`spawning` and silent past the threshold (default 120 s):
 //!   process alive + no fresh spawn artifact output → `stuck`
 //!   (`silent_timeout`), process gone → `dead`
-//!   (`process_gone_without_exit_event`). Observed ambient transcript agents
-//!   with no process handle are not actionable stuck work from silence alone;
-//!   they stay visible until the unprobeable-dead threshold below reaps them.
+//!   (`process_gone_without_exit_event`).
 //! - any non-dead agent whose known PID has vanished → `dead`.
 //! - runaway: the same tool called with identical argument digests N times
 //!   consecutively (default 5) → `stuck` with `runaway = true`
@@ -50,11 +48,12 @@
 //!   silently.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fs,
     path::Path,
     sync::{
-        Mutex, MutexGuard, OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::UNIX_EPOCH,
@@ -63,21 +62,11 @@ use std::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{
-    AgentEndState, AgentEventKind, AgentEventRecord, Event, EventSource,
-    retention::{DEFAULTS as RETENTION_DEFAULTS, RetentionTtl},
-};
+use synapse_core::{AgentEventKind, AgentEventRecord, Event, EventSource};
 use synapse_reflex::EventBus;
-use synapse_storage::{
-    Db, StorageError, StorageResult,
-    agent_events::{agent_event_scan_start, decode_agent_event_key},
-    cf, decode_json,
-};
+use synapse_storage::{Db, StorageResult, agent_events::agent_event_scan_start, cf, decode_json};
 
-use super::agent_events::{
-    AgentEventWriteReadback, TransitionJournalIntent, commit_agent_event_records_with_intents,
-    project_committed_agent_event_artifacts, provider_for_agent_kind, unix_time_ns_now,
-};
+use super::agent_events::{record_agent_events_unobserved, unix_time_ns_now};
 
 /// Payload marker distinguishing machine-emitted `state_changed` rows from
 /// sender-pushed ones. The tracker never consumes its own output live, and
@@ -101,30 +90,7 @@ pub(crate) const DEFAULT_RUNAWAY_IDENTICAL_CALLS: u32 = 5;
 
 /// Dead/exited agents older than this are pruned from the in-memory tracker
 /// (their journal rows remain the durable record).
-pub(crate) const DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
-
-/// Whether the in-memory projection is **contractually not required** to hold
-/// this agent (issue #1937).
-///
-/// One definition, used both by the pruner that removes such entries and by
-/// every caller that would otherwise treat their absence as a fault. Keeping
-/// them separate is what produced #1937: the ambient projection checkpoint read
-/// absence from the tracker as a broken projection, recovered the entry from the
-/// journal, and the very next sweep pruned it again — because it was a spawn
-/// that had been `Dead` for far longer than [`DEAD_RETENTION_MS`], which is
-/// exactly the entry `prune_dead` exists to delete. 22 spawns were re-recovered
-/// 238 times each, always `already_current=false`, and could never converge:
-/// recovery and pruning were enforcing contradictory retention policies.
-///
-/// Absence of such an entry is the projection working, not failing.
-pub(crate) const fn beyond_dead_retention(
-    state: AgentLifecycleState,
-    since_unix_ms: u64,
-    now_unix_ms: u64,
-) -> bool {
-    matches!(state, AgentLifecycleState::Dead)
-        && now_unix_ms.saturating_sub(since_unix_ms) > DEAD_RETENTION_MS
-}
+const DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// An UNPROBEABLE agent — one with no OS pid the daemon can liveness-check,
 /// e.g. an observed/ambient session tailed from a transcript on disk — that has
@@ -150,8 +116,6 @@ pub(crate) const DEFAULT_UNPROBEABLE_DEAD_AFTER_MS: u64 = 30 * 60 * 1000;
 /// dormant-but-visible window for far fewer false reaps of working agents (#1594).
 pub(crate) const UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT: u64 = 4;
 
-const AMBIENT_SPAWN_ID_PREFIX: &str = "agent-spawn-ambient-";
-
 /// The `reason_code` the unprobeable-silence reaper stamps on an *inferred*
 /// death. Unlike a confirmed terminal event (`Killed`/`Exited`/process-gone),
 /// this death is a heuristic guess from silence alone; a subsequent real
@@ -169,15 +133,19 @@ const RESURRECTED_REASON: &str = "resurrected_by_live_evidence";
 /// reset in production; readable in tests via [`events_dropped_after_death_count`].
 static EVENTS_DROPPED_AFTER_DEATH: AtomicU64 = AtomicU64::new(0);
 
+/// Test accessor for the process-wide after-death drop counter. Production
+/// visibility comes from the `events_dropped_after_death_total` field the
+/// `AGENT_STATE_EVENT_AFTER_DEATH` warn carries on every drop.
+#[cfg(test)]
+pub(crate) fn events_dropped_after_death_count() -> u64 {
+    EVENTS_DROPPED_AFTER_DEATH.load(Ordering::Relaxed)
+}
+
 /// Rebuild lookback window over `CF_AGENT_EVENTS`.
 const REBUILD_LOOKBACK_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
 /// Rebuild scan page size.
 const REBUILD_PAGE_ROWS: usize = 4096;
-
-/// The ambient cursor outbox carries at most registration's two rows plus one
-/// coalesced lifecycle row. Exact-recovery refuses any broader replay surface.
-const MAX_AMBIENT_EXACT_RECOVERY_ROWS: usize = 3;
 
 static NEXT_BUS_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -210,7 +178,7 @@ impl AgentLifecycleState {
         }
     }
 
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
+    fn parse(raw: &str) -> Option<Self> {
         match raw {
             "spawning" => Some(Self::Spawning),
             "working" => Some(Self::Working),
@@ -272,7 +240,7 @@ impl AgentAttentionClass {
 fn normal_terminal_reason(reason_code: Option<&str>) -> bool {
     matches!(
         reason_code,
-        Some("spawn_completed" | "local_agent_completed" | UNPROBEABLE_SILENT_ENDED_REASON)
+        Some("spawn_completed" | "local_agent_completed")
     )
 }
 
@@ -355,12 +323,6 @@ pub(crate) struct StateTransition {
     pub evidence: Value,
 }
 
-#[derive(Clone, Debug, Default)]
-struct LivenessSweepActions {
-    terminal_events: Vec<AgentEventRecord>,
-    transitions: Vec<StateTransition>,
-}
-
 #[derive(Clone, Debug)]
 struct AgentEntry {
     anchor: String,
@@ -424,15 +386,6 @@ impl AgentEntry {
     }
 }
 
-fn is_ambient_without_process_handle(entry: &AgentEntry) -> bool {
-    entry.probe_pid().is_none()
-        && entry
-            .spawn_id
-            .as_deref()
-            .unwrap_or(entry.anchor.as_str())
-            .starts_with(AMBIENT_SPAWN_ID_PREFIX)
-}
-
 fn late_exit_reconciles_process_probe_death(entry: &AgentEntry, record: &AgentEventRecord) -> bool {
     record.kind == AgentEventKind::Exited
         && entry.reason_code.as_deref() == Some("process_gone_without_exit_event")
@@ -473,125 +426,6 @@ fn newest_spawn_artifact_activity(entry: &AgentEntry) -> Option<AgentArtifactAct
     .into_iter()
     .filter_map(|(source, file_name)| artifact_activity(log_dir, source, file_name))
     .max_by_key(|activity| (activity.modified_unix_ms, activity.len_bytes))
-}
-
-fn process_gone_terminal_event(
-    entry: &AgentEntry,
-    probed_pid: u32,
-    now_unix_ms: u64,
-) -> AgentEventRecord {
-    let completion = entry
-        .log_dir
-        .as_deref()
-        .map(read_spawn_completion_for_process_gone)
-        .unwrap_or_else(|| SpawnCompletionForProcessGone {
-            read_error: Some("agent state entry had no log_dir".to_owned()),
-            ..SpawnCompletionForProcessGone::default()
-        });
-    let reason_code = if completion.status.as_deref() == Some("ok")
-        && matches!(completion.exit_code, Some(0) | None)
-    {
-        "spawn_completed"
-    } else {
-        "process_gone_without_exit_event"
-    };
-    let mut record = AgentEventRecord::new(
-        now_unix_ms.saturating_mul(1_000_000),
-        AgentEventKind::Exited,
-    );
-    record.spawn_id.clone_from(&entry.spawn_id);
-    record.session_id.clone_from(&entry.session_id);
-    record.reason_code = Some(reason_code.to_owned());
-    record.end_state = Some(completion.end_state());
-    record.attributes.agent_name.clone_from(&entry.agent_kind);
-    record.attributes.provider_name = entry
-        .agent_kind
-        .as_deref()
-        .and_then(provider_for_agent_kind);
-    record
-        .attributes
-        .conversation_id
-        .clone_from(&entry.session_id);
-    record.payload = json!({
-        "source_of_truth": "OS process table + agent spawn completion-status.json",
-        "probed_pid": probed_pid,
-        "silent_ms": now_unix_ms.saturating_sub(entry.last_event_unix_ms),
-        "last_event_kind": entry.last_event_kind,
-        "log_dir": entry.log_dir,
-        "completion_status_path": completion.path,
-        "completion_status": completion.status,
-        "completion_status_read_error": completion.read_error,
-        "exit_code": completion.exit_code,
-        "error_message": completion.error_message,
-        "final_message_bytes": completion.final_message_bytes,
-        "fallback_final_message_written": completion.fallback_final_message_written,
-    });
-    record
-}
-
-#[derive(Clone, Debug, Default)]
-struct SpawnCompletionForProcessGone {
-    path: Option<String>,
-    status: Option<String>,
-    read_error: Option<String>,
-    exit_code: Option<i64>,
-    error_message: Option<String>,
-    final_message_bytes: Option<u64>,
-    fallback_final_message_written: Option<bool>,
-}
-
-impl SpawnCompletionForProcessGone {
-    fn end_state(&self) -> AgentEndState {
-        match (self.status.as_deref(), self.exit_code) {
-            (Some("ok"), Some(0) | None) => AgentEndState::Success,
-            (Some("running") | None, _) => AgentEndState::Indeterminate,
-            (Some("ok"), Some(_)) => AgentEndState::Error,
-            (Some(_), _) => AgentEndState::Error,
-        }
-    }
-}
-
-fn read_spawn_completion_for_process_gone(log_dir: &str) -> SpawnCompletionForProcessGone {
-    let path = Path::new(log_dir).join("completion-status.json");
-    let path_display = path.display().to_string();
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return SpawnCompletionForProcessGone {
-                path: Some(path_display),
-                read_error: Some(format!("read completion-status.json: {error}")),
-                ..SpawnCompletionForProcessGone::default()
-            };
-        }
-    };
-    let status = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(status) => status,
-        Err(error) => {
-            return SpawnCompletionForProcessGone {
-                path: Some(path_display),
-                read_error: Some(format!("parse completion-status.json: {error}")),
-                ..SpawnCompletionForProcessGone::default()
-            };
-        }
-    };
-    SpawnCompletionForProcessGone {
-        path: Some(path_display),
-        status: status
-            .get("status")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        read_error: None,
-        exit_code: status.get("exit_code").and_then(Value::as_i64),
-        error_message: status
-            .get("error_message")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.chars().take(512).collect::<String>()),
-        final_message_bytes: status.get("final_message_bytes").and_then(Value::as_u64),
-        fallback_final_message_written: status
-            .get("fallback_final_message_written")
-            .and_then(Value::as_bool),
-    }
 }
 
 fn artifact_activity(
@@ -643,8 +477,8 @@ impl Default for LivenessConfig {
 static LIVENESS_CONFIG: OnceLock<LivenessConfig> = OnceLock::new();
 
 /// Parses the liveness env knobs (`SYNAPSE_AGENT_STUCK_AFTER_MS`,
-/// `SYNAPSE_AGENT_LIVENESS_SWEEP_MS`, `SYNAPSE_AGENT_RUNAWAY_TOOL_CALLS`,
-/// `SYNAPSE_AGENT_UNPROBEABLE_DEAD_AFTER_MS`) and installs them process-wide.
+/// `SYNAPSE_AGENT_LIVENESS_SWEEP_MS`, `SYNAPSE_AGENT_RUNAWAY_TOOL_CALLS`)
+/// and installs them process-wide.
 ///
 /// # Errors
 ///
@@ -692,7 +526,7 @@ pub(crate) fn liveness_config() -> LivenessConfig {
 /// The in-memory projection. Pure with respect to its inputs so unit tests
 /// drive planted event sequences directly; the daemon uses one process-wide
 /// instance behind [`tracker`].
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct AgentStateTracker {
     agents: BTreeMap<String, AgentEntry>,
     session_to_anchor: BTreeMap<String, String>,
@@ -886,14 +720,14 @@ impl AgentStateTracker {
     }
 
     /// Heartbeat-silence + process-table liveness pass (#898).
-    fn sweep(
+    pub(crate) fn sweep(
         &mut self,
         now_unix_ms: u64,
         stuck_after_ms: u64,
         unprobeable_dead_after_ms: u64,
         process_alive: &dyn Fn(u32) -> bool,
-    ) -> LivenessSweepActions {
-        let mut actions = LivenessSweepActions::default();
+    ) -> Vec<StateTransition> {
+        let mut transitions = Vec::new();
         for entry in self.agents.values_mut() {
             if entry.state == AgentLifecycleState::Dead {
                 continue;
@@ -903,9 +737,18 @@ impl AgentStateTracker {
             if let Some(pid) = entry.probe_pid()
                 && !process_alive(pid)
             {
-                actions
-                    .terminal_events
-                    .push(process_gone_terminal_event(entry, pid, now_unix_ms));
+                transitions.push(force_transition(
+                    entry,
+                    AgentLifecycleState::Dead,
+                    "process_gone_without_exit_event",
+                    None,
+                    json!({
+                        "probed_pid": pid,
+                        "silent_ms": now_unix_ms.saturating_sub(entry.last_event_unix_ms),
+                        "last_event_kind": entry.last_event_kind,
+                    }),
+                    now_unix_ms,
+                ));
                 continue;
             }
             if matches!(
@@ -920,7 +763,7 @@ impl AgentStateTracker {
                 let observed_at_unix_ms = activity.modified_unix_ms.min(now_unix_ms);
                 entry.last_event_unix_ms = entry.last_event_unix_ms.max(observed_at_unix_ms);
                 if entry.state == AgentLifecycleState::Stuck {
-                    actions.transitions.push(force_transition(
+                    transitions.push(force_transition(
                         entry,
                         AgentLifecycleState::Working,
                         "artifact_activity_resumed",
@@ -959,7 +802,7 @@ impl AgentStateTracker {
                     unprobeable_dead_after_ms
                 };
                 if silent_ms >= dead_after_ms {
-                    actions.transitions.push(force_transition(
+                    transitions.push(force_transition(
                         entry,
                         AgentLifecycleState::Dead,
                         UNPROBEABLE_SILENT_ENDED_REASON,
@@ -972,9 +815,6 @@ impl AgentStateTracker {
                         }),
                         now_unix_ms,
                     ));
-                    continue;
-                }
-                if is_ambient_without_process_handle(entry) {
                     continue;
                 }
             }
@@ -997,7 +837,7 @@ impl AgentStateTracker {
             } else {
                 "silent_timeout_unprobeable"
             };
-            actions.transitions.push(force_transition(
+            transitions.push(force_transition(
                 entry,
                 AgentLifecycleState::Stuck,
                 reason,
@@ -1012,14 +852,17 @@ impl AgentStateTracker {
             ));
         }
         self.prune_dead(now_unix_ms);
-        actions
+        transitions
     }
 
     fn prune_dead(&mut self, now_unix_ms: u64) {
         let expired: Vec<String> = self
             .agents
             .values()
-            .filter(|entry| beyond_dead_retention(entry.state, entry.since_unix_ms, now_unix_ms))
+            .filter(|entry| {
+                entry.state == AgentLifecycleState::Dead
+                    && now_unix_ms.saturating_sub(entry.since_unix_ms) > DEAD_RETENTION_MS
+            })
             .map(|entry| entry.anchor.clone())
             .collect();
         for anchor in expired {
@@ -1387,35 +1230,48 @@ pub(crate) fn is_state_machine_row(record: &AgentEventRecord) -> bool {
         && record.payload.get("origin").and_then(Value::as_str) == Some(STATE_MACHINE_ORIGIN)
 }
 
-/// The real process-global agent-state tracker. The tracker is one shared
-/// singleton for the daemon process.
-fn tracker() -> &'static Mutex<AgentStateTracker> {
+/// The real process-global agent-state tracker. Production always resolves
+/// here, so the tracker is one shared singleton exactly as before.
+fn global_tracker() -> &'static Mutex<AgentStateTracker> {
     static TRACKER: OnceLock<Mutex<AgentStateTracker>> = OnceLock::new();
     TRACKER.get_or_init(|| Mutex::new(AgentStateTracker::default()))
 }
 
-fn transition_pipeline() -> &'static Mutex<()> {
-    static PIPELINE: OnceLock<Mutex<()>> = OnceLock::new();
-    PIPELINE.get_or_init(|| Mutex::new(()))
+thread_local! {
+    /// Per-thread override of [`global_tracker`], installed only by
+    /// [`isolate_for_test`]. Production never sets it, so [`tracker`] always
+    /// returns the process-global tracker and behavior is unchanged.
+    static TRACKER_OVERRIDE: Cell<Option<&'static Mutex<AgentStateTracker>>> =
+        const { Cell::new(None) };
 }
 
-/// Exact owner for the global agent-transition linearization boundary. It is
-/// exposed only to side-effect executors that must keep the boundary across an
-/// immediate physical operation on the same thread.
-pub(crate) struct TransitionPipelineGuard {
-    _guard: MutexGuard<'static, ()>,
+/// Resolves the agent-state tracker for the current thread: the test override
+/// if one is installed, otherwise the process-global tracker.
+fn tracker() -> &'static Mutex<AgentStateTracker> {
+    TRACKER_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or_else(global_tracker)
 }
 
-pub(crate) fn acquire_transition_pipeline_lock() -> Result<TransitionPipelineGuard, String> {
-    transition_pipeline()
-        .lock()
-        .map(|guard| TransitionPipelineGuard { _guard: guard })
-        .map_err(|poisoned| format!("agent transition pipeline lock poisoned: {poisoned}"))
-}
-
-pub(crate) fn with_transition_pipeline_lock<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
-    let _guard = acquire_transition_pipeline_lock()?;
-    Ok(operation())
+/// Installs a fresh, thread-local agent-state tracker so a test's
+/// `read_for_session` reads are hermetic.
+///
+/// A parallel test recording agent events into the process-global tracker can
+/// then no longer contaminate this thread's `session_list`
+/// `attached_agent_registry` projection — the agent-state analogue of the
+/// input-lease leak in issue #1574.
+///
+/// Idempotent per thread; the leaked cell count is bounded by the number of
+/// tests that opt in, and libtest gives each test a fresh thread.
+#[cfg(test)]
+pub(crate) fn isolate_for_test() {
+    TRACKER_OVERRIDE.with(|override_cell| {
+        if override_cell.get().is_none() {
+            override_cell.set(Some(Box::leak(Box::new(Mutex::new(
+                AgentStateTracker::default(),
+            )))));
+        }
+    });
 }
 
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
@@ -1426,326 +1282,117 @@ pub(crate) fn install_event_bus(bus: EventBus) {
     let _already_installed = EVENT_BUS.set(bus);
 }
 
-/// Atomically journals primary events, all derived state transitions, and the
-/// final per-anchor Pending escalation cursor before publishing any in-memory
-/// state. The tracker is staged on a clone and swapped only after independent
-/// physical readback proves the complete Calyx transaction.
-pub(crate) fn record_agent_events_transactionally(
-    db: &Db,
-    records: &[AgentEventRecord],
-) -> StorageResult<Vec<AgentEventWriteReadback>> {
-    for record in records {
-        let _encoded = super::agent_events::validate_and_encode(record)?;
-    }
-    let pipeline_guard = transition_pipeline().lock().map_err(|poisoned| {
-        synapse_storage::StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_STATE_TRANSITION_PIPELINE_POISONED: atomic journal/projection coordinator is unavailable: {poisoned}"
-            ),
-        }
-    })?;
-    let mut live = tracker().lock().map_err(|poisoned| {
-        synapse_storage::StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_STATE_TRACKER_POISONED: cannot stage atomic journal projection: {poisoned}"
-            ),
-        }
-    })?;
-    let mut candidate = live.clone();
-    let mut staged_transitions = Vec::<(usize, StateTransition)>::new();
-    for (record_index, record) in records.iter().enumerate() {
-        if !is_state_machine_row(record)
-            && let Some(transition) = candidate.apply_event(record)
-        {
-            staged_transitions.push((record_index, transition));
-        }
-    }
-
-    let now_ns = unix_time_ns_now();
-    let mut per_anchor_floor = BTreeMap::<String, u64>::new();
-    let mut transition_rows = Vec::with_capacity(staged_transitions.len());
-    for (trigger_index, transition) in &staged_transitions {
-        let floor = match per_anchor_floor.get(&transition.anchor).copied() {
-            Some(floor) => floor,
-            None => super::escalation::projection_generation_for_anchor(db, &transition.anchor)
-                .map_err(|error| synapse_storage::StorageError::ReadFailed {
-                    cf_name: cf::CF_KV.to_owned(),
-                    detail: format!(
-                        "AGENT_STATE_PROJECTION_CURSOR_READ_FAILED: anchor={:?} detail={}",
-                        transition.anchor, error.message
-                    ),
-                })?
-                .map(|generation| generation.journal_ts_ns)
-                .unwrap_or_default(),
-        };
-        let proposed = now_ns.max(records[*trigger_index].ts_ns);
-        let transition_ts_ns = if proposed > floor {
-            proposed
-        } else {
-            floor.checked_add(1).ok_or_else(|| {
-                synapse_storage::StorageError::WriteFailed {
-                    cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                    detail: format!(
-                        "AGENT_STATE_GENERATION_EXHAUSTED: anchor={:?} durable journal timestamp reached u64::MAX",
-                        transition.anchor
-                    ),
-                }
-            })?
-        };
-        per_anchor_floor.insert(transition.anchor.clone(), transition_ts_ns);
-        transition_rows.push(transition_record(transition, transition_ts_ns));
-    }
-
-    let primary_count = records.len();
-    let mut combined_records = records.to_vec();
-    combined_records.extend(transition_rows);
-    let mut final_transition_by_anchor = BTreeMap::<String, (usize, StateTransition)>::new();
-    for (transition_index, (_trigger_index, transition)) in staged_transitions.iter().enumerate() {
-        final_transition_by_anchor.insert(
-            transition.anchor.clone(),
-            (primary_count + transition_index, transition.clone()),
-        );
-    }
-    let intents = final_transition_by_anchor
-        .values()
-        .map(|(record_index, transition)| TransitionJournalIntent {
-            record_index: *record_index,
-            transition: transition.clone(),
-        })
-        .collect::<Vec<_>>();
-    let committed =
-        commit_agent_event_records_with_intents(db, &combined_records, &intents).inspect_err(
-            |error| {
+/// Feeds journal events into the process-wide tracker and journals any
+/// resulting transitions. Called by the `record_agent_events` choke point
+/// after the primary rows committed, so every writer feeds the machine and
+/// no writer can bypass it.
+pub(crate) fn observe_recorded_events(db: &Db, records: &[AgentEventRecord]) {
+    let transitions = {
+        let mut guard = match tracker().lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => {
                 tracing::error!(
-                    code = "AGENT_EVENT_WRITE_FAILED",
-                    primary_record_count = records.len(),
-                    transition_count = staged_transitions.len(),
-                    cursor_count = intents.len(),
-                    detail = %error,
-                    "atomic primary-event/state-transition/projection-cursor commit failed; live tracker was not advanced"
+                    code = "AGENT_STATE_TRACKER_POISONED",
+                    record_count = records.len(),
+                    "agent state tracker lock poisoned; journal events not projected"
                 );
-            },
-        )?;
-    *live = candidate;
-    drop(live);
-    drop(pipeline_guard);
-
-    project_committed_agent_event_artifacts(db, &committed);
-    publish_committed_transitions(
-        db,
-        &staged_transitions,
-        &final_transition_by_anchor,
-        primary_count,
-        &committed.readbacks,
-    );
-    Ok(committed.readbacks[..primary_count].to_vec())
+                return;
+            }
+        };
+        records
+            .iter()
+            .filter(|record| !is_state_machine_row(record))
+            .filter_map(|record| guard.apply_event(record))
+            .collect::<Vec<_>>()
+    };
+    emit_transitions(db, &transitions);
 }
 
 /// One liveness pass over the process-wide tracker: process probes + silence
 /// thresholds. Returns the number of transitions emitted.
 pub(crate) fn liveness_sweep_once(db: &Db, now_unix_ms: u64) -> usize {
     let config = liveness_config();
-    let pipeline_guard = match transition_pipeline().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::error!(
-                code = "AGENT_STATE_TRANSITION_PIPELINE_POISONED",
-                detail = %poisoned,
-                "liveness sweep could not acquire the atomic transition pipeline"
-            );
-            return 0;
-        }
-    };
-    let mut live = match tracker().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::error!(
-                code = "AGENT_STATE_TRACKER_POISONED",
-                detail = %poisoned,
-                "agent state tracker lock poisoned; liveness sweep skipped"
-            );
-            return 0;
-        }
-    };
-    let mut candidate = live.clone();
-    let actions = candidate.sweep(
-        now_unix_ms,
-        config.stuck_after_ms,
-        config.unprobeable_dead_after_ms,
-        &|pid| crate::m4::process_exists(pid),
-    );
-    let mut transitions = actions.transitions;
-    for event in &actions.terminal_events {
-        if let Some(transition) = candidate.apply_event(event) {
-            transitions.push(transition);
-        }
-    }
-    if actions.terminal_events.is_empty() && transitions.is_empty() {
-        *live = candidate;
-        return 0;
-    }
-    for record in &actions.terminal_events {
-        if let Err(error) = super::agent_events::validate_and_encode(record) {
-            tracing::error!(
-                code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
-                detail = %error,
-                "liveness terminal event failed validation; staged tracker was discarded"
-            );
-            return 0;
-        }
-    }
-
-    let now_ns = now_unix_ms.saturating_mul(1_000_000);
-    let mut per_anchor_floor = BTreeMap::<String, u64>::new();
-    let mut transition_rows = Vec::with_capacity(transitions.len());
-    for transition in &transitions {
-        let floor = match per_anchor_floor.get(&transition.anchor).copied() {
-            Some(floor) => floor,
-            None => {
-                match super::escalation::projection_generation_for_anchor(db, &transition.anchor) {
-                    Ok(generation) => generation
-                        .map(|generation| generation.journal_ts_ns)
-                        .unwrap_or_default(),
-                    Err(error) => {
-                        tracing::error!(
-                            code = "AGENT_STATE_PROJECTION_CURSOR_READ_FAILED",
-                            anchor = %transition.anchor,
-                            detail = %error.message,
-                            "liveness sweep could not stage a durable transition generation"
-                        );
-                        return 0;
-                    }
-                }
+    let transitions = {
+        let mut guard = match tracker().lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => {
+                tracing::error!(
+                    code = "AGENT_STATE_TRACKER_POISONED",
+                    "agent state tracker lock poisoned; liveness sweep skipped"
+                );
+                return 0;
             }
         };
-        let transition_ts_ns = if now_ns > floor {
-            now_ns
-        } else if let Some(next) = floor.checked_add(1) {
-            next
-        } else {
-            tracing::error!(
-                code = "AGENT_STATE_GENERATION_EXHAUSTED",
-                anchor = %transition.anchor,
-                "liveness transition generation reached u64::MAX"
-            );
-            return 0;
-        };
-        per_anchor_floor.insert(transition.anchor.clone(), transition_ts_ns);
-        transition_rows.push(transition_record(transition, transition_ts_ns));
-    }
-    let primary_count = actions.terminal_events.len();
-    let mut combined_records = actions.terminal_events;
-    combined_records.extend(transition_rows);
-    let mut final_transition_by_anchor = BTreeMap::<String, (usize, StateTransition)>::new();
-    for (transition_index, transition) in transitions.iter().enumerate() {
-        final_transition_by_anchor.insert(
-            transition.anchor.clone(),
-            (primary_count + transition_index, transition.clone()),
-        );
-    }
-    let intents = final_transition_by_anchor
-        .values()
-        .map(|(record_index, transition)| TransitionJournalIntent {
-            record_index: *record_index,
-            transition: transition.clone(),
-        })
-        .collect::<Vec<_>>();
-    let committed = match commit_agent_event_records_with_intents(db, &combined_records, &intents) {
-        Ok(committed) => committed,
-        Err(error) => {
-            tracing::error!(
-                code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
-                terminal_event_count = primary_count,
-                transition_count = transitions.len(),
-                detail = %error,
-                "liveness journal/transition/cursor transaction failed; staged tracker was discarded for retry"
-            );
-            return 0;
-        }
+        guard.sweep(
+            now_unix_ms,
+            config.stuck_after_ms,
+            config.unprobeable_dead_after_ms,
+            &|pid| crate::m4::process_exists(pid),
+        )
     };
-    *live = candidate;
-    drop(live);
-    drop(pipeline_guard);
-    project_committed_agent_event_artifacts(db, &committed);
-    let staged = transitions
-        .into_iter()
-        .map(|transition| (0_usize, transition))
-        .collect::<Vec<_>>();
-    publish_committed_transitions(
-        db,
-        &staged,
-        &final_transition_by_anchor,
-        primary_count,
-        &committed.readbacks,
-    );
-    primary_count.saturating_add(staged.len())
+    emit_transitions(db, &transitions);
+    transitions.len()
 }
 
-/// Publishes transition side effects only after the primary rows, derived
-/// transition rows, and final Pending cursors have committed atomically and
-/// been independently read back.
-fn publish_committed_transitions(
-    db: &Db,
-    transitions: &[(usize, StateTransition)],
-    final_transition_by_anchor: &BTreeMap<String, (usize, StateTransition)>,
-    primary_count: usize,
-    readbacks: &[AgentEventWriteReadback],
-) {
+/// Journals + publishes transitions. A journal failure here is logged loudly
+/// (`AGENT_STATE_ROW_WRITE_FAILED`) but never unwinds the caller: the primary
+/// event rows already committed and the machine state is re-derivable from
+/// them, so refusing the committed write would be dishonest.
+fn emit_transitions(db: &Db, transitions: &[StateTransition]) {
     if transitions.is_empty() {
         return;
     }
-    for (transition_index, (_trigger_index, transition)) in transitions.iter().enumerate() {
-        let Some(readback) = readbacks.get(primary_count + transition_index) else {
+    let now_ns = unix_time_ns_now();
+    let rows: Vec<AgentEventRecord> = transitions
+        .iter()
+        .map(|transition| transition_record(transition, now_ns))
+        .collect();
+    match record_agent_events_unobserved(db, &rows) {
+        Ok(readbacks) => {
+            let terminal = transitions
+                .iter()
+                .any(|transition| transition.state_to == AgentLifecycleState::Dead);
+            if terminal && let Err(error) = db.flush() {
+                tracing::error!(
+                    code = "AGENT_STATE_ROW_WRITE_FAILED",
+                    detail = %error,
+                    "terminal state row flush failed; row is batched but not yet crash-durable"
+                );
+            }
+            for (transition, readback) in transitions.iter().zip(&readbacks) {
+                tracing::info!(
+                    code = "AGENT_STATE_CHANGED",
+                    anchor = %transition.anchor,
+                    state_from = transition.state_from.as_str(),
+                    state_to = transition.state_to.as_str(),
+                    reason_code = %transition.reason_code,
+                    runaway = transition.runaway,
+                    ts_ns = readback.ts_ns,
+                    seq = readback.seq,
+                    "readback=CF_AGENT_EVENTS edge=state_machine"
+                );
+            }
+        }
+        Err(error) => {
             tracing::error!(
-                code = "AGENT_STATE_COMMIT_READBACK_INVALID",
-                transition_index,
-                primary_count,
-                readback_count = readbacks.len(),
-                "committed transition has no matching journal readback; projection publication stopped"
+                code = "AGENT_STATE_ROW_WRITE_FAILED",
+                transition_count = transitions.len(),
+                detail = %error,
+                "state transition rows could not be journaled; in-memory state advanced and is re-derivable from the primary events"
             );
-            return;
-        };
-        tracing::info!(
-            code = "AGENT_STATE_CHANGED",
-            anchor = %transition.anchor,
-            state_from = transition.state_from.as_str(),
-            state_to = transition.state_to.as_str(),
-            reason_code = %transition.reason_code,
-            runaway = transition.runaway,
-            journal_ts_ns = readback.ts_ns,
-            seq = readback.seq,
-            committed_seq = readback.committed_seq,
-            committed_revision = %synapse_storage::constellations::hex_encode(&readback.committed_revision_sha256),
-            journal_key = %synapse_storage::constellations::hex_encode(&readback.key),
-            "readback=CF_AGENT_EVENTS edge=state_machine"
-        );
+        }
     }
-    // Only the final transition for an anchor is externally projected from a
-    // multi-event batch. Every intermediate transition remains in the
-    // append-only journal, while the atomic cursor names the final reality.
-    for (record_index, transition) in final_transition_by_anchor.values() {
-        let Some(readback) = readbacks.get(*record_index) else {
-            tracing::error!(
-                code = "AGENT_STATE_COMMIT_READBACK_INVALID",
-                anchor = %transition.anchor,
-                record_index,
-                readback_count = readbacks.len(),
-                "final transition cursor has no matching journal readback"
-            );
-            continue;
-        };
-        super::escalation::note_transition(
-            db,
-            transition,
-            readback.ts_ns,
-            readback.seq,
-            readback.ts_ns / 1_000_000,
-        );
+    // #948: feed live attention-state transitions to the escalation engine
+    // after the authoritative rows commit. Replayed transitions go through
+    // `apply_event` directly (rebuild_from_journal), never here, so restart
+    // never re-fires historical escalations. A failure inside the engine is
+    // logged loudly there and never unwinds this committed write.
+    let now_unix_ms = now_ns / 1_000_000;
+    for transition in transitions {
+        super::escalation::note_transition(db, transition, now_unix_ms);
     }
     if let Some(bus) = EVENT_BUS.get() {
-        for (_trigger_index, transition) in transitions {
+        for transition in transitions {
             let report = bus.publish(Event {
                 seq: NEXT_BUS_EVENT_SEQ.fetch_add(1, Ordering::Relaxed),
                 at: chrono::Utc::now(),
@@ -1785,34 +1432,11 @@ fn transition_record(transition: &StateTransition, ts_ns: u64) -> AgentEventReco
     record.state_to = Some(transition.state_to.as_str().to_owned());
     record.payload = json!({
         "origin": STATE_MACHINE_ORIGIN,
-        "anchor": transition.anchor,
         "waiting_for": transition.waiting_for,
         "runaway": transition.runaway,
         "evidence": transition.evidence,
     });
     record
-}
-
-pub(crate) fn validate_transition_record_identity(
-    record: &AgentEventRecord,
-    transition: &StateTransition,
-) -> StorageResult<()> {
-    let expected = transition_record(transition, record.ts_ns);
-    let actual_bytes = synapse_storage::encode_json(record)?;
-    let expected_bytes = synapse_storage::encode_json(&expected)?;
-    if actual_bytes != expected_bytes {
-        return Err(synapse_storage::StorageError::WriteFailed {
-            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-            detail: format!(
-                "AGENT_STATE_TRANSITION_RECORD_MISMATCH: anchor={:?} state_from={} state_to={} reason_code={:?}; refusing to bind a cursor to non-identical journal bytes",
-                transition.anchor,
-                transition.state_from.as_str(),
-                transition.state_to.as_str(),
-                transition.reason_code
-            ),
-        });
-    }
-    Ok(())
 }
 
 /// Readback of one journal replay.
@@ -1885,476 +1509,6 @@ pub(crate) fn rebuild_from_journal(db: &Db) -> StorageResult<RebuildReadback> {
     Ok(readback)
 }
 
-/// One exact physical `CF_AGENT_EVENTS` row supplied by the ambient
-/// transactional-outbox reconciler. `value` is the canonical encoded event
-/// bytes read from `key`; recovery independently point-reads both again.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AmbientExactJournalRow {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-}
-
-/// Readback from a quiet live-projection recovery. Recovery never appends a
-/// primary or derived journal row and never publishes transition side effects.
-#[derive(Clone, Debug)]
-pub(crate) struct AmbientProjectionRecoveryReadback {
-    pub readback: AgentStateRead,
-    pub rows_applied: usize,
-    pub already_current: bool,
-}
-
-fn ambient_recovery_read_error(detail: impl Into<String>) -> StorageError {
-    StorageError::ReadFailed {
-        cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-        detail: detail.into(),
-    }
-}
-
-fn ambient_agent_event_retention_ns() -> StorageResult<u64> {
-    let retention = RETENTION_DEFAULTS
-        .iter()
-        .find(|retention| retention.cf == cf::CF_AGENT_EVENTS)
-        .ok_or_else(|| {
-            ambient_recovery_read_error(
-                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_MISSING: CF_AGENT_EVENTS has no retention default; remediation=restore the finite journal retention contract before witness-only recovery",
-            )
-        })?;
-    let hours = match retention.ttl {
-        RetentionTtl::Hours(hours) => hours,
-        RetentionTtl::Days(days) => days.checked_mul(24).ok_or_else(|| {
-            ambient_recovery_read_error(
-                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_OVERFLOW: CF_AGENT_EVENTS day retention does not fit hours; remediation=repair the retention default",
-            )
-        })?,
-        RetentionTtl::None | RetentionTtl::LruOnly => {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_INVALID: CF_AGENT_EVENTS retention is {:?}; remediation=configure a finite time retention before witness-only recovery",
-                retention.ttl
-            )));
-        }
-    };
-    hours
-        .checked_mul(60 * 60)
-        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-        .ok_or_else(|| {
-            ambient_recovery_read_error(
-                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_OVERFLOW: CF_AGENT_EVENTS retention does not fit nanoseconds; remediation=repair the retention default",
-            )
-        })
-}
-
-fn point_read_exact_ambient_journal_row(
-    db: &Db,
-    spawn_id: &str,
-    row: &AmbientExactJournalRow,
-) -> StorageResult<[u8; 32]> {
-    let key_hex = synapse_storage::constellations::hex_encode(&row.key);
-    let revisioned = db
-        .get_cf_revisioned(cf::CF_AGENT_EVENTS, &row.key)
-        .map_err(|error| {
-            ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_POINT_READ_FAILED: spawn_id={spawn_id} key_hex={key_hex}: {error}; remediation=repair the exact Calyx journal point-read before retrying projection recovery"
-            ))
-        })?
-        .ok_or_else(|| {
-            ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_ROW_MISSING: spawn_id={spawn_id} key_hex={key_hex}; remediation=restore/reconcile the exact retained journal row and leave the ambient outbox unacknowledged"
-            ))
-        })?;
-    let actual = revisioned.value.ok_or_else(|| {
-        ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_ROW_EXPIRED: spawn_id={spawn_id} key_hex={key_hex}; remediation=leave the ambient outbox unacknowledged and reconcile the retention-expired operation from durable evidence"
-        ))
-    })?;
-    if actual != row.value {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_ROW_DIVERGED: spawn_id={spawn_id} key_hex={key_hex} expected_value_sha256={} actual_value_sha256={}; remediation=quarantine and repair the divergent journal row before projection recovery",
-            synapse_storage::constellations::sha256_hex(&row.value),
-            synapse_storage::constellations::sha256_hex(&actual)
-        )));
-    }
-    Ok(revisioned.revision_sha256)
-}
-
-fn ambient_projection_journal_witness(
-    db: &Db,
-    spawn_id: &str,
-) -> StorageResult<Option<super::escalation::TransitionProjectionJournalWitness>> {
-    super::escalation::projection_journal_witness_for_anchor(db, spawn_id).map_err(|error| {
-        ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_READ_FAILED: spawn_id={spawn_id}: {}; remediation=repair the Applied transition projection cursor, Pending index, and exact audit evidence before recovery",
-            error.message
-        ))
-    })
-}
-
-fn ambient_authoritative_projection_row(
-    spawn_id: &str,
-    witness: &super::escalation::TransitionProjectionJournalWitness,
-) -> StorageResult<AmbientExactJournalRow> {
-    let (key_ts_ns, key_seq) = decode_agent_event_key(&witness.journal_key)?;
-    let key_hex = synapse_storage::constellations::hex_encode(&witness.journal_key);
-    let record: AgentEventRecord = decode_json(&witness.journal_value)?;
-    let canonical = super::agent_events::validate_and_encode(&record)?;
-    if key_ts_ns != witness.generation.journal_ts_ns
-        || key_seq != witness.generation.journal_seq
-        || canonical != witness.journal_value
-        || record.ts_ns != witness.generation.journal_ts_ns
-        || record.spawn_id.as_deref() != Some(spawn_id)
-        || !is_state_machine_row(&record)
-        || record
-            .state_to
-            .as_deref()
-            .and_then(AgentLifecycleState::parse)
-            .is_none()
-    {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_INVALID: spawn_id={spawn_id} generation=({},{}) key_hex={key_hex} key_generation=({key_ts_ns},{key_seq}) record_ts_ns={} record_spawn_id={:?} kind={:?} state_to={:?} canonical_bytes_match={} machine_row={}; remediation=repair the validated Applied projection witness before recovery",
-            witness.generation.journal_ts_ns,
-            witness.generation.journal_seq,
-            record.ts_ns,
-            record.spawn_id,
-            record.kind,
-            record.state_to,
-            canonical == witness.journal_value,
-            is_state_machine_row(&record)
-        )));
-    }
-    Ok(AmbientExactJournalRow {
-        key: witness.journal_key.clone(),
-        value: witness.journal_value.clone(),
-    })
-}
-
-fn point_read_optional_ambient_authoritative_row(
-    db: &Db,
-    spawn_id: &str,
-    row: &AmbientExactJournalRow,
-) -> StorageResult<Option<[u8; 32]>> {
-    let key_hex = synapse_storage::constellations::hex_encode(&row.key);
-    let Some(revisioned) = db
-        .get_cf_revisioned(cf::CF_AGENT_EVENTS, &row.key)
-        .map_err(|error| {
-            ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_READ_FAILED: spawn_id={spawn_id} key_hex={key_hex}: {error}; remediation=repair the exact transition journal point-read before recovery"
-            ))
-        })?
-    else {
-        let (journal_ts_ns, _journal_seq) = decode_agent_event_key(&row.key)?;
-        let retention_ns = ambient_agent_event_retention_ns()?;
-        let now_ns = unix_time_ns_now();
-        let age_ns = now_ns.saturating_sub(journal_ts_ns);
-        if age_ns < retention_ns {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_MISSING_BEFORE_RETENTION: spawn_id={spawn_id} key_hex={key_hex} journal_ts_ns={journal_ts_ns} now_ns={now_ns} age_ns={age_ns} retention_ns={retention_ns}; remediation=repair the prematurely missing physical transition row instead of masking it with the durable witness"
-            )));
-        }
-        return Ok(None);
-    };
-    let Some(actual) = revisioned.value else {
-        // `get_cf_revisioned` exposes `value=None` only for a logically expired
-        // retention envelope. The validated Applied projection cursor is the
-        // durable exact witness once that older journal value retires.
-        return Ok(None);
-    };
-    if actual != row.value {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_DIVERGED: spawn_id={spawn_id} key_hex={key_hex} expected_value_sha256={} actual_value_sha256={}; remediation=quarantine and repair the live journal row that diverges from the Applied projection witness",
-            synapse_storage::constellations::sha256_hex(&row.value),
-            synapse_storage::constellations::sha256_hex(&actual)
-        )));
-    }
-    Ok(Some(revisioned.revision_sha256))
-}
-
-/// Quietly installs the lifecycle projection of an already committed ambient
-/// outbox batch into the process-wide tracker (#1772).
-///
-/// This is deliberately not a general replay API. It accepts only the bounded
-/// one-operation ambient shape, requires strictly ordered journal keys, rejects
-/// machine-derived rows, validates canonical event bytes and spawn identity,
-/// joins the anchor's latest Applied transition watermark/audit witness,
-/// point-reads every live physical row before and after ordered reduction, and
-/// requires the durable witness to remain byte/revision-identical when its
-/// older journal row has retired. It takes the normal transition-pipeline ->
-/// tracker lock order, and swaps the candidate only after the second exact
-/// evidence read. No journal write, cursor write, SSE publication, or
-/// transition side effect occurs here.
-pub(crate) fn recover_ambient_projection_from_exact_journal_rows(
-    db: &Db,
-    spawn_id: &str,
-    rows: &[AmbientExactJournalRow],
-) -> StorageResult<AmbientProjectionRecoveryReadback> {
-    if spawn_id.trim().is_empty() || rows.is_empty() || rows.len() > MAX_AMBIENT_EXACT_RECOVERY_ROWS
-    {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_INPUT_INVALID: spawn_id={spawn_id:?} rows={} max_rows={MAX_AMBIENT_EXACT_RECOVERY_ROWS}; remediation=provide one exact bounded ambient outbox batch",
-            rows.len()
-        )));
-    }
-
-    let mut records = Vec::with_capacity(rows.len());
-    let mut previous_key: Option<&[u8]> = None;
-    for row in rows {
-        if previous_key.is_some_and(|previous| previous >= row.key.as_slice()) {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_ORDER_INVALID: spawn_id={spawn_id} journal keys are not strictly ascending; remediation=repeat the exact ordered CF_AGENT_EVENTS scan"
-            )));
-        }
-        let (key_ts_ns, _key_seq) = decode_agent_event_key(&row.key)?;
-        let record: AgentEventRecord = decode_json(&row.value)?;
-        let canonical = super::agent_events::validate_and_encode(&record)?;
-        if canonical != row.value
-            || record.ts_ns != key_ts_ns
-            || record.spawn_id.as_deref() != Some(spawn_id)
-            || is_state_machine_row(&record)
-        {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_IDENTITY_INVALID: spawn_id={spawn_id} key_hex={} key_ts_ns={key_ts_ns} record_ts_ns={} record_spawn_id={:?} kind={:?} canonical_bytes_match={} machine_row={}; remediation=repair the exact ambient primary-row set before projection recovery",
-                synapse_storage::constellations::hex_encode(&row.key),
-                record.ts_ns,
-                record.spawn_id,
-                record.kind,
-                canonical == row.value,
-                is_state_machine_row(&record)
-            )));
-        }
-        previous_key = Some(&row.key);
-        records.push(record);
-    }
-    let expected_last = records.last().ok_or_else(|| {
-        ambient_recovery_read_error(
-            "AGENT_STATE_AMBIENT_RECOVERY_INPUT_INVALID: validated record set became empty",
-        )
-    })?;
-    let expected_last_event_unix_ms = expected_last.ts_ns / 1_000_000;
-    let expected_last_event_kind = expected_last.kind;
-    let now_unix_ms = unix_time_ns_now() / 1_000_000;
-
-    let _pipeline_guard = transition_pipeline().lock().map_err(|poisoned| {
-        ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_PIPELINE_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon before exact projection recovery"
-        ))
-    })?;
-    let mut live = tracker().lock().map_err(|poisoned| {
-        ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_TRACKER_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon before exact projection recovery"
-        ))
-    })?;
-    let first_projection_witness = ambient_projection_journal_witness(db, spawn_id)?;
-    let authoritative_row = first_projection_witness
-        .as_ref()
-        .map(|witness| ambient_authoritative_projection_row(spawn_id, witness))
-        .transpose()?;
-    let mut recovery_rows = rows.to_vec();
-    if let Some(authoritative) = &authoritative_row {
-        recovery_rows.push(authoritative.clone());
-    }
-    recovery_rows.sort_by(|left, right| left.key.cmp(&right.key));
-    if recovery_rows
-        .windows(2)
-        .any(|window| window[0].key == window[1].key)
-    {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_KEY_DUPLICATE: spawn_id={spawn_id}; the outbox batch overlaps its authoritative projection generation; remediation=repair the cursor/journal key identities before recovery"
-        )));
-    }
-    let recovery_records = recovery_rows
-        .iter()
-        .map(|row| decode_json::<AgentEventRecord>(&row.value))
-        .collect::<StorageResult<Vec<_>>>()?;
-    let expected_authoritative_state = recovery_records
-        .iter()
-        .rev()
-        .find(|record| is_state_machine_row(record))
-        .and_then(|record| {
-            record
-                .state_to
-                .as_deref()
-                .and_then(AgentLifecycleState::parse)
-        });
-    if authoritative_row.is_some() != expected_authoritative_state.is_some() {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_STATE_MISSING: spawn_id={spawn_id} witness_present={} parsed_state={expected_authoritative_state:?}; remediation=repair the Applied transition witness before recovery",
-            authoritative_row.is_some()
-        )));
-    }
-    let first_primary_revisions = rows
-        .iter()
-        .map(|row| point_read_exact_ambient_journal_row(db, spawn_id, row))
-        .collect::<StorageResult<Vec<_>>>()?;
-    let first_authoritative_revision = match &authoritative_row {
-        Some(row) => point_read_optional_ambient_authoritative_row(db, spawn_id, row)?,
-        None => None,
-    };
-
-    let current = live.read_for_session(spawn_id, now_unix_ms);
-    if let (Some(readback), Some(expected_state)) = (current.as_ref(), expected_authoritative_state)
-        && readback.last_event_unix_ms >= expected_last_event_unix_ms
-        && readback.state != expected_state
-    {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_LIVE_STATE_DIVERGED: spawn_id={spawn_id} expected_authoritative_state={} actual_state={} actual_last_event_unix_ms={}; remediation=rebuild the singleton from the stable Applied transition witness before acknowledging the ambient operation",
-            expected_state.as_str(),
-            readback.state.as_str(),
-            readback.last_event_unix_ms
-        )));
-    }
-    let already_current = match current.as_ref() {
-        Some(readback) if readback.last_event_unix_ms > expected_last_event_unix_ms => true,
-        Some(readback) if readback.last_event_unix_ms == expected_last_event_unix_ms => {
-            if expected_authoritative_state.is_none()
-                && readback.last_event_kind != expected_last_event_kind
-            {
-                return Err(ambient_recovery_read_error(format!(
-                    "AGENT_STATE_AMBIENT_RECOVERY_GENERATION_AMBIGUOUS: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} actual_last_event_kind={:?}; remediation=rebuild the complete ordered agent stream instead of applying an ambiguous same-millisecond fragment",
-                    readback.last_event_kind
-                )));
-            }
-            true
-        }
-        _ => false,
-    };
-
-    let mut candidate = live.clone();
-    let rows_applied = if already_current {
-        0
-    } else {
-        for record in &recovery_records {
-            if is_state_machine_row(record) {
-                candidate.apply_authoritative(record);
-            } else {
-                let _quiet_transition = candidate.apply_event(record);
-            }
-        }
-        let staged = candidate
-            .read_for_session(spawn_id, now_unix_ms)
-            .ok_or_else(|| {
-                ambient_recovery_read_error(format!(
-                    "AGENT_STATE_AMBIENT_RECOVERY_STAGED_PROJECTION_MISSING: spawn_id={spawn_id}; remediation=repair the reducer/ambient identity contract before retrying"
-                ))
-            })?;
-        if staged.last_event_unix_ms < expected_last_event_unix_ms
-            || expected_authoritative_state
-                .is_some_and(|expected_state| staged.state != expected_state)
-            || (expected_authoritative_state.is_none()
-                && staged.last_event_unix_ms == expected_last_event_unix_ms
-                && staged.last_event_kind != expected_last_event_kind)
-        {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_STAGED_PROJECTION_MISMATCH: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} expected_authoritative_state={:?} actual_state={} actual_last_event_unix_ms={} actual_last_event_kind={:?}; remediation=repair the reducer before installing this projection",
-                expected_authoritative_state.map(AgentLifecycleState::as_str),
-                staged.state.as_str(),
-                staged.last_event_unix_ms,
-                staged.last_event_kind
-            )));
-        }
-        recovery_records.len()
-    };
-
-    for (row, first_revision) in rows.iter().zip(&first_primary_revisions) {
-        let second_revision = point_read_exact_ambient_journal_row(db, spawn_id, row)?;
-        if &second_revision != first_revision {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_ROW_REVISION_CHANGED: spawn_id={spawn_id} key_hex={} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and reconcile the changed physical journal row",
-                synapse_storage::constellations::hex_encode(&row.key),
-                synapse_storage::constellations::hex_encode(first_revision),
-                synapse_storage::constellations::hex_encode(&second_revision)
-            )));
-        }
-    }
-    if let Some(authoritative) = &authoritative_row {
-        let second_authoritative_revision =
-            point_read_optional_ambient_authoritative_row(db, spawn_id, authoritative)?;
-        if second_authoritative_revision != first_authoritative_revision {
-            return Err(ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_REVISION_CHANGED: spawn_id={spawn_id} key_hex={} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and retry only after the physical authoritative-row retention boundary is stable",
-                synapse_storage::constellations::hex_encode(&authoritative.key),
-                first_authoritative_revision.map_or_else(
-                    || "witness_only".to_owned(),
-                    |revision| synapse_storage::constellations::hex_encode(&revision)
-                ),
-                second_authoritative_revision.map_or_else(
-                    || "witness_only".to_owned(),
-                    |revision| synapse_storage::constellations::hex_encode(&revision)
-                )
-            )));
-        }
-    }
-    let second_projection_witness = ambient_projection_journal_witness(db, spawn_id)?;
-    if second_projection_witness != first_projection_witness {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_CHANGED: spawn_id={spawn_id} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and repeat recovery from one stable Applied transition projection generation",
-            first_projection_witness.as_ref().map_or_else(
-                || "absent".to_owned(),
-                |witness| synapse_storage::constellations::hex_encode(
-                    &witness.watermark_revision_sha256
-                )
-            ),
-            second_projection_witness.as_ref().map_or_else(
-                || "absent".to_owned(),
-                |witness| synapse_storage::constellations::hex_encode(
-                    &witness.watermark_revision_sha256
-                )
-            )
-        )));
-    }
-    if !already_current {
-        *live = candidate;
-    }
-    drop(live);
-
-    // Separate singleton read operation while the transition pipeline remains
-    // held prevents another writer from making the recovery verdict ambiguous.
-    let readback = tracker()
-        .lock()
-        .map_err(|poisoned| {
-            ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_READBACK_LOCK_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon and repeat exact recovery"
-            ))
-        })?
-        .read_for_session(spawn_id, now_unix_ms)
-        .ok_or_else(|| {
-            ambient_recovery_read_error(format!(
-                "AGENT_STATE_AMBIENT_RECOVERY_READBACK_MISSING: spawn_id={spawn_id}; remediation=leave the outbox unacknowledged and repair the live singleton projection"
-            ))
-        })?;
-    if readback.last_event_unix_ms < expected_last_event_unix_ms
-        || expected_authoritative_state
-            .is_some_and(|expected_state| readback.state != expected_state)
-        || (expected_authoritative_state.is_none()
-            && readback.last_event_unix_ms == expected_last_event_unix_ms
-            && readback.last_event_kind != expected_last_event_kind)
-    {
-        return Err(ambient_recovery_read_error(format!(
-            "AGENT_STATE_AMBIENT_RECOVERY_READBACK_MISMATCH: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} expected_authoritative_state={:?} actual_state={} actual_last_event_unix_ms={} actual_last_event_kind={:?}; remediation=leave the outbox unacknowledged and repair the singleton projection",
-            expected_authoritative_state.map(AgentLifecycleState::as_str),
-            readback.state.as_str(),
-            readback.last_event_unix_ms,
-            readback.last_event_kind
-        )));
-    }
-    tracing::warn!(
-        code = "AGENT_STATE_AMBIENT_PROJECTION_RECOVERED",
-        spawn_id,
-        rows_verified = recovery_rows.len(),
-        primary_rows_verified = rows.len(),
-        authoritative_witness_present = first_projection_witness.is_some(),
-        authoritative_physical_row_present = first_authoritative_revision.is_some(),
-        rows_applied,
-        already_current,
-        projected_state = readback.state.as_str(),
-        projected_last_event_unix_ms = readback.last_event_unix_ms,
-        projected_last_event_kind = ?readback.last_event_kind,
-        "readback=CF_AGENT_EVENTS+AgentStateTracker edge=ambient_exact_projection_recovery"
-    );
-    Ok(AmbientProjectionRecoveryReadback {
-        readback,
-        rows_applied,
-        already_current,
-    })
-}
-
 /// Read joins for `session_list` / `session_status` (process-wide tracker).
 pub(crate) fn read_for_session(session_id: &str, now_unix_ms: u64) -> Option<AgentStateRead> {
     tracker()
@@ -2416,4 +1570,949 @@ pub(crate) fn read_from_journal_records(
         }
     }
     local.read_for_session(lookup_id, now_unix_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use synapse_core::GenAiAttributes;
+
+    use super::*;
+
+    fn event(
+        kind: AgentEventKind,
+        spawn_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> AgentEventRecord {
+        let mut record = AgentEventRecord::new(unix_time_ns_now(), kind);
+        record.spawn_id = spawn_id.map(ToOwned::to_owned);
+        record.session_id = session_id.map(ToOwned::to_owned);
+        record
+    }
+
+    fn tool_call(spawn_id: &str, tool: &str, digest: &str) -> AgentEventRecord {
+        let mut record = event(AgentEventKind::ToolCallStarted, Some(spawn_id), None);
+        record.attributes = GenAiAttributes {
+            tool_name: Some(tool.to_owned()),
+            ..GenAiAttributes::default()
+        };
+        record.payload = json!({ "tool_input_sha256": digest });
+        record
+    }
+
+    fn set_event_time_ms(record: &mut AgentEventRecord, unix_ms: u64) {
+        record.ts_ns = unix_ms.saturating_mul(1_000_000);
+    }
+
+    #[test]
+    fn spawn_lifecycle_produces_expected_states_and_reason_codes() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-lifecycle";
+        let session = "session-ut-lifecycle";
+
+        // First sight initializes silently.
+        assert!(
+            tracker
+                .apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None))
+                .is_none(),
+            "first sight must not emit a transition"
+        );
+        let read = tracker.read_for_session(session, 0);
+        assert!(read.is_none(), "the MCP session is not registered yet");
+        assert_eq!(tracker.unbound_reads(0).len(), 1);
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Spawning
+        );
+
+        // SpawnReady links the session and moves to working.
+        let mut ready = event(AgentEventKind::SpawnReady, Some(spawn), Some(session));
+        ready.payload = json!({ "launcher_process_id": 1111, "agent_process_id": 2222 });
+        let transition = tracker.apply_event(&ready).expect("spawning→working");
+        assert_eq!(transition.state_from, AgentLifecycleState::Spawning);
+        assert_eq!(transition.state_to, AgentLifecycleState::Working);
+        assert_eq!(transition.reason_code, "spawn_ready");
+        let read = tracker
+            .read_for_session(session, 0)
+            .expect("session must resolve via the spawn link");
+        assert_eq!(read.state, AgentLifecycleState::Working);
+        assert_eq!(read.agent_process_id, Some(2222));
+        assert!(tracker.unbound_reads(0).is_empty(), "linked agent is bound");
+
+        // Permission request → awaiting_approval with waiting_for detail.
+        let mut approval = event(AgentEventKind::StateChanged, Some(spawn), None);
+        approval.reason_code = Some("permission_request".to_owned());
+        approval.state_to = Some("awaiting_approval".to_owned());
+        approval.attributes.tool_name = Some("Bash".to_owned());
+        let transition = tracker.apply_event(&approval).expect("working→awaiting");
+        assert_eq!(transition.state_to, AgentLifecycleState::AwaitingApproval);
+        assert_eq!(transition.waiting_for.as_deref(), Some("tool:Bash"));
+
+        // Tool call resumes work, turn end goes idle.
+        let transition = tracker
+            .apply_event(&tool_call(spawn, "Bash", "sha256:abc"))
+            .expect("awaiting→working");
+        assert_eq!(transition.state_to, AgentLifecycleState::Working);
+        let transition = tracker
+            .apply_event(&event(AgentEventKind::TurnFinished, Some(spawn), None))
+            .expect("working→idle");
+        assert_eq!(transition.state_to, AgentLifecycleState::Idle);
+        assert_eq!(transition.reason_code, "turn_finished");
+
+        // needs_input via ingress notification.
+        let mut needs = event(AgentEventKind::StateChanged, Some(spawn), None);
+        needs.reason_code = Some("idle_prompt".to_owned());
+        needs.state_to = Some("needs_input".to_owned());
+        let transition = tracker.apply_event(&needs).expect("idle→needs_input");
+        assert_eq!(transition.state_to, AgentLifecycleState::NeedsInput);
+        assert_eq!(transition.waiting_for.as_deref(), Some("idle_prompt"));
+
+        // CLI session end → ready_for_review; MCP exit → dead.
+        let mut cli_end = event(AgentEventKind::StateChanged, Some(spawn), None);
+        cli_end.reason_code = Some("cli_session_end".to_owned());
+        let transition = tracker.apply_event(&cli_end).expect("→ready_for_review");
+        assert_eq!(transition.state_to, AgentLifecycleState::ReadyForReview);
+        let mut exited = event(AgentEventKind::Exited, None, Some(session));
+        exited.reason_code = Some("explicit_session_end".to_owned());
+        let transition = tracker.apply_event(&exited).expect("→dead");
+        assert_eq!(transition.state_to, AgentLifecycleState::Dead);
+        assert_eq!(transition.reason_code, "explicit_session_end");
+    }
+
+    #[test]
+    fn hook_after_kill_never_resurrects_a_dead_agent() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-postmortem";
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        let transition = tracker
+            .apply_event(&event(AgentEventKind::Killed, Some(spawn), None))
+            .expect("spawning→dead");
+        assert_eq!(transition.state_to, AgentLifecycleState::Dead);
+
+        // The straggler hook event must not change anything.
+        assert!(
+            tracker
+                .apply_event(&tool_call(spawn, "Bash", "sha256:late"))
+                .is_none(),
+            "post-mortem hook must not emit a transition"
+        );
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Dead,
+            "agent must stay dead"
+        );
+    }
+
+    #[test]
+    fn late_exited_reconciles_provisional_process_gone_death() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-exit-race";
+        let session = "session-ut-exit-race";
+        let mut ready = event(AgentEventKind::SpawnReady, Some(spawn), Some(session));
+        ready.payload = json!({
+            "agent_process_id": 99,
+        });
+        tracker.apply_event(&ready);
+
+        let now = unix_time_ns_now() / 1_000_000;
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid != 99,
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(
+            transitions[0].reason_code,
+            "process_gone_without_exit_event"
+        );
+
+        let mut exited = event(AgentEventKind::Exited, None, Some(session));
+        exited.reason_code = Some("spawn_completed".to_owned());
+        assert!(
+            tracker.apply_event(&exited).is_none(),
+            "late exit updates same terminal state without a new transition"
+        );
+        let read = tracker
+            .read_for_session(session, now)
+            .expect("session read after late exit");
+        assert_eq!(read.state, AgentLifecycleState::Dead);
+        assert_eq!(read.reason_code.as_deref(), Some("spawn_completed"));
+        assert_eq!(read.attention_class, AgentAttentionClass::None);
+        assert_eq!(read.last_event_kind, AgentEventKind::Exited);
+    }
+
+    #[test]
+    fn runaway_tool_loop_flags_stuck_and_recovers_on_different_call() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-runaway";
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        tracker.apply_event(&event(AgentEventKind::TurnStarted, Some(spawn), None));
+
+        let threshold = liveness_config().runaway_identical_calls;
+        let mut runaway_transition = None;
+        for call in 1..=threshold {
+            let transition = tracker.apply_event(&tool_call(spawn, "observe", "sha256:same"));
+            if call < threshold {
+                assert!(
+                    transition.is_none()
+                        || transition.as_ref().unwrap().state_to != AgentLifecycleState::Stuck,
+                    "call {call} of {threshold} must not flag yet"
+                );
+            } else {
+                runaway_transition = transition;
+            }
+        }
+        let transition = runaway_transition.expect("threshold call must transition");
+        assert_eq!(transition.state_to, AgentLifecycleState::Stuck);
+        assert_eq!(transition.reason_code, "runaway_tool_loop");
+        assert!(transition.runaway);
+        assert_eq!(
+            transition.evidence["consecutive_identical_calls"],
+            u64::from(threshold)
+        );
+        let read = tracker.unbound_reads(0).remove(0);
+        assert!(read.runaway);
+        assert_eq!(
+            read.waiting_for.as_deref(),
+            Some(&*format!("runaway:observex{threshold}"))
+        );
+
+        // A different argument digest breaks the loop and clears the flag.
+        let transition = tracker
+            .apply_event(&tool_call(spawn, "observe", "sha256:different"))
+            .expect("stuck→working");
+        assert_eq!(transition.state_to, AgentLifecycleState::Working);
+        assert!(!tracker.unbound_reads(0)[0].runaway);
+    }
+
+    #[test]
+    fn sweep_distinguishes_stuck_from_dead_via_process_probe() {
+        let mut tracker = AgentStateTracker::default();
+        let alive_spawn = "agent-spawn-ut-sweep-alive";
+        let dead_spawn = "agent-spawn-ut-sweep-dead";
+        for (spawn, pid) in [(alive_spawn, 11_u32), (dead_spawn, 22_u32)] {
+            let mut ready = event(
+                AgentEventKind::SpawnReady,
+                Some(spawn),
+                Some(&format!("session-{spawn}")),
+            );
+            ready.payload = json!({ "agent_process_id": pid });
+            tracker.apply_event(&ready);
+        }
+        let now = unix_time_ns_now() / 1_000_000 + DEFAULT_STUCK_AFTER_MS + 1;
+
+        // pid 11 alive → stuck; pid 22 gone → dead (no exit event existed).
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid == 11,
+        );
+        assert_eq!(transitions.len(), 2, "{transitions:?}");
+        let stuck = transitions
+            .iter()
+            .find(|transition| transition.anchor == alive_spawn)
+            .expect("alive agent transition");
+        assert_eq!(stuck.state_to, AgentLifecycleState::Stuck);
+        assert_eq!(stuck.reason_code, "silent_timeout");
+        assert_eq!(stuck.evidence["last_event_kind"], "spawn_ready");
+        let dead = transitions
+            .iter()
+            .find(|transition| transition.anchor == dead_spawn)
+            .expect("dead agent transition");
+        assert_eq!(dead.state_to, AgentLifecycleState::Dead);
+        assert_eq!(dead.reason_code, "process_gone_without_exit_event");
+        assert_eq!(dead.evidence["probed_pid"], 22);
+
+        // The stuck agent recovers when activity resumes.
+        let transition = tracker
+            .apply_event(&event(
+                AgentEventKind::MessageReceived,
+                None,
+                Some(&format!("session-{alive_spawn}")),
+            ))
+            .expect("stuck→working on activity");
+        assert_eq!(transition.state_to, AgentLifecycleState::Working);
+        assert_eq!(transition.reason_code, "activity_resumed");
+
+        // A quiet waiting agent is never swept into stuck.
+        let mut needs = event(AgentEventKind::StateChanged, Some(alive_spawn), None);
+        needs.reason_code = Some("permission_prompt".to_owned());
+        needs.state_to = Some("needs_input".to_owned());
+        tracker.apply_event(&needs);
+        let transitions = tracker.sweep(
+            now + DEFAULT_STUCK_AFTER_MS * 10,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid == 11,
+        );
+        assert!(
+            transitions.is_empty(),
+            "needs_input must not be silence-swept: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_treats_recent_spawn_stdout_as_liveness_activity() {
+        let mut tracker = AgentStateTracker::default();
+        let dir = tempfile::TempDir::new().expect("temp");
+        let spawn = "agent-spawn-ut-active-stdout";
+        let session = "session-ut-active-stdout";
+        let base = unix_time_ns_now() / 1_000_000;
+        let old_event_ms = base.saturating_sub(DEFAULT_STUCK_AFTER_MS + 10_000);
+        let mut ready = event(AgentEventKind::SpawnReady, Some(spawn), Some(session));
+        set_event_time_ms(&mut ready, old_event_ms);
+        ready.payload = json!({
+            "agent_process_id": 77,
+            "log_dir": dir.path().display().to_string(),
+        });
+        tracker.apply_event(&ready);
+        fs::write(
+            dir.path().join("stdout.jsonl"),
+            b"{\"type\":\"codex.event_msg\",\"msg\":\"still reading files\"}\n",
+        )
+        .expect("write stdout");
+
+        let now = unix_time_ns_now() / 1_000_000;
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid == 77,
+        );
+        assert!(
+            transitions.is_empty(),
+            "fresh stdout must prevent false stuck: {transitions:?}"
+        );
+        let read = tracker
+            .read_for_session(session, now)
+            .expect("session read");
+        assert_eq!(read.state, AgentLifecycleState::Working);
+        assert!(
+            read.silent_ms < DEFAULT_STUCK_AFTER_MS,
+            "stdout mtime must refresh silence readback: {read:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_treats_spawn_requested_stdout_as_activity_before_ready() {
+        let mut tracker = AgentStateTracker::default();
+        let dir = tempfile::TempDir::new().expect("temp");
+        let spawn = "agent-spawn-ut-spawning-stdout";
+        let base = unix_time_ns_now() / 1_000_000;
+        let old_event_ms = base.saturating_sub(DEFAULT_STUCK_AFTER_MS + 10_000);
+        let mut requested = event(AgentEventKind::SpawnRequested, Some(spawn), None);
+        set_event_time_ms(&mut requested, old_event_ms);
+        requested.payload = json!({
+            "log_dir": dir.path().display().to_string(),
+        });
+        tracker.apply_event(&requested);
+        fs::write(
+            dir.path().join("stdout.jsonl"),
+            b"{\"type\":\"codex.event_msg\",\"msg\":\"provisioning output advanced\"}\n",
+        )
+        .expect("write stdout");
+
+        let now = unix_time_ns_now() / 1_000_000;
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("spawn_requested has no pid yet"),
+        );
+        assert!(
+            transitions.is_empty(),
+            "fresh stdout must prevent spawn_silent_timeout: {transitions:?}"
+        );
+        let read = tracker.unbound_reads(now).remove(0);
+        assert_eq!(read.state, AgentLifecycleState::Spawning);
+        assert!(
+            read.silent_ms < DEFAULT_STUCK_AFTER_MS,
+            "stdout mtime must refresh spawning silence readback: {read:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_resolves_non_runaway_stuck_when_spawn_stdout_advances() {
+        let mut tracker = AgentStateTracker::default();
+        let dir = tempfile::TempDir::new().expect("temp");
+        let spawn = "agent-spawn-ut-stuck-stdout-resume";
+        let session = "session-ut-stuck-stdout-resume";
+        let base = unix_time_ns_now() / 1_000_000;
+        let old_event_ms = base.saturating_sub(DEFAULT_STUCK_AFTER_MS + 10_000);
+        let mut ready = event(AgentEventKind::SpawnReady, Some(spawn), Some(session));
+        set_event_time_ms(&mut ready, old_event_ms);
+        ready.payload = json!({
+            "agent_process_id": 88,
+            "log_dir": dir.path().display().to_string(),
+        });
+        tracker.apply_event(&ready);
+
+        let first_sweep = old_event_ms + DEFAULT_STUCK_AFTER_MS + 1;
+        let transitions = tracker.sweep(
+            first_sweep,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid == 88,
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Stuck);
+        assert_eq!(transitions[0].reason_code, "silent_timeout");
+
+        fs::write(
+            dir.path().join("stdout.jsonl"),
+            b"{\"type\":\"codex.event_msg\",\"msg\":\"tool output advanced\"}\n",
+        )
+        .expect("write stdout");
+
+        let now = unix_time_ns_now() / 1_000_000;
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|pid| pid == 88,
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_from, AgentLifecycleState::Stuck);
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Working);
+        assert_eq!(transitions[0].reason_code, "artifact_activity_resumed");
+        assert_eq!(transitions[0].evidence["artifact_source"], "stdout_jsonl");
+    }
+
+    #[test]
+    fn sweep_without_pid_marks_unprobeable_stuck_and_idle_sessions_are_untouched() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-nopid";
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        // A plain interactive session sits idle and must never be swept.
+        let mut live = event(
+            AgentEventKind::StateChanged,
+            None,
+            Some("session-ut-interactive"),
+        );
+        live.reason_code = Some("session_initialized".to_owned());
+        live.state_to = Some("live".to_owned());
+        tracker.apply_event(&live);
+
+        let now = unix_time_ns_now() / 1_000_000 + DEFAULT_STUCK_AFTER_MS + 1;
+        let transitions = tracker.sweep(
+            now,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("no pid is known; the probe must not run"),
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].anchor, spawn);
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Stuck);
+        assert_eq!(transitions[0].reason_code, "spawn_silent_timeout");
+        assert_eq!(
+            tracker
+                .read_for_session("session-ut-interactive", now)
+                .expect("interactive session tracked")
+                .state,
+            AgentLifecycleState::Idle
+        );
+    }
+
+    #[test]
+    fn completed_spawn_dead_state_is_not_actionable_attention() {
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(AgentLifecycleState::Dead, Some("spawn_completed")),
+            AgentAttentionClass::None
+        );
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(
+                AgentLifecycleState::Dead,
+                Some("local_agent_completed")
+            ),
+            AgentAttentionClass::None
+        );
+        assert_eq!(
+            AgentAttentionClass::for_lifecycle(
+                AgentLifecycleState::Dead,
+                Some("spawned_agent_process_exited")
+            ),
+            AgentAttentionClass::TerminalRuntimeFailure
+        );
+    }
+
+    #[test]
+    fn unprobeable_silent_past_threshold_ends_and_revives_on_reregister() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-claude-ut-dormant";
+        // An observed/ambient session with no pid: registered, started a tool
+        // call, then the underlying Claude session was closed mid-tool — its
+        // last journaled event is `tool_call_started` (Working) and there is no
+        // pid to probe (this is exactly the live silent_timeout_unprobeable
+        // pile-up). Source of truth = the in-memory tracker state.
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        tracker.apply_event(&tool_call(spawn, "act_run_shell", "sha256:dormant"));
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Working
+        );
+
+        // Below the ended threshold it is merely Stuck/unprobeable (still
+        // visible), not reaped — no false-positive end-of-life.
+        let base = unix_time_ns_now() / 1_000_000;
+        let just_stuck = base + DEFAULT_STUCK_AFTER_MS + 1;
+        let transitions = tracker.sweep(
+            just_stuck,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Stuck);
+        assert_eq!(transitions[0].reason_code, "silent_timeout_unprobeable");
+
+        // Work-aware deadline: the last event is an in-flight `ToolCallStarted`,
+        // so at the *base* unprobeable deadline the mid-tool agent is NOT reaped
+        // — a long tool call is legitimately silent (#1594).
+        let base_deadline = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let deferred = tracker.sweep(
+            base_deadline,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert!(
+            deferred.is_empty(),
+            "in-flight tool call must defer the death verdict: {deferred:?}"
+        );
+        assert_eq!(
+            tracker.unbound_reads(base_deadline)[0].state,
+            AgentLifecycleState::Stuck,
+            "deferred agent stays visibly stuck, not dead"
+        );
+
+        // Past the *extended* in-flight deadline it finally transitions straight
+        // to Dead so it leaves the attention queue and is pruned after retention.
+        let ended =
+            base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT + 1;
+        let transitions = tracker.sweep(
+            ended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(transitions[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(transitions[0].evidence["in_flight_tool_call"], true);
+        assert!(
+            transitions[0].evidence["silent_ms"].as_u64().unwrap()
+                >= DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT
+        );
+
+        // Resurrection guard: the session resumes (appends again) and the
+        // ingester re-registers it. A fresh SpawnRequested must revive the same
+        // anchor rather than be ignored as a post-death straggler.
+        let revived = tracker
+            .apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None))
+            .expect("re-registration must revive a dormancy-reaped agent");
+        assert_eq!(revived.state_from, AgentLifecycleState::Dead);
+        assert_eq!(revived.state_to, AgentLifecycleState::Spawning);
+    }
+
+    /// #1594 core: a liveness-sweep death is an *inference*, and a subsequent
+    /// real agent-loop event proves it wrong. The agent must resurrect (not have
+    /// its 176 real events silently discarded). Source of truth = the tracker's
+    /// own read after the event is applied.
+    #[test]
+    fn live_evidence_resurrects_inferred_dead_ambient_agent() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-claude-ut-resurrect";
+        // An unprobeable ambient agent that idled between turns: last real event
+        // is a `TurnFinished` (Idle), no pid to probe.
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        tracker.apply_event(&tool_call(spawn, "act_run_shell", "sha256:work"));
+        tracker.apply_event(&event(AgentEventKind::TurnFinished, Some(spawn), None));
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Idle,
+            "idle-between-turns before the sweep"
+        );
+
+        // The sweep reaps it as inferred-dead after the idle deadline.
+        let base = unix_time_ns_now() / 1_000_000;
+        let ended = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let transitions = tracker.sweep(
+            ended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(transitions[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(
+            tracker.unbound_reads(ended)[0].state,
+            AgentLifecycleState::Dead,
+            "reaped by inference before resurrection"
+        );
+
+        // A post-death `ToolCallStarted` is proof the agent loop is running:
+        // resurrect to Working with an audited RESURRECTED transition instead of
+        // dropping it as a straggler.
+        let resurrect = tracker
+            .apply_event(&tool_call(spawn, "browser_nav", "sha256:alive-again"))
+            .expect("live evidence must resurrect an inferred-dead agent");
+        assert_eq!(resurrect.state_from, AgentLifecycleState::Dead);
+        assert_eq!(resurrect.state_to, AgentLifecycleState::Working);
+        assert_eq!(resurrect.reason_code, RESURRECTED_REASON);
+        assert_eq!(resurrect.evidence["resurrected"], true);
+        assert_eq!(
+            resurrect.evidence["prior_death_reason"],
+            "unprobeable_silent_ended"
+        );
+        assert_eq!(
+            resurrect.evidence["trigger_event_kind"],
+            "tool_call_started"
+        );
+
+        // Source-of-truth read: the agent is alive again, not dead.
+        let read = tracker.unbound_reads(ended)[0].clone();
+        assert_eq!(read.state, AgentLifecycleState::Working);
+        assert_eq!(read.reason_code.as_deref(), Some(RESURRECTED_REASON));
+        assert_eq!(read.attention_class, AgentAttentionClass::None);
+
+        // And it keeps making progress afterwards (a following turn goes idle).
+        let after = tracker
+            .apply_event(&event(AgentEventKind::TurnFinished, Some(spawn), None))
+            .expect("resurrected agent keeps transitioning");
+        assert_eq!(after.state_from, AgentLifecycleState::Working);
+        assert_eq!(after.state_to, AgentLifecycleState::Idle);
+    }
+
+    /// A CONFIRMED death (an explicit kill/exit) must never be resurrected by a
+    /// straggler event — and each discarded event must bump the visible
+    /// after-death drop counter (#1594 part 3).
+    #[test]
+    fn confirmed_dead_drops_straggler_events_and_counts_them() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-confirmed-dead";
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        let killed = tracker
+            .apply_event(&event(AgentEventKind::Killed, Some(spawn), None))
+            .expect("spawning→dead");
+        assert_eq!(killed.state_to, AgentLifecycleState::Dead);
+
+        let before = events_dropped_after_death_count();
+        // Even proof-of-life events are discarded for a confirmed-dead agent.
+        for digest in ["sha256:a", "sha256:b", "sha256:c"] {
+            assert!(
+                tracker
+                    .apply_event(&tool_call(spawn, "Bash", digest))
+                    .is_none(),
+                "straggler must not resurrect a confirmed-dead agent"
+            );
+        }
+        assert!(
+            tracker
+                .apply_event(&event(AgentEventKind::TurnStarted, Some(spawn), None))
+                .is_none(),
+            "TurnStarted straggler must not resurrect a confirmed-dead agent"
+        );
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Dead,
+            "confirmed-dead agent stays dead"
+        );
+        // Four proof-of-life stragglers were dropped; the counter reflects it.
+        assert!(
+            events_dropped_after_death_count() >= before + 4,
+            "after-death drop counter must advance by the dropped-event count"
+        );
+    }
+
+    /// Boundary/edge coverage for the work-aware in-flight deadline: at exactly
+    /// the base deadline an in-flight tool call is deferred, and an agent whose
+    /// last event is NOT an in-flight tool call is reaped at the base deadline.
+    #[test]
+    fn work_aware_deadline_defers_only_in_flight_tool_calls() {
+        let mut tracker = AgentStateTracker::default();
+        let in_flight = "agent-spawn-ut-inflight";
+        let idle = "agent-spawn-ut-idle";
+        let base = unix_time_ns_now() / 1_000_000;
+
+        // in-flight: last event is a ToolCallStarted (Working).
+        let mut req_a = event(AgentEventKind::SpawnRequested, Some(in_flight), None);
+        set_event_time_ms(&mut req_a, base);
+        tracker.apply_event(&req_a);
+        let mut call = tool_call(in_flight, "act_run_shell", "sha256:long");
+        set_event_time_ms(&mut call, base);
+        tracker.apply_event(&call);
+
+        // idle: last event is a TurnFinished (Idle), not in-flight.
+        let mut req_b = event(AgentEventKind::SpawnRequested, Some(idle), None);
+        set_event_time_ms(&mut req_b, base);
+        tracker.apply_event(&req_b);
+        let mut finished = event(AgentEventKind::TurnFinished, Some(idle), None);
+        set_event_time_ms(&mut finished, base);
+        tracker.apply_event(&finished);
+
+        // At the base deadline: the idle agent is reaped Dead, but the in-flight
+        // agent's death is deferred — it only becomes visibly Stuck
+        // (silent_timeout_unprobeable), never Dead.
+        let at_base = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS;
+        let transitions = tracker.sweep(
+            at_base,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let idle_transition = transitions
+            .iter()
+            .find(|transition| transition.anchor == idle)
+            .expect("idle agent transition");
+        assert_eq!(idle_transition.state_to, AgentLifecycleState::Dead);
+        assert_eq!(idle_transition.reason_code, "unprobeable_silent_ended");
+        assert_eq!(idle_transition.evidence["in_flight_tool_call"], false);
+
+        // No transition may reap the in-flight agent to Dead at the base deadline.
+        assert!(
+            !transitions
+                .iter()
+                .any(|transition| transition.anchor == in_flight
+                    && transition.state_to == AgentLifecycleState::Dead),
+            "in-flight tool call must not be reaped at the base deadline: {transitions:?}"
+        );
+        let in_flight_read = tracker
+            .unbound_reads(at_base)
+            .into_iter()
+            .find(|read| read.anchor == in_flight)
+            .expect("in-flight agent tracked");
+        assert_ne!(
+            in_flight_read.state,
+            AgentLifecycleState::Dead,
+            "deferred in-flight agent stays alive/visible, not dead"
+        );
+
+        // Past the extended in-flight deadline it is finally reaped Dead.
+        let past_extended =
+            base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT + 1;
+        let extended = tracker.sweep(
+            past_extended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let in_flight_death = extended
+            .iter()
+            .find(|transition| transition.anchor == in_flight)
+            .expect("in-flight agent reaped past extended deadline");
+        assert_eq!(in_flight_death.state_to, AgentLifecycleState::Dead);
+        assert_eq!(in_flight_death.evidence["in_flight_tool_call"], true);
+    }
+
+    /// Edge (#1594): resurrection is not tool-call-specific. A `TurnFinished`
+    /// (not just `ToolCallStarted`) is also proof of life and must overturn an
+    /// inferred death — landing in `Idle`, since a finished turn maps to `Idle`.
+    #[test]
+    fn turn_finished_only_resurrects_inferred_dead_to_idle() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-ut-turnfinished-revive";
+        let base = 1_000_000u64;
+
+        let mut req = event(AgentEventKind::SpawnRequested, Some(spawn), None);
+        set_event_time_ms(&mut req, base);
+        tracker.apply_event(&req);
+        // Last event is a `TurnStarted` (Working) — NOT an in-flight tool call,
+        // so it reaps at the base deadline, not the extended one.
+        let mut started = event(AgentEventKind::TurnStarted, Some(spawn), None);
+        set_event_time_ms(&mut started, base);
+        tracker.apply_event(&started);
+
+        let ended = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let reaped = tracker.sweep(
+            ended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(reaped[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(reaped[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(reaped[0].evidence["in_flight_tool_call"], false);
+
+        // A bare `TurnFinished` overturns the inferred death → Idle.
+        let mut finished = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut finished, ended);
+        let resurrect = tracker
+            .apply_event(&finished)
+            .expect("TurnFinished must resurrect an inferred-dead agent");
+        assert_eq!(resurrect.state_from, AgentLifecycleState::Dead);
+        assert_eq!(resurrect.state_to, AgentLifecycleState::Idle);
+        assert_eq!(resurrect.reason_code, RESURRECTED_REASON);
+        assert_eq!(resurrect.evidence["resurrected"], true);
+        assert_eq!(resurrect.evidence["trigger_event_kind"], "turn_finished");
+        assert_eq!(
+            tracker.unbound_reads(ended)[0].state,
+            AgentLifecycleState::Idle,
+            "source-of-truth read: alive (idle) again, not dead"
+        );
+    }
+
+    /// Edge (#1594): resurrection is repeatable, not a one-shot. An ambient
+    /// agent that is reaped, resurrected, idles, is reaped AGAIN by a later
+    /// sweep, and produces fresh evidence must resurrect a second time.
+    #[test]
+    fn resurrection_survives_repeated_sweep_death_cycles() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-ut-multi-sweep";
+        let t0 = 1_000_000u64;
+
+        let mut req = event(AgentEventKind::SpawnRequested, Some(spawn), None);
+        set_event_time_ms(&mut req, t0);
+        tracker.apply_event(&req);
+        let mut fin0 = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut fin0, t0);
+        tracker.apply_event(&fin0);
+
+        // Sweep #1 → inferred-dead.
+        let sweep1 = t0 + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let dead1 = tracker.sweep(
+            sweep1,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(dead1[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(dead1[0].reason_code, "unprobeable_silent_ended");
+
+        // Resurrection #1 via ToolCallStarted → Working.
+        let mut call = tool_call(spawn, "act_run_shell", "sha256:cycle-1");
+        set_event_time_ms(&mut call, sweep1);
+        let r1 = tracker
+            .apply_event(&call)
+            .expect("first resurrection on live evidence");
+        assert_eq!(r1.state_from, AgentLifecycleState::Dead);
+        assert_eq!(r1.state_to, AgentLifecycleState::Working);
+        assert_eq!(r1.reason_code, RESURRECTED_REASON);
+
+        // It idles again.
+        let mut fin1 = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut fin1, sweep1);
+        tracker.apply_event(&fin1);
+
+        // Sweep #2 (later) reaps it inferred-dead a SECOND time.
+        let sweep2 = sweep1 + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let dead2 = tracker.sweep(
+            sweep2,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let dead2_t = dead2
+            .iter()
+            .find(|transition| transition.anchor == spawn)
+            .expect("second inferred death");
+        assert_eq!(dead2_t.state_to, AgentLifecycleState::Dead);
+        assert_eq!(dead2_t.reason_code, "unprobeable_silent_ended");
+
+        // Resurrection #2 via TurnStarted → Working: not a one-shot.
+        let mut started = event(AgentEventKind::TurnStarted, Some(spawn), None);
+        set_event_time_ms(&mut started, sweep2);
+        let r2 = tracker
+            .apply_event(&started)
+            .expect("second resurrection after a second sweep");
+        assert_eq!(r2.state_from, AgentLifecycleState::Dead);
+        assert_eq!(r2.state_to, AgentLifecycleState::Working);
+        assert_eq!(r2.reason_code, RESURRECTED_REASON);
+        assert_eq!(
+            tracker.unbound_reads(sweep2)[0].state,
+            AgentLifecycleState::Working,
+            "alive again after the second resurrection"
+        );
+    }
+
+    /// Physical-row integration: events written through the journal choke
+    /// point land state rows in CF_AGENT_EVENTS (real DB, no mocks).
+    #[test]
+    fn choke_point_writes_physical_state_changed_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(&temp.path().join("db"), synapse_core::SCHEMA_VERSION)
+            .expect("temp DB must open");
+        let spawn = format!("agent-spawn-it-chokepoint-{}", std::process::id());
+
+        let requested = event(AgentEventKind::SpawnRequested, Some(&spawn), None);
+        super::super::agent_events::record_agent_event(&db, &requested).expect("first write");
+        let mut ready = event(
+            AgentEventKind::SpawnReady,
+            Some(&spawn),
+            Some("session-it-choke"),
+        );
+        ready.state_to = Some("live".to_owned());
+        super::super::agent_events::record_agent_event(&db, &ready).expect("second write");
+        db.flush().expect("flush");
+
+        let rows = db.scan_cf(cf::CF_AGENT_EVENTS).expect("scan");
+        let state_rows: Vec<AgentEventRecord> = rows
+            .iter()
+            .map(|(_key, value)| decode_json::<AgentEventRecord>(value).expect("rows decode"))
+            .filter(|record| {
+                is_state_machine_row(record) && record.spawn_id.as_deref() == Some(spawn.as_str())
+            })
+            .collect();
+        assert_eq!(
+            state_rows.len(),
+            1,
+            "exactly the spawning→working transition must be journaled: {state_rows:?}"
+        );
+        assert_eq!(state_rows[0].state_from.as_deref(), Some("spawning"));
+        assert_eq!(state_rows[0].state_to.as_deref(), Some("working"));
+        assert_eq!(state_rows[0].reason_code.as_deref(), Some("spawn_ready"));
+    }
+
+    /// Rebuild reconstructs states from physical journal rows, including
+    /// machine-emitted authoritative rows.
+    #[test]
+    fn rebuild_restores_states_from_journal_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(&temp.path().join("db"), synapse_core::SCHEMA_VERSION)
+            .expect("temp DB must open");
+        let spawn = format!("agent-spawn-it-rebuild-{}", std::process::id());
+        let session = format!("session-it-rebuild-{}", std::process::id());
+
+        super::super::agent_events::record_agent_event(
+            &db,
+            &event(AgentEventKind::SpawnRequested, Some(&spawn), None),
+        )
+        .expect("spawn_requested");
+        super::super::agent_events::record_agent_event(
+            &db,
+            &event(AgentEventKind::SpawnReady, Some(&spawn), Some(&session)),
+        )
+        .expect("spawn_ready");
+        db.flush().expect("flush");
+
+        let mut rebuilt = AgentStateTracker::default();
+        let now_ns = unix_time_ns_now();
+        let (rows, _more) = db
+            .scan_cf_from(
+                cf::CF_AGENT_EVENTS,
+                &agent_event_scan_start(now_ns.saturating_sub(REBUILD_LOOKBACK_NS)),
+                REBUILD_PAGE_ROWS,
+            )
+            .expect("scan");
+        for (_key, value) in &rows {
+            let record = decode_json::<AgentEventRecord>(value).expect("row decodes");
+            if record.spawn_id.as_deref() != Some(spawn.as_str())
+                && record.session_id.as_deref() != Some(session.as_str())
+            {
+                continue;
+            }
+            if is_state_machine_row(&record) {
+                rebuilt.apply_authoritative(&record);
+            } else {
+                let _quiet = rebuilt.apply_event(&record);
+            }
+        }
+        let read = rebuilt
+            .read_for_session(&session, 0)
+            .expect("rebuilt tracker must resolve the session");
+        assert_eq!(read.state, AgentLifecycleState::Working);
+        assert_eq!(read.spawn_id.as_deref(), Some(spawn.as_str()));
+    }
 }

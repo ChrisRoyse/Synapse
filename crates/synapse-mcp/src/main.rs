@@ -52,165 +52,8 @@
         clippy::unwrap_used
     )
 )]
-/// Process-wide allocator for every `synapse-mcp` binary.
-///
-/// # Why this is not a style preference
-///
-/// The daemon ran on the Windows NT Heap (Rust's default `System` allocator),
-/// which commits segments and effectively never decommits them. Under this
-/// daemon's allocation pattern — full-CF scans producing hundreds of thousands
-/// of individual `Vec<u8>` row payloads per call, repeatedly — the heap's
-/// high-water mark ratchets up and never comes back down.
-///
-/// Measured on two independent long-lived daemons via a `VirtualQueryEx` walk of
-/// the committed address space:
-///
-/// | daemon | PRIVATE regions | 64 KB-1 MB band | commit / working set |
-/// |---|---:|---:|---:|
-/// | pid 66956 (#2115) | 264,537 | 120,703 regions / 21.42 GB | 25.8 GB / 4.7 GB |
-/// | pid 29756 (#2141) | 254,579 | 110,508 regions / 16.60 GB | 20.8 GB / 9.8 GB |
-///
-/// In both cases ~81% of private commit sits in the 64 KB-1 MB band, spread over
-/// six figures of regions. That distribution is a fragmented heap, not a live
-/// collection: the working set collapsing to a fraction of commit proves the
-/// *live* set is far smaller than what the process holds from the OS.
-///
-/// mimalloc targets exactly this shape. Its free-list sharding keeps same-size
-/// blocks together in 64 KB pages, and its eager page purging returns an emptied
-/// page to the OS with `MEM_DECOMMIT` on Windows (`MIMALLOC_PURGE_DELAY`,
-/// default 1000 ms) rather than holding the commit forever.
-///
-/// # Why the daemon overrides the default purge delay
-///
-/// The installed #2243 workload is an always-on background daemon whose
-/// short-lived rebuild workers release hundreds of thousands of decoded rows at
-/// explicit phase boundaries. Leaving the 1000 ms default in place let abandoned
-/// worker arenas remain charged long enough to overlap the next lane. Startup
-/// therefore applies and reads back `purge_decommits=1`, `purge_delay=0`, and
-/// `arena_purge_mult=1`: an empty page is decommitted at the ownership boundary,
-/// while the exclusive whole-corpus maintenance lane prevents repeated
-/// purge/reallocate churn from concurrent bulk passes. These are allocator
-/// retention semantics, not an allocation or process-memory cap.
-///
-/// # Blast radius
-///
-/// This replaces the allocator for the whole process, including CPU-only ORT
-/// host allocations made through `synapse-models`. Device execution providers
-/// are excluded by the daemon's compile-time zero-VRAM guard below.
-///
-/// Tracked by #2115 (the histogram and the double-materializing scan that feeds
-/// it) and #2141 (which gated this change on exactly the histogram evidence
-/// tabulated above, rather than on the plausibility of the story).
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-// The binary feature surface is closed, but Cargo also permits a caller to
-// inject a dependency feature with `dependency/feature` syntax. Make every
-// accelerator/heavy model-runtime path a compile-time error too.
-const _: () = assert!(
-    !synapse_calyx::SYNAPSE_CALYX_CUDA_COMPILED
-        && !synapse_models::CUDA_EXECUTION_PROVIDER_COMPILED
-        && !synapse_audio::CUDA_EXECUTION_PROVIDER_COMPILED
-        && !calyx_registry::EMBEDDING_RUNTIMES_COMPILED
-        && !calyx_registry::CANDLE_CUDA_COMPILED
-        && !calyx_ward::MODEL_LENSES_COMPILED
-        && !calyx_sextant::CUVS_COMPILED
-        && !calyx_sextant::CUDA_PQ_COMPILED,
-    "SYNAPSE_ZERO_VRAM_COMPILE_GUARD: synapse-mcp cannot contain Calyx CUDA, model CUDA, registry embedding runtimes, Ward model lenses, cuVS, or CUDA PQ"
-);
-
-unsafe extern "C" {
-    // Present in the mimalloc v3 library linked by `libmimalloc-sys`. The sys
-    // crate has not exposed this v3 entry point yet, so keep the declaration
-    // beside the process-global allocator that owns its use.
-    fn mi_thread_set_in_threadpool();
-}
-
-fn mark_mimalloc_threadpool_worker() {
-    // SAFETY: this is called by the worker itself at thread start, exactly as
-    // mimalloc requires. It has no arguments and mutates only that thread's
-    // allocator-local state.
-    unsafe { mi_thread_set_in_threadpool() };
-}
-
-// mimalloc v3 option indexes from the exact vendored v3 `mimalloc.h` linked by
-// libmimalloc-sys 0.1.49. The sys crate intentionally omits unstable option
-// constants, so startup version-gates these indexes and fails closed if a
-// future allocator changes the ABI instead of silently applying the wrong
-// policy.
-// The linked v3.3.2 reports 30302: major * 10_000 + minor * 100 + patch.
-const MIMALLOC_V3_MIN_VERSION: i32 = 30_000;
-const MIMALLOC_V4_MIN_VERSION: i32 = 40_000;
-const MI_OPTION_PURGE_DECOMMITS_V3: libmimalloc_sys::mi_option_t = 5;
-const MI_OPTION_PURGE_DELAY_V3: libmimalloc_sys::mi_option_t = 15;
-const MI_OPTION_ARENA_PURGE_MULT_V3: libmimalloc_sys::mi_option_t = 24;
-
-#[derive(Clone, Copy)]
-struct MimallocBackgroundPolicy {
-    version: i32,
-    purge_decommits: i32,
-    purge_delay_ms: i32,
-    arena_purge_mult: i32,
-}
-
-fn configure_mimalloc_for_background_daemon() -> anyhow::Result<MimallocBackgroundPolicy> {
-    // SAFETY: this runs as the first statement in `main`, before runtime or
-    // worker creation. mimalloc documents option mutation as non-thread-safe;
-    // no other application thread can allocate concurrently at this point.
-    let version = unsafe { libmimalloc_sys::mi_version() };
-    anyhow::ensure!(
-        (MIMALLOC_V3_MIN_VERSION..MIMALLOC_V4_MIN_VERSION).contains(&version),
-        "SYNAPSE_MIMALLOC_VERSION_UNSUPPORTED: linked mimalloc version {version} is outside the verified v3 option ABI; update the startup option indexes from the linked mimalloc.h before running the daemon"
-    );
-    // Immediate purge plus Windows decommit returns every newly empty page to
-    // physical-memory accounting at its real ownership boundary. An arena
-    // multiplier of one prevents abandoned short-lived worker arenas from
-    // extending that delay again. This changes retention policy, never
-    // admission or allocation limits.
-    unsafe {
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS_V3, 1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY_V3, 0);
-        libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_PURGE_MULT_V3, 1);
-    }
-    let observed = unsafe {
-        (
-            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DECOMMITS_V3),
-            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY_V3),
-            libmimalloc_sys::mi_option_get(MI_OPTION_ARENA_PURGE_MULT_V3),
-        )
-    };
-    anyhow::ensure!(
-        observed == (1, 0, 1),
-        "SYNAPSE_MIMALLOC_BACKGROUND_POLICY_REJECTED: requested purge_decommits=1 purge_delay_ms=0 arena_purge_mult=1, read back purge_decommits={} purge_delay_ms={} arena_purge_mult={}; inspect allocator startup configuration before retrying",
-        observed.0,
-        observed.1,
-        observed.2
-    );
-    Ok(MimallocBackgroundPolicy {
-        version,
-        purge_decommits: observed.0,
-        purge_delay_ms: observed.1,
-        arena_purge_mult: observed.2,
-    })
-}
-
-fn reclaim_mimalloc_transient_pages() {
-    // SAFETY: `GLOBAL_ALLOCATOR` makes mimalloc the process allocator before
-    // `main` begins. `mi_collect(true)` takes no pointer; it eagerly collects
-    // abandoned pages and returns unused pages to the OS. The Calyx hook calls
-    // it only at bounded streaming boundaries.
-    unsafe { libmimalloc_sys::mi_collect(true) };
-}
-
 mod approval_protocol;
-// Preserve the daemon's domain name while compiling the high-cohesion bridge
-// once as an independently schedulable workspace crate (#2216).
-use synapse_chrome_bridge as chrome_debugger_bridge;
-mod bearer_token {
-    pub(crate) use synapse_chrome_bridge::bearer_token::{
-        TokenSource, load_token, load_token_value,
-    };
-}
+mod chrome_debugger_bridge;
 mod connect;
 mod daemon_lifecycle;
 mod desktop_worker;
@@ -222,20 +65,15 @@ mod m1;
 mod m2;
 mod m3;
 mod m4;
-// #2090: OS-initiated shutdown (console close, logoff, restart) is a
-// Windows-only contract. The POSIX daemon's signal path already runs the full
-// drain with no OS deadline, so there is nothing to gate in on other hosts.
-#[cfg(windows)]
-mod os_shutdown;
-mod process_qos;
-mod process_topology;
 mod safety;
 mod secret_crypto;
 mod server;
 mod single_instance;
 mod stdio_eof;
+#[cfg(test)]
+mod test_support;
 
-use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Duration};
+use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::Context;
 use clap::{ArgAction, Parser, ValueEnum};
@@ -255,90 +93,7 @@ use crate::{
 
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
-const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
-const TOKIO_MAX_BLOCKING_THREADS_ENV: &str = "SYNAPSE_TOKIO_MAX_BLOCKING_THREADS";
-const RAYON_WORKER_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 const STDIO_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_TOKIO_WORKER_THREADS: usize = 4;
-const MAX_TOKIO_BLOCKING_THREADS: usize = 8;
-const MAX_RAYON_WORKER_THREADS: usize = 4;
-const MAX_CONFIGURED_RUNTIME_THREADS: usize = 1024;
-
-#[derive(Clone, Copy, Debug)]
-struct RuntimePoolConfig {
-    logical_cpus: usize,
-    tokio_worker_threads: usize,
-    tokio_worker_threads_source: &'static str,
-    tokio_max_blocking_threads: usize,
-    tokio_max_blocking_threads_source: &'static str,
-    rayon_worker_threads: usize,
-    rayon_worker_threads_source: &'static str,
-}
-
-fn runtime_pool_config() -> anyhow::Result<RuntimePoolConfig> {
-    let logical_cpus = std::thread::available_parallelism()
-        .context("read host parallelism for bounded daemon worker pools")?
-        .get();
-    let (tokio_worker_threads, tokio_worker_threads_source) = configured_pool_threads(
-        TOKIO_WORKER_THREADS_ENV,
-        logical_cpus.min(MAX_TOKIO_WORKER_THREADS),
-    )?;
-    let (tokio_max_blocking_threads, tokio_max_blocking_threads_source) =
-        configured_pool_threads(TOKIO_MAX_BLOCKING_THREADS_ENV, MAX_TOKIO_BLOCKING_THREADS)?;
-    let (rayon_worker_threads, rayon_worker_threads_source) = configured_pool_threads(
-        RAYON_WORKER_THREADS_ENV,
-        logical_cpus.min(MAX_RAYON_WORKER_THREADS),
-    )?;
-    Ok(RuntimePoolConfig {
-        logical_cpus,
-        tokio_worker_threads,
-        tokio_worker_threads_source,
-        tokio_max_blocking_threads,
-        tokio_max_blocking_threads_source,
-        rayon_worker_threads,
-        rayon_worker_threads_source,
-    })
-}
-
-fn configured_pool_threads(name: &str, default: usize) -> anyhow::Result<(usize, &'static str)> {
-    let raw = match std::env::var(name) {
-        Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => return Ok((default, "bounded_default")),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("{name} must be valid UTF-8 when set")
-        }
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{name} must not be empty when set");
-    }
-    let configured = trimmed
-        .parse::<usize>()
-        .with_context(|| format!("{name} must be a positive integer, got {raw:?}"))?;
-    if configured == 0 {
-        anyhow::bail!("{name} must be >= 1 when set");
-    }
-    if configured > MAX_CONFIGURED_RUNTIME_THREADS {
-        anyhow::bail!(
-            "{name} must be <= {MAX_CONFIGURED_RUNTIME_THREADS} when set, got {configured}"
-        );
-    }
-    Ok((configured, "environment"))
-}
-
-fn initialize_rayon_pool(config: RuntimePoolConfig) -> anyhow::Result<()> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(config.rayon_worker_threads)
-        .thread_name(|index| format!("synapse-rayon-{index}"))
-        .start_handler(|_| mark_mimalloc_threadpool_worker())
-        .build_global()
-        .with_context(|| {
-            format!(
-                "initialize bounded global Rayon pool with {} workers",
-                config.rayon_worker_threads
-            )
-        })
-}
 
 type StdioServiceTask =
     ShutdownTaskOwner<Result<rmcp::service::QuitReason, tokio::task::JoinError>>;
@@ -355,32 +110,10 @@ enum Mode {
     ApprovalProtocol,
     /// Internal child process bound to a hidden desktop for UIA/PrintWindow work.
     DesktopWorker,
-    /// Internal kill-contained ORT/DirectML inference child.
-    DetectionWorker,
     /// Enumerate/classify synapse-mcp processes; with --kill-stray, clean them.
     Doctor,
     /// Run a registry-backed local model as a Synapse MCP client/agent.
     LocalAgent,
-}
-
-enum CliTransportPreflight {
-    NonHttp,
-    Http(SocketAddr),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum SstWriteVersion {
-    V2,
-    V3,
-}
-
-impl SstWriteVersion {
-    const fn number(self) -> u32 {
-        match self {
-            Self::V2 => 2,
-            Self::V3 => 3,
-        }
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -394,22 +127,10 @@ struct Cli {
     mode: Mode,
     #[arg(long, default_value = "127.0.0.1:7700", env = "SYNAPSE_BIND")]
     bind: String,
-    /// Exact lifecycle-owner PID for an HTTP daemon. When set, parent exit is a
-    /// first-class graceful shutdown source; PID reuse is rejected by the
-    /// retained process handle and creation-time identity.
-    #[arg(long, env = "SYNAPSE_PARENT_PID")]
-    parent_pid: Option<u32>,
     #[arg(long, env = "SYNAPSE_ALLOW_NON_LOOPBACK")]
     allow_non_loopback: bool,
     #[arg(long, env = "SYNAPSE_DB")]
     db: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SYNAPSE_STORAGE_BACKEND",
-        default_value = "calyx",
-        value_name = "calyx"
-    )]
-    storage_backend: String,
     #[arg(long, env = "SYNAPSE_PROFILE_DIR")]
     profile_dir: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOG_LEVEL", default_value = "info")]
@@ -438,54 +159,6 @@ struct Cli {
         value_name = "BYTES"
     )]
     storage_pressure_free_bytes_sample: Option<u64>,
-    #[arg(
-        long,
-        env = "SYNAPSE_CALYX_VAULT",
-        default_value_t = true,
-        action = ArgAction::Set
-    )]
-    calyx_vault: bool,
-    #[arg(long, env = "SYNAPSE_CALYX_VAULT_DIR", value_name = "PATH")]
-    calyx_vault_dir: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SYNAPSE_CALYX_CONFIG",
-        value_name = "PATH",
-        requires = "calyx_config_sha256"
-    )]
-    calyx_config: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SYNAPSE_CALYX_CONFIG_SHA256",
-        value_name = "SHA256",
-        requires = "calyx_config"
-    )]
-    calyx_config_sha256: Option<String>,
-    /// SST format emitted by this process. Setup pins pre-commit upgrade
-    /// rehearsals to v2 so a v2-only predecessor remains a valid rollback;
-    /// committed generations use the compressed v3 default.
-    #[arg(
-        long,
-        env = "SYNAPSE_CALYX_SST_WRITE_VERSION",
-        value_enum,
-        default_value_t = SstWriteVersion::V3
-    )]
-    calyx_sst_write_version: SstWriteVersion,
-    /// Offline, atomic rollback repair for a vault touched by a pre-commit v3
-    /// candidate. Rewrites only v3 SSTs to v2, verifies every row, prints one
-    /// JSON receipt, and exits without starting any transport or subsystem.
-    #[arg(long, requires = "db", conflicts_with = "parent_pid")]
-    calyx_downgrade_sst_v2_and_exit: bool,
-    /// Offline, authenticated restoration of the unique historical Anneal
-    /// tuning pointer needed by a rollback predecessor.
-    #[arg(long, requires = "db", conflicts_with = "parent_pid")]
-    calyx_restore_legacy_anneal_pointer_and_exit: bool,
-    /// Print the exact immutable public MCP tool-surface fingerprint and exit.
-    /// This path constructs schemas only: it opens no DB, listener, model, or
-    /// capture subsystem. Setup uses it to seal a candidate's own surface into
-    /// the adoption journal before the incumbent authority is mutated.
-    #[arg(long, conflicts_with_all = ["parent_pid", "calyx_downgrade_sst_v2_and_exit", "calyx_restore_legacy_anneal_pointer_and_exit"])]
-    print_tool_surface_receipt_and_exit: bool,
     #[arg(
         long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
@@ -538,12 +211,6 @@ struct Cli {
     desktop_worker_json: Option<PathBuf>,
     #[arg(long, hide = true)]
     desktop_worker_bgra: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    desktop_worker_request: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    detection_worker_request: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    detection_worker_response: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MODEL", value_name = "NAME")]
     local_agent_model: Option<String>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_TASK", value_name = "TEXT")]
@@ -602,19 +269,9 @@ impl Cli {
         m2::M2ServiceConfig::from_env()
     }
 
-    fn m3_config(&self) -> anyhow::Result<m3::M3ServiceConfig> {
-        let storage_backend = synapse_storage::StorageBackendKind::parse_config(
-            &self.storage_backend,
-        )
-        .with_context(|| {
-            format!(
-                "parse --storage-backend/SYNAPSE_STORAGE_BACKEND value {:?}",
-                self.storage_backend
-            )
-        })?;
-        let mut config = m3::M3ServiceConfig::from_cli_parts(
+    fn m3_config(&self) -> m3::M3ServiceConfig {
+        m3::M3ServiceConfig::from_cli_parts(
             self.db.clone(),
-            storage_backend,
             self.profile_dir.clone(),
             self.reflex_disabled,
             self.bind.clone(),
@@ -624,12 +281,7 @@ impl Cli {
             self.allowed_permissions.clone(),
             self.reflex_force_degraded,
             self.storage_pressure_free_bytes_sample,
-        );
-        config.calyx_vault = self.calyx_vault;
-        config.calyx_vault_dir = self.calyx_vault_dir.clone();
-        config.calyx_config_path = self.calyx_config.clone();
-        config.calyx_config_sha256 = self.calyx_config_sha256.clone();
-        Ok(config)
+        )
     }
 
     fn m4_config(&self) -> anyhow::Result<m4::M4ServiceConfig> {
@@ -652,42 +304,7 @@ fn parse_env_list(name: &str) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
-    let mimalloc_policy = match configure_mimalloc_for_background_daemon() {
-        Ok(policy) => policy,
-        Err(error) => return top_level_error_exit(error),
-    };
-    if let Err(error) = synapse_capture::capture_backend_preference_from_environment() {
-        return top_level_error_exit(anyhow::anyhow!(error.to_string()));
-    }
-    if let Err((code, detail)) = m1::validate_detection_backend_policy() {
-        return top_level_error_exit(anyhow::anyhow!("{code}: {detail}"));
-    }
-    if let Err(error) = synapse_audio::stt_backend_policy() {
-        return top_level_error_exit(anyhow::anyhow!(error.to_string()));
-    }
-    if let Some(result) = m1::run_detection_worker_from_process_args() {
-        return match result {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("synapse-mcp detection worker error: {error:#}");
-                ExitCode::from(1)
-            }
-        };
-    }
-    if let Err(error) =
-        synapse_calyx::install_process_memory_reclaimer(reclaim_mimalloc_transient_pages)
-    {
-        return top_level_error_exit(anyhow::Error::new(error));
-    }
-    let runtime_pools = match runtime_pool_config() {
-        Ok(config) => config,
-        Err(error) => return top_level_error_exit(error),
-    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(runtime_pools.tokio_worker_threads)
-        .max_blocking_threads(runtime_pools.tokio_max_blocking_threads)
-        .thread_name("synapse-tokio")
-        .on_thread_start(mark_mimalloc_threadpool_worker)
         .enable_all()
         .build()
     {
@@ -696,7 +313,7 @@ fn main() -> ExitCode {
             return top_level_error_exit(anyhow::anyhow!("initialize tokio runtime: {error:#}"));
         }
     };
-    let result = runtime.block_on(run(runtime_pools, mimalloc_policy));
+    let result = runtime.block_on(run());
     runtime.shutdown_timeout(Duration::from_secs(5));
     match result {
         Ok(code) => code,
@@ -705,23 +322,14 @@ fn main() -> ExitCode {
 }
 
 fn top_level_error_exit(err: anyhow::Error) -> ExitCode {
-    match daemon_lifecycle::record_top_level_error(&format!("{err:#}")) {
-        Ok(
-            daemon_lifecycle::TopLevelErrorRecordOutcome::Recorded
-            | daemon_lifecycle::TopLevelErrorRecordOutcome::NotConfigured,
-        ) => {}
-        Err(lifecycle_error) => {
-            eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
-        }
+    if let Err(lifecycle_error) = daemon_lifecycle::record_top_level_error(&format!("{err:#}")) {
+        eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
     }
     eprintln!("synapse-mcp error: {err:#}");
     ExitCode::from(1)
 }
 
-async fn run(
-    runtime_pools: RuntimePoolConfig,
-    mimalloc_policy: MimallocBackgroundPolicy,
-) -> anyhow::Result<ExitCode> {
+async fn run() -> anyhow::Result<ExitCode> {
     if let Some(invocation) =
         chrome_debugger_bridge::native_host_invocation_from_args(std::env::args_os().skip(1))
     {
@@ -735,107 +343,8 @@ async fn run(
     }
 
     let cli = Cli::parse();
-    if cli.print_tool_surface_receipt_and_exit {
-        println!("{}", server::offline_tool_surface_receipt()?);
-        return Ok(ExitCode::SUCCESS);
-    }
-    synapse_calyx::configure_sst_write_version(cli.calyx_sst_write_version.number())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    synapse_calyx::configure_anneal_legacy_pointer_preservation(
-        cli.calyx_sst_write_version == SstWriteVersion::V2,
-    )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    if cli.calyx_downgrade_sst_v2_and_exit {
-        if cli.calyx_sst_write_version != SstWriteVersion::V2 {
-            anyhow::bail!(
-                "SYNAPSE_CALYX_SST_DOWNGRADE_WRITE_VERSION_INVALID: --calyx-downgrade-sst-v2-and-exit requires --calyx-sst-write-version v2"
-            );
-        }
-        let db = cli
-            .db
-            .as_deref()
-            .context("--db is required for --calyx-downgrade-sst-v2-and-exit")?;
-        let (rewritten_files, input_bytes, output_bytes) =
-            synapse_calyx::downgrade_v3_ssts_to_v2(db)?;
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "synapse_calyx_sst_downgrade_receipt/v1",
-                "db": db,
-                "from_version": 3,
-                "to_version": 2,
-                "rewritten_files": rewritten_files,
-                "input_bytes": input_bytes,
-                "output_bytes": output_bytes,
-            })
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    if cli.calyx_restore_legacy_anneal_pointer_and_exit {
-        if cli.calyx_sst_write_version != SstWriteVersion::V2 {
-            anyhow::bail!(
-                "SYNAPSE_CALYX_ANNEAL_RESTORE_WRITE_VERSION_INVALID: --calyx-restore-legacy-anneal-pointer-and-exit requires --calyx-sst-write-version v2"
-            );
-        }
-        let db = cli
-            .db
-            .as_deref()
-            .context("--db is required for --calyx-restore-legacy-anneal-pointer-and-exit")?;
-        let vault = synapse_calyx::SynapseCalyxVault::open_latest_readback(
-            synapse_calyx::SynapseCalyxConfig::from_vault_dir(db.to_path_buf()),
-        )?;
-        let (from_hash, to_hash, artifact_bytes) =
-            vault.restore_legacy_anneal_pointer_for_rollback()?;
-        let encode_hash = |hash: [u8; 32]| {
-            use std::fmt::Write as _;
-            hash.iter()
-                .fold(String::with_capacity(64), |mut out, byte| {
-                    let _ = write!(out, "{byte:02x}");
-                    out
-                })
-        };
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "synapse_calyx_anneal_legacy_pointer_restore_receipt/v1",
-                "db": db,
-                "from_artifact_sha256": encode_hash(from_hash),
-                "to_artifact_sha256": encode_hash(to_hash),
-                "artifact_bytes": artifact_bytes,
-            })
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Validate the only transport-specific daemon argument immediately after
-    // CLI decoding. This must precede even telemetry initialization: rejected
-    // input is not allowed to register process-global metrics, configure file
-    // logging, or emit anything beyond its one structured stderr diagnostic.
-    let transport_preflight = if matches!(cli.mode, Mode::Http) {
-        match http::preflight_bind(&cli.bind, cli.allow_non_loopback) {
-            Ok(bind_addr) => CliTransportPreflight::Http(bind_addr),
-            Err(error) => {
-                eprintln!("synapse-mcp error: {error}");
-                return Ok(ExitCode::from(2));
-            }
-        }
-    } else {
-        if let Some(parent_pid) = cli.parent_pid {
-            eprintln!(
-                "synapse-mcp error: MCP_PARENT_PID_MODE_INVALID parent_pid={parent_pid} mode={:?}; --parent-pid is valid only for --mode http",
-                cli.mode
-            );
-            return Ok(ExitCode::from(2));
-        }
-        CliTransportPreflight::NonHttp
-    };
 
     let telemetry_guard = configure_telemetry(&cli)?;
-    let http_parent_watchdog = cli
-        .parent_pid
-        .map(connect::install_explicit_parent_watchdog)
-        .transpose()
-        .context("arm exact HTTP daemon parent watchdog before subsystem startup")?;
 
     // The connect bridge is a thin stdio<->HTTP proxy; it does not initialize
     // perception/action/storage, so return before the daemon-only setup below.
@@ -879,16 +388,7 @@ async fn run(
             depth: cli.desktop_worker_depth,
             json_path: cli.desktop_worker_json.clone(),
             bgra_path: cli.desktop_worker_bgra.clone(),
-            request_path: cli.desktop_worker_request.clone(),
         })?;
-        drop(telemetry_guard);
-        return Ok(code);
-    }
-    if matches!(cli.mode, Mode::DetectionWorker) {
-        let code = m1::run_detection_worker_from_cli(
-            cli.detection_worker_request.clone(),
-            cli.detection_worker_response.clone(),
-        )?;
         drop(telemetry_guard);
         return Ok(code);
     }
@@ -915,50 +415,6 @@ async fn run(
         return result;
     }
 
-    // All non-daemon modes returned above. Pair the decoded mode with its typed
-    // preflight result so HTTP cannot continue without its validated address
-    // and no other mode can accidentally consume one.
-    let daemon_transport = match (cli.mode, transport_preflight) {
-        (Mode::Stdio, CliTransportPreflight::NonHttp) => CliTransportPreflight::NonHttp,
-        (Mode::Http, CliTransportPreflight::Http(bind_addr)) => {
-            CliTransportPreflight::Http(bind_addr)
-        }
-        (
-            Mode::Connect
-            | Mode::ChromeNativeHost
-            | Mode::ApprovalProtocol
-            | Mode::DesktopWorker
-            | Mode::DetectionWorker
-            | Mode::Doctor
-            | Mode::LocalAgent,
-            CliTransportPreflight::NonHttp,
-        ) => unreachable!("non-daemon modes are handled before daemon initialization"),
-        _ => unreachable!("CLI transport preflight result does not match the decoded mode"),
-    };
-
-    // Declare the daemon's scheduling QoS before any subsystem starts, so every
-    // thread this process later spawns inherits the asserted priority class
-    // rather than the one the launcher happened to hand down (#1910).
-    initialize_rayon_pool(runtime_pools)?;
-    tracing::info!(
-        code = "SYNAPSE_RUNTIME_POOLS_CONFIGURED",
-        logical_cpus = runtime_pools.logical_cpus,
-        tokio_worker_threads = runtime_pools.tokio_worker_threads,
-        tokio_worker_threads_source = runtime_pools.tokio_worker_threads_source,
-        tokio_max_blocking_threads = runtime_pools.tokio_max_blocking_threads,
-        tokio_max_blocking_threads_source = runtime_pools.tokio_max_blocking_threads_source,
-        rayon_worker_threads = runtime_pools.rayon_worker_threads,
-        rayon_worker_threads_source = runtime_pools.rayon_worker_threads_source,
-        mimalloc_threadpool_workers = true,
-        mimalloc_version = mimalloc_policy.version,
-        mimalloc_purge_decommits = mimalloc_policy.purge_decommits,
-        mimalloc_purge_delay_ms = mimalloc_policy.purge_delay_ms,
-        mimalloc_arena_purge_mult = mimalloc_policy.arena_purge_mult,
-        "bounded background runtime worker pools configured"
-    );
-    let process_qos = process_qos::assert_interactive_qos();
-    crate::server::set_process_qos_report(process_qos);
-
     let dpi_awareness = synapse_capture::init_process_dpi_awareness()
         .context("initialize per-monitor DPI awareness")?;
     tracing::info!(?cli, code = "MCP_CLI_PARSED", "synapse-mcp cli parsed");
@@ -967,24 +423,22 @@ async fn run(
         code = "CAPTURE_DPI_AWARENESS_INITIALIZED",
         "capture dpi awareness initialized"
     );
+    let recovery_file = synapse_action::configure_crash_recovery_file(cli.db.as_deref())
+        .context("configure action crash recovery ledger")?;
+    let recovery_report = synapse_action::recover_stale_inputs_from_configured_path()
+        .context("recover stale action inputs from previous daemon")?;
+    tracing::info!(
+        code = "ACTION_CRASH_RECOVERY_CONFIGURED",
+        recovery_file = %recovery_file.display(),
+        recovered_keys = recovery_report.recovered_keys,
+        recovered_buttons = recovery_report.recovered_buttons,
+        recovered_pads = recovery_report.recovered_pads,
+        ignored_trailing_bytes = recovery_report.ignored_trailing_bytes,
+        "action crash recovery ledger configured"
+    );
 
     let m2_config = Cli::m2_config();
-    let m3_config = match cli.m3_config() {
-        Ok(config) => config,
-        Err(error) => {
-            if let Some(storage_error) = error.downcast_ref::<synapse_storage::StorageError>() {
-                tracing::error!(
-                    code = storage_error.code(),
-                    detail = %storage_error,
-                    "storage backend configuration invalid"
-                );
-                eprintln!("synapse-mcp error: {error:#}");
-                drop(telemetry_guard);
-                return Ok(ExitCode::from(2));
-            }
-            return Err(error);
-        }
-    };
+    let m3_config = cli.m3_config();
     let m4_config = match cli.m4_config() {
         Ok(config) => config,
         Err(error) => {
@@ -1006,89 +460,30 @@ async fn run(
             return Err(error);
         }
     };
-    let recovery_file = synapse_action::configure_crash_recovery_file(cli.db.as_deref())
-        .context("configure action crash recovery ledger")?;
-    let recovery_report = synapse_action::recover_stale_inputs_from_configured_path()
-        .context("recover stale action inputs from previous daemon")?;
-    tracing::info!(
-        code = "ACTION_CRASH_RECOVERY_CONFIGURED",
-        recovery_file = %recovery_file.display(),
-        recovered_keys = recovery_report.recovered_keys,
-        recovered_buttons = recovery_report.recovered_buttons,
-        recovered_pads = recovery_report.recovered_pads,
-        ignored_trailing_bytes = recovery_report.ignored_trailing_bytes,
-        "action crash recovery ledger configured"
-    );
 
-    // #2082 fix 2 — the startup release sweep, gated on ownership since the
-    // 2026-08-25 operator-interference incident.
-    //
-    // The ledger-driven recovery above only knows about strands a previous
-    // daemon managed to *write down*. A panic between the OS key-down and the
-    // ledger append, a ledger on a different drive, or a `SYNAPSE_DB` that moved
-    // all leave a real, system-wide stranded key that the ledger has no record
-    // of — and `SendInput` state does not die with the process that set it. So
-    // the sweep also asks the OS directly (`GetAsyncKeyState`) across the full
-    // virtual-key space, because the narrower modifier-only sweep let a stranded
-    // `VK_F13` survive boot while still logging `..._SWEEP_CLEAN` (#2082 A1).
-    //
-    // What it may *emit* is a separate question from what it may *read*, and
-    // conflating the two is what broke. `GetAsyncKeyState` answers "what is
-    // down", never "who put it down": a key the operator is physically holding
-    // at the instant of boot reads exactly like an inherited strand. Releasing
-    // it is not a harmless no-op — it stops auto-repeat, delivers `WM_KEYUP`,
-    // and for a mouse button becomes a real click under the operator's cursor.
-    // The old code released anyway, on the premise that boots are rare. On
-    // 2026-08-25 the daemon OOM'd inside its Job memory cap and booted every ~85
-    // seconds for hours, and that premise inverted: it took the operator's `W`,
-    // `D`, `SPACE`, `1`, `LBUTTON` and `RBUTTON` out of their hands, several
-    // times a minute, across 34 boots on which the ledger reported
-    // `recovered_keys=0` — i.e. the daemon provably held nothing.
-    //
-    // So emission now requires positive proof of ownership: the durable ledger
-    // must show this daemon actually holding something, and this boot must not
-    // be part of a storm. Otherwise the scan still runs and still reports, and
-    // nothing is emitted. It runs before either transport can accept a request,
-    // and covers stdio and HTTP alike because it sits above the mode dispatch.
-    let boot_storm = synapse_action::record_boot_and_detect_storm()
-        .context("record daemon boot for synthetic-input storm detection")?;
-    if boot_storm.storm {
-        tracing::error!(
-            code = "SYNTHETIC_INPUT_BOOT_STORM_DETECTED",
-            history_file = %boot_storm.history_file.display(),
-            boots_in_window = boot_storm.boots_in_window,
-            window_ms = boot_storm.window_ms,
-            "the daemon is restarting fast enough to constitute a boot storm; the startup synthetic-input release sweep is withheld for this boot because a crash loop that repeatedly releases keys is operator interference, not strand recovery — investigate the restart cause"
-        );
-    }
-    let _startup_sweep =
-        synapse_action::release_all_synthetic_input_on_startup(synapse_action::StartupEvidence {
-            ledger_recovered_keys: recovery_report.recovered_keys,
-            ledger_recovered_buttons: recovery_report.recovered_buttons,
-            boot_storm: boot_storm.storm,
-        });
-    // #2082 fix 4 — the watchdog. A dedicated OS thread, not a tokio task, so it
-    // still runs when the runtime or the emitter actor is the thing that wedged.
-    // Its `SYNTHETIC_INPUT_WATCHDOG_STARTED` line now also records which of the
-    // two hold bounds is in force and what both tracks are, so the 30 s vs 300 s
-    // selection is auditable from the log alone (#2082 finding E).
-    let _watchdog_started = synapse_action::spawn_synthetic_input_watchdog();
-
-    match daemon_transport {
-        CliTransportPreflight::NonHttp => {
-            run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await
-        }
-        CliTransportPreflight::Http(bind_addr) => {
-            let code = Box::pin(http::serve(
-                bind_addr,
+    match cli.mode {
+        Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
+        Mode::Http => {
+            let code = http::serve(
+                &cli.bind,
+                cli.allow_non_loopback,
                 &m2_config,
                 m3_config,
                 m4_config,
-                http_parent_watchdog,
-            ))
+            )
             .await?;
             drop(telemetry_guard);
             Ok(code)
+        }
+        Mode::Connect
+        | Mode::ChromeNativeHost
+        | Mode::ApprovalProtocol
+        | Mode::DesktopWorker
+        | Mode::Doctor
+        | Mode::LocalAgent => {
+            unreachable!(
+                "connect, chrome-native-host, approval-protocol, desktop-worker, doctor, and local-agent modes are handled before daemon setup"
+            )
         }
     }
 }
@@ -1105,15 +500,7 @@ fn configure_telemetry_from_level(log_level: &str) -> anyhow::Result<TelemetryGu
     init_tracing(TelemetryConfig {
         log_dir,
         file_level: level,
-        // The persistent supervisor redirects stderr to a separate crash log.
-        // Mirroring the INFO firehose there duplicated the complete structured
-        // log and produced 200-330 MiB single-generation stderr files. Preserve
-        // actionable warnings/errors on stderr while keeping routine evidence
-        // in the bounded hourly file sink.
-        console_level: match level {
-            LevelFilter::OFF | LevelFilter::ERROR => level,
-            _ => LevelFilter::WARN,
-        },
+        console_level: level,
         ..TelemetryConfig::default()
     })
     .context("initialize telemetry")
@@ -1238,7 +625,6 @@ struct StdioLifetimeLockReadiness {
     server_dispatch_quiescent: bool,
     m2_emitter_safe: bool,
     win_event_owners_quiescent: bool,
-    calyx_vault_closed: bool,
     hotkey_owners_quiescent: bool,
     k2_tasks_quiescent: bool,
     desktop_worker_owners_quiescent: bool,
@@ -1252,7 +638,6 @@ const fn stdio_lifetime_locks_safe_to_close(readiness: StdioLifetimeLockReadines
         && readiness.server_dispatch_quiescent
         && readiness.m2_emitter_safe
         && readiness.win_event_owners_quiescent
-        && readiness.calyx_vault_closed
         && readiness.hotkey_owners_quiescent
         && readiness.k2_tasks_quiescent
         && readiness.desktop_worker_owners_quiescent
@@ -1293,7 +678,6 @@ fn close_stdio_lifetime_locks(
             server_dispatch_quiescent = readiness.server_dispatch_quiescent,
             m2_emitter_safe = readiness.m2_emitter_safe,
             win_event_owners_quiescent = readiness.win_event_owners_quiescent,
-            calyx_vault_closed = readiness.calyx_vault_closed,
             hotkey_owners_quiescent = readiness.hotkey_owners_quiescent,
             k2_tasks_quiescent = readiness.k2_tasks_quiescent,
             desktop_worker_owners_quiescent = readiness.desktop_worker_owners_quiescent,
@@ -1360,60 +744,6 @@ async fn drain_stdio_m2_owner(
     reason: &'static str,
 ) -> M2EmitterDrainReport {
     drain_m2_emitter_owner(owner.take(), "stdio", reason).await
-}
-
-async fn close_stdio_calyx_vault(
-    m3_state: &crate::m3::SharedM3State,
-    reason: &'static str,
-    expected_open: bool,
-) -> (
-    bool,
-    anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
-) {
-    let maintenance = crate::m3::shutdown_storage_maintenance_tasks(m3_state, reason).await;
-    let maintenance_verdict = maintenance.verdict();
-    let result = if maintenance.owners_quiescent() {
-        let close_result = match m3_state.lock() {
-            Ok(mut state) => state
-                .close_calyx_vault_for_shutdown(reason, expected_open)
-                .map_err(anyhow::Error::new)
-                .and_then(|readback| {
-                    crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
-                    Ok(readback)
-                }),
-            Err(poisoned) => {
-                let detail =
-                    format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
-                drop(poisoned);
-                Err(anyhow::anyhow!(detail))
-            }
-        };
-        match (maintenance_verdict, close_result) {
-            (Ok(()), close_result) => close_result,
-            (Err(maintenance_error), Ok(_readback)) => Err(maintenance_error.context(
-                "periodic storage-maintenance owner joined with a failure before the Calyx vault was closed; retaining the daemon lifetime locks",
-            )),
-            (Err(maintenance_error), Err(close_error)) => Err(anyhow::anyhow!(
-                "storage-maintenance shutdown failed ({maintenance_error:#}); Calyx vault close also failed ({close_error:#})"
-            )),
-        }
-    } else {
-        Err(anyhow::anyhow!(
-            "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
-        ))
-    };
-    let safe_to_terminate = result
-        .as_ref()
-        .is_ok_and(|readback| readback.safe_to_terminate);
-    tracing::info!(
-        code = "MCP_STDIO_CALYX_VAULT_CLOSE_READBACK",
-        reason,
-        expected_open,
-        safe_to_terminate,
-        result = ?result,
-        "readback=calyx_vault edge=stdio_shutdown after_flush_close"
-    );
-    (safe_to_terminate, result)
 }
 
 #[derive(Clone, Debug)]
@@ -1610,7 +940,7 @@ async fn run_stdio(
     tracing::info!(code = "MCP_STDIO_STARTED", "starting stdio MCP transport");
 
     // Single-instance guard (epic #717 / single-daemon invariant): an embedded
-    // stdio daemon is a FULL daemon: it opens storage and owns its own
+    // stdio daemon is a FULL daemon: it opens RocksDB and owns its own
     // process-global input lease + per-session registries. Without this guard a
     // stray or misconfigured stdio launch would run a SECOND parallel daemon
     // whose lease/state cannot coordinate with the canonical HTTP daemon, which
@@ -1618,7 +948,7 @@ async fn run_stdio(
     // lock before binding the port; the stdio path must obey the same rule.
     // Fail loud, naming the current holder, and point the operator at --mode
     // connect (the supported way for a stdio-only client to reach the shared
-    // daemon) instead of crashing later on a cryptic backend lock error.
+    // daemon) instead of crashing later on a cryptic RocksDB LOCK error.
     let db_path = m3_config
         .db_path
         .clone()
@@ -1795,8 +1125,6 @@ async fn run_stdio(
         .context("record daemon lifecycle startup corrupt-shell-job recovery failure")?;
         return Ok(ExitCode::from(4));
     }
-    #[cfg(windows)]
-    crate::server::operational_facades::host_transition::reconcile_pending_intent_on_startup();
 
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
@@ -1815,57 +1143,31 @@ async fn run_stdio(
         let maintenance_result = match m3_state.lock() {
             Ok(mut state) => state
                 .ensure_storage_maintenance_tasks()
-                .map_err(anyhow::Error::new)
-                .and_then(|_| {
-                    let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
-                    crate::m3::record_calyx_vault_status_event(&status, "opened")?;
-                    Ok(())
-                })
-                .context("start stdio storage maintenance and Calyx vault"),
+                .context("start stdio storage maintenance"),
             Err(poisoned) => {
                 drop(poisoned);
                 Err(anyhow::anyhow!(
-                    "m3 service state lock poisoned during stdio storage/Calyx startup"
+                    "m3 service state lock poisoned during stdio storage maintenance startup"
                 ))
             }
         };
         if let Err(error) = maintenance_result {
-            let (_calyx_vault_closed, calyx_cleanup) = close_stdio_calyx_vault(
-                &m3_state,
-                "stdio_storage_or_calyx_open_or_maintenance_start_failed",
-                false,
-            )
-            .await;
-            if let Err(cleanup_error) = &calyx_cleanup {
-                tracing::error!(
-                    code = "STDIO_CALYX_STARTUP_FAILURE_CLEANUP_FAILED",
-                    detail = %cleanup_error,
-                    "failed to close Calyx vault after stdio startup failure"
-                );
-            }
             tracing::error!(
-                code = "STORAGE_OR_CALYX_OPEN_OR_MAINTENANCE_START_FAILED",
+                code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
                 mode = "stdio",
                 db_path = %db_path.display(),
                 detail = %error,
-                "refusing to start: stdio storage open/maintenance or Calyx vault startup failed"
+                "refusing to start: stdio storage open/maintenance startup failed"
             );
             daemon_lifecycle::record_startup_exit(
-                "stdio_storage_or_calyx_open_or_maintenance_start_failed",
+                "stdio_storage_open_or_maintenance_start_failed",
                 serde_json::json!({
                     "mode": "stdio",
                     "db_path": db_path.display().to_string(),
                     "detail": error.to_string(),
-                    "calyx_cleanup": calyx_cleanup.as_ref().map(|readback| serde_json::to_value(readback).unwrap_or_else(|serialize_error| serde_json::json!({"serialize_error": serialize_error.to_string()}))).ok(),
-                    "calyx_cleanup_error": calyx_cleanup.as_ref().err().map(|cleanup_error| cleanup_error.to_string()),
                 }),
             )
             .context("record daemon lifecycle stdio storage maintenance startup failure")?;
-            if let Err(cleanup_error) = calyx_cleanup {
-                return Err(error).with_context(|| {
-                    format!("Calyx cleanup after startup failure also failed: {cleanup_error:#}")
-                });
-            }
             return Err(error);
         }
     }
@@ -1901,14 +1203,6 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio hotkey install failure");
-            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                &m3_state_for_calyx,
-                "stdio_operator_hotkey_install_failed",
-                true,
-            )
-            .await;
-            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             drop(service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1923,7 +1217,6 @@ async fn run_stdio(
                     server_dispatch_quiescent: true,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
-                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -1939,7 +1232,6 @@ async fn run_stdio(
                     ("operator_hotkey_install", Err(install_error)),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
-                    ("calyx_vault_close", calyx_vault_close.map(|_readback| ())),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -1985,14 +1277,6 @@ async fn run_stdio(
                     .verdict()
                     .context("drain M2 emitter after stdio closed before init");
                 drop(start);
-                let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-                let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                    &m3_state_for_calyx,
-                    "stdio_connection_closed_before_init",
-                    true,
-                )
-                .await;
-                drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
                     inspect_win_event_shutdown_history(
@@ -2008,7 +1292,6 @@ async fn run_stdio(
                         server_dispatch_quiescent: true,
                         m2_emitter_safe,
                         win_event_owners_quiescent,
-                        calyx_vault_closed,
                         hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                         k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                         desktop_worker_owners_quiescent: false,
@@ -2023,10 +1306,6 @@ async fn run_stdio(
                     vec![
                         ("authority_finalizer_drain", authority_drain),
                         ("m2_emitter_drain", emitter_drain),
-                        (
-                            "calyx_vault_close",
-                            calyx_vault_close.map(|_readback| ()),
-                        ),
                         ("win_event_shutdown_history", win_event_shutdown_history),
                         ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                         ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -2067,14 +1346,6 @@ async fn run_stdio(
                     .verdict()
                     .context("drain M2 emitter after stdio startup failure");
                 drop(start);
-                let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-                let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                    &m3_state_for_calyx,
-                    "stdio_start_failed_before_init",
-                    true,
-                )
-                .await;
-                drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
                     inspect_win_event_shutdown_history(
@@ -2088,7 +1359,6 @@ async fn run_stdio(
                         server_dispatch_quiescent: true,
                         m2_emitter_safe,
                         win_event_owners_quiescent,
-                        calyx_vault_closed,
                         hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                         k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                         desktop_worker_owners_quiescent: false,
@@ -2104,10 +1374,6 @@ async fn run_stdio(
                         ("rmcp_start", Err(start_error)),
                         ("authority_finalizer_drain", authority_drain),
                         ("m2_emitter_drain", emitter_drain),
-                        (
-                            "calyx_vault_close",
-                            calyx_vault_close.map(|_readback| ()),
-                        ),
                         ("win_event_shutdown_history", win_event_shutdown_history),
                         ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                         ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -2152,14 +1418,6 @@ async fn run_stdio(
                 .verdict()
                 .context("drain M2 emitter after stdio signal before init");
             drop(start);
-            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                &m3_state_for_calyx,
-                "stdio_signal_before_init",
-                true,
-            )
-            .await;
-            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -2175,7 +1433,6 @@ async fn run_stdio(
                     server_dispatch_quiescent: true,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
-                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -2194,10 +1451,6 @@ async fn run_stdio(
                     ),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
-                    (
-                        "calyx_vault_close",
-                        calyx_vault_close.map(|_readback| ()),
-                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -2247,14 +1500,6 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio service completion");
-            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                &m3_state_for_calyx,
-                "stdio_service_completed",
-                true,
-            )
-            .await;
-            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -2273,7 +1518,6 @@ async fn run_stdio(
                     server_dispatch_quiescent,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
-                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -2289,10 +1533,6 @@ async fn run_stdio(
                     ("rmcp_service_task_join", service_task_join),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
-                    (
-                        "calyx_vault_close",
-                        calyx_vault_close.map(|_readback| ()),
-                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -2344,14 +1584,6 @@ async fn run_stdio(
             let emitter_drain = emitter_report
                 .verdict()
                 .context("drain M2 emitter after stdio signal after init");
-            let m3_state_for_calyx = authority_finalizer_service.m3_state_handle();
-            let (calyx_vault_closed, calyx_vault_close) = close_stdio_calyx_vault(
-                &m3_state_for_calyx,
-                "stdio_signal_after_init",
-                true,
-            )
-            .await;
-            drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
                 inspect_win_event_shutdown_history(
@@ -2371,7 +1603,6 @@ async fn run_stdio(
                     server_dispatch_quiescent,
                     m2_emitter_safe,
                     win_event_owners_quiescent,
-                    calyx_vault_closed,
                     hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
                     k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
                     desktop_worker_owners_quiescent: false,
@@ -2391,10 +1622,6 @@ async fn run_stdio(
                     ("rmcp_service_task_join", service_task_join),
                     ("authority_finalizer_drain", authority_drain),
                     ("m2_emitter_drain", emitter_drain),
-                    (
-                        "calyx_vault_close",
-                        calyx_vault_close.map(|_readback| ()),
-                    ),
                     ("win_event_shutdown_history", win_event_shutdown_history),
                     ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
                     ("operator_panic_k2_drain", operator_drain.k2_verdict),
@@ -2437,5 +1664,180 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("ctrl-c handler closed while waiting {phase}")),
         signal = ctrl_break.recv() => signal
             .ok_or_else(|| anyhow::anyhow!("ctrl-break handler closed while waiting {phase}")),
+    }
+}
+
+#[cfg(test)]
+mod stdio_shutdown_tests {
+    use super::*;
+
+    fn clean_win_event_shutdown_record(
+        owner_id: u64,
+    ) -> synapse_a11y::WinEventSubscriptionShutdownRecord {
+        synapse_a11y::WinEventSubscriptionShutdownRecord {
+            owner_id,
+            report: synapse_a11y::WinEventSubscriptionShutdownReport {
+                reason: "synthetic_stdio_history",
+                thread_id: owner_id as u32,
+                hook_count: 2,
+                stop_requested: true,
+                stop_wake_sent: true,
+                sender_disconnected: true,
+                subscription_slot_released: true,
+                thread_owner_present: true,
+                thread_terminal: true,
+                thread_joined: true,
+                thread_exit_report_received: true,
+                unregister_attempted: 2,
+                unregister_succeeded: 2,
+                unregister_failed_event_ids: Vec::new(),
+                exact_owner_retained: false,
+                failures: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn stdio_shutdown_aggregation_retains_every_failed_phase() {
+        let error = aggregate_stdio_shutdown_results(
+            "synthetic_shutdown",
+            vec![
+                (
+                    "rmcp_service_task_join",
+                    Err(anyhow::anyhow!("dispatch stuck")),
+                ),
+                (
+                    "authority_finalizer_drain",
+                    Err(anyhow::anyhow!("admission poisoned")),
+                ),
+                ("m2_emitter_drain", Err(anyhow::anyhow!("emitter timeout"))),
+            ],
+        )
+        .expect_err("any failed shutdown phase must reject a graceful verdict");
+        let detail = format!("{error:#}");
+
+        assert!(detail.contains("rmcp_service_task_join: dispatch stuck"));
+        assert!(detail.contains("authority_finalizer_drain: admission poisoned"));
+        assert!(detail.contains("m2_emitter_drain: emitter timeout"));
+    }
+
+    #[tokio::test]
+    async fn owned_service_join_completion_is_quiescent() {
+        let service_task = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            Ok(rmcp::service::QuitReason::Closed)
+        });
+        let (quiescent, result) =
+            inspect_stdio_service_task_join(service_task.await, "owned_join_completed");
+
+        assert!(
+            quiescent,
+            "completed outer join proves the inner join result"
+        );
+        result.expect("clean owned join should pass the shutdown phase");
+    }
+
+    #[tokio::test]
+    async fn cancelled_outer_service_join_owner_is_not_quiescent() {
+        let service_task = tokio::spawn(async {
+            std::future::pending::<Result<rmcp::service::QuitReason, tokio::task::JoinError>>()
+                .await
+        });
+        service_task.abort();
+        let (quiescent, result) =
+            inspect_stdio_service_task_join(service_task.await, "outer_owner_cancelled");
+        let detail = format!(
+            "{:#}",
+            result.expect_err("cancelled outer owner must fail the shutdown phase")
+        );
+
+        assert!(
+            !quiescent,
+            "an aborted waiting() owner can detach rmcp's private task"
+        );
+        assert!(detail.contains("before inner join readback"));
+    }
+
+    #[test]
+    fn stdio_lifetime_unlock_requires_every_owner_set_quiescent() {
+        let safe = StdioLifetimeLockReadiness {
+            authority_safe_to_unlock: true,
+            server_dispatch_quiescent: true,
+            m2_emitter_safe: true,
+            win_event_owners_quiescent: true,
+            hotkey_owners_quiescent: true,
+            k2_tasks_quiescent: true,
+            desktop_worker_owners_quiescent: true,
+            retained_shutdown_task_owners_quiescent: true,
+            unresolved_shell_child_owners_quiescent: true,
+            activity_recorder_retained_owners_quiescent: true,
+        };
+        assert!(stdio_lifetime_locks_safe_to_close(safe));
+
+        let mut readiness = safe;
+        readiness.authority_safe_to_unlock = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.server_dispatch_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.m2_emitter_safe = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.win_event_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.hotkey_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.k2_tasks_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.desktop_worker_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.retained_shutdown_task_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.unresolved_shell_child_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.activity_recorder_retained_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+    }
+
+    #[test]
+    fn win_event_history_rejects_any_older_failed_owner_and_retained_owner() {
+        let clean = clean_win_event_shutdown_record(22);
+        let clean_readback =
+            win_event_shutdown_history_readback_from(std::slice::from_ref(&clean), 0);
+        assert!(clean_readback.owners_quiescent());
+        clean_readback.verdict().expect(
+            "a nonzero installed-hook count is safe when every hook was physically unregistered",
+        );
+
+        let mut failed = clean_win_event_shutdown_record(21);
+        failed.report.stop_wake_sent = false;
+        let history = [clean, failed];
+        let failed_readback = win_event_shutdown_history_readback_from(&history, 0);
+        assert!(!failed_readback.owners_quiescent());
+        let detail = failed_readback
+            .verdict()
+            .expect_err("an older immutable failed owner must remain fail-closed")
+            .to_string();
+        assert!(detail.contains("owner_id=21"));
+
+        let retained_readback = win_event_shutdown_history_readback_from(&history[..1], 1);
+        assert!(!retained_readback.owners_quiescent());
+        assert!(retained_readback.verdict().is_err());
     }
 }

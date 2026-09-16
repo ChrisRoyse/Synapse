@@ -35,7 +35,7 @@ The full surface is assembled in `SynapseService::tool_router()` (`server.rs:603
 Conventions seen throughout:
 - Browser/CDP tools accept `cdp_target_id` + `window_hwnd` to address a session-owned tab, defaulting to the active session target; they are background-safe (no tab activation, no OS foreground, no human-foreground fallback).
 - Action tools take `verify_delta` / `verify_timeout_ms` and a `backend` (auto/software/hardware) selector.
-- Many tools persist to Calyx-backed column-family collections (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
+- Many tools persist to RocksDB column families (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
 
 > Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct.
 
@@ -52,8 +52,8 @@ Source-of-truth observation, OCR, screenshots, window enumeration, and the CDP/C
 | `find` | Search visible a11y nodes & detected entities; flags suspected prompt injection | `query?`, `role?`, `name_substring?`, `automation_id?`, `scope?`, `limit?`, `in_window?`, `window_hwnd?` | read-only |
 | `read_text` | OCR a region/element | `region?`, `element_id?`, `window_hwnd?`, `backend` (default Auto), `lang_hint?` | read-only |
 | `capture_screenshot` | Write PNG/JPEG of target/region | `path` (req), `region?`, `window_hwnd?`, `overwrite=false` | writes file |
-| `browser_screenshot` | Write PNG/JPEG page screenshot from an owned raw-CDP tab | `path` (req), `scope` (Viewport), `clip?`, `element_id?`, `masks?`, `format?`, `quality?`, `omit_background=false`, `cdp_target_id?`, `window_hwnd?`, `overwrite=false` | writes via exact target-scoped `Page.captureScreenshot`; never activates/focuses a window; normal-profile targets fail before Chrome mutation; reports independent disk/page/loader readback |
-| `browser_pdf` | Write PDF from an owned raw-CDP tab | `path` (req .pdf), `landscape=false`, `print_background=false`, `paper_width?`, `paper_height?`, `margin_*?`, `scale?`, `page_ranges?`, `prefer_css_page_size=false`, `cdp_target_id?`, `window_hwnd?`, `overwrite=false` | writes via raw-CDP `Page.printToPDF`; normal-profile targets fail before Chrome mutation; reports byte count/hash and target readback |
+| `browser_screenshot` | Write PNG/JPEG page screenshot from a normal Chrome bridge tab | `path` (req), `scope` (Viewport), `clip?`, `element_id?`, `masks?`, `format?`, `quality?`, `omit_background=false`, `cdp_target_id?`, `window_hwnd?`, `overwrite=false` | writes file; queues `captureVisibleTab` calls to avoid Chrome capture quota; restores tab/scroll/masks; reports `required_foreground` when Chrome window focus is needed |
+| `browser_pdf` | Write PDF from a normal Chrome bridge tab | `path` (req .pdf), `landscape=false`, `print_background=false`, `paper_width?`, `paper_height?`, `margin_*?`, `scale?`, `page_ranges?`, `prefer_css_page_size=false`, `cdp_target_id?`, `window_hwnd?`, `overwrite=false` | writes PDF via narrow `Page.printToPDF` bridge lane; reports byte count/hash and target readback |
 | `browser_downloads` | List/wait/save/move normal Chrome downloads | `operation` (List), `window_hwnd?`, `download_id?`, `url_contains?`, `filename_contains?`, `mime_contains?`, `state?`, `since_unix_ms?`, `limit?`, `wait_timeout_ms?`, `path?`, `overwrite=false` | lists Chrome download rows/events; wait blocks for target state; save/move writes chosen path with bytes/SHA-256 |
 | `hidden_desktop_pip_frame` | Read-only PiP frame of a session-owned hidden desktop window | `window_hwnd` (req), `path` (req), `watched_session_id?`, `region?`, `overwrite=false` | writes PNG; never forwards input |
 | `set_capture_target` | Set active capture target | `target: CaptureTargetParam` (req), `min_update_interval_ms?`, `cursor_visible?`, `dirty_region_only?` | session state |
@@ -132,7 +132,7 @@ See [10_reflex_subsystem.md](10_reflex_subsystem.md), [08_audio_subsystem.md](08
 | `reflex_cancel` | Cancel a reflex | `reflex_id` (req) | cancels reflex |
 | `reflex_list` | List reflexes | `include_expired?` | read-only |
 | `reflex_history` | Persisted reflex audit history | `reflex_id?`, `limit` | read-only |
-| `audio_tail` | Latest real-time loopback audio tail (PCM s16le), including `device_frames`/`device_captured_seconds` and explicit `timeline_gap_frames`/`timeline_gap_seconds` provenance | `seconds?` | read-only |
+| `audio_tail` | Latest loopback audio tail (PCM s16le) | `seconds?` | read-only |
 | `audio_transcribe` | Whisper-tiny transcription of tail | `seconds?`, `language?` | runs ASR |
 
 ## 16.6 Profiles, registry & authoring — `m3_tools.rs`
@@ -150,7 +150,7 @@ See [11_profiles_subsystem.md](11_profiles_subsystem.md).
 | `profile_authoring_decide` | Accept/reject a candidate | `candidate_id` (req), `decision` (req), `operator_note?`, `reason?` | mutates candidate state |
 | `profile_authoring_export` | Export candidate bundle | `candidate_id` (req), `output_path` (req) | writes file |
 | `profile_quality_refresh` | Refresh profile quality scoring | `profile_id` (req), `max_audit_rows?` | writes scoring rows |
-| `profile_registry_query` | Hidden implementation for registry rows; scoped clients use `profile operation=registry_query` | `view` (req), filters (summarized) | read-only |
+| `profile_registry_query` | Query registry rows (search/inspect/report) | `view` (req), filters (summarized) | read-only |
 | `profile_registry_install` | Install/update a registry package | `source_id` (req), `manifest_path` (req) | writes registry rows |
 | `profile_registry_disable` | Disable/remove an installed row | `profile_id` (req), `state` (req) | mutates registry |
 | `profile_registry_export` | Export registry rows to JSON | `output_path` (req), `row_kind?`, `limit?` | writes file |
@@ -288,7 +288,7 @@ All target a session-owned tab via `cdp_target_id?` + `window_hwnd?` (default ac
 |------|------|-------------|-----------|
 | `browser_aria_snapshot` | browser_assert.rs | Playwright-style ARIA snapshot | `root_element_id?`, `max_nodes?`, `max_depth?` |
 | `browser_assert` | browser_assert.rs | Assert locator with bounded retry (visible/text/value/checked/enabled/attribute/count) | `locator` (req), `matcher` (req), expected_*, `timeout_ms=5000`, `interval_ms=100`, `negate?` |
-| `browser_clock` | browser_clock_events.rs | Reversible fake page clock (install/uninstall/set/fast-forward/status) | `operation` (Status), `time_unix_ms?`, `delta_ms?` |
+| `browser_clock` | browser_clock_events.rs | Fake page clock (install/set/fast-forward/status) | `operation` (Status), `time_unix_ms?`, `delta_ms?` |
 | `browser_page_events` | browser_clock_events.rs | Arm/read page lifecycle, popup, worker events | `since_seq?`, `limit=100`, `event_kind?`, `worker_type?` |
 | `browser_handle_dialog` | browser_dialog.rs | Read/accept/dismiss JS dialogs via raw CDP or normal Chrome bridge | `operation` (Status), `default_policy?`, `prompt_text?`, `since_seq?`, `limit=20` |
 | `browser_drag` | browser_dnd.rs | Drag element->element (CDP mouse default) | `source_selector`, `target_selector` (req), `mode?`, `steps=12`, `duration_ms=350`, `auto_wait=true` |
@@ -374,6 +374,6 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 
 ## 16.18 Notes & caveats
 
-- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile operation=registry_query` / hidden `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
+- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
 - Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`.

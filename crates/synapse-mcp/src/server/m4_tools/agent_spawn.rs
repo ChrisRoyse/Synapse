@@ -1062,146 +1062,6 @@ pub(super) fn read_synapse_bearer_token() -> Result<String, ErrorData> {
     Ok(token)
 }
 
-/// Staging-name prefix for a spawn directory that has not been published yet.
-///
-/// Every spawn-root consumer (`recover_orphaned_agent_spawn_terminal_artifacts`
-/// here, and the transcript ingest scan in `server::agent_transcripts`) skips
-/// entries that do not start with `agent-spawn-`, so a staging directory is
-/// invisible to all of them until it is renamed into place.
-const AGENT_SPAWN_STAGING_PREFIX: &str = ".staging-";
-
-/// Creates the spawn directory and every file required before it is visible to
-/// transcript ingestion as a single publish.
-///
-/// The directory is built under a staging name; the manifest, immutable prompt,
-/// and empty append-only stdout/stderr sources are created and fsynced inside
-/// it; only then is it renamed to `agent-spawn-<id>` within the same parent
-/// directory. Microsoft documents `MoveFileEx` as moving a directory together
-/// with its children, and a rename within one directory on NTFS is a single
-/// metadata operation — so the published name either appears with all required
-/// ingest inputs already inside or does not appear at all.
-///
-/// If anything fails before the rename, the staging directory is removed, so an
-/// interrupted spawn leaves no visible partial directory (#1879/#2244).
-fn publish_agent_spawn_dir_with_required_files(
-    root: &Path,
-    spawn_id: &str,
-    params: &ActSpawnAgentParams,
-    working_dir: &Path,
-    prompt: &[u8],
-) -> Result<(), ErrorData> {
-    let log_dir = root.join(spawn_id);
-    if log_dir.exists() {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent refuses to reuse the existing spawn directory {}: spawn ids are minted per launch, so an existing directory means a colliding or replayed spawn id",
-                log_dir.display()
-            ),
-        ));
-    }
-    // Encode the manifest before creating anything on disk: an encoding fault
-    // must not be able to leave a directory behind.
-    let manifest = build_spawn_manifest(spawn_id, params, working_dir)?;
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_spawn_agent failed to encode spawn manifest: {error}"),
-        )
-    })?;
-
-    fs::create_dir_all(root).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to create agent spawn root {}: {error}",
-                root.display()
-            ),
-        )
-    })?;
-    let staging_dir = root.join(format!("{AGENT_SPAWN_STAGING_PREFIX}{spawn_id}"));
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir).map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "act_spawn_agent failed to clear the leftover spawn staging directory {}: {error}",
-                    staging_dir.display()
-                ),
-            )
-        })?;
-    }
-    fs::create_dir_all(&staging_dir).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to create the spawn staging directory {}: {error}",
-                staging_dir.display()
-            ),
-        )
-    })?;
-
-    for (file_name, contents, purpose) in [
-        (
-            AGENT_SPAWN_MANIFEST_FILENAME,
-            manifest_bytes.as_slice(),
-            "spawn manifest",
-        ),
-        ("prompt.txt", prompt, "immutable prompt"),
-        ("stdout.jsonl", &[][..], "append-only transcript source"),
-        ("stderr.log", &[][..], "append-only stderr source"),
-    ] {
-        let staged_path = staging_dir.join(file_name);
-        if let Err(error) = write_and_sync_file(&staged_path, contents) {
-            discard_agent_spawn_staging_dir(&staging_dir);
-            return Err(mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "act_spawn_agent failed to create and sync mandatory {purpose} {} before directory publication: {error}",
-                    staged_path.display()
-                ),
-            ));
-        }
-    }
-    if let Err(error) = fs::rename(&staging_dir, &log_dir) {
-        discard_agent_spawn_staging_dir(&staging_dir);
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to publish the spawn directory {} from {}: {error}",
-                log_dir.display(),
-                staging_dir.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Creates one new staged file and flushes its content and metadata before the
-/// directory is published. `create_new` makes an unexpected pre-existing path
-/// a loud staging-integrity failure instead of truncating it.
-fn write_and_sync_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut file = fs::File::create_new(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-/// Removes an unpublished staging directory. Failure to clean up is logged
-/// rather than raised: the caller is already returning the real error, and a
-/// leftover `.staging-*` entry is invisible to every spawn-root consumer.
-fn discard_agent_spawn_staging_dir(staging_dir: &Path) {
-    if let Err(error) = fs::remove_dir_all(staging_dir) {
-        tracing::warn!(
-            code = "AGENT_SPAWN_STAGING_DISCARD_FAILED",
-            staging_dir = %staging_dir.display(),
-            detail = %error,
-            remediation = "remove the leftover .staging-* entry under the agent spawn root; it is skipped by orphan recovery and transcript ingest but occupies disk",
-            "act_spawn_agent could not remove an unpublished spawn staging directory"
-        );
-    }
-}
-
 pub(super) fn prepare_agent_spawn_files(
     spawn_id: &str,
     params: &ActSpawnAgentParams,
@@ -1210,6 +1070,15 @@ pub(super) fn prepare_agent_spawn_files(
     let agent_kind = params.effective_cli()?;
     let root = agent_spawn_root_dir()?;
     let log_dir = root.join(spawn_id);
+    fs::create_dir_all(&log_dir).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to create log directory {}: {error}",
+                log_dir.display()
+            ),
+        )
+    })?;
     let prompt_path = log_dir.join("prompt.txt");
     let stdout_path = log_dir.join("stdout.jsonl");
     let stderr_path = log_dir.join("stderr.log");
@@ -1246,17 +1115,15 @@ pub(super) fn prepare_agent_spawn_files(
         &task_started_path,
         &task_started_script_path,
     )?;
-    // The visible spawn directory is the transcript ingester's discovery
-    // boundary. Publish it only after every path the ingester requires exists;
-    // a timeout can otherwise kill the wrapper before shell redirection creates
-    // stdout.jsonl, permanently parking the cursor on a missing source (#2244).
-    publish_agent_spawn_dir_with_required_files(
-        &root,
-        spawn_id,
-        params,
-        working_dir,
-        prompt.as_bytes(),
-    )?;
+    fs::write(&prompt_path, prompt).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write prompt file {}: {error}",
+                prompt_path.display()
+            ),
+        )
+    })?;
     if let Some(config_path) = &mcp_config_path {
         let config = json!({
             "mcpServers": {
@@ -1340,6 +1207,28 @@ pub(super) fn prepare_agent_spawn_files(
         })?;
     }
 
+    // Spawn manifest: the authoritative record of which CLI and (when the
+    // operator pinned one) which model this spawn was launched with. The
+    // transcript ingester reads it to attribute cost — indispensable for Codex,
+    // whose `exec --json` stream carries no model id (#949).
+    let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
+    let manifest = build_spawn_manifest(spawn_id, params, working_dir)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_spawn_agent failed to encode spawn manifest: {error}"),
+        )
+    })?;
+    fs::write(&manifest_path, manifest_bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write spawn manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+
     Ok(AgentSpawnFiles {
         log_dir,
         prompt_path,
@@ -1364,7 +1253,7 @@ pub(super) fn prepare_agent_spawn_files(
 
 /// Derives the push-telemetry ingress endpoint from the MCP URL the spawned
 /// agent is wired to. The daemon serves both from one origin, so anything
-/// other than a `/mcp`-suffixed URL is a caller error, not an inferred route.
+/// other than a `/mcp`-suffixed URL is a caller error, not a guessing game.
 pub(super) fn agent_event_ingress_url(
     spawn_id: &str,
     mcp_url: &str,
@@ -1483,6 +1372,7 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "Bash(git branch:*)",
     "Bash(cargo build:*)",
     "Bash(cargo check:*)",
+    "Bash(cargo test:*)",
     "Bash(cargo clippy:*)",
     "Bash(cargo fmt:*)",
 ];
@@ -2037,7 +1927,6 @@ pub(super) fn agent_spawn_powershell_script(
     AppServerStderrPath = {app_stderr_path}\n\
     WorkingDir = {working_dir}\n\
     McpUrl = {mcp_url}\n\
-    ReadinessTimeoutMs = {readiness_timeout_ms}\n\
     NotifyScriptPath = {notify_script_path}\n\
 }}\n\
 {model_arg}\
@@ -2051,7 +1940,6 @@ pub(super) fn agent_spawn_powershell_script(
                 app_stderr_path = ps_single_quoted_path(app_stderr_path),
                 working_dir = working_dir,
                 mcp_url = ps_single_quote(&params.mcp_url),
-                readiness_timeout_ms = params.wait_timeout_ms,
                 notify_script_path = ps_single_quoted_path(notify_script_path),
                 model_arg = model_arg,
                 approval_gate_arg = approval_gate_arg,
@@ -2432,6 +2320,11 @@ pub(super) fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(test)]
+pub(super) fn agent_spawn_wait_deadline(wait_timeout_ms: u64) -> Result<Instant, ErrorData> {
+    agent_spawn_wait_deadline_from(Instant::now(), wait_timeout_ms)
+}
+
 pub(super) fn agent_spawn_wait_deadline_from(
     start: Instant,
     wait_timeout_ms: u64,
@@ -2690,22 +2583,7 @@ pub(super) fn read_spawned_agent_control_artifact(
     if control.protocol != "codex_app_server_ws" {
         validation_errors.push("protocol mismatch");
     }
-    let expected_http_origin = control
-        .endpoint
-        .strip_prefix("ws://127.0.0.1:")
-        .and_then(|port| port.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .map(|port| format!("http://127.0.0.1:{port}"));
-    if let Some(expected_http_origin) = expected_http_origin {
-        let expected_ready_url = format!("{expected_http_origin}/readyz");
-        let expected_health_url = format!("{expected_http_origin}/healthz");
-        if control.app_server_ready_url.as_deref() != Some(expected_ready_url.as_str()) {
-            validation_errors.push("app_server_ready_url does not match endpoint");
-        }
-        if control.app_server_health_url.as_deref() != Some(expected_health_url.as_str()) {
-            validation_errors.push("app_server_health_url does not match endpoint");
-        }
-    } else {
+    if !control.endpoint.starts_with("ws://127.0.0.1:") {
         validation_errors.push("endpoint must be loopback ws://127.0.0.1:<port>");
     }
     if control.control_path != path.display().to_string() {
@@ -2719,78 +2597,6 @@ pub(super) fn read_spawned_agent_control_artifact(
     }
     if control.app_server_process_id == 0 {
         validation_errors.push("app_server_process_id missing");
-    }
-    if control.app_server_readiness_status.as_deref() != Some("healthy") {
-        validation_errors.push("app_server_readiness_status must be healthy");
-    }
-    if control
-        .app_server_readiness_timeout_ms
-        .is_none_or(|value| value == 0)
-    {
-        validation_errors.push("app_server_readiness_timeout_ms missing");
-    }
-    if !matches!(control.app_server_readyz_status_code, Some(200..=299)) {
-        validation_errors.push("app_server_readyz_status_code must be successful");
-    }
-    if !matches!(control.app_server_healthz_status_code, Some(200..=299)) {
-        validation_errors.push("app_server_healthz_status_code must be successful");
-    }
-    if control.app_server_readyz_elapsed_ms.is_none() {
-        validation_errors.push("app_server_readyz_elapsed_ms missing");
-    }
-    if control.app_server_readiness_elapsed_ms.is_none() {
-        validation_errors.push("app_server_readiness_elapsed_ms missing");
-    }
-    if matches!(
-        (
-            control.app_server_readyz_elapsed_ms,
-            control.app_server_readiness_elapsed_ms,
-        ),
-        (Some(readyz_elapsed), Some(readiness_elapsed)) if readyz_elapsed > readiness_elapsed
-    ) {
-        validation_errors.push("readyz elapsed time exceeds total readiness time");
-    }
-    if matches!(
-        (
-            control.app_server_readiness_elapsed_ms,
-            control.app_server_readiness_timeout_ms,
-        ),
-        (Some(elapsed), Some(timeout)) if elapsed > timeout
-    ) {
-        validation_errors.push("readiness elapsed time exceeds caller budget");
-    }
-    if control
-        .app_server_ready_attempts
-        .is_none_or(|value| value == 0)
-    {
-        validation_errors.push("app_server_ready_attempts missing");
-    }
-    if control
-        .app_server_health_attempts
-        .is_none_or(|value| value == 0)
-    {
-        validation_errors.push("app_server_health_attempts missing");
-    }
-    if control.app_server_websocket_status.as_deref() != Some("open") {
-        validation_errors.push("app_server_websocket_status must be open");
-    }
-    if control
-        .app_server_websocket_opened_at_unix_ms
-        .is_none_or(|value| value == 0)
-    {
-        validation_errors.push("app_server_websocket_opened_at_unix_ms missing");
-    }
-    if control.app_server_websocket_error.is_some() {
-        validation_errors.push("app_server_websocket_error present");
-    }
-    if control.app_server_readiness_failure_json.is_some() {
-        validation_errors.push("app_server_readiness_failure_json present");
-    }
-    if control.last_error.is_some() {
-        validation_errors.push("last_error present");
-    }
-    if control.turn_status == "runner_error" {
-        validation_errors.push("turn_status is runner_error");
     }
     if !validation_errors.is_empty() {
         return Err(json!({
@@ -2887,6 +2693,24 @@ pub(super) fn spawn_session_observation_from_read(
     })
 }
 
+#[cfg(test)]
+pub(super) fn spawn_session_candidate_readiness(
+    summary: &crate::server::session_tools::SessionSummary,
+    agent_kind: ActSpawnAgentCli,
+    target: Option<&ActSpawnAgentTarget>,
+    before_session_ids: &BTreeSet<String>,
+    launched_at_unix_ms: u64,
+) -> Value {
+    spawn_session_candidate_readiness_from_read(
+        &summary.registry,
+        summary.active_target.as_ref(),
+        agent_kind,
+        target,
+        before_session_ids,
+        launched_at_unix_ms,
+    )
+}
+
 pub(super) fn spawn_session_candidate_readiness_from_read(
     registry: &SessionRegistryRead,
     active_target: Option<&TargetWire>,
@@ -2977,6 +2801,33 @@ pub(super) fn task_start_session_id_for_spawn(
         .and_then(Value::as_str)
         .filter(|session_id| !session_id.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+pub(super) fn spawn_session_identity_matches(
+    summary: &crate::server::session_tools::SessionSummary,
+    agent_kind: ActSpawnAgentCli,
+    before_session_ids: &BTreeSet<String>,
+    launched_at_unix_ms: u64,
+) -> bool {
+    spawn_session_identity_matches_from_read(
+        &summary.registry,
+        agent_kind,
+        before_session_ids,
+        launched_at_unix_ms,
+    )
+}
+
+pub(super) fn spawn_session_identity_matches_from_read(
+    registry: &SessionRegistryRead,
+    agent_kind: ActSpawnAgentCli,
+    before_session_ids: &BTreeSet<String>,
+    launched_at_unix_ms: u64,
+) -> bool {
+    !before_session_ids.contains(&registry.session_id)
+        && registry.lifecycle == "live"
+        && registry.started_at_unix_ms + 2_000 >= launched_at_unix_ms
+        && registry_matches_cli(registry, agent_kind)
 }
 
 pub(super) fn registry_matches_cli(registry: &SessionRegistryRead, cli: ActSpawnAgentCli) -> bool {

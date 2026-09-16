@@ -230,18 +230,6 @@ pub struct AudioContext {
     pub recent_events: Vec<AudioEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction_estimate: Option<DirectionEstimate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcription: Option<AudioTranscription>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AudioTranscription {
-    pub text: String,
-    pub confidence: f32,
-    pub confidence_source: String,
-    pub latency_ms: u64,
-    pub model_id: String,
 }
 
 pub type AudioCue = AudioEvent;
@@ -340,48 +328,6 @@ pub struct ObservationDiagnostics {
     pub entities_truncated: bool,
     pub size_bytes: u32,
     pub size_estimate_tokens: u32,
-    /// Durable identity of the `CF_OBSERVATIONS` row this observation was
-    /// written to (#2064).
-    ///
-    /// Stamped onto the **response** after the audit write returns, so a caller
-    /// can name the exact row it just produced and read it back through
-    /// `storage operation=row_read`. Before #2064 the key was minted inside the
-    /// write path and never left it, which made "what did the daemon actually
-    /// persist for that observation" unanswerable from the public surface at any
-    /// grant level — and that was the acceptance criterion #2054 could not
-    /// perform.
-    ///
-    /// Always `None` in a persisted row: the key is assigned by the write, so
-    /// stamping it into the value the write is carrying would make the row body
-    /// depend on its own key. `None` therefore means "this is the stored row",
-    /// not "unknown".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persisted: Option<ObservationPersistedRow>,
-}
-
-/// The exact `CF_OBSERVATIONS` row an observe wrote (#2064).
-///
-/// `key_hex` is the physical row key — `ts_ns` big-endian `u64` followed by
-/// `key_seq` big-endian `u32`, 12 bytes / 24 hex characters — which is the form
-/// `storage operation=anchors` and `storage operation=row_read` accept. The
-/// decomposed parts are carried beside it so a caller never has to parse hex to
-/// correlate with `OBSERVATION_AUDIT_RECORDED` log records.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ObservationPersistedRow {
-    /// Column family the row lives in. Always `CF_OBSERVATIONS`.
-    pub cf_name: String,
-    /// Hex-encoded exact physical row key (`ts_ns` BE `u64` || `key_seq` BE `u32`).
-    pub key_hex: String,
-    /// The row's own `observation_id` (`observe-{ts_ns:020}-{key_seq:010}`).
-    pub observation_id: String,
-    /// Key timestamp component. Not `Observation::at`: this is the audit clock
-    /// read at write time, which is what the key is built from.
-    pub ts_ns: u64,
-    /// Key sequence component — the process-global observation audit counter.
-    /// Named `key_seq` because `Observation::seq` is the assembler's own,
-    /// unrelated, per-process observation counter.
-    pub key_seq: u32,
 }
 
 pub const PERCEIVED_TEXT_UNTRUSTED_NOTICE: &str =
@@ -495,11 +441,6 @@ pub struct CaptureRuntimeReadback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_priority: Option<String>,
     pub stop_requested: bool,
-    pub worker_finished: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_error_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -511,22 +452,6 @@ pub enum SensorStatus {
     },
     DegradedSensorFailed {
         reason_code: String,
-    },
-    /// The producer stage was reached and completed, but performed no work
-    /// because the active configuration never asked it to (#2054).
-    ///
-    /// This exists so `Healthy` can mean exactly one thing: this sensor
-    /// produced a reading for this observation. It is distinct from `Disabled`
-    /// (the perception mode switched the producer off outright) and from
-    /// `Unavailable` (the producer was wanted but could not be reached).
-    /// Conflating "no inference was requested" with "inference completed" let
-    /// a health/FSV reader claim neural perception ran when it never did.
-    ///
-    /// `reason_code` is machine-readable; `detail` names the exact
-    /// configuration that would turn the producer on.
-    NotConfigured {
-        reason_code: String,
-        detail: String,
     },
     Disabled,
     #[default]
@@ -561,41 +486,6 @@ pub struct OcrResult {
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspected_injection: Vec<SuspectedInjectionAnnotation>,
-    /// #1823: what was *physically* captured, when the capture surface is a
-    /// browser window whose rendered content depends on which tab is active.
-    /// Present only for browser-window OCR so a caller can detect programmatically
-    /// that the pixels came from a specific tab rather than assume they belong to
-    /// whatever target the session bound.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub captured_target: Option<OcrCapturedTarget>,
-}
-
-/// Physical provenance of a browser-window OCR capture (#1823).
-///
-/// Visible-surface GDI window capture sees only the tab that is currently rendered
-/// in the window, so per-tab OCR of a background tab is impossible by construction.
-/// This records the tab that actually produced the pixels, plus the session's
-/// bound tab when there is one, so cross-tab contamination is always visible in
-/// the response instead of being silently plausible.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct OcrCapturedTarget {
-    /// Browser window HWND the pixels were captured from.
-    pub window_hwnd: i64,
-    /// CDP/bridge target id of the tab rendered in that window at capture time.
-    pub captured_cdp_target_id: String,
-    /// URL of the tab rendered in that window at capture time.
-    pub captured_url: String,
-    /// Title of the tab rendered in that window at capture time.
-    pub captured_title: String,
-    /// The MCP session's bound CDP tab, when the session had one bound.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_bound_cdp_target_id: Option<String>,
-    /// True when the captured tab is the session's bound tab. Always true for a
-    /// successful read: a mismatch fails closed with `OCR_TARGET_NOT_FOREGROUND`.
-    pub matches_session_target: bool,
-    /// How the captured tab identity was established.
-    pub readback_source: String,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]

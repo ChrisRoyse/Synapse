@@ -18,12 +18,6 @@ pub const CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 pub const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 pub const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 pub const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
-pub const CALYX_CONSTELLATION_MEASUREMENTS_TOTAL: &str = "calyx_constellation_measurements_total";
-pub const CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL: &str =
-    "calyx_constellation_measurement_errors_total";
-pub const CALYX_CONSTELLATION_MEASUREMENT_DURATION_US: &str =
-    "calyx_constellation_measurement_duration_us";
-pub const CALYX_SLOT_LENS_REFUSED_TOTAL: &str = "calyx_slot_lens_refused_total";
 pub const PROFILES_ACTIVE: &str = "profiles_active";
 pub const PROFILE_RELOADS_TOTAL: &str = "profile_reloads_total";
 pub const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
@@ -165,42 +159,6 @@ pub const M3_METRICS: &[MetricSpec] = &[
         max_label_combinations: 8,
         label_policy: "flush trigger closed set.",
         description: "Storage write batch flushes by trigger.",
-    },
-    MetricSpec {
-        name: CALYX_CONSTELLATION_MEASUREMENTS_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["panel", "source_cf", "outcome"],
-        max_label_combinations: 48,
-        label_policy: "panel and source_cf are closed sets; outcome is the Calyx put disposition.",
-        description: "Native Calyx constellations measured and submitted from Synapse rows.",
-    },
-    MetricSpec {
-        name: CALYX_SLOT_LENS_REFUSED_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["panel", "lens"],
-        max_label_combinations: 64,
-        label_policy: "panel and lens are closed sets declared by the panel slot blocks.",
-        description: "Lens refusals degraded to a per-slot Absent{Error} instead of failing the                       whole constellation (#1924). The durable counterpart is the panel's                       records_slot_refused coverage.",
-    },
-    MetricSpec {
-        name: CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["panel", "source_cf", "error_type"],
-        max_label_combinations: 64,
-        label_policy: "panel/source_cf are closed sets; error_type is a stable Synapse/Calyx code.",
-        description: "Native Calyx constellation measurement or persistence failures.",
-    },
-    MetricSpec {
-        name: CALYX_CONSTELLATION_MEASUREMENT_DURATION_US,
-        kind: MetricKind::Histogram,
-        unit: Some(Unit::Microseconds),
-        labels: &["panel", "source_cf"],
-        max_label_combinations: 8,
-        label_policy: "panel/source_cf are closed sets.",
-        description: "Wall-clock duration for row-to-constellation measurement and native put.",
     },
     MetricSpec {
         name: PROFILES_ACTIVE,
@@ -379,5 +337,120 @@ fn describe_metric(spec: MetricSpec) {
             describe_histogram!(spec.name, unit, spec.description);
         }
         (MetricKind::Histogram, None) => describe_histogram!(spec.name, spec.description),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        AUDIO_LOOPBACK_UNDERRUNS_TOTAL, AUDIO_STT_INFERENCES_TOTAL, AUDIO_STT_LATENCY_MS,
+        CACHE_EVICTIONS_TOTAL, CARDINALITY_LIMIT, EVENTS_DROPPED_FOR_SUBSCRIBER,
+        EVENTS_PUBLISHED_TOTAL, HTTP_ACTIVE_SESSIONS, HTTP_REQUESTS_TOTAL, MetricKind,
+        PROFILE_RELOADS_TOTAL, PROFILES_ACTIVE, REFLEX_FIRES_TOTAL, REFLEX_RECURSION_CLAMPS_TOTAL,
+        REFLEX_STARVED_TOTAL, REFLEX_TICK_JITTER_US, SSE_ACTIVE_SUBSCRIBERS,
+        SSE_BUFFER_OVERFLOWS_TOTAL, STORAGE_CF_BYTES, STORAGE_DISK_PRESSURE_LEVEL,
+        STORAGE_WRITE_BATCH_FLUSHES_TOTAL, counter, install_prometheus_recorder, m3_metric_specs,
+        register_m3_metrics, render_prometheus,
+    };
+
+    #[test]
+    fn m3_registry_contains_exact_issue_metrics() {
+        let expected = BTreeSet::from([
+            EVENTS_DROPPED_FOR_SUBSCRIBER,
+            EVENTS_PUBLISHED_TOTAL,
+            REFLEX_FIRES_TOTAL,
+            REFLEX_TICK_JITTER_US,
+            REFLEX_RECURSION_CLAMPS_TOTAL,
+            REFLEX_STARVED_TOTAL,
+            CACHE_EVICTIONS_TOTAL,
+            STORAGE_DISK_PRESSURE_LEVEL,
+            STORAGE_CF_BYTES,
+            STORAGE_WRITE_BATCH_FLUSHES_TOTAL,
+            PROFILES_ACTIVE,
+            PROFILE_RELOADS_TOTAL,
+            AUDIO_LOOPBACK_UNDERRUNS_TOTAL,
+            AUDIO_STT_INFERENCES_TOTAL,
+            AUDIO_STT_LATENCY_MS,
+            HTTP_REQUESTS_TOTAL,
+            HTTP_ACTIVE_SESSIONS,
+            SSE_ACTIVE_SUBSCRIBERS,
+            SSE_BUFFER_OVERFLOWS_TOTAL,
+        ]);
+        let actual = m3_metric_specs()
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 19);
+    }
+
+    #[test]
+    fn m3_registry_cardinality_budgets_stay_bounded() {
+        for spec in m3_metric_specs() {
+            assert!(
+                spec.has_bounded_cardinality(),
+                "{} permits {} label combinations, expected < {}",
+                spec.name,
+                spec.max_label_combinations,
+                CARDINALITY_LIMIT
+            );
+            assert!(
+                !spec.description.is_empty(),
+                "{} must carry a metric description",
+                spec.name
+            );
+            assert!(
+                !spec.label_policy.is_empty(),
+                "{} must document how labels are bounded",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn installed_prometheus_recorder_renders_counter_samples()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _handle = install_prometheus_recorder()?;
+        register_m3_metrics();
+        counter!(
+            EVENTS_PUBLISHED_TOTAL,
+            "source" => "telemetry_test",
+            "kind" => "smoke"
+        )
+        .increment(1);
+
+        let rendered = render_prometheus().ok_or("prometheus recorder render handle missing")?;
+        assert!(rendered.contains(EVENTS_PUBLISHED_TOTAL), "{rendered}");
+        assert!(rendered.contains("source=\"telemetry_test\""), "{rendered}");
+        assert!(rendered.contains("kind=\"smoke\""), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn m3_registry_keeps_expected_metric_kinds() {
+        let specs = m3_metric_specs();
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| matches!(spec.kind, MetricKind::Counter))
+                .count(),
+            12
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| matches!(spec.kind, MetricKind::Gauge))
+                .count(),
+            5
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| matches!(spec.kind, MetricKind::Histogram))
+                .count(),
+            2
+        );
     }
 }

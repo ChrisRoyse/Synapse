@@ -15,18 +15,8 @@ use synapse_core::Event;
 pub use error::{AudioError, AudioResult};
 pub use loopback::LoopbackStatus;
 pub use ring::{AudioFormat, AudioRing, AudioWindow};
-pub use stt::{
-    STT_BACKEND_ENV, SttBackendPolicy, SttBackendReadback, Transcription,
-    TranscriptionConfidenceSource, WhisperTinyStt, stt_backend_policy,
-};
+pub use stt::{Transcription, TranscriptionConfidenceSource, WhisperTinyStt};
 pub use synapse_core::DirectionEstimate;
-
-/// Whether audio/STT can select a CUDA execution provider.
-///
-/// Exported
-/// so the installed daemon can make dependency feature injection a hard
-/// compile-time error rather than a runtime configuration promise.
-pub const CUDA_EXECUTION_PROVIDER_COMPILED: bool = false;
 
 pub const DEFAULT_RING_SECONDS: u32 = 30;
 pub const MAX_RING_SECONDS: u32 = 30;
@@ -92,7 +82,7 @@ impl AudioRuntime {
     ) -> AudioResult<Self> {
         validate_config(&config)?;
         let ring = Arc::new(AudioRing::new(config.ring_seconds));
-        let detector_state = detectors::SharedDetectorState::new(config.ring_seconds);
+        let detector_state = detectors::SharedDetectorState::default();
         let loopback = if config.start_loopback {
             Some(loopback::start_loopback(
                 Arc::clone(&ring),
@@ -228,9 +218,6 @@ impl AudioRuntime {
             || LoopbackStatus {
                 running: false,
                 frames_captured: 0,
-                timeline_discontinuities: 0,
-                timeline_gap_frames: 0,
-                last_timeline_discontinuity: None,
                 last_error_code: None,
             },
             loopback::LoopbackHandle::status,
@@ -241,22 +228,6 @@ impl AudioRuntime {
     #[tracing::instrument(skip_all, fields(component = "audio_runtime"))]
     pub fn stt_model_loaded(&self) -> bool {
         self.stt.lock().is_ok_and(|stt| stt.is_loaded())
-    }
-
-    /// Independently reads the configured and selected STT execution provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured model error if the runtime or STT readback mutex
-    /// is poisoned.
-    pub fn stt_backend_readback(&self) -> AudioResult<SttBackendReadback> {
-        self.stt
-            .lock()
-            .map_err(|_| AudioError::ModelLoadFailed {
-                path: stt::default_model_path(),
-                detail: "STT runtime readback lock was poisoned".to_owned(),
-            })?
-            .backend_readback()
     }
 }
 

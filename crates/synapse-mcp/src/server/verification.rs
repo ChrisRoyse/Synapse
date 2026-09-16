@@ -16,11 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use synapse_storage::{Db, cf, decode_json};
+use synapse_storage::{Db, cf};
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::{CdpTargetInfoParams, mcp_error};
-use crate::m3::grounding::{self, SOURCE_VERIFICATION};
 use crate::server::url_redaction::redact_url_for_public_readback;
 
 const AUDIT_PREFIX: &str = "verification/audit/v1/";
@@ -608,27 +607,35 @@ impl SynapseService {
     ) -> Result<Option<VerificationBinding>, ErrorData> {
         let db = self.verification_db()?;
         let key = format!("{BINDING_PREFIX}{source}");
-        let raw = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("verification binding lookup failed for source {source:?}: {error}"),
-            )
-        })?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
-            mcp_error(
-                synapse_core::error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "verification binding decode failed for source {source:?} key {key:?}: {error}"
-                ),
-            )
-        })?;
-        if let Some(window_hwnd) = binding.window_hwnd {
-            validate_persisted_verification_hwnd("verification_persisted_binding", window_hwnd)?;
+        let rows = db
+            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("verification binding lookup failed for source {source:?}: {error}"),
+                )
+            })?;
+        for (raw_key, raw) in rows {
+            if raw_key.as_slice() != key.as_bytes() {
+                continue; // exact-source match only (avoid prefix collisions)
+            }
+            let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
+                mcp_error(
+                    synapse_core::error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "verification binding decode failed for source {source:?} key {key:?}: {error}"
+                    ),
+                )
+            })?;
+            if let Some(window_hwnd) = binding.window_hwnd {
+                validate_persisted_verification_hwnd(
+                    "verification_persisted_binding",
+                    window_hwnd,
+                )?;
+            }
+            return Ok(binding.enabled.then_some(binding));
         }
-        Ok(binding.enabled.then_some(binding))
+        Ok(None)
     }
 
     fn verification_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
@@ -671,56 +678,6 @@ impl SynapseService {
                 format!("verification audit row flush failed: {error}"),
             )
         })?;
-        let key_bytes = key.as_bytes().to_vec();
-        let readback_value = db
-            .get_cf(cf::CF_KV, &key_bytes)
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("verification audit row readback failed: {error}"),
-                )
-            })?
-            .ok_or_else(|| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    format!("verification audit row absent immediately after write for key {key}"),
-                )
-            })?;
-        let readback: VerificationAuditRow = decode_json(&readback_value).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("verification audit row readback decode failed: {error}"),
-            )
-        })?;
-        let source_record = serde_json::to_value(&readback).map_err(|error| {
-            mcp_error(
-                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                format!("verification audit anchor projection failed: {error}"),
-            )
-        })?;
-        let report = grounding::write_outcome_constellation_and_anchor(
-            &db,
-            cf::CF_KV,
-            &key_bytes,
-            &readback_value,
-            &source_record,
-            grounding::bool_anchor(
-                "synapse:verification_outcome",
-                readback.code_count > 0,
-                SOURCE_VERIFICATION,
-                readback.read_at_unix_ms,
-            ),
-            "verification audit anchor",
-        )?;
-        tracing::info!(
-            code = "VERIFICATION_OUTCOME_ANCHORED",
-            audit_key = %key,
-            source = %readback.source,
-            code_count = readback.code_count,
-            cx_id = %report.cx_id,
-            ledger_seq = report.ledger_seq,
-            "verification audit outcome grounded on CF_KV audit constellation"
-        );
         Ok(key)
     }
 }
@@ -929,4 +886,80 @@ fn classify_code(token: &str) -> Option<&'static str> {
         return Some("alphanumeric");
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_google_g_code_unconditionally() {
+        let codes =
+            extract_verification_codes("Your Google verification code is G-739212 for sign-in");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c.code == "G-739212" && c.kind == "google_g")
+        );
+    }
+
+    #[test]
+    fn numeric_code_only_with_keyword() {
+        let with = extract_verification_codes("Your verification code is 481923. Do not share it.");
+        assert!(
+            with.iter()
+                .any(|c| c.code == "481923" && c.kind == "numeric")
+        );
+        // Bare numbers with no code keyword nearby are NOT treated as codes.
+        let without = extract_verification_codes("Order 481923 shipped on 2026 at 14:32 to 90210");
+        assert!(without.iter().all(|c| c.code != "481923"));
+    }
+
+    #[test]
+    fn clause_boundary_excludes_adjacent_sentence_numbers() {
+        // The keyword "code." ends one sentence; the order number / year / zip in
+        // the NEXT sentence must NOT be picked up as codes.
+        let text = "Your verification code is 481923. Order 559001 shipped 2026 to 90210.";
+        let got: Vec<String> = extract_verification_codes(text)
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
+        assert!(got.contains(&"481923".to_owned()), "got {got:?}");
+        assert!(!got.contains(&"559001".to_owned()), "got {got:?}");
+        assert!(!got.contains(&"2026".to_owned()), "got {got:?}");
+        assert!(!got.contains(&"90210".to_owned()), "got {got:?}");
+    }
+
+    #[test]
+    fn alphanumeric_code_with_keyword() {
+        let codes = extract_verification_codes("Enter passcode A1B2C3 to confirm your account");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c.code == "A1B2C3" && c.kind == "alphanumeric")
+        );
+    }
+
+    #[test]
+    fn poll_match_filters_by_service_context() {
+        let codes = extract_verification_codes(
+            "Stripe: your verification code is 224488. Acme login code: A1B2C3.",
+        );
+        // service filter matches by surrounding context
+        let stripe = verification_match(&codes, Some("stripe")).expect("stripe code");
+        assert_eq!(stripe.code, "224488");
+        let acme = verification_match(&codes, Some("acme")).expect("acme code");
+        assert_eq!(acme.code, "A1B2C3");
+        // no filter -> first code
+        assert_eq!(verification_match(&codes, None).unwrap().code, "224488");
+        // unknown service -> none
+        assert!(verification_match(&codes, Some("paypal")).is_none());
+    }
+
+    #[test]
+    fn masking_hides_the_code() {
+        assert_eq!(mask_code("481923"), "48***3");
+        assert_eq!(mask_code("G-739212"), "G-*****2");
+        assert_eq!(mask_code("99"), "**");
+    }
 }

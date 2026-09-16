@@ -1,0 +1,10 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "Rect { x: -10, y: 20, w: 30, h: 40, }"
+---
+{
+  "x": -10,
+  "y": 20,
+  "w": 30,
+  "h": 40
+}

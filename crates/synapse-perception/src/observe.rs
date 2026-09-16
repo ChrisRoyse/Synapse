@@ -392,9 +392,6 @@ impl ObservationAssembler {
                 entities_truncated,
                 size_bytes: 0,
                 size_estimate_tokens: 0,
-                // Assigned by the audit write, which has not run yet. See
-                // `refresh_size_fields` (#2064).
-                persisted: None,
             },
         };
         update_size_fields(&mut observation)?;
@@ -422,16 +419,20 @@ pub fn assemble_from_input(input: ObservationInput) -> PerceptionResult<Observat
 }
 
 #[must_use]
-pub const fn auto_mode(_foreground: &ForegroundContext) -> PerceptionMode {
-    PerceptionMode::A11yOnly
+pub fn auto_mode(foreground: &ForegroundContext) -> PerceptionMode {
+    if is_known_game_process(&foreground.process_name) {
+        PerceptionMode::Hybrid
+    } else {
+        PerceptionMode::A11yOnly
+    }
 }
 
 #[must_use]
-pub const fn auto_mode_with_a11y(
-    _foreground: &ForegroundContext,
+pub fn auto_mode_with_a11y(
+    foreground: &ForegroundContext,
     summary: &A11yTreeSummary,
 ) -> PerceptionMode {
-    if summary.is_sparse() {
+    if is_known_game_process(&foreground.process_name) || summary.is_sparse() {
         PerceptionMode::Hybrid
     } else {
         PerceptionMode::A11yOnly
@@ -461,6 +462,20 @@ pub fn bounded_sensor_latency(input: BTreeMap<String, f32>) -> BTreeMap<String, 
         .into_iter()
         .filter(|(key, value)| SENSOR_KEYS.contains(&key.as_str()) && value.is_finite())
         .collect()
+}
+
+#[must_use]
+pub fn is_known_game_process(process_name: &str) -> bool {
+    matches!(
+        process_name.to_ascii_lowercase().as_str(),
+        "eldenring.exe"
+            | "fortniteclient-win64-shipping.exe"
+            | "game.exe"
+            | "minecraft.exe"
+            | "overwatch.exe"
+            | "starfield.exe"
+            | "valorant.exe"
+    )
 }
 
 fn filter_elements(
@@ -548,26 +563,6 @@ fn ensure_any_sensor_available(
     Err(PerceptionError::ObserveNoPerceptionAvailable {
         detail: "all perception producers unavailable or disabled".to_owned(),
     })
-}
-
-/// Recompute `diagnostics.size_bytes` / `size_estimate_tokens` after a caller
-/// mutates an already-assembled observation (#2064).
-///
-/// The observe path stamps `diagnostics.persisted` onto the response once the
-/// audit write returns the durable row key. That happens after assembly, so the
-/// size fields the assembler computed would otherwise under-report the response
-/// the caller actually receives — a small lie, but this crate does not ship
-/// fields that describe something other than what they name. Two passes, exactly
-/// as [`ObservationAssembler::assemble`] does, because the size fields are part
-/// of the encoding they measure.
-///
-/// # Errors
-///
-/// Returns [`PerceptionError::ObserveInternal`] when the observation will not
-/// serialize.
-pub fn refresh_size_fields(observation: &mut Observation) -> PerceptionResult<()> {
-    update_size_fields(observation)?;
-    update_size_fields(observation)
 }
 
 fn update_size_fields(observation: &mut Observation) -> PerceptionResult<()> {

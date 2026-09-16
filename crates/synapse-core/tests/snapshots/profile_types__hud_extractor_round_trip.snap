@@ -1,0 +1,12 @@
+---
+source: crates/synapse-core/tests/profile_types.rs
+expression: "round_trip(\"HudExtractor\", \"snapshot\", full_extractor())?"
+---
+{
+  "kind": "template_match",
+  "templates": [
+    "hearts/full.png",
+    "hearts/half.png",
+    "hearts/empty.png"
+  ]
+}

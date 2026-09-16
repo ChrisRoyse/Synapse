@@ -66,9 +66,10 @@ pub(crate) struct RetainedShutdownTaskOwnerReport {
 }
 
 impl RetainedShutdownTaskOwnerReport {
-    /// Verdict-bearing outputs remain unresolved if their typed supervisor is
-    /// lost. Unit-output owners are removed from `retention_incidents` only
-    /// after the registry consumes their exact `Poll::Ready(Ok(()))` join.
+    /// A task reaches this ledger only after its surrounding shutdown owner was
+    /// lost. Even a later successful join cannot reconstruct or validate the
+    /// erased task output, so the incident permanently rejects a graceful
+    /// lifetime-lock verdict for this process.
     pub(crate) const fn safe_to_unlock(&self) -> bool {
         self.active_owner_count == 0 && self.retention_incident_count == 0
     }
@@ -77,10 +78,6 @@ impl RetainedShutdownTaskOwnerReport {
 struct RetainedShutdownTask {
     owner: RetainedShutdownTaskOwner,
     task: Box<dyn ErasedShutdownTaskOwner>,
-    /// A successful terminal join is the complete cleanup verdict for tasks
-    /// whose output is `()`. Verdict-bearing task outputs must still be
-    /// acknowledged by their original typed supervisor.
-    terminal_success_reconciles: bool,
 }
 
 #[derive(Default)]
@@ -120,20 +117,54 @@ fn retained_shutdown_task_registry() -> &'static Mutex<RetainedShutdownTaskRegis
     REGISTRY.get_or_init(|| Mutex::new(RetainedShutdownTaskRegistry::default()))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RETAINED_SHUTDOWN_TASK_REGISTRY: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetainedShutdownTaskRegistry>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct IsolatedRetainedShutdownTaskRegistry {
+    previous: Option<std::sync::Arc<Mutex<RetainedShutdownTaskRegistry>>>,
+}
+
+#[cfg(test)]
+impl IsolatedRetainedShutdownTaskRegistry {
+    fn install() -> Self {
+        let isolated = std::sync::Arc::new(Mutex::new(RetainedShutdownTaskRegistry::default()));
+        let previous =
+            TEST_RETAINED_SHUTDOWN_TASK_REGISTRY.with(|cell| cell.borrow_mut().replace(isolated));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IsolatedRetainedShutdownTaskRegistry {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_RETAINED_SHUTDOWN_TASK_REGISTRY.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 fn with_retained_shutdown_task_registry<R>(
     operation: impl FnOnce(&mut RetainedShutdownTaskRegistry) -> R,
 ) -> R {
+    #[cfg(test)]
+    {
+        let isolated = TEST_RETAINED_SHUTDOWN_TASK_REGISTRY.with(|cell| cell.borrow().clone());
+        if let Some(isolated) = isolated {
+            let mut registry = isolated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return operation(&mut registry);
+        }
+    }
     let mut registry = retained_shutdown_task_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     operation(&mut registry)
 }
 
-fn retain_shutdown_task<T: Send + 'static>(
-    label: &'static str,
-    task: JoinHandle<T>,
-    terminal_success_reconciles: bool,
-) {
+fn retain_shutdown_task<T: Send + 'static>(label: &'static str, task: JoinHandle<T>) {
     let tokio_task_id = format!("{:?}", task.id());
     let task: Box<dyn ErasedShutdownTaskOwner> = Box::new(TypedShutdownTaskOwner { task });
     with_retained_shutdown_task_registry(|registry| {
@@ -143,25 +174,19 @@ fn retain_shutdown_task<T: Send + 'static>(
             tokio_task_id,
         };
         registry.retention_incidents.push(owner.clone());
-        let detail = if terminal_success_reconciles {
-            "surrounding shutdown future dropped before the exact unit-output task reached a terminal join; lifetime-lock release remains rejected until the retained JoinHandle yields Poll::Ready(Ok(()))"
-        } else {
-            "surrounding shutdown future dropped before exact task reached a terminal join; this abnormal ownership transfer permanently rejects graceful lifetime-lock release because its typed output verdict would be erased"
-        };
-        registry.push_evidence("retained_live_owner", owner.clone(), detail.to_owned());
-        registry.active.push(RetainedShutdownTask {
-            owner,
-            task,
-            terminal_success_reconciles,
-        });
+        registry.push_evidence(
+            "retained_live_owner",
+            owner.clone(),
+            "surrounding shutdown future dropped before exact task reached a terminal join; this abnormal ownership transfer permanently rejects graceful lifetime-lock release"
+                .to_owned(),
+        );
+        registry.active.push(RetainedShutdownTask { owner, task });
     });
 }
 
 fn record_unacknowledged_terminal_shutdown_task<T: Send + 'static>(
     label: &'static str,
     task: JoinHandle<T>,
-    terminal_success_reconciles: bool,
-    terminal_success_observed: bool,
 ) {
     let tokio_task_id = format!("{:?}", task.id());
     with_retained_shutdown_task_registry(|registry| {
@@ -170,22 +195,13 @@ fn record_unacknowledged_terminal_shutdown_task<T: Send + 'static>(
             task_label: label,
             tokio_task_id,
         };
-        if terminal_success_reconciles && terminal_success_observed {
-            registry.push_evidence(
-                "terminal_unit_output_reconciled",
-                owner,
-                "the exact unit-output JoinHandle yielded Poll::Ready(Ok(())); that terminal join is the complete typed cleanup verdict even though the surrounding shutdown phase was cancelled before acknowledgement"
-                    .to_owned(),
-            );
-        } else {
-            registry.retention_incidents.push(owner.clone());
-            registry.push_evidence(
-                "terminal_output_unacknowledged",
-                owner,
-                "the exact JoinHandle yielded Poll::Ready, but its surrounding shutdown phase was cancelled before acknowledging that the terminal output was incorporated into the cleanup verdict"
-                    .to_owned(),
-            );
-        }
+        registry.retention_incidents.push(owner.clone());
+        registry.push_evidence(
+            "terminal_output_unacknowledged",
+            owner,
+            "the exact JoinHandle yielded Poll::Ready, but its surrounding shutdown phase was cancelled before acknowledging that the terminal output was incorporated into the cleanup verdict"
+                .to_owned(),
+        );
     });
     drop(task);
 }
@@ -200,25 +216,13 @@ pub(crate) fn retained_shutdown_task_owner_report() -> RetainedShutdownTaskOwner
                 continue;
             };
             let retained = registry.active.swap_remove(index);
-            let terminal_success = terminal_join.is_ok();
             let detail = match terminal_join {
-                Ok(()) if retained.terminal_success_reconciles => {
-                    registry
-                        .retention_incidents
-                        .retain(|incident| incident.owner_id != retained.owner.owner_id);
-                    "retained exact unit-output JoinHandle reached Poll::Ready(Ok(())); the complete typed cleanup verdict is reconciled and no live owner remains".to_owned()
-                }
-                Ok(()) => "retained exact JoinHandle reached a successful terminal join, but its verdict-bearing output was erased and cannot restore a graceful shutdown verdict".to_owned(),
+                Ok(()) => "retained exact JoinHandle reached a successful terminal join, but its erased output cannot restore a graceful shutdown verdict".to_owned(),
                 Err(error) => {
                     format!("retained exact JoinHandle reached terminal join error: {error}")
                 }
             };
-            let event = if retained.terminal_success_reconciles && terminal_success {
-                "terminal_join_reconciled"
-            } else {
-                "terminal_join_reaped"
-            };
-            registry.push_evidence(event, retained.owner, detail);
+            registry.push_evidence("terminal_join_reaped", retained.owner, detail);
         }
         RetainedShutdownTaskOwnerReport {
             active_owner_count: registry.active.len(),
@@ -241,9 +245,7 @@ pub(crate) struct ShutdownTaskOwner<T: Send + 'static> {
     label: &'static str,
     task: Option<JoinHandle<T>>,
     terminal_join_observed: bool,
-    terminal_success_observed: bool,
     terminal_outcome_acknowledged: bool,
-    terminal_success_reconciles: bool,
 }
 
 impl<T: Send + 'static> ShutdownTaskOwner<T> {
@@ -252,9 +254,7 @@ impl<T: Send + 'static> ShutdownTaskOwner<T> {
             label,
             task: Some(task),
             terminal_join_observed: false,
-            terminal_success_observed: false,
             terminal_outcome_acknowledged: false,
-            terminal_success_reconciles: false,
         }
     }
 
@@ -263,16 +263,6 @@ impl<T: Send + 'static> ShutdownTaskOwner<T> {
             unreachable!("shutdown task owner must contain its exact JoinHandle");
         };
         task.abort();
-    }
-
-    /// Scheduling hint used only to detect that a task stopped before its
-    /// owner expected it to. The terminal outcome must still be consumed by
-    /// polling this owner and acknowledged into the caller's verdict.
-    pub(crate) fn task_finished_hint(&self) -> bool {
-        let Some(task) = self.task.as_ref() else {
-            unreachable!("shutdown task owner must contain its exact JoinHandle");
-        };
-        task.is_finished()
     }
 
     /// Returns true only after this wrapper has consumed the exact
@@ -305,9 +295,8 @@ impl<T: Send + 'static> std::future::Future for ShutdownTaskOwner<T> {
             unreachable!("shutdown task owner must contain its exact JoinHandle");
         };
         let result = Pin::new(task).poll(context);
-        if let Poll::Ready(joined) = &result {
+        if result.is_ready() {
             this.terminal_join_observed = true;
-            this.terminal_success_observed = joined.is_ok();
         }
         result
     }
@@ -329,12 +318,7 @@ impl<T: Send + 'static> Drop for ShutdownTaskOwner<T> {
                 task = self.label,
                 "shutdown owner reached a terminal join but its output was not acknowledged into the surrounding cleanup verdict"
             );
-            record_unacknowledged_terminal_shutdown_task(
-                self.label,
-                task,
-                self.terminal_success_reconciles,
-                self.terminal_success_observed,
-            );
+            record_unacknowledged_terminal_shutdown_task(self.label, task);
             return;
         }
 
@@ -348,24 +332,7 @@ impl<T: Send + 'static> Drop for ShutdownTaskOwner<T> {
         // task output. Move every unobserved owner into the process-global
         // registry so cancellation cannot erase a join failure or cleanup
         // verdict in the finished-before-wrapper-poll race.
-        retain_shutdown_task(self.label, task, self.terminal_success_reconciles);
-    }
-}
-
-impl ShutdownTaskOwner<()> {
-    /// Owns a task whose successful unit output is itself the complete cleanup
-    /// verdict. If an outer cancellation transfers this handle to the retained
-    /// registry, a later `Poll::Ready(Ok(()))` can therefore reconcile the
-    /// incident without guessing at erased typed state.
-    pub(crate) const fn new_unit(label: &'static str, task: JoinHandle<()>) -> Self {
-        Self {
-            label,
-            task: Some(task),
-            terminal_join_observed: false,
-            terminal_success_observed: false,
-            terminal_outcome_acknowledged: false,
-            terminal_success_reconciles: true,
-        }
+        retain_shutdown_task(self.label, task);
     }
 }
 
@@ -773,4 +740,319 @@ async fn wait_for_m2_emitter_done_with_timeout(
         "readback=action_emitter_state edge=daemon_shutdown after_emitter_done"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use synapse_action::ResolvedBackend;
+    use synapse_core::{GamepadReport, Key, KeyCode, MouseButton};
+
+    use super::*;
+
+    fn empty_snapshot() -> ActionStateSnapshot {
+        ActionStateSnapshot {
+            held_keys: Vec::new(),
+            held_key_bits: Vec::new(),
+            held_key_timer_keys: Vec::new(),
+            held_key_timer_count: 0,
+            held_buttons: Vec::new(),
+            held_button_bits: Vec::new(),
+            pad_state: HashMap::new(),
+            held_keys_by_backend: HashMap::new(),
+            held_buttons_by_backend: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn observes_published_empty_final_state() -> anyhow::Result<()> {
+        let (sender, receiver) = watch::channel(None);
+        let publisher = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sender.send(Some(empty_snapshot()))
+        });
+
+        wait_for_m2_emitter_done_with_timeout(
+            Some(receiver),
+            "test",
+            "published_empty",
+            Duration::from_secs(1),
+        )
+        .await?;
+        publisher
+            .await
+            .map_err(|error| anyhow::anyhow!("join final-state publisher: {error}"))?
+            .map_err(|_error| anyhow::anyhow!("final-state receiver closed early"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_receiver() {
+        let error = wait_for_m2_emitter_done_with_timeout(
+            None,
+            "test",
+            "missing_receiver",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("missing receiver must fail shutdown drain");
+        assert_eq!(
+            error,
+            M2EmitterDrainError::MissingReceiver {
+                transport: "test",
+                source: "missing_receiver"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_channel_close_without_final_state() {
+        let (sender, receiver) = watch::channel(None);
+        drop(sender);
+        let error = wait_for_m2_emitter_done_with_timeout(
+            Some(receiver),
+            "test",
+            "channel_closed",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("closed channel without final state must fail shutdown drain");
+        assert_eq!(
+            error,
+            M2EmitterDrainError::ChannelClosed {
+                transport: "test",
+                source: "channel_closed"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_timeout_without_final_state() {
+        let (_sender, receiver) = watch::channel(None);
+        let error = wait_for_m2_emitter_done_with_timeout(
+            Some(receiver),
+            "test",
+            "timeout",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("missing final state at deadline must fail shutdown drain");
+        assert_eq!(
+            error,
+            M2EmitterDrainError::Timeout {
+                transport: "test",
+                source: "timeout",
+                timeout_ms: 10
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_nonempty_final_state_with_exact_counts() {
+        let mut snapshot = empty_snapshot();
+        let key = Key {
+            code: KeyCode::Named {
+                value: "Shift".to_owned(),
+            },
+            use_scancode: false,
+        };
+        snapshot.held_keys.push(key.clone());
+        snapshot.held_key_bits.push(7);
+        snapshot.held_key_timer_keys.push(key.clone());
+        snapshot.held_buttons.push(MouseButton::Left);
+        snapshot.held_button_bits.push(3);
+        snapshot.pad_state.insert(0, GamepadReport::default());
+        snapshot
+            .held_keys_by_backend
+            .insert(ResolvedBackend::Software, vec![key]);
+        snapshot
+            .held_keys_by_backend
+            .insert(ResolvedBackend::Hardware, Vec::new());
+        snapshot
+            .held_buttons_by_backend
+            .insert(ResolvedBackend::Software, vec![MouseButton::Left]);
+        snapshot
+            .held_buttons_by_backend
+            .insert(ResolvedBackend::Hardware, Vec::new());
+        snapshot.held_key_timer_count = 2;
+        let (sender, receiver) = watch::channel(Some(snapshot));
+        let _keep_sender_alive = sender;
+
+        let error = wait_for_m2_emitter_done_with_timeout(
+            Some(receiver),
+            "test",
+            "nonempty",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("nonempty final state must fail shutdown drain");
+        assert_eq!(
+            error,
+            M2EmitterDrainError::NonEmptyFinalState {
+                transport: "test",
+                source: "nonempty",
+                counts: ActionStateCounts {
+                    held_keys: 1,
+                    held_key_bits: 1,
+                    held_key_timer_keys: 1,
+                    held_key_timer_count: 2,
+                    held_buttons: 1,
+                    held_button_bits: 1,
+                    held_pads: 1,
+                    held_keys_by_backend_entries: 2,
+                    held_keys_by_backend_nonempty_entries: 1,
+                    held_keys_by_backend_values: 1,
+                    held_buttons_by_backend_entries: 2,
+                    held_buttons_by_backend_nonempty_entries: 1,
+                    held_buttons_by_backend_values: 1,
+                }
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_drain_requires_and_joins_the_exact_emitter_task() {
+        let snapshot = empty_snapshot();
+        let (sender, receiver) = watch::channel(Some(snapshot.clone()));
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(sender);
+            snapshot
+        });
+        let report = drain_m2_emitter_owner(
+            Some(M2EmitterOwner {
+                done: Some(receiver),
+                task: Some(ShutdownTaskOwner::new("test_m2_emitter", task)),
+                acquisition_failure: None,
+            }),
+            "test",
+            "exact_owner",
+        )
+        .await;
+
+        assert!(report.safe_to_unlock());
+        report.verdict().expect("exact emitter task joined cleanly");
+
+        let missing = drain_m2_emitter_owner(None, "test", "missing_owner").await;
+        assert!(!missing.safe_to_unlock());
+        assert!(missing.verdict().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_future_retains_sticky_incident_after_terminal_join() {
+        let _isolated_registry = IsolatedRetainedShutdownTaskRegistry::install();
+        const LABEL: &str = "test_cancelled_shutdown_owner";
+        let (finish_sender, finish_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _finished = finish_receiver.await;
+        });
+        drop(ShutdownTaskOwner::new(LABEL, task));
+
+        let retained = retained_shutdown_task_owner_report();
+        assert!(!retained.safe_to_unlock(), "{retained:?}");
+        assert_eq!(retained.retention_incident_count, 1, "{retained:?}");
+        assert!(
+            retained
+                .active_owners
+                .iter()
+                .any(|owner| owner.task_label == LABEL),
+            "live exact JoinHandle must remain inspectable after owner cancellation: {retained:?}"
+        );
+
+        finish_sender
+            .send(())
+            .expect("release retained task through a successful terminal output");
+        let reaped = loop {
+            tokio::task::yield_now().await;
+            let report = retained_shutdown_task_owner_report();
+            if !report
+                .active_owners
+                .iter()
+                .any(|owner| owner.task_label == LABEL)
+            {
+                break report;
+            }
+        };
+        assert!(reaped.evidence.iter().any(|evidence| {
+            evidence.event == "retained_live_owner" && evidence.owner.task_label == LABEL
+        }));
+        assert!(reaped.evidence.iter().any(|evidence| {
+            evidence.event == "terminal_join_reaped" && evidence.owner.task_label == LABEL
+        }));
+        assert_eq!(reaped.active_owner_count, 0, "{reaped:?}");
+        assert_eq!(reaped.retention_incident_count, 1, "{reaped:?}");
+        assert!(
+            reaped
+                .retention_incidents
+                .iter()
+                .any(|owner| owner.task_label == LABEL),
+            "the abnormal ownership transfer must remain auditable: {reaped:?}"
+        );
+        assert!(
+            !reaped.safe_to_unlock(),
+            "a later terminal join cannot reconstruct the erased cleanup verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_but_unpolled_shutdown_owner_is_a_sticky_incident() {
+        let _isolated_registry = IsolatedRetainedShutdownTaskRegistry::install();
+        const LABEL: &str = "test_finished_unpolled_shutdown_owner";
+        let task = tokio::spawn(async {});
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        // `is_finished()` does not consume the JoinHandle output. Simulate a
+        // surrounding drain future being cancelled in the exact gap between
+        // that hint becoming true and the wrapper receiving Poll::Ready.
+        drop(ShutdownTaskOwner::new(LABEL, task));
+
+        let report = retained_shutdown_task_owner_report();
+        assert_eq!(report.active_owner_count, 0, "{report:?}");
+        assert_eq!(report.retention_incident_count, 1, "{report:?}");
+        assert!(
+            report
+                .retention_incidents
+                .iter()
+                .any(|owner| owner.task_label == LABEL)
+        );
+        assert!(report.evidence.iter().any(|evidence| {
+            evidence.event == "terminal_join_reaped" && evidence.owner.task_label == LABEL
+        }));
+        assert!(
+            !report.safe_to_unlock(),
+            "an unobserved terminal result must permanently reject graceful lock release: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn polled_but_unacknowledged_shutdown_output_is_a_sticky_incident() {
+        let _isolated_registry = IsolatedRetainedShutdownTaskRegistry::install();
+        const LABEL: &str = "test_polled_unacknowledged_shutdown_owner";
+        let mut owner = ShutdownTaskOwner::new(LABEL, tokio::spawn(async { 7_u8 }));
+        assert_eq!(
+            (&mut owner)
+                .await
+                .expect("synthetic shutdown owner joins cleanly"),
+            7
+        );
+
+        // Simulate cancellation after the JoinHandle yielded its cleanup
+        // output but before the surrounding phase incorporated that output
+        // into its aggregate report.
+        drop(owner);
+
+        let report = retained_shutdown_task_owner_report();
+        assert_eq!(report.active_owner_count, 0, "{report:?}");
+        assert_eq!(report.retention_incident_count, 1, "{report:?}");
+        assert!(report.evidence.iter().any(|evidence| {
+            evidence.event == "terminal_output_unacknowledged" && evidence.owner.task_label == LABEL
+        }));
+        assert!(
+            !report.safe_to_unlock(),
+            "an erased terminal cleanup output must permanently reject graceful lock release: {report:?}"
+        );
+    }
 }

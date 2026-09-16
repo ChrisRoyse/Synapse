@@ -3,171 +3,26 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rocksdb::{ColumnFamilyRef, DB, IteratorMode};
+use synapse_core::{error_codes, retention::DEFAULTS};
+
 use crate::{StorageError, StorageResult};
 
-// Retention is an hours-to-days policy, while one exact Calyx reachability
-// census can traverse millions of Base rows.  Running that census every five
-// minutes kept a CPU core busy for most of the daemon lifetime on mature
-// vaults.  Pressure remains monitored independently every 30 seconds; routine
-// retention reclamation is completion-relative and may lag expiry by at most
-// one bounded six-hour window.
-const GC_INTERVAL: Duration = Duration::from_hours(6);
-/// How long after boot the first maintenance pass runs, instead of one full
-/// cadence.
-///
-/// Three minutes is chosen from both ends. It is past the boot burst — storage
-/// open, Calyx vault open, ambient ingestion catch-up — so the pass does not
-/// compete with the work that makes the daemon answerable in the first place.
-/// And it is far beyond any crash-loop generation lifetime, so a daemon that is
-/// failing every few seconds never starts a pass it cannot finish. See the
-/// commentary in [`spawn_runner`].
-const STARTUP_CATCHUP_DELAY: Duration = Duration::from_mins(3);
-const GC_RETRY_MAX_ATTEMPTS: u32 = 5;
-const GC_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
-const GC_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
-const GC_RETRYABLE_CALYX_BACKPRESSURE: &str = "retryable_calyx_backpressure";
-const GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE: &str = "retry_exhausted_calyx_backpressure";
-const GC_DEFERRED_ON_MAINTENANCE_LOCK: &str = "deferred_on_maintenance_lock";
-const GC_MAINTENANCE_LOCK_STARVED: &str = "maintenance_lock_starved";
-const GC_TERMINAL_ERROR: &str = "terminal_non_retryable";
-
-/// Calyx's admission-refusal code for the shared native maintenance lock.
-///
-/// Matched by value rather than imported because it is a Calyx subsystem-local
-/// code that crosses the Synapse bridge verbatim (it has no `SYNAPSE_CALYX_*`
-/// alias in the PRD-18 mapping table), so `StorageError::code()` reports exactly
-/// this string.
-const CALYX_ASTER_NATIVE_COMPACTION_BUSY: &str = "CALYX_ASTER_NATIVE_COMPACTION_BUSY";
-
-/// In-tick attempts allowed when admission to the native maintenance lock was
-/// refused.
-///
-/// Calyx's fair-handoff admission already waited out the active holder before
-/// reporting this, so the retry allowance here is deliberately small: more
-/// attempts would push one tick past the start of its successor without adding
-/// any waiting that the fair handoff did not already do.
-const GC_MAINTENANCE_LOCK_MAX_ATTEMPTS: u32 = 2;
-
-/// How long continuous admission refusal stays *backpressure* before it is
-/// escalated to a storage error.
-///
-/// Four GC intervals. Below this the maintenance lock is legitimately busy and
-/// GC is deferred, which is a healthy, self-clearing state; at or above it the
-/// lock is not being handed over at all and that is a real fault worth failing
-/// health on — named with the exact holder and hold duration Calyx reported.
-const GC_MAINTENANCE_LOCK_DEFER_BUDGET: Duration = Duration::from_mins(20);
+const GC_INTERVAL: Duration = Duration::from_mins(5);
+const MIB: u64 = 1024 * 1024;
+const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
+const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
+const CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
+const SOFT_CAP_REASON: &str = "soft_cap";
+const MAX_EVICT_KEYS_PER_CF_PER_PASS: usize = 4096;
+const MAX_ROW_CAP_EVICT_PASSES_PER_CF: usize = 8;
+const UNSAFE_LEXICAL_EVICTION_REFUSED: &str = "unsafe_lexical_eviction_refused";
+const UNSUPPORTED_BYTE_CAP_POLICY_SKIPPED: &str = "unsupported_byte_cap_policy_skipped";
 
 /// One storage GC pass across all configured column families.
 #[derive(Debug, Default)]
 pub struct GcReport {
     pub cf_reports: Vec<GcCfReport>,
-    /// The one pinned MVCC instant this pass decided deletions from (#2058).
-    ///
-    /// `None` for maintenance passes that take no deletion decision at all
-    /// (checkpoint, derived state), which is why it is an `Option` rather than a
-    /// zeroed struct: a reported `pinned_seq` of 0 would be indistinguishable
-    /// from a real census that failed to record one.
-    pub source_census: Option<DerivedSourceCensus>,
-    /// One bounded in-RAM MVCC version-chain reclamation pass (#2122).
-    ///
-    /// `None` for maintenance kinds that run no such pass, for the same reason
-    /// `source_census` is an `Option`: a zeroed pass would read as "reclamation
-    /// ran and freed nothing", which is exactly the state a daemon with the
-    /// reclaimer unwired reports, and telling those two apart is the whole point
-    /// of publishing it.
-    pub snapshot_version_gc: Option<SnapshotVersionGcPassReport>,
-}
-
-/// One snapshot-version GC pass plus the memory measurement that bracketed it.
-///
-/// The Calyx-side pass says what was reclaimed; the private-commit samples say
-/// whether it mattered. Both are needed: #2122's whole failure mode was a
-/// subsystem reporting success (a GC task that ran every 5 minutes, on time,
-/// with no errors) while the number that actually moves — process committed
-/// private memory — ratcheted up 1.07 GB/hour underneath it.
-#[derive(Clone, Debug, Default)]
-pub struct SnapshotVersionGcPassReport {
-    pub pass: synapse_calyx::SynapseCalyxSnapshotVersionGcPass,
-    /// Process committed private bytes sampled immediately before the pass.
-    ///
-    /// Private commit, never working set: on Windows the working set is trimmed
-    /// by the OS and fell while this leak grew (see
-    /// `synapse_calyx::process_private_bytes`).
-    pub private_bytes_before: u64,
-    /// The same counter immediately after the pass.
-    ///
-    /// Not expected to fall by `bytes_reclaimed`: freeing an allocation returns
-    /// it to the process allocator, which decides separately whether to return
-    /// the page to the OS. This measures the pass's effect on the number the
-    /// operator sees, which is the honest thing to publish even when the two
-    /// disagree.
-    pub private_bytes_after: u64,
-    /// Budget multiplier this pass ran at; 1 is the unescalated base.
-    pub escalation_factor: u32,
-    pub budget_max_versions: usize,
-    pub budget_max_pass_us: u64,
-}
-
-impl SnapshotVersionGcPassReport {
-    /// One-line readback for health and logs.
-    #[must_use]
-    pub fn detail(&self) -> String {
-        format!(
-            "floor_seq={} current_seq={} active_leases={} versions_reclaimed={} bytes_reclaimed={} \
-             chains_compacted={} chains_scanned={} shards={}/{} shard_guard_holds={} \n             sweep_completed={} stopped_on={} \
-             elapsed_us={} max_shard_hold_us={} private_bytes_before={} private_bytes_after={} \
-             escalation_factor={} budget_max_versions={} budget_max_pass_us={}",
-            self.pass.floor_seq,
-            self.pass.current_seq,
-            self.pass.active_leases,
-            self.pass.versions_reclaimed,
-            self.pass.bytes_reclaimed,
-            self.pass.chains_compacted,
-            self.pass.chains_scanned,
-            self.pass.shards_visited,
-            self.pass.shards_total,
-            self.pass.shard_guard_holds,
-            self.pass.sweep_completed,
-            self.pass.stopped_on,
-            self.pass.elapsed_us,
-            self.pass.max_shard_hold_us,
-            self.private_bytes_before,
-            self.private_bytes_after,
-            self.escalation_factor,
-            self.budget_max_versions,
-            self.budget_max_pass_us,
-        )
-    }
-}
-
-/// What the #1882 GC protection set was derived from (#2058).
-///
-/// GC's authority to delete a source row is exactly "no live derived
-/// constellation points at it", and that claim is only true relative to some
-/// instant. This records which instant, so a health reader can tell a completed
-/// census from a skipped one without inferring it from the absence of an error.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DerivedSourceCensus {
-    /// Whether this pass established a full baseline, applied an exact MVCC
-    /// delta, observed no Base changes, or rebuilt after explicit invalidation.
-    pub mode: &'static str,
-    /// The committed sequence the census pinned for its whole walk.
-    pub pinned_seq: u64,
-    /// Sequence of the prior exact census when this pass refreshed a cache.
-    pub previous_pinned_seq: Option<u64>,
-    /// Bounded pages read at that sequence.
-    pub pages: u64,
-    /// `Base` rows handed to the fold.
-    pub base_rows_visited: u64,
-    /// Exact Base keys changed after `previous_pinned_seq`.
-    pub changed_base_keys: u64,
-    /// Why incremental state was invalidated and fully rebuilt, when it was.
-    pub rebase_reason: Option<&'static str>,
-    /// Source column families with at least one protected row.
-    pub referenced_column_families: u64,
-    /// Source rows protected from eviction because a live derived
-    /// constellation still points at them.
-    pub referenced_rows: u64,
 }
 
 impl GcReport {
@@ -193,10 +48,8 @@ impl GcReport {
 #[derive(Debug)]
 pub struct GcCfReport {
     pub cf_name: String,
-    /// Measured values. `None` means policy resolved the outcome before any
-    /// scan; zero remains a real measured zero.
-    pub before_value: Option<u64>,
-    pub after_value: Option<u64>,
+    pub before_value: u64,
+    pub after_value: u64,
     pub before_estimated_num_keys: Option<u64>,
     pub after_estimated_num_keys: Option<u64>,
     pub examined_rows: u64,
@@ -214,76 +67,7 @@ pub struct GcTaskReadback {
     pub last_completed_unix_ms: Option<u64>,
     pub last_duration_ms: Option<u64>,
     pub last_error: Option<String>,
-    pub last_error_classification: Option<String>,
-    pub last_attempt_count: u32,
-    pub next_retry_unix_ms: Option<u64>,
-    pub retry_exhausted: bool,
-    pub last_successful_unix_ms: Option<u64>,
-    pub last_successful_cf_readback_count: Option<u64>,
-    pub last_successful_total_examined_rows: Option<u64>,
-    pub last_successful_total_evicted_rows: Option<u64>,
-    pub last_successful_after_value_sum: Option<u64>,
     pub last_unsupported_policy_skips: Vec<String>,
-    /// True while the newest tick was refused admission to the shared Calyx
-    /// native maintenance lock rather than failing (#2067).
-    ///
-    /// This is backpressure, not a fault: some other named pass owns the lock
-    /// and will release it. `last_error` stays `None` in this state — and so
-    /// storage health stays out of `error` — until the deferral outlives
-    /// [`GC_MAINTENANCE_LOCK_DEFER_BUDGET`], at which point `last_error` names
-    /// the holder and how long it has held.
-    pub deferred_on_maintenance_lock: bool,
-    /// When the current unbroken run of deferrals began.
-    pub deferred_since_unix_ms: Option<u64>,
-    /// Length of that unbroken run, in ticks.
-    pub consecutive_maintenance_lock_deferrals: u32,
-    /// Calyx's own refusal text for the newest deferral, which carries the
-    /// holder's purpose and how many milliseconds it had held the lock.
-    pub last_maintenance_lock_detail: Option<String>,
-    /// The single pinned committed sequence the last successful pass took its
-    /// #1882 protection set from (#2058).
-    pub last_successful_source_census_pinned_seq: Option<u64>,
-    /// Exact census refresh mode published by the last successful pass.
-    pub last_successful_source_census_mode: Option<String>,
-    /// Previous exact sequence used as this pass's delta lower bound.
-    pub last_successful_source_census_previous_pinned_seq: Option<u64>,
-    /// Bounded pages that census read at that one sequence.
-    pub last_successful_source_census_pages: Option<u64>,
-    /// `Base` rows that census folded at that one sequence.
-    pub last_successful_source_census_base_rows: Option<u64>,
-    /// Base keys in the exact MVCC delta for the last successful pass.
-    pub last_successful_source_census_changed_base_keys: Option<u64>,
-    /// Explicit reason the cache was rebuilt rather than incremented.
-    pub last_successful_source_census_rebase_reason: Option<String>,
-    /// Source rows that census protected from eviction.
-    pub last_successful_source_census_referenced_rows: Option<u64>,
-    /// In-RAM MVCC versions reclaimed by the last successful pass (#2122).
-    ///
-    /// The pass/fail number for the fix: it was structurally zero forever,
-    /// because `snapshot_version_gc` had no caller anywhere in Synapse.
-    pub last_successful_snapshot_versions_reclaimed: Option<u64>,
-    /// Value bytes those versions held.
-    pub last_successful_snapshot_version_bytes_reclaimed: Option<u64>,
-    /// The pinned-reader floor that pass reclaimed strictly below, and the
-    /// vault's committed sequence at the time.
-    ///
-    /// Published as a pair because a floor stuck far below `current_seq` is the
-    /// one way this fix fails silently: a leaked reader lease pins it and every
-    /// subsequent pass correctly reclaims nothing while reporting success.
-    pub last_successful_snapshot_version_floor_seq: Option<u64>,
-    pub last_successful_snapshot_version_current_seq: Option<u64>,
-    /// Whether that pass visited every shard and every chain. Only a completed
-    /// sweep licenses reading `versions_reclaimed = 0` as "nothing left to
-    /// reclaim" rather than "this pass ran out of budget first".
-    pub last_successful_snapshot_version_sweep_completed: Option<bool>,
-    /// Longest single row-table shard write-guard hold in that pass, in
-    /// microseconds. This is the commit-latency cost of reclamation and the
-    /// number that has to stay bounded for it to be safe to run continuously.
-    pub last_successful_snapshot_version_max_shard_hold_us: Option<u64>,
-    /// Process committed private bytes sampled just after that pass.
-    pub last_successful_snapshot_version_private_bytes: Option<u64>,
-    /// The full pass readback, as one parseable line.
-    pub last_successful_snapshot_version_detail: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -319,144 +103,94 @@ impl GcTask {
         readback.running = !self.handle.is_finished();
         readback
     }
-
-    /// Requests terminal shutdown and retains the exact task owner until the
-    /// periodic loop has joined.
-    ///
-    /// A maintenance attempt may already be running inside `spawn_blocking`.
-    /// Tokio cannot abort a started blocking closure, so dropping/aborting only
-    /// the async wrapper would let storage work outlive the vault it owns. This
-    /// method instead signals the loop and awaits its `JoinHandle`; an in-flight
-    /// attempt therefore finishes before the caller may close storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured storage error if the task failed before reaching
-    /// its terminal join boundary.
-    pub async fn shutdown(mut self, task: &'static str) -> StorageResult<()> {
-        let shutdown_signal_sent = self
-            .shutdown
-            .take()
-            .is_some_and(|shutdown| shutdown.send(()).is_ok());
-        tracing::info!(
-            code = "STORAGE_MAINTENANCE_SHUTDOWN_REQUESTED",
-            task,
-            shutdown_signal_sent,
-            task_finished_before_join = self.handle.is_finished(),
-            "requested periodic storage-maintenance shutdown and retained its exact task owner"
-        );
-        let joined = (&mut self.handle).await;
-        match joined {
-            Ok(()) => {
-                tracing::info!(
-                    code = "STORAGE_MAINTENANCE_SHUTDOWN_JOINED",
-                    task,
-                    "periodic storage-maintenance task reached terminal state before vault close"
-                );
-                Ok(())
-            }
-            Err(error) => Err(StorageError::WriteFailed {
-                cf_name: "storage_maintenance".to_owned(),
-                detail: format!(
-                    "join periodic {task} task before vault close: {error}; the task is terminal but shutdown is not clean"
-                ),
-            }),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct GcConfig {
     interval: Duration,
+    budgets: Vec<GcBudget>,
+    unsupported_byte_cap_budgets: Vec<GcBudget>,
 }
 
 impl GcConfig {
-    pub const fn from_retention_defaults() -> Self {
+    pub fn from_retention_defaults() -> Self {
+        let mut budgets = Vec::new();
+        let mut unsupported_byte_cap_budgets = Vec::new();
+        for default in DEFAULTS {
+            let budget = GcBudget {
+                cf_name: default.cf,
+                soft_cap: default.soft_cap_mb.saturating_mul(MIB),
+                hard_cap: default.hard_cap_mb.saturating_mul(MIB),
+                unit: CapUnit::Bytes,
+            };
+            if supports_chronological_eviction(default.cf) {
+                budgets.push(budget);
+            } else {
+                unsupported_byte_cap_budgets.push(budget);
+            }
+        }
         Self {
             interval: GC_INTERVAL,
+            budgets,
+            unsupported_byte_cap_budgets,
         }
     }
 }
 
 impl GcConfig {
-    pub(crate) const fn interval(&self) -> Duration {
-        self.interval
+    pub(crate) fn for_row_caps(
+        interval: Duration,
+        cf_name: &'static str,
+        soft_cap: u64,
+        hard_cap: u64,
+    ) -> Self {
+        Self {
+            interval,
+            budgets: vec![GcBudget {
+                cf_name,
+                soft_cap,
+                hard_cap,
+                unit: CapUnit::Rows,
+            }],
+            unsupported_byte_cap_budgets: Vec::new(),
+        }
     }
-}
 
-pub trait GcRunner: Send + Sync + 'static {
-    fn run_once(&self) -> StorageResult<GcReport>;
-
-    /// Requests one completion-relative continuation sooner than the runner's
-    /// normal cadence after a successful pass.
-    ///
-    /// The default keeps the configured cadence byte-for-byte. A runner may
-    /// override this only when the pass itself proved that bounded,
-    /// state-convergent work remains. Failures never consume this hint: their
-    /// retry remains the normal cadence so an invariant failure cannot become
-    /// a hot loop. Returning a duration instead of a boolean makes the idle
-    /// admission window explicit at the owner that understands the work.
-    fn successful_continuation_delay(&self) -> Option<Duration> {
-        None
+    #[cfg(test)]
+    pub(crate) fn for_byte_caps(
+        interval: Duration,
+        cf_name: &'static str,
+        soft_cap: u64,
+        hard_cap: u64,
+    ) -> Self {
+        Self {
+            interval,
+            budgets: vec![GcBudget {
+                cf_name,
+                soft_cap,
+                hard_cap,
+                unit: CapUnit::Bytes,
+            }],
+            unsupported_byte_cap_budgets: Vec::new(),
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum MaintenanceTaskKind {
-    GarbageCollection,
-    Checkpoint,
-    /// Keeps the vault's derived layers — the persisted search generation and
-    /// the measured lens coverage — from silently expiring (#1891, #1894).
-    DerivedState,
+struct GcBudget {
+    cf_name: &'static str,
+    soft_cap: u64,
+    hard_cap: u64,
+    unit: CapUnit,
 }
 
-impl MaintenanceTaskKind {
-    const fn operation(self) -> &'static str {
-        match self {
-            Self::GarbageCollection => "storage_gc",
-            Self::Checkpoint => "storage_checkpoint",
-            Self::DerivedState => "storage_derived_state",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::GarbageCollection => "garbage_collection",
-            Self::Checkpoint => "checkpoint",
-            Self::DerivedState => "derived_state",
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapUnit {
+    Bytes,
+    Rows,
 }
 
-fn schedule_next_runner_tick(
-    interval: &mut tokio::time::Interval,
-    runner: &dyn GcRunner,
-    task_kind: MaintenanceTaskKind,
-    cadence: Duration,
-    succeeded: bool,
-) {
-    let next_delay = if succeeded {
-        runner.successful_continuation_delay().unwrap_or(cadence)
-    } else {
-        cadence
-    };
-    interval.reset_after(next_delay);
-    if next_delay != cadence {
-        tracing::info!(
-            code = "STORAGE_MAINTENANCE_CONTINUATION_SCHEDULED",
-            task = task_kind.label(),
-            continuation_after_ms = next_delay.as_millis(),
-            normal_cadence_ms = cadence.as_millis(),
-            "successful storage maintenance proved bounded work remains and scheduled one completion-relative continuation"
-        );
-    }
-}
-
-pub fn spawn_runner(
-    runner: Arc<dyn GcRunner>,
-    interval: Duration,
-    task_kind: MaintenanceTaskKind,
-) -> StorageResult<GcTask> {
+pub fn spawn(db: Arc<DB>, config: GcConfig) -> StorageResult<GcTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
             cf_name: "storage_gc".to_owned(),
@@ -466,128 +200,18 @@ pub fn spawn_runner(
     let state = Arc::new(GcTaskState::default());
     let task_state = Arc::clone(&state);
     let task = handle.spawn(async move {
-        let cadence = interval;
-        // First tick is a short startup catch-up, not a full cadence (2026-08-25).
-        //
-        // Scheduling the first tick a whole `cadence` out means a maintenance
-        // pass only ever runs if one daemon generation survives that long
-        // uninterrupted. At the six-hour retention cadence that is a real
-        // precondition, not a formality: a host that reboots, upgrades, or
-        // crashes more often than every six hours never reclaims anything, and
-        // retention silently degrades from "lags expiry by at most one bounded
-        // window" to "never runs". That is what happened here — CF_AGENT_TRANSCRIPTS
-        // accumulated 129,584 unreclaimed TTL-expired rows, so an ordered page
-        // had to examine 133,680 candidates to return 4,096 live ones, and the
-        // cost of those scans is what pushed the daemon over its Job memory cap
-        // and into the crash loop that never let GC run in the first place.
-        //
-        // The catch-up delay doubles as the crash-loop guard. It is long enough
-        // that a daemon dying every few seconds never reaches it — so a sick
-        // daemon cannot spend its short life re-running a pass that can take
-        // minutes — and short enough that any daemon healthy enough to serve
-        // traffic reclaims its backlog early instead of six hours from now.
-        // Tasks whose own cadence is already shorter keep it.
-        let first_tick = cadence.min(STARTUP_CATCHUP_DELAY);
-        let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + first_tick, cadence);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut interval = tokio::time::interval(config.interval);
         loop {
             tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {
                     let started = mark_gc_tick_started(&task_state);
-                    let mut attempt = 0_u32;
-                    let result = loop {
-                        attempt = attempt.saturating_add(1);
-                        mark_gc_attempt_started(&task_state, attempt);
-                        // The GC pass is synchronous and can run for minutes over
-                        // hundreds of megabytes (native-CF compaction, tombstone
-                        // purge). Admit each attempt onto the dedicated blocking
-                        // pool so neither the pass nor retry backoff parks a
-                        // runtime worker serving MCP requests (#1798/#1836).
-                        let tick_runner = Arc::clone(&runner);
-                        let attempt_result = crate::maintenance::run_background_admitted_maintenance(
-                            task_kind.operation(),
-                            move || tick_runner.run_once(),
-                        )
-                        .await;
-                        let Some(kind) = retryable_gc_failure_kind(&attempt_result) else {
-                            break attempt_result;
-                        };
-                        if attempt >= kind.max_attempts() {
-                            break attempt_result;
-                        }
-                        let classification = kind.retrying_classification();
-                        let delay = gc_retry_delay(started.unix_ms, attempt);
-                        let next_retry_unix_ms = unix_time_ms_now().saturating_add(
-                            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        );
-                        mark_gc_retry_scheduled(
-                            &task_state,
-                            attempt,
-                            next_retry_unix_ms,
-                            classification,
-                            &attempt_result,
-                        );
-                        tracing::warn!(
-                            code = "STORAGE_MAINTENANCE_RETRY_SCHEDULED",
-                            task = task_kind.label(),
-                            attempt,
-                            max_attempts = GC_RETRY_MAX_ATTEMPTS,
-                            retry_after_ms = delay.as_millis(),
-                            next_retry_unix_ms,
-                            classification,
-                            error = ?attempt_result.as_ref().err(),
-                            "storage maintenance released admission after retryable contention and scheduled a bounded retry"
-                        );
-                        // Tokio sleep performs no work while pending. It is
-                        // outside both the admitted blocking operation and every
-                        // storage/commit/checkpoint lock.
-                        tokio::time::sleep(delay).await;
-                    };
-                    let deferral = mark_gc_tick_completed(&task_state, started, attempt, &result);
-                    // A maintenance pass may legitimately take longer than its
-                    // cadence. `MissedTickBehavior::Delay` prevents a *burst* of
-                    // overdue ticks, but the first already-due tick still
-                    // resolves immediately when the loop reaches `tick()`
-                    // again. That admitted a second multi-minute derived-state
-                    // pass as soon as the first one released the whole-corpus
-                    // lane, keeping foreground Calyx calls queued indefinitely.
-                    //
-                    // Maintenance is state-convergent: one completed pass has
-                    // already observed everything committed before its own
-                    // coherent snapshots. Discard cadence debt and schedule the
-                    // next pass one full cadence after this terminal readback.
-                    // This is completion-relative scheduling, not a disabled or
-                    // skipped capability; every runner still executes forever,
-                    // with a real idle/admission window between passes.
-                    schedule_next_runner_tick(&mut interval, &*runner, task_kind, cadence, result.is_ok());
+                    let result = run_once(&db, &config);
+                    mark_gc_tick_completed(&task_state, started, &result);
                     if let Err(error) = result {
-                        match deferral {
-                            Some(deferral) if !deferral.escalated => tracing::warn!(
-                                code = "STORAGE_MAINTENANCE_DEFERRED_ON_LOCK",
-                                task = task_kind.label(),
-                                attempts = attempt,
-                                classification = GC_DEFERRED_ON_MAINTENANCE_LOCK,
-                                deferred_since_unix_ms = deferral.since_unix_ms,
-                                deferred_for_ms = deferral.deferred_for_ms,
-                                consecutive_deferrals = deferral.consecutive,
-                                escalate_after_ms = GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis(),
-                                error = %error,
-                                "storage maintenance was refused admission to the shared Calyx maintenance lock; this tick is deferred, not failed"
-                            ),
-                            _ => tracing::warn!(
-                                code = "STORAGE_MAINTENANCE_TICK_FAILED",
-                                task = task_kind.label(),
-                                attempts = attempt,
-                                classification = final_error_classification(&error, attempt),
-                                error = %error,
-                                "storage maintenance tick failed"
-                            ),
-                        }
+                        tracing::warn!(error = %error, "storage GC tick failed");
                     }
                 }
+                _ = &mut shutdown_rx => break,
             }
         }
     });
@@ -596,6 +220,392 @@ pub fn spawn_runner(
         handle: task,
         state,
     })
+}
+
+pub fn run_once(db: &DB, config: &GcConfig) -> StorageResult<GcReport> {
+    let mut cf_reports =
+        Vec::with_capacity(config.budgets.len() + config.unsupported_byte_cap_budgets.len());
+    for budget in &config.budgets {
+        cf_reports.push(run_cf(db, *budget)?);
+    }
+    for budget in &config.unsupported_byte_cap_budgets {
+        cf_reports.push(report_skipped_unsupported_byte_cap(db, *budget)?);
+    }
+    Ok(GcReport { cf_reports })
+}
+
+fn run_cf(db: &DB, budget: GcBudget) -> StorageResult<GcCfReport> {
+    let cf = cf_handle(db, budget.cf_name)?;
+    let before_estimated_num_keys = cf_property(db, &cf, budget.cf_name, ESTIMATE_NUM_KEYS)?;
+    let before_measurement = measured_value(db, &cf, budget)?;
+    let mut examined_rows = before_measurement.examined_rows;
+    let mut scan_limited = before_measurement.scan_limited;
+    let before_value = before_measurement.value;
+    let hard_cap_reached = before_value >= budget.hard_cap;
+    if hard_cap_reached {
+        tracing::warn!(
+            code = error_codes::STORAGE_CF_HARD_CAP_REACHED,
+            cf = budget.cf_name,
+            before_value,
+            hard_cap = budget.hard_cap,
+            "storage column family hard cap reached"
+        );
+    }
+
+    let mut evicted_rows = 0_u64;
+    let mut after_value = before_value;
+    let mut after_estimated_num_keys = before_estimated_num_keys;
+    if before_value > budget.soft_cap {
+        let outcome =
+            evict_over_soft_cap(db, &cf, budget, before_value, before_estimated_num_keys)?;
+        evicted_rows = outcome.evicted_rows;
+        after_value = outcome.after_value;
+        after_estimated_num_keys = outcome.after_estimated_num_keys;
+        examined_rows = examined_rows.saturating_add(outcome.examined_rows);
+        scan_limited |= outcome.scan_limited;
+    }
+
+    record_eviction_metric(budget, evicted_rows, before_value, after_value);
+
+    Ok(GcCfReport {
+        cf_name: budget.cf_name.to_owned(),
+        before_value,
+        after_value,
+        before_estimated_num_keys,
+        after_estimated_num_keys,
+        examined_rows,
+        scan_limited,
+        evicted_rows,
+        eviction_skipped_reason: None,
+        hard_cap_reached,
+        hard_cap_code: hard_cap_reached.then_some(error_codes::STORAGE_CF_HARD_CAP_REACHED),
+    })
+}
+
+#[derive(Debug)]
+struct GcEvictionOutcome {
+    evicted_rows: u64,
+    after_value: u64,
+    after_estimated_num_keys: Option<u64>,
+    examined_rows: u64,
+    scan_limited: bool,
+}
+
+fn evict_over_soft_cap(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    budget: GcBudget,
+    before_value: u64,
+    before_estimated_num_keys: Option<u64>,
+) -> StorageResult<GcEvictionOutcome> {
+    refuse_unsafe_byte_eviction(budget, before_value)?;
+
+    let mut outcome = GcEvictionOutcome {
+        evicted_rows: 0,
+        after_value: before_value,
+        after_estimated_num_keys: before_estimated_num_keys,
+        examined_rows: 0,
+        scan_limited: false,
+    };
+    let max_passes = match budget.unit {
+        CapUnit::Bytes => 1,
+        CapUnit::Rows => MAX_ROW_CAP_EVICT_PASSES_PER_CF,
+    };
+    for pass_index in 0..max_passes {
+        let planned_remove_count = remove_count(
+            budget,
+            outcome.after_value,
+            outcome.after_estimated_num_keys,
+        );
+        if planned_remove_count == 0 {
+            break;
+        }
+        let collect_limit = planned_remove_count
+            .saturating_add(1)
+            .min(MAX_EVICT_KEYS_PER_CF_PER_PASS.saturating_add(1));
+        let (keys, more) = collect_oldest_keys(db, cf, budget.cf_name, collect_limit)?;
+        outcome.examined_rows = outcome
+            .examined_rows
+            .saturating_add(usize_to_u64(keys.len()));
+        outcome.scan_limited |= more;
+        let pass_evicted = evict_oldest(db, cf, budget, &keys, planned_remove_count)?;
+        outcome.evicted_rows = outcome.evicted_rows.saturating_add(pass_evicted);
+        if pass_evicted == 0 {
+            break;
+        }
+
+        let after_measurement = measured_value(db, cf, budget)?;
+        outcome.examined_rows = outcome
+            .examined_rows
+            .saturating_add(after_measurement.examined_rows);
+        outcome.scan_limited |= after_measurement.scan_limited;
+        outcome.after_value = after_measurement.value;
+        outcome.after_estimated_num_keys = cf_property(db, cf, budget.cf_name, ESTIMATE_NUM_KEYS)?;
+
+        if budget.unit == CapUnit::Bytes || outcome.after_value <= budget.soft_cap {
+            break;
+        }
+        if pass_index + 1 == max_passes {
+            log_bounded_pass_limit_reached(budget, &outcome, max_passes);
+        }
+    }
+    Ok(outcome)
+}
+
+fn report_skipped_unsupported_byte_cap(db: &DB, budget: GcBudget) -> StorageResult<GcCfReport> {
+    debug_assert_eq!(budget.unit, CapUnit::Bytes);
+    debug_assert!(!supports_chronological_eviction(budget.cf_name));
+    let cf = cf_handle(db, budget.cf_name)?;
+    let before_estimated_num_keys = cf_property(db, &cf, budget.cf_name, ESTIMATE_NUM_KEYS)?;
+    let before_value =
+        cf_property(db, &cf, budget.cf_name, ESTIMATE_LIVE_DATA_SIZE)?.unwrap_or_default();
+    let hard_cap_reached = before_value >= budget.hard_cap;
+    tracing::warn!(
+        code = "STORAGE_GC_UNSUPPORTED_BYTE_CAP_POLICY_SKIPPED",
+        cf = budget.cf_name,
+        before_value,
+        soft_cap = budget.soft_cap,
+        hard_cap = budget.hard_cap,
+        hard_cap_reached,
+        reason = UNSUPPORTED_BYTE_CAP_POLICY_SKIPPED,
+        "storage GC skipped default byte-cap policy because this column family's key order is not an oldest-first retention order; add schema-aware retention before enabling eviction"
+    );
+    Ok(GcCfReport {
+        cf_name: budget.cf_name.to_owned(),
+        before_value,
+        after_value: before_value,
+        before_estimated_num_keys,
+        after_estimated_num_keys: before_estimated_num_keys,
+        examined_rows: 0,
+        scan_limited: false,
+        evicted_rows: 0,
+        eviction_skipped_reason: Some(UNSUPPORTED_BYTE_CAP_POLICY_SKIPPED),
+        hard_cap_reached,
+        hard_cap_code: hard_cap_reached.then_some(error_codes::STORAGE_CF_HARD_CAP_REACHED),
+    })
+}
+
+fn refuse_unsafe_byte_eviction(budget: GcBudget, before_value: u64) -> StorageResult<()> {
+    if budget.unit != CapUnit::Bytes || supports_chronological_eviction(budget.cf_name) {
+        return Ok(());
+    }
+
+    let detail = format!(
+        "refusing generic byte-cap eviction for {cf}: key order is not an oldest-first retention order; implement a schema-aware retention index before byte eviction",
+        cf = budget.cf_name
+    );
+    tracing::error!(
+        code = error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
+        cf = budget.cf_name,
+        before_value,
+        soft_cap = budget.soft_cap,
+        hard_cap = budget.hard_cap,
+        reason = UNSAFE_LEXICAL_EVICTION_REFUSED,
+        detail = %detail,
+        "refusing generic byte-cap eviction because this column family's key order is not an oldest-first retention order"
+    );
+    Err(StorageError::UnsafeGcEvictionRefused {
+        cf_name: budget.cf_name.to_owned(),
+        detail,
+    })
+}
+
+fn log_bounded_pass_limit_reached(
+    budget: GcBudget,
+    outcome: &GcEvictionOutcome,
+    max_passes: usize,
+) {
+    tracing::warn!(
+        code = "STORAGE_GC_BOUNDED_PASS_LIMIT_REACHED",
+        cf = budget.cf_name,
+        after_value = outcome.after_value,
+        soft_cap = budget.soft_cap,
+        hard_cap = budget.hard_cap,
+        evicted_rows = outcome.evicted_rows,
+        max_passes,
+        scan_limited = outcome.scan_limited,
+        "storage GC stopped after bounded passes; retry later or use schema-specific retention if the CF remains over cap"
+    );
+}
+
+fn record_eviction_metric(
+    budget: GcBudget,
+    evicted_rows: u64,
+    before_value: u64,
+    after_value: u64,
+) {
+    if evicted_rows == 0 {
+        return;
+    }
+    synapse_telemetry::metrics::counter!(
+        CACHE_EVICTIONS_TOTAL,
+        "cf" => budget.cf_name,
+        "reason" => SOFT_CAP_REASON
+    )
+    .increment(evicted_rows);
+    tracing::info!(
+        code = "STORAGE_CACHE_EVICTIONS_TOTAL_INCREMENTED",
+        metric_name = CACHE_EVICTIONS_TOTAL,
+        cf = budget.cf_name,
+        reason = SOFT_CAP_REASON,
+        delta = evicted_rows,
+        before_value,
+        after_value,
+        "storage cache eviction counter incremented"
+    );
+}
+
+fn evict_oldest(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    budget: GcBudget,
+    keys: &[Vec<u8>],
+    planned_remove_count: usize,
+) -> StorageResult<u64> {
+    let remove_count = planned_remove_count.min(keys.len());
+    if remove_count == 0 {
+        return Ok(0);
+    }
+
+    let start = keys
+        .first()
+        .ok_or_else(|| read_failed(budget.cf_name, "missing first key for GC range".to_owned()))?;
+    let end = if keys.len() > remove_count {
+        keys[remove_count].clone()
+    } else {
+        keys.last().map_or_else(Vec::new, |last| key_after(last))
+    };
+    db.delete_range_cf(cf, start, &end)
+        .map_err(|error| write_failed(budget.cf_name, error.to_string()))?;
+    db.flush_cf(cf)
+        .map_err(|error| write_failed(budget.cf_name, error.to_string()))?;
+    db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+    Ok(usize_to_u64(remove_count))
+}
+
+fn remove_count(
+    budget: GcBudget,
+    before_value: u64,
+    before_estimated_num_keys: Option<u64>,
+) -> usize {
+    let count = match budget.unit {
+        // Explicit row cap (storage_gc_once / dashboard "cap at N"): evict exactly
+        // the overage so the column family lands precisely at `soft_cap`. This is
+        // an operator-driven, one-shot action — there is no minimum batch, so
+        // capping a 140-row store at 136 removes 4 rows, not a forced quarter.
+        CapUnit::Rows => {
+            usize::try_from(before_value.saturating_sub(budget.soft_cap)).unwrap_or(usize::MAX)
+        }
+        // Byte/disk-pressure GC cannot map a byte overage onto an exact row count,
+        // so it evicts a bounded 25%-of-estimated-rows batch per pass to amortize
+        // compaction across periodic ticks without materializing the whole CF.
+        CapUnit::Bytes => before_estimated_num_keys
+            .unwrap_or_default()
+            .div_ceil(4)
+            .try_into()
+            .unwrap_or(usize::MAX),
+    };
+    count.min(MAX_EVICT_KEYS_PER_CF_PER_PASS)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Measurement {
+    value: u64,
+    examined_rows: u64,
+    scan_limited: bool,
+}
+
+fn measured_value(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    budget: GcBudget,
+) -> StorageResult<Measurement> {
+    match budget.unit {
+        CapUnit::Rows => {
+            let limit = budget.hard_cap.saturating_add(1);
+            let (value, scan_limited) = bounded_count_rows(db, cf, budget.cf_name, limit)?;
+            Ok(Measurement {
+                value,
+                examined_rows: value,
+                scan_limited,
+            })
+        }
+        CapUnit::Bytes => {
+            cf_property(db, cf, budget.cf_name, ESTIMATE_LIVE_DATA_SIZE).map(|value| Measurement {
+                value: value.unwrap_or_default(),
+                examined_rows: 0,
+                scan_limited: false,
+            })
+        }
+    }
+}
+
+fn collect_oldest_keys(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    cf_name: &str,
+    limit: usize,
+) -> StorageResult<(Vec<Vec<u8>>, bool)> {
+    let mut keys = Vec::new();
+    let mut more = false;
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _value) = item.map_err(|error| read_failed(cf_name, error.to_string()))?;
+        if keys.len() >= limit {
+            more = true;
+            break;
+        }
+        keys.push(key.to_vec());
+    }
+    Ok((keys, more))
+}
+
+fn bounded_count_rows(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    cf_name: &str,
+    limit: u64,
+) -> StorageResult<(u64, bool)> {
+    let mut count = 0_u64;
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (_key, _value) = item.map_err(|error| read_failed(cf_name, error.to_string()))?;
+        if count >= limit {
+            return Ok((count, true));
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((count, false))
+}
+
+fn cf_property(
+    db: &DB,
+    cf: &ColumnFamilyRef<'_>,
+    cf_name: &str,
+    property: &str,
+) -> StorageResult<Option<u64>> {
+    db.property_int_value_cf(cf, property)
+        .map_err(|error| read_failed(cf_name, error.to_string()))
+}
+
+fn cf_handle<'db>(db: &'db DB, cf_name: &str) -> StorageResult<ColumnFamilyRef<'db>> {
+    db.cf_handle(cf_name)
+        .ok_or_else(|| read_failed(cf_name, "column family handle missing".to_owned()))
+}
+
+fn key_after(key: &[u8]) -> Vec<u8> {
+    let mut end = key.to_vec();
+    end.push(0);
+    end
+}
+
+fn supports_chronological_eviction(cf_name: &str) -> bool {
+    matches!(
+        cf_name,
+        crate::cf::CF_EVENTS
+            | crate::cf::CF_ACTION_LOG
+            | crate::cf::CF_TIMELINE
+            | crate::cf::CF_EPISODES
+            | crate::cf::CF_AGENT_EVENTS
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,181 +622,19 @@ fn mark_gc_tick_started(state: &GcTaskState) -> TickStarted {
     if let Ok(mut readback) = state.readback.lock() {
         readback.running = true;
         readback.last_started_unix_ms = Some(started.unix_ms);
-        readback.last_attempt_count = 0;
-        readback.next_retry_unix_ms = None;
-        readback.retry_exhausted = false;
     }
     started
 }
 
-fn mark_gc_attempt_started(state: &GcTaskState, attempt: u32) {
-    if let Ok(mut readback) = state.readback.lock() {
-        readback.last_attempt_count = attempt;
-        readback.next_retry_unix_ms = None;
-    }
-}
-
-fn mark_gc_retry_scheduled(
-    state: &GcTaskState,
-    attempt: u32,
-    next_retry_unix_ms: u64,
-    classification: &'static str,
-    result: &StorageResult<GcReport>,
-) {
-    if let Ok(mut readback) = state.readback.lock() {
-        readback.last_attempt_count = attempt;
-        readback.next_retry_unix_ms = Some(next_retry_unix_ms);
-        readback.retry_exhausted = false;
-        // A deferral mid-tick must not flash `last_error` — a health read that
-        // lands between attempts would otherwise see a self-clearing admission
-        // refusal as a storage fault (#2067). The refusal text is still exposed,
-        // as the deferral detail it is.
-        if classification == GC_DEFERRED_ON_MAINTENANCE_LOCK {
-            readback.last_error = None;
-            readback.last_maintenance_lock_detail = result.as_ref().err().map(ToString::to_string);
-        } else {
-            readback.last_error = result.as_ref().err().map(ToString::to_string);
-        }
-        readback.last_error_classification = Some(classification.to_owned());
-    }
-}
-
-/// What a tick that ended in maintenance-lock deferral looked like.
-#[derive(Clone, Copy, Debug)]
-struct GcDeferral {
-    since_unix_ms: u64,
-    deferred_for_ms: u64,
-    consecutive: u32,
-    /// The unbroken deferral outlived [`GC_MAINTENANCE_LOCK_DEFER_BUDGET`], so
-    /// it was promoted from backpressure to a reported storage error.
-    escalated: bool,
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "one tick completion must atomically classify success, deferral escalation, counters, and operator-visible readback"
-)]
 fn mark_gc_tick_completed(
     state: &GcTaskState,
     started: TickStarted,
-    attempts: u32,
     result: &StorageResult<GcReport>,
-) -> Option<GcDeferral> {
-    let mut deferral = None;
+) {
     if let Ok(mut readback) = state.readback.lock() {
-        let completed_unix_ms = unix_time_ms_now();
-        readback.last_completed_unix_ms = Some(completed_unix_ms);
+        readback.last_completed_unix_ms = Some(unix_time_ms_now());
         readback.last_duration_ms = Some(duration_millis_u64(started.instant.elapsed()));
-        readback.last_attempt_count = attempts;
-        readback.next_retry_unix_ms = None;
-        let failure_kind = result.as_ref().err().map(gc_failure_kind);
-        if failure_kind == Some(GcFailureKind::MaintenanceLockBusy) {
-            // Admission backpressure: some other named pass legitimately owns
-            // the lock. Report it as the deferral it is and leave `last_error`
-            // clear so health does not call a self-clearing contention a
-            // storage fault — unless the deferral has outlived its budget, in
-            // which case the lock is genuinely not being handed over (#2067).
-            let since_unix_ms = *readback
-                .deferred_since_unix_ms
-                .get_or_insert(started.unix_ms);
-            let consecutive = readback
-                .consecutive_maintenance_lock_deferrals
-                .saturating_add(1);
-            let deferred_for_ms = completed_unix_ms.saturating_sub(since_unix_ms);
-            let detail = result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let escalated = deferred_for_ms
-                >= u64::try_from(GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis()).unwrap_or(u64::MAX);
-            readback.deferred_on_maintenance_lock = true;
-            readback.consecutive_maintenance_lock_deferrals = consecutive;
-            readback.last_maintenance_lock_detail = Some(detail.clone());
-            readback.retry_exhausted = false;
-            readback.last_unsupported_policy_skips = Vec::new();
-            if escalated {
-                readback.last_error = Some(format!(
-                    "storage maintenance has been unable to acquire the Calyx native maintenance lock for {deferred_for_ms} ms across {consecutive} consecutive ticks (escalation budget {} ms); the refusal names its holder: {detail}",
-                    GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis()
-                ));
-                readback.last_error_classification = Some(GC_MAINTENANCE_LOCK_STARVED.to_owned());
-            } else {
-                readback.last_error = None;
-                readback.last_error_classification =
-                    Some(GC_DEFERRED_ON_MAINTENANCE_LOCK.to_owned());
-            }
-            deferral = Some(GcDeferral {
-                since_unix_ms,
-                deferred_for_ms,
-                consecutive,
-                escalated,
-            });
-            return deferral;
-        }
-        readback.deferred_on_maintenance_lock = false;
-        readback.deferred_since_unix_ms = None;
-        readback.consecutive_maintenance_lock_deferrals = 0;
-        readback.last_maintenance_lock_detail = None;
         readback.last_error = result.as_ref().err().map(ToString::to_string);
-        readback.last_error_classification = result
-            .as_ref()
-            .err()
-            .map(|error| final_error_classification(error, attempts).to_owned());
-        readback.retry_exhausted =
-            failure_kind.is_some_and(|kind| kind.is_retryable() && attempts >= kind.max_attempts());
-        if let Ok(report) = result {
-            readback.last_successful_unix_ms = readback.last_completed_unix_ms;
-            // Only when this pass actually reported on column families (#2088
-            // ask 3). `storage_checkpoint` and `storage_derived_state` sweep no
-            // CF and evict no row, so a zeroed set of aggregates here would be
-            // indistinguishable from a GC pass that examined a corpus and found
-            // nothing — a report describing nothing, published as a measurement.
-            // Left untouched instead, exactly as `source_census` below already
-            // is, so whatever a real pass last measured stays readable.
-            if !report.cf_reports.is_empty() {
-                readback.last_successful_cf_readback_count =
-                    Some(u64::try_from(report.cf_reports.len()).unwrap_or(u64::MAX));
-                readback.last_successful_total_examined_rows = Some(
-                    report
-                        .cf_reports
-                        .iter()
-                        .map(|cf| cf.examined_rows)
-                        .fold(0_u64, u64::saturating_add),
-                );
-                readback.last_successful_total_evicted_rows = Some(report.total_evicted_rows());
-                readback.last_successful_after_value_sum = Some(
-                    report
-                        .cf_reports
-                        .iter()
-                        .filter_map(|cf| cf.after_value)
-                        .fold(0_u64, u64::saturating_add),
-                );
-            }
-            // Left untouched when this pass carried no census, so the last real
-            // census a GC pass ran is still readable after a checkpoint or
-            // derived-state tick reports through the same readback (#2058).
-            if let Some(census) = report.source_census {
-                readback.last_successful_source_census_pinned_seq = Some(census.pinned_seq);
-                readback.last_successful_source_census_mode = Some(census.mode.to_owned());
-                readback.last_successful_source_census_previous_pinned_seq =
-                    census.previous_pinned_seq;
-                readback.last_successful_source_census_pages = Some(census.pages);
-                readback.last_successful_source_census_base_rows = Some(census.base_rows_visited);
-                readback.last_successful_source_census_changed_base_keys =
-                    Some(census.changed_base_keys);
-                readback.last_successful_source_census_rebase_reason =
-                    census.rebase_reason.map(str::to_owned);
-                readback.last_successful_source_census_referenced_rows =
-                    Some(census.referenced_rows);
-            }
-            // Same discipline: left untouched by maintenance kinds that run no
-            // reclamation pass, so a checkpoint tick reporting through this
-            // readback cannot erase what the last real pass measured (#2122).
-            if let Some(reclaim) = report.snapshot_version_gc.as_ref() {
-                mark_snapshot_version_gc_pass(&mut readback, reclaim);
-            }
-        }
         readback.last_unsupported_policy_skips = result
             .as_ref()
             .ok()
@@ -794,132 +642,14 @@ fn mark_gc_tick_completed(
                 report
                     .cf_reports
                     .iter()
-                    .filter(|cf| cf.eviction_skipped_reason.is_some())
+                    .filter(|cf| {
+                        cf.eviction_skipped_reason == Some(UNSUPPORTED_BYTE_CAP_POLICY_SKIPPED)
+                    })
                     .map(|cf| cf.cf_name.clone())
                     .collect()
             })
             .unwrap_or_default();
     }
-    deferral
-}
-
-/// Publishes one snapshot-version GC pass into the task readback (#2122).
-fn mark_snapshot_version_gc_pass(
-    readback: &mut GcTaskReadback,
-    reclaim: &SnapshotVersionGcPassReport,
-) {
-    readback.last_successful_snapshot_versions_reclaimed = Some(reclaim.pass.versions_reclaimed);
-    readback.last_successful_snapshot_version_bytes_reclaimed = Some(reclaim.pass.bytes_reclaimed);
-    readback.last_successful_snapshot_version_floor_seq = Some(reclaim.pass.floor_seq);
-    readback.last_successful_snapshot_version_current_seq = Some(reclaim.pass.current_seq);
-    readback.last_successful_snapshot_version_sweep_completed = Some(reclaim.pass.sweep_completed);
-    readback.last_successful_snapshot_version_max_shard_hold_us =
-        Some(reclaim.pass.max_shard_hold_us);
-    readback.last_successful_snapshot_version_private_bytes = Some(reclaim.private_bytes_after);
-    readback.last_successful_snapshot_version_detail = Some(reclaim.detail());
-}
-
-/// Why a maintenance attempt failed, at the granularity the tick loop acts on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GcFailureKind {
-    /// Calyx asked the caller to slow down. The work itself is sound.
-    CalyxBackpressure,
-    /// Admission to the shared native maintenance lock was refused because
-    /// another named pass owns it. Transient by construction (#2067).
-    MaintenanceLockBusy,
-    /// Anything else: a real storage failure that retrying cannot fix.
-    Terminal,
-}
-
-impl GcFailureKind {
-    const fn is_retryable(self) -> bool {
-        matches!(self, Self::CalyxBackpressure | Self::MaintenanceLockBusy)
-    }
-
-    const fn max_attempts(self) -> u32 {
-        match self {
-            Self::CalyxBackpressure => GC_RETRY_MAX_ATTEMPTS,
-            Self::MaintenanceLockBusy => GC_MAINTENANCE_LOCK_MAX_ATTEMPTS,
-            Self::Terminal => 1,
-        }
-    }
-
-    const fn retrying_classification(self) -> &'static str {
-        match self {
-            Self::CalyxBackpressure => GC_RETRYABLE_CALYX_BACKPRESSURE,
-            Self::MaintenanceLockBusy => GC_DEFERRED_ON_MAINTENANCE_LOCK,
-            Self::Terminal => GC_TERMINAL_ERROR,
-        }
-    }
-}
-
-/// How the maintenance tick loop will treat one failure: the classification it
-/// publishes, whether it retries in place, and how many attempts it allows.
-///
-/// This is the same verdict [`mark_gc_tick_completed`] writes into
-/// [`GcTaskReadback::last_error_classification`], exposed so an operator — or a
-/// manual FSV — can ask it of an error without waiting five minutes for a tick
-/// to publish one. It reads the error's own `code()` and nothing else, so the
-/// answer it gives is the answer the loop gives.
-///
-/// Load-bearing for #2088 ask 2: `storage_derived_state` now returns real
-/// errors, and the decision that a failed derived-state tick is **not** retried
-/// in place is expressed by the error variant it returns rather than by the
-/// absence of an error. This is where that decision is observable.
-#[must_use]
-pub fn maintenance_failure_classification(error: &StorageError) -> (&'static str, bool, u32) {
-    let kind = gc_failure_kind(error);
-    (
-        kind.retrying_classification(),
-        kind.is_retryable(),
-        kind.max_attempts(),
-    )
-}
-
-fn gc_failure_kind(error: &StorageError) -> GcFailureKind {
-    match error.code() {
-        code if code == synapse_calyx::SYNAPSE_CALYX_BACKPRESSURE => {
-            GcFailureKind::CalyxBackpressure
-        }
-        CALYX_ASTER_NATIVE_COMPACTION_BUSY => GcFailureKind::MaintenanceLockBusy,
-        _ => GcFailureKind::Terminal,
-    }
-}
-
-fn retryable_gc_failure_kind(result: &StorageResult<GcReport>) -> Option<GcFailureKind> {
-    result
-        .as_ref()
-        .err()
-        .map(gc_failure_kind)
-        .filter(|kind| kind.is_retryable())
-}
-
-fn final_error_classification(error: &StorageError, attempts: u32) -> &'static str {
-    let kind = gc_failure_kind(error);
-    match kind {
-        GcFailureKind::CalyxBackpressure if attempts >= kind.max_attempts() => {
-            GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE
-        }
-        GcFailureKind::CalyxBackpressure => GC_RETRYABLE_CALYX_BACKPRESSURE,
-        // Reached only through the non-deferral branch (a deferral classifies
-        // itself against the escalation budget instead of the attempt count).
-        GcFailureKind::MaintenanceLockBusy => GC_DEFERRED_ON_MAINTENANCE_LOCK,
-        GcFailureKind::Terminal => GC_TERMINAL_ERROR,
-    }
-}
-
-fn gc_retry_delay(tick_unix_ms: u64, attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(16);
-    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let exponential_ms = u64::try_from(GC_RETRY_BASE_DELAY.as_millis())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(multiplier);
-    let cap_ms = u64::try_from(GC_RETRY_MAX_DELAY.as_millis()).unwrap_or(u64::MAX);
-    let bounded_ms = exponential_ms.min(cap_ms);
-    let jitter_window_ms = (bounded_ms / 4).max(1);
-    let jitter_ms =
-        tick_unix_ms.wrapping_add(u64::from(attempt).wrapping_mul(0x9E37_79B9)) % jitter_window_ms;
-    Duration::from_millis(bounded_ms.saturating_add(jitter_ms).min(cap_ms))
 }
 
 fn unix_time_ms_now() -> u64 {
@@ -931,4 +661,22 @@ fn unix_time_ms_now() -> u64 {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn read_failed(cf_name: &str, detail: String) -> StorageError {
+    StorageError::ReadFailed {
+        cf_name: cf_name.to_owned(),
+        detail,
+    }
+}
+
+fn write_failed(cf_name: &str, detail: String) -> StorageError {
+    StorageError::WriteFailed {
+        cf_name: cf_name.to_owned(),
+        detail,
+    }
 }

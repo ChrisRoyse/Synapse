@@ -1,0 +1,26 @@
+{
+  "cf_name": "CF_PROFILES",
+  "key": "profile_registry/v1/quarantine/profile.luanti.minetest.signed/0.3.0/a91973d5b68f9bbe",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "profile_package_quarantine",
+    "row_id": "profile.luanti.minetest.signed@0.3.0@a91973d5b68f9bbe",
+    "created_at": "2026-05-27T02:05:00Z",
+    "updated_at": "2026-05-27T02:05:00Z",
+    "source_id": "registry.synthetic.local-fixture",
+    "state": "quarantined",
+    "package_id": "profile.luanti.minetest.signed",
+    "package_version": "0.3.0",
+    "profile_id": "luanti.minetest",
+    "manifest_digest": "sha256:a91973d5b68f9bbe15019c24ec7012bc3c3ac3af54e11ca2af942dd3c88c8195",
+    "trust_policy_id": "signed-required",
+    "signature_status": "invalid",
+    "signer_id": "synapse.fixture.signer",
+    "key_id": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "signature_payload_digest": "sha256:6a1ed2fa1bca7ae7897b9666ffa5c8f4e7f4b69a0fa9aabd913e3b6ecaad3911",
+    "quarantine_reason": "signature_invalid",
+    "activation_state": "quarantined",
+    "error_code": "PROFILE_TRUST_VERIFICATION_FAILED",
+    "error_message": "profile package signature did not verify: signature error: Verification equation was not satisfied"
+  }
+}

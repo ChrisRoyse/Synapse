@@ -407,11 +407,13 @@ impl SynapseService {
         let from_row_exists_after = cf_row_exists(&db, &from_key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let to_row = db
-            .get_cf(cf::CF_SESSIONS, &to_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            .scan_cf_prefix(cf::CF_SESSIONS, &to_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .into_iter()
+            .find(|(row_key, _value)| row_key == &to_key);
         let to_row_exists_after = to_row.is_some();
         let to_row_session_id = to_row
-            .map(|value| {
+            .map(|(_key, value)| {
                 synapse_storage::decode_json::<PersistedSessionLease>(&value)
                     .map(|lease| lease.session_id)
                     .map_err(|error| {
@@ -520,7 +522,6 @@ impl SynapseService {
         }
         match lease::try_acquire(session_id, lease::ttl_from_ms(remaining_ms)) {
             LeaseOutcome::Acquired(status) | LeaseOutcome::Renewed(status) => {
-                crate::m2::foreground_fence::disarm("foreground_input_lease_continuity_restored");
                 if let Err(error) = self.persist_session_lease(session_id, &status) {
                     let released = lease::release_if_owner(session_id);
                     tracing::error!(
@@ -597,10 +598,10 @@ impl SynapseService {
     ) -> Result<Option<PersistedSessionTarget>, ErrorData> {
         let key = session_target_key(session_id);
         let db = self.session_continuity_db()?;
-        let value = db
-            .get_cf(cf::CF_SESSIONS, &key)
+        let rows = db
+            .scan_cf_prefix(cf::CF_SESSIONS, &key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let Some(value) = value else {
+        let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
             return Ok(None);
         };
         let persisted =
@@ -629,10 +630,10 @@ impl SynapseService {
     ) -> Result<Option<PersistedSessionLease>, ErrorData> {
         let key = session_lease_key(session_id);
         let db = self.session_continuity_db()?;
-        let value = db
-            .get_cf(cf::CF_SESSIONS, &key)
+        let rows = db
+            .scan_cf_prefix(cf::CF_SESSIONS, &key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let Some(value) = value else {
+        let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
             return Ok(None);
         };
         let persisted =
@@ -743,10 +744,10 @@ fn read_persisted_session_target_from_db(
     session_id: &str,
 ) -> Result<Option<PersistedSessionTarget>, String> {
     let key = session_target_key(session_id);
-    let value = db
-        .get_cf(cf::CF_SESSIONS, &key)
+    let rows = db
+        .scan_cf_prefix(cf::CF_SESSIONS, &key)
         .map_err(|error| error.to_string())?;
-    let Some(value) = value else {
+    let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
         return Ok(None);
     };
     let persisted =
@@ -800,8 +801,10 @@ fn snapshot_persisted_session_lease_row_from_db(
 ) -> Result<PersistedSessionLeaseRowSnapshot, String> {
     let key = session_lease_key(session_id);
     let value = db
-        .get_cf(cf::CF_SESSIONS, &key)
-        .map_err(|error| error.to_string())?;
+        .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find_map(|(row_key, value)| (row_key == key).then_some(value));
     Ok(PersistedSessionLeaseRowSnapshot { value })
 }
 
@@ -894,7 +897,10 @@ fn delete_exact_session_row(db: &Db, key: Vec<u8>) -> Result<(), ErrorData> {
 }
 
 fn cf_row_exists(db: &Db, key: &[u8]) -> synapse_storage::StorageResult<bool> {
-    db.get_cf(cf::CF_SESSIONS, key).map(|value| value.is_some())
+    db.scan_cf_prefix(cf::CF_SESSIONS, key).map(|rows| {
+        rows.into_iter()
+            .any(|(row_key, _value)| row_key.as_slice() == key)
+    })
 }
 
 pub(crate) fn delete_persisted_cdp_target_owner_row(
@@ -1197,4 +1203,296 @@ fn unix_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use synapse_core::SCHEMA_VERSION;
+
+    fn persisted_owner_row(
+        session_id: &str,
+        target_id: &str,
+        hwnd: i64,
+    ) -> PersistedCdpTargetOwner {
+        let endpoint = "chrome-extension://synapse-test/chrome.tabs".to_owned();
+        let owner_key = format!(
+            "cdp:0x{hwnd:x}:{}:{}",
+            endpoint,
+            target_id.trim().to_ascii_lowercase()
+        );
+        PersistedCdpTargetOwner {
+            schema_version: 1,
+            owner_key,
+            stored_at_unix_ms: 1_000,
+            owner_session_id: session_id.to_owned(),
+            owner_client_name: Some("claude-code".to_owned()),
+            owner_agent_kind: "claude".to_owned(),
+            owner_started_at_unix_ms: Some(900),
+            owner: CdpTargetOwner {
+                session_id: session_id.to_owned(),
+                window_hwnd: hwnd,
+                endpoint,
+                chrome_window_id: Some(42),
+                capture_window_hwnd: Some(hwnd),
+                cdp_target_id: target_id.to_owned(),
+                requested_url: "http://127.0.0.1/test".to_owned(),
+                target_url: "http://127.0.0.1/test".to_owned(),
+                created_at_unix_ms: 950,
+            },
+        }
+    }
+
+    #[test]
+    fn continuity_delete_removes_exact_session_rows_and_keeps_neighbors() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let session_id = "continuity-session";
+        let neighbor_session_id = "continuity-session-extra";
+        let target = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: session_id.to_owned(),
+            stored_at_unix_ms: 1_000,
+            target: SessionTarget::Window { hwnd: 0x1234 },
+        };
+        let lease = PersistedSessionLease {
+            schema_version: 1,
+            session_id: session_id.to_owned(),
+            stored_at_unix_ms: 1_000,
+            renewed_at_unix_ms: 1_100,
+            ttl_ms: 5_000,
+            expires_at_unix_ms: 6_100,
+        };
+        let neighbor_target = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: neighbor_session_id.to_owned(),
+            stored_at_unix_ms: 2_000,
+            target: SessionTarget::Window { hwnd: 0x5678 },
+        };
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [
+                (
+                    session_target_key(session_id),
+                    synapse_storage::encode_json(&target)?,
+                ),
+                (
+                    session_lease_key(session_id),
+                    synapse_storage::encode_json(&lease)?,
+                ),
+                (
+                    session_target_key(neighbor_session_id),
+                    synapse_storage::encode_json(&neighbor_target)?,
+                ),
+            ],
+        )?;
+
+        assert!(cf_row_exists(&db, &session_target_key(session_id))?);
+        assert!(cf_row_exists(&db, &session_lease_key(session_id))?);
+        assert!(cf_row_exists(
+            &db,
+            &session_target_key(neighbor_session_id)
+        )?);
+
+        let readback = delete_persisted_session_continuity_rows_from_db(&db, session_id)
+            .map_err(anyhow::Error::msg)?;
+
+        println!(
+            "readback=CF_SESSIONS test=continuity_delete target_before={} target_after={} lease_before={} lease_after={}",
+            readback.target_row_existed_before,
+            readback.target_row_exists_after,
+            readback.lease_row_existed_before,
+            readback.lease_row_exists_after
+        );
+        assert!(readback.target_row_deleted);
+        assert!(readback.lease_row_deleted);
+        assert!(!cf_row_exists(&db, &session_target_key(session_id))?);
+        assert!(!cf_row_exists(&db, &session_lease_key(session_id))?);
+        let neighbor_row = db
+            .scan_cf_prefix(cf::CF_SESSIONS, &session_target_key(neighbor_session_id))?
+            .into_iter()
+            .find(|(row_key, _value)| row_key == &session_target_key(neighbor_session_id))
+            .ok_or_else(|| anyhow::anyhow!("neighbor target row should remain"))?;
+        let decoded = synapse_storage::decode_json::<PersistedSessionTarget>(&neighbor_row.1)?;
+        assert_eq!(decoded.session_id, neighbor_session_id);
+        assert_eq!(decoded.target, SessionTarget::Window { hwnd: 0x5678 });
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_cdp_owner_validation_rejects_noncanonical_window_handles() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let row = persisted_owner_row("shape-session", "chrome-tab:shape", hwnd);
+            let error = validate_persisted_cdp_target_owner("chrome-tab:shape", &row)
+                .expect_err("noncanonical persisted HWND must be classified as corruption");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+            );
+        }
+        let mut invalid_capture = persisted_owner_row("shape-session", "chrome-tab:shape", 0x1234);
+        invalid_capture.owner.capture_window_hwnd = Some(i64::from(u32::MAX) + 1);
+        let error = validate_persisted_cdp_target_owner("chrome-tab:shape", &invalid_capture)
+            .expect_err("noncanonical persisted capture HWND must be corruption");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+        );
+        let row = persisted_owner_row("shape-session", "chrome-tab:shape", i64::from(u32::MAX));
+        validate_persisted_cdp_target_owner("chrome-tab:shape", &row)
+            .expect("maximum canonical persisted HWND must remain valid");
+    }
+
+    #[test]
+    fn persisted_session_target_validation_rejects_noncanonical_window_handles() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            for target in [
+                SessionTarget::Window { hwnd },
+                SessionTarget::Cdp {
+                    window_hwnd: hwnd,
+                    cdp_target_id: "chrome-tab:shape".to_owned(),
+                },
+            ] {
+                let error = validate_persisted_session_target_hwnd("shape-session", &target)
+                    .expect_err("noncanonical persisted HWND must be classified as corruption");
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data.get("code")),
+                    Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+                );
+            }
+        }
+        for target in [
+            SessionTarget::Window {
+                hwnd: i64::from(u32::MAX),
+            },
+            SessionTarget::Cdp {
+                window_hwnd: i64::from(u32::MAX),
+                cdp_target_id: "chrome-tab:shape".to_owned(),
+            },
+        ] {
+            validate_persisted_session_target_hwnd("shape-session", &target)
+                .expect("maximum canonical persisted HWND must remain valid");
+        }
+    }
+
+    #[test]
+    fn persisted_cdp_owner_scan_filters_session_and_keeps_neighbors() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let session_id = "stale-claude-session";
+        let neighbor_session_id = "neighbor-session";
+        let owned = persisted_owner_row(session_id, "chrome-tab:Owned", 0x1000);
+        let neighbor = persisted_owner_row(neighbor_session_id, "chrome-tab:Neighbor", 0x2000);
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [
+                (
+                    cdp_target_owner_row_key(&owned.owner_key, &owned.owner.cdp_target_id),
+                    synapse_storage::encode_json(&owned)?,
+                ),
+                (
+                    cdp_target_owner_row_key(&neighbor.owner_key, &neighbor.owner.cdp_target_id),
+                    synapse_storage::encode_json(&neighbor)?,
+                ),
+            ],
+        )?;
+
+        let rows = read_persisted_cdp_target_owners_for_session_from_db(&db, session_id)
+            .map_err(anyhow::Error::msg)?;
+
+        println!(
+            "readback=CF_SESSIONS test=persisted_cdp_owner_scan before_total=2 selected={} selected_target={}",
+            rows.len(),
+            rows.first()
+                .map(|(_key, row)| row.owner.cdp_target_id.as_str())
+                .unwrap_or("<none>")
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, owned.owner_key);
+        assert_eq!(rows[0].1.owner_session_id, session_id);
+        assert_eq!(rows[0].1.owner.cdp_target_id, "chrome-tab:Owned");
+
+        let neighbor_rows =
+            read_persisted_cdp_target_owners_for_session_from_db(&db, neighbor_session_id)
+                .map_err(anyhow::Error::msg)?;
+        assert_eq!(neighbor_rows.len(), 1);
+        assert_eq!(neighbor_rows[0].1.owner_session_id, neighbor_session_id);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_cdp_owner_session_ids_include_orphan_owner_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let first = persisted_owner_row("orphan-session-a", "chrome-tab:100", 0x1000);
+        let second = persisted_owner_row("orphan-session-b", "chrome-tab:200", 0x2000);
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [
+                (
+                    cdp_target_owner_row_key(&first.owner_key, &first.owner.cdp_target_id),
+                    synapse_storage::encode_json(&first)?,
+                ),
+                (
+                    cdp_target_owner_row_key(&second.owner_key, &second.owner.cdp_target_id),
+                    synapse_storage::encode_json(&second)?,
+                ),
+            ],
+        )?;
+
+        let ids =
+            read_persisted_cdp_target_owner_session_ids_from_db(&db).map_err(anyhow::Error::msg)?;
+
+        println!("readback=CF_SESSIONS test=persisted_cdp_owner_session_ids selected={ids:?}");
+        assert_eq!(
+            ids,
+            BTreeSet::from(["orphan-session-a".to_owned(), "orphan-session-b".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_session_target_session_ids_include_orphan_target_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let first = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: "orphan-target-a".to_owned(),
+            stored_at_unix_ms: 1_000,
+            target: SessionTarget::Window { hwnd: 0x1111 },
+        };
+        let second = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: "orphan-target-b".to_owned(),
+            stored_at_unix_ms: 2_000,
+            target: SessionTarget::Cdp {
+                window_hwnd: 0x2222,
+                cdp_target_id: "chrome-tab:200".to_owned(),
+            },
+        };
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [
+                (
+                    session_target_key(&first.session_id),
+                    synapse_storage::encode_json(&first)?,
+                ),
+                (
+                    session_target_key(&second.session_id),
+                    synapse_storage::encode_json(&second)?,
+                ),
+            ],
+        )?;
+
+        let ids =
+            read_persisted_session_target_session_ids_from_db(&db).map_err(anyhow::Error::msg)?;
+
+        println!("readback=CF_SESSIONS test=persisted_session_target_session_ids selected={ids:?}");
+        assert_eq!(
+            ids,
+            BTreeSet::from(["orphan-target-a".to_owned(), "orphan-target-b".to_owned()])
+        );
+        Ok(())
+    }
 }

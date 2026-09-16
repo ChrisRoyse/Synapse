@@ -1,0 +1,24 @@
+schema_version = 1
+kind = "registry_source"
+source_id = "registry.synthetic.local-fixture"
+source_kind = "fixture"
+enabled = true
+auth_mode = "none"
+base_url = "file://crates/synapse-profiles/tests/fixtures/profile_registry/profile_registry_protocol"
+protocol_version = "synapse-registry-v0"
+trust_policy_id = "trust.synthetic.local"
+last_health_status = "ok"
+last_successful_sync_at = "2026-05-27T01:00:00Z"
+
+[cache_policy]
+max_age_seconds = 3600
+offline_cache_allowed = true
+
+[capabilities]
+search = true
+package_fetch = true
+update_metadata = true
+contribution_submission = true
+moderation_status = true
+trust_metadata = true
+revocations = true

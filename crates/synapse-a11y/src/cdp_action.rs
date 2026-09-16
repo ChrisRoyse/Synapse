@@ -30,14 +30,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chromiumoxide::Browser;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, GetBoxModelParams, ResolveNodeParams, Rgba, ScrollIntoViewIfNeededParams,
+    BackendNodeId, GetBoxModelParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
 };
-use chromiumoxide::cdp::browser_protocol::emulation::SetDefaultBackgroundColorOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{
-    DispatchDragEventParams, DispatchDragEventType, DispatchKeyEventParams, DispatchKeyEventType,
-    DispatchMouseEventParams, DispatchMouseEventType, DispatchTouchEventParams,
-    DispatchTouchEventType, DragData, DragDataItem, InsertTextParams, MouseButton, TouchPoint,
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    DispatchTouchEventParams, DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
@@ -48,37 +47,29 @@ use chromiumoxide::cdp::browser_protocol::page::{
     EnableParams as PageEnableParams, EventDomContentEventFired, EventFrameNavigated,
     EventLifecycleEvent, EventLoadEventFired, EventNavigatedWithinDocument, GetFrameTreeParams,
     GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, PrintToPdfParams, ReloadParams,
-    RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier, SetDocumentContentParams,
-    SetLifecycleEventsEnabledParams, Viewport,
+    NavigateToHistoryEntryParams, ReloadParams, RemoveScriptToEvaluateOnNewDocumentParams,
+    ScriptIdentifier, SetDocumentContentParams, SetLifecycleEventsEnabledParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
-use chromiumoxide::{Browser, Page};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Debug)]
-struct DurableInitScriptSession {
+#[derive(Clone, Debug)]
+struct DurableInitScriptEntry {
     endpoint: String,
     target_id: String,
-    // Page.addScriptToEvaluateOnNewDocument registrations belong to the CDP
-    // page session that created them. Retain that exact physical session until
-    // removal; an identifier alone is not transferable to a fresh session.
-    _browser: Browser,
-    page: Page,
-    handler_task: tokio::task::JoinHandle<()>,
-    identifiers: HashSet<String>,
+    identifier: String,
 }
 
-fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptSession>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptSession>>> = OnceLock::new();
+fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptEntry>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptEntry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn durable_init_script_key(endpoint: &str, target_id: &str) -> String {
-    format!("{endpoint}\n{target_id}")
+fn durable_init_script_key(endpoint: &str, target_id: &str, identifier: &str) -> String {
+    format!("{endpoint}\n{target_id}\n{identifier}")
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -118,17 +109,6 @@ pub struct CdpMouseStrokeResult {
     pub start: CdpActionPoint,
     pub end: CdpActionPoint,
     pub duration_ms: f64,
-}
-
-/// Dispatch summary for a trusted CDP HTML5 drag sequence.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct CdpHtml5DragResult {
-    pub target_id: String,
-    pub source: CdpActionPoint,
-    pub target: CdpActionPoint,
-    pub mime_type: String,
-    pub data_length: usize,
-    pub dispatched_events: Vec<String>,
 }
 
 /// Dispatch summary for a CDP touch tap.
@@ -270,32 +250,6 @@ pub struct CdpPageState {
     pub ready_state: String,
     pub history_current_index: i64,
     pub history_entry_count: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct CdpPrintToPdfOptions {
-    pub landscape: bool,
-    pub display_header_footer: bool,
-    pub print_background: bool,
-    pub scale: Option<f64>,
-    pub paper_width: Option<f64>,
-    pub paper_height: Option<f64>,
-    pub margin_top: Option<f64>,
-    pub margin_bottom: Option<f64>,
-    pub margin_left: Option<f64>,
-    pub margin_right: Option<f64>,
-    pub page_ranges: Option<String>,
-    pub header_template: Option<String>,
-    pub footer_template: Option<String>,
-    pub prefer_css_page_size: bool,
-    pub timeout_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CdpPrintToPdfResult {
-    pub target_id: String,
-    pub pdf_bytes: Vec<u8>,
-    pub page_state: CdpPageState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1425,79 +1379,6 @@ pub async fn cdp_mouse_stroke_target(
     })
 }
 
-/// Dispatches Chrome-generated HTML5 dragEnter/dragOver/drop events to an exact
-/// raw-CDP target without activating its browser window.
-///
-/// # Errors
-///
-/// Fails before dispatch for an empty MIME type, invalid coordinates, or an
-/// unreachable/mismatched target; any CDP acknowledgement failure is returned.
-pub async fn cdp_html5_drag_target(
-    endpoint: &str,
-    target_id: &str,
-    source: CdpActionPoint,
-    target: CdpActionPoint,
-    mime_type: &str,
-    data: &str,
-) -> A11yResult<CdpHtml5DragResult> {
-    validate_cdp_action_point(source, "HTML5 drag source")?;
-    validate_cdp_action_point(target, "HTML5 drag target")?;
-    let mime_type = mime_type.trim();
-    if mime_type.is_empty() {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: "HTML5 drag MIME type must not be empty".to_owned(),
-        });
-    }
-    let mime_type_owned = mime_type.to_owned();
-    let data_owned = data.to_owned();
-    let target_id_owned = target_id.to_owned();
-    with_target_page(endpoint, target_id, |page| async move {
-        let actual_target_id = page.target_id().inner().clone();
-        if actual_target_id != target_id_owned {
-            return Err(A11yError::CdpAttachFailed {
-                detail: format!(
-                    "HTML5 drag resolved target {actual_target_id:?}, expected {target_id_owned:?}"
-                ),
-            });
-        }
-        let drag_data = DragData::new(
-            vec![DragDataItem::new(
-                mime_type_owned.clone(),
-                data_owned.clone(),
-            )],
-            1,
-        );
-        let events = [
-            (DispatchDragEventType::DragEnter, source, "dragEnter"),
-            (DispatchDragEventType::DragOver, target, "dragOver"),
-            (DispatchDragEventType::Drop, target, "drop"),
-        ];
-        let mut dispatched_events = Vec::with_capacity(events.len());
-        for (event_type, point, label) in events {
-            page.execute(DispatchDragEventParams::new(
-                event_type,
-                point.x,
-                point.y,
-                drag_data.clone(),
-            ))
-            .await
-            .map_err(|error| A11yError::CdpAxtreeFailed {
-                detail: format!("Input.dispatchDragEvent {label}: {error}"),
-            })?;
-            dispatched_events.push(label.to_owned());
-        }
-        Ok(CdpHtml5DragResult {
-            target_id: actual_target_id,
-            source,
-            target,
-            mime_type: mime_type_owned,
-            data_length: data_owned.len(),
-            dispatched_events,
-        })
-    })
-    .await
-}
-
 /// Touch-taps viewport CSS coordinates in a specific CDP page target without
 /// moving the OS cursor or activating the browser window.
 ///
@@ -2362,6 +2243,31 @@ fn mark_persisted_init_script_registration_removed(
     Ok(())
 }
 
+fn persisted_init_script_registration_removed_readback(
+    endpoint: &str,
+    target_id: &str,
+    identifier: &str,
+) -> A11yResult<bool> {
+    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
+    if !snapshot.failures.is_empty() {
+        return Err(cdp_owner_ledger_error(format!(
+            "cannot read init-script registration state: {}",
+            snapshot.failures.join(" | ")
+        )));
+    }
+    Ok(snapshot.rows.iter().any(|row| {
+        row.owner.endpoint == endpoint
+            && row.owner.target_id == target_id
+            && matches!(
+                &row.owner.mutation,
+                PersistedCdpMutationKind::InitScriptEffect {
+                    registration_identifier: Some(row_identifier),
+                    registration_removed: true,
+                } if row_identifier == identifier
+            )
+    }))
+}
+
 fn transition_persisted_init_script_registration_removed(
     owner: &PersistedCdpMutationOwner,
 ) -> A11yResult<PersistedCdpMutationOwner> {
@@ -2385,62 +2291,6 @@ fn transition_persisted_init_script_registration_removed(
     )?;
     resolve_persisted_cdp_mutation_owner(owner)?;
     Ok(removed_owner)
-}
-
-pub fn resolve_persisted_init_script_effect_after_current_teardown(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<()> {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    if !snapshot.failures.is_empty() {
-        return Err(cdp_owner_ledger_error(format!(
-            "cannot resolve init-script effect after current-document teardown: {}",
-            snapshot.failures.join(" | ")
-        )));
-    }
-    let matching = snapshot
-        .rows
-        .into_iter()
-        .filter(|row| {
-            row.owner.endpoint == endpoint
-                && row.owner.target_id == target_id
-                && matches!(
-                    &row.owner.mutation,
-                    PersistedCdpMutationKind::InitScriptEffect {
-                        registration_identifier: Some(row_identifier),
-                        registration_removed: true,
-                    } if row_identifier == identifier
-                )
-        })
-        .collect::<Vec<_>>();
-    if matching.len() != 1 {
-        return Err(cdp_owner_ledger_error(format!(
-            "expected exactly one registration-removed init-script effect for endpoint {endpoint:?}, target {target_id:?}, identifier {identifier:?}; found {}",
-            matching.len()
-        )));
-    }
-    resolve_persisted_cdp_mutation_owner(&matching[0].owner)?;
-    let after = read_persisted_cdp_mutation_owner_snapshot();
-    if !after.failures.is_empty()
-        || after.rows.iter().any(|row| {
-            row.owner.endpoint == endpoint
-                && row.owner.target_id == target_id
-                && matches!(
-                    &row.owner.mutation,
-                    PersistedCdpMutationKind::InitScriptEffect {
-                        registration_identifier: Some(row_identifier),
-                        ..
-                    } if row_identifier == identifier
-                )
-        })
-    {
-        return Err(cdp_owner_ledger_error(format!(
-            "init-script effect terminal readback failed for endpoint {endpoint:?}, target {target_id:?}, identifier {identifier:?}; failures={:?}",
-            after.failures
-        )));
-    }
-    Ok(())
 }
 
 async fn remove_init_script_registration_for_recovery(
@@ -2910,6 +2760,33 @@ where
     }
 }
 
+#[cfg(test)]
+async fn evaluate_within_budget<Fut, T>(
+    operation: &str,
+    scope: &str,
+    timeout_ms: Option<u64>,
+    fut: Fut,
+) -> A11yResult<T>
+where
+    Fut: std::future::Future<Output = A11yResult<T>>,
+{
+    let Some(timeout_ms) = timeout_ms else {
+        return fut.await;
+    };
+    let budget = Duration::from_millis(timeout_ms);
+    let started = Instant::now();
+    if let Ok(result) = tokio::time::timeout(budget, fut).await {
+        result
+    } else {
+        let elapsed_ms = duration_millis_u64(started.elapsed());
+        Err(A11yError::CdpEvaluateTimeout {
+            detail: format!(
+                "{operation} ({scope} scope) was still running when the {timeout_ms} ms timeout_ms budget elapsed (elapsed {elapsed_ms} ms); if waiting for a returned promise is unnecessary, retry with await_promise=false"
+            ),
+        })
+    }
+}
+
 pub async fn cdp_evaluate_expression(
     endpoint: &str,
     target_id: &str,
@@ -3241,324 +3118,103 @@ async fn cdp_add_init_script_target_owned(
             detail: "durable browser mutation owners are disabled by operator panic; refusing init-script install".to_owned(),
         });
     }
-    let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source.to_owned());
-    if let Some(world_name) = world_name {
-        builder = builder.world_name(world_name.to_owned());
-    }
-    if let Some(include_command_line_api) = include_command_line_api {
-        builder = builder.include_command_line_api(include_command_line_api);
-    }
-    if let Some(run_immediately) = run_immediately {
-        builder = builder.run_immediately(run_immediately);
-    }
-    let params = builder
-        .build()
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {error}"),
+    let source = source.to_owned();
+    let world_name = world_name.map(ToOwned::to_owned);
+    let owner_endpoint = endpoint.to_owned();
+    let result = with_target_page(endpoint, target_id, |page| async move {
+        let target_id = page.target_id().inner().clone();
+        let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source);
+        if let Some(world_name) = world_name {
+            builder = builder.world_name(world_name);
+        }
+        if let Some(include_command_line_api) = include_command_line_api {
+            builder = builder.include_command_line_api(include_command_line_api);
+        }
+        if let Some(run_immediately) = run_immediately {
+            builder = builder.run_immediately(run_immediately);
+        }
+        let params = builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {err}"),
         })?;
-
-    let key = durable_init_script_key(endpoint, target_id);
-    let existing = durable_init_script_registry()
-        .lock()
-        .map_err(|_| A11yError::CdpAttachFailed {
-            detail: "durable init-script session registry lock is poisoned before install"
-                .to_owned(),
-        })?
-        .remove(&key);
-    let mut session = match existing {
-        Some(session) => session,
-        None => connect_durable_init_script_session(endpoint, target_id).await?,
-    };
-    if session.handler_task.is_finished() {
-        return finish_durable_init_script_session(
-            session,
-            Err(A11yError::CdpAttachFailed {
-                detail: format!(
-                    "durable init-script CDP session for target {target_id:?} ended before install; refusing to allocate a session-local identifier"
-                ),
-            }),
-            "init-script stale-session rejection",
-        )
-        .await;
-    }
-
-    // Persist a conservative unknown-registration effect owner before the
-    // physical command. If the response is lost, K2 cannot safely infer an
-    // identifier and must close the exact target rather than reload a possibly
-    // still-registered script.
-    let pending_effect_owner = match persist_cdp_mutation_owner(
-        endpoint,
-        target_id,
-        PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: None,
-            registration_removed: false,
-        },
-    ) {
-        Ok(owner) => owner,
-        Err(error) => return return_failed_init_script_session(session, error).await,
-    };
-    let added = match session.page.execute(params).await {
-        Ok(added) => added.result,
-        Err(error) => {
-            let primary = A11yError::CdpAxtreeFailed {
-                detail: format!("Page.addScriptToEvaluateOnNewDocument: {error}"),
-            };
-            return return_failed_init_script_session(session, primary).await;
-        }
-    };
-    let identifier = added.identifier.inner().clone();
-    if session.identifiers.contains(&identifier) {
-        let primary = A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.addScriptToEvaluateOnNewDocument reused live session-local identifier {identifier:?}; refusing to guess which registration the protocol map retained"
-            ),
-        };
-        return return_failed_init_script_session(session, primary).await;
-    }
-    session.identifiers.insert(identifier.clone());
-
-    // Commit the identifier-bearing owner before retiring the conservative
-    // pending row. Normal registration removal intentionally leaves this
-    // effect owner active until a new-document reload readback terminates
-    // page-world code which may already have executed.
-    if let Err(error) = persist_cdp_mutation_owner(
-        endpoint,
-        target_id,
-        PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: Some(identifier.clone()),
-            registration_removed: false,
-        },
-    ) {
-        return rollback_unpublished_init_script(
-            session,
-            endpoint,
-            target_id,
-            &identifier,
-            &pending_effect_owner,
-            false,
-            error,
-        )
-        .await;
-    }
-    if let Err(error) = resolve_persisted_cdp_mutation_owner(&pending_effect_owner) {
-        return rollback_unpublished_init_script(
-            session,
-            endpoint,
-            target_id,
-            &identifier,
-            &pending_effect_owner,
-            false,
-            error,
-        )
-        .await;
-    }
-    let state = match read_page_state(&session.page).await {
-        Ok(state) => state,
-        Err(error) => {
-            return rollback_unpublished_init_script(
-                session,
-                endpoint,
-                target_id,
-                &identifier,
-                &pending_effect_owner,
-                true,
-                error,
-            )
-            .await;
-        }
-    };
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        let primary = A11yError::CdpAttachFailed {
-            detail: "operator panic crossed init-script installation; refusing publication"
-                .to_owned(),
-        };
-        let (cleanup, retained, _) =
-            remove_init_script_from_session(session, endpoint, target_id, &identifier).await;
-        let retention = retain_init_script_session_after_cleanup(retained).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail: format!(
-                "{primary}; exact registration cleanup={cleanup:?}; session={retention}"
-            ),
-        });
-    }
-    if let Err(failure) = store_durable_init_script_session(session) {
-        let (registry_error, session) = *failure;
-        let (cleanup, retained, _) =
-            remove_init_script_from_session(session, endpoint, target_id, &identifier).await;
-        let retention = retain_init_script_session_after_cleanup(retained).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail: format!(
-                "{registry_error}; exact untracked init-script cleanup={cleanup:?}; session={retention}"
-            ),
-        });
-    }
-    Ok(CdpInitScriptResult {
-        target_id: target_id.to_owned(),
-        identifier,
-        state,
-    })
-}
-
-async fn connect_durable_init_script_session(
-    endpoint: &str,
-    target_id: &str,
-) -> A11yResult<DurableInitScriptSession> {
-    let target_id = target_id.trim();
-    if target_id.is_empty() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "CDP target id must not be empty".to_owned(),
-        });
-    }
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
+        // Persist a conservative unknown-registration effect owner before the
+        // physical command. If the response is lost, K2 cannot safely infer an
+        // identifier and must close the exact target rather than reload a
+        // possibly still-registered script.
+        let pending_effect_owner = persist_cdp_mutation_owner(
+            &owner_endpoint,
+            &target_id,
+            PersistedCdpMutationKind::InitScriptEffect {
+                registration_identifier: None,
+                registration_removed: false,
+            },
+        )?;
+        let added = page
+            .execute(params)
             .await
-            .map_err(|error| A11yError::CdpAttachFailed {
-                detail: format!("connect durable init-script session to {endpoint}: {error}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-    let page = match async {
-        let page = get_target_page_with_discovery(&browser, target_id).await?;
-        prime_target_page_for_input(&page, target_id).await?;
-        Ok::<Page, A11yError>(page)
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.addScriptToEvaluateOnNewDocument: {err}"),
+            })?
+            .result;
+        let identifier = added.identifier.inner().clone();
+        // Commit the identifier-bearing owner before retiring the conservative
+        // pending row. Normal registration removal intentionally leaves this
+        // effect owner active until a new-document reload readback terminates
+        // page-world code which may already have executed.
+        let _effect_owner = persist_cdp_mutation_owner(
+            &owner_endpoint,
+            &target_id,
+            PersistedCdpMutationKind::InitScriptEffect {
+                registration_identifier: Some(identifier.clone()),
+                registration_removed: false,
+            },
+        )?;
+        resolve_persisted_cdp_mutation_owner(&pending_effect_owner)?;
+        let state = read_page_state(&page).await?;
+        Ok(CdpInitScriptResult {
+            target_id,
+            identifier,
+            state,
+        })
+    })
+    .await?;
+    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
+        return Err(A11yError::CdpAttachFailed {
+            detail:
+                "operator panic crossed init-script installation; the new identifier was removed"
+                    .to_owned(),
+        });
     }
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => {
-            finish_chromiumoxide_handler::<()>(
-                Err(error),
-                handler_task,
-                "durable init-script session connect",
-            )
-            .await?;
-            unreachable!("an error input cannot become a successful handler verdict")
-        }
-    };
-    Ok(DurableInitScriptSession {
+    let entry = DurableInitScriptEntry {
         endpoint: endpoint.to_owned(),
         target_id: target_id.to_owned(),
-        _browser: browser,
-        page,
-        handler_task,
-        identifiers: HashSet::new(),
-    })
-}
-
-fn store_durable_init_script_session(
-    session: DurableInitScriptSession,
-) -> Result<(), Box<(String, DurableInitScriptSession)>> {
-    let key = durable_init_script_key(&session.endpoint, &session.target_id);
-    let mut registry = match durable_init_script_registry().lock() {
-        Ok(registry) => registry,
-        Err(_) => {
-            return Err(Box::new((
-                "durable init-script session registry lock is poisoned while returning exact session ownership"
-                    .to_owned(),
-                session,
-            )));
-        }
+        identifier: result.identifier.clone(),
     };
-    if registry.contains_key(&key) {
-        return Err(Box::new((
-            format!(
-                "durable init-script session registry already owns endpoint {:?}, target {:?}; refusing to overwrite either physical owner",
-                session.endpoint, session.target_id
-            ),
-            session,
-        )));
-    }
-    registry.insert(key, session);
-    Ok(())
-}
-
-async fn finish_durable_init_script_session<T>(
-    session: DurableInitScriptSession,
-    result: A11yResult<T>,
-    operation: &str,
-) -> A11yResult<T> {
-    let DurableInitScriptSession { handler_task, .. } = session;
-    finish_chromiumoxide_handler(result, handler_task, operation).await
-}
-
-async fn return_failed_init_script_session<T>(
-    session: DurableInitScriptSession,
-    primary: A11yError,
-) -> A11yResult<T> {
-    if session.handler_task.is_finished() || session.identifiers.is_empty() {
-        return finish_durable_init_script_session(
-            session,
-            Err(primary),
-            "failed durable init-script command",
-        )
-        .await;
-    }
-    match store_durable_init_script_session(session) {
-        Ok(()) => Err(primary),
-        Err(failure) => {
-            let (registry_error, session) = *failure;
-            finish_durable_init_script_session(
-                session,
-                Err(A11yError::CdpAttachFailed {
-                    detail: format!(
-                        "durable init-script command failed: {primary}; exact session retention also failed: {registry_error}"
-                    ),
-                }),
-                "failed durable init-script session retention",
-            )
-            .await
+    let key = durable_init_script_key(endpoint, target_id, &result.identifier);
+    let registered = match durable_init_script_registry().lock() {
+        Ok(mut registry) => {
+            if crate::cdp_network::durable_browser_mutation_owners_enabled() {
+                registry.insert(key, entry);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
-    }
-}
-
-async fn rollback_unpublished_init_script<T>(
-    session: DurableInitScriptSession,
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-    pending_effect_owner: &PersistedCdpMutationOwner,
-    pending_already_resolved: bool,
-    primary: A11yError,
-) -> A11yResult<T> {
-    let (cleanup, retained, physical_removed) =
-        remove_init_script_from_session(session, endpoint, target_id, identifier).await;
-    let pending_cleanup = if physical_removed && !pending_already_resolved {
-        resolve_persisted_cdp_mutation_owner(pending_effect_owner)
-            .map(|()| "resolved".to_owned())
-            .unwrap_or_else(|error| format!("failed: {error}"))
-    } else if pending_already_resolved {
-        "already_resolved".to_owned()
-    } else {
-        "retained_because_physical_removal_was_not_acknowledged".to_owned()
+        Err(_) => Err(()),
     };
-    let retention = retain_init_script_session_after_cleanup(retained).await;
-    Err(A11yError::CdpAxtreeFailed {
-        detail: format!(
-            "init-script publication failed: {primary}; exact registration rollback={cleanup:?}; pending owner={pending_cleanup}; session={retention}"
-        ),
-    })
-}
-
-async fn retain_init_script_session_after_cleanup(
-    retained: Option<DurableInitScriptSession>,
-) -> String {
-    let Some(retained) = retained else {
-        return "session_terminated".to_owned();
-    };
-    match store_durable_init_script_session(retained) {
-        Ok(()) => "retained".to_owned(),
-        Err(failure) => {
-            let (registry_error, retained) = *failure;
-            let shutdown = finish_durable_init_script_session(
-                retained,
-                Err::<(), _>(A11yError::CdpAttachFailed {
-                    detail: registry_error,
-                }),
-                "init-script session retention failure",
-            )
-            .await;
-            format!("failed_and_session_terminated: {shutdown:?}")
-        }
+    if registered != Ok(true) {
+        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
+        return Err(A11yError::CdpAttachFailed {
+            detail: if registered == Ok(false) {
+                "operator panic crossed init-script registration; the new identifier was removed"
+                    .to_owned()
+            } else {
+                "durable init-script registry lock is poisoned; the untracked physical identifier was removed"
+                    .to_owned()
+            },
+        });
     }
+    Ok(result)
 }
 
 /// Removes a script previously installed with
@@ -3574,243 +3230,122 @@ pub async fn cdp_remove_init_script_target(
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    let endpoint = endpoint.to_owned();
-    let target_id = target_id.to_owned();
-    let identifier = identifier.to_owned();
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-        let result =
-            cdp_remove_init_script_target_while_guarded(&endpoint, &target_id, &identifier).await;
-        let _ = result_tx.send(result);
-    });
-    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
-        detail: "owned init-script removal task terminated before publishing a verdict".to_owned(),
-    })?
+    let result = cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await?;
+    let key = durable_init_script_key(endpoint, target_id, identifier);
+    let mut registry =
+        durable_init_script_registry()
+            .lock()
+            .map_err(|_| A11yError::CdpAttachFailed {
+                detail: "durable init-script registry lock is poisoned after physical removal"
+                    .to_owned(),
+            })?;
+    registry.remove(&key);
+    drop(registry);
+    Ok(result)
 }
 
-pub async fn cdp_remove_init_script_target_while_guarded(
+async fn cdp_remove_init_script_target_owned(
     endpoint: &str,
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    let identifier = identifier.trim();
-    if identifier.is_empty() {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: "init-script identifier must not be empty".to_owned(),
-        });
-    }
-    let key = durable_init_script_key(endpoint, target_id);
-    let session = durable_init_script_registry()
-        .lock()
-        .map_err(|_| A11yError::CdpAttachFailed {
-            detail: "durable init-script session registry lock is poisoned before removal"
-                .to_owned(),
-        })?
-        .remove(&key);
-    let Some(session) = session else {
-        let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-        if !snapshot.failures.is_empty() {
-            return Err(cdp_owner_ledger_error(format!(
-                "cannot reconcile missing live init-script session: {}",
-                snapshot.failures.join(" | ")
-            )));
-        }
-        let already_removed = snapshot
-            .rows
-            .iter()
-            .filter(|row| {
-                row.owner.endpoint == endpoint
-                    && row.owner.target_id == target_id
-                    && matches!(
-                        &row.owner.mutation,
-                        PersistedCdpMutationKind::InitScriptEffect {
-                            registration_identifier: Some(row_identifier),
-                            registration_removed: true,
-                        } if row_identifier == identifier
-                    )
-            })
-            .count();
-        if already_removed == 1 {
-            let identifier = identifier.to_owned();
-            return with_target_page(endpoint, target_id, |page| async move {
-                let state = read_page_state(&page).await?;
-                Ok(CdpInitScriptResult {
-                    target_id: page.target_id().inner().clone(),
-                    identifier,
-                    state,
-                })
-            })
-            .await;
-        }
-        return Err(A11yError::CdpAttachFailed {
-            detail: format!(
-                "no exact live CDP session owns init-script identifier {identifier:?} for endpoint {endpoint:?}, target {target_id:?}, and the durable ledger has {already_removed} acknowledged removed owner(s); refusing removal through a different session"
-            ),
-        });
-    };
-    if !session.identifiers.contains(identifier) {
-        let known = session.identifiers.iter().cloned().collect::<Vec<_>>();
-        let primary = A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "init-script identifier {identifier:?} is not owned by the exact live CDP session for target {target_id:?}; owned identifiers={known:?}"
-            ),
-        };
-        return return_failed_init_script_session(session, primary).await;
-    }
-    let (result, retained, _) =
-        remove_init_script_from_session(session, endpoint, target_id, identifier).await;
-    if let Some(retained) = retained
-        && let Err(failure) = store_durable_init_script_session(retained)
-    {
-        let (registry_error, retained) = *failure;
-        return finish_durable_init_script_session(
-                retained,
-                Err(A11yError::CdpAttachFailed {
-                    detail: format!(
-                        "init-script removal verdict={result:?}; exact session retention failed: {registry_error}"
-                    ),
-                }),
-                "init-script removal session retention",
-            )
-            .await;
-    }
-    result
+    cdp_remove_init_script_target_physical(endpoint, target_id, identifier).await
 }
 
-async fn remove_init_script_from_session(
-    mut session: DurableInitScriptSession,
+async fn cdp_remove_init_script_target_physical(
     endpoint: &str,
     target_id: &str,
     identifier: &str,
-) -> (
-    A11yResult<CdpInitScriptResult>,
-    Option<DurableInitScriptSession>,
-    bool,
-) {
-    let physical = session
-        .page
-        .execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
-            ScriptIdentifier::new(identifier.to_owned()),
+) -> A11yResult<CdpInitScriptResult> {
+    let owner_endpoint = endpoint.to_owned();
+    let owner_target_id = target_id.to_owned();
+    let identifier = identifier.to_owned();
+    with_target_page(endpoint, target_id, |page| async move {
+        let target_id = page.target_id().inner().clone();
+        page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
+            ScriptIdentifier::new(identifier.clone()),
         ))
         .await
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.removeScriptToEvaluateOnNewDocument({identifier:?}) on exact owning session: {error}"
-            ),
-        });
-    if let Err(error) = physical {
-        if session.handler_task.is_finished() {
-            let result = finish_durable_init_script_session(
-                session,
-                Err(error),
-                "init-script exact-session removal failure",
-            )
-            .await;
-            return (result, None, false);
-        }
-        return (Err(error), Some(session), false);
-    }
-
-    session.identifiers.remove(identifier);
-    let result = async {
-        mark_persisted_init_script_registration_removed(endpoint, target_id, identifier)?;
-        let state = read_page_state(&session.page).await?;
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.removeScriptToEvaluateOnNewDocument({identifier:?}): {err}"),
+        })?;
+        mark_persisted_init_script_registration_removed(
+            &owner_endpoint,
+            &owner_target_id,
+            &identifier,
+        )?;
+        let state = read_page_state(&page).await?;
         Ok(CdpInitScriptResult {
-            target_id: target_id.to_owned(),
-            identifier: identifier.to_owned(),
+            target_id,
+            identifier,
             state,
         })
-    }
-    .await;
-    if session.identifiers.is_empty() {
-        let result = finish_durable_init_script_session(
-            session,
-            result,
-            "last init-script exact-session removal",
-        )
-        .await;
-        (result, None, true)
-    } else {
-        (result, Some(session), true)
-    }
+    })
+    .await
 }
 
 pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
     durable_init_script_registry()
         .lock()
-        .map(|sessions| {
-            sessions
-                .values()
-                .map(|session| session.identifiers.len())
-                .sum()
-        })
-        .map_err(|_| "durable init-script session registry lock is poisoned".to_owned())
+        .map(|entries| entries.len())
+        .map_err(|_| "durable init-script registry lock is poisoned".to_owned())
 }
 
 pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
-    let sessions = match durable_init_script_registry().lock() {
-        Ok(mut sessions) => std::mem::take(&mut *sessions),
+    let entries = match durable_init_script_registry().lock() {
+        Ok(mut entries) => std::mem::take(&mut *entries),
         Err(_) => {
             return CdpDurableInitScriptDrainReadback {
-                failures: vec!["durable init-script session registry lock is poisoned".to_owned()],
+                failures: vec!["durable init-script registry lock is poisoned".to_owned()],
                 active_after: usize::MAX,
                 ..Default::default()
             };
         }
     };
-    let found = sessions
-        .values()
-        .map(|session| session.identifiers.len())
-        .sum();
+    let found = entries.len();
     let mut removed = 0usize;
     let mut failures = Vec::new();
-    for mut session in sessions.into_values() {
-        loop {
-            let Some(identifier) = session.identifiers.iter().next().cloned() else {
-                let shutdown = finish_durable_init_script_session(
-                    session,
-                    Ok(()),
-                    "drained init-script exact session",
+    let mut failed_entries = Vec::new();
+    for (key, entry) in entries {
+        let removal = match persisted_init_script_registration_removed_readback(
+            &entry.endpoint,
+            &entry.target_id,
+            &entry.identifier,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => remove_init_script_registration_for_recovery(
+                &entry.endpoint,
+                &entry.target_id,
+                &entry.identifier,
+            )
+            .await
+            .and_then(|()| {
+                mark_persisted_init_script_registration_removed(
+                    &entry.endpoint,
+                    &entry.target_id,
+                    &entry.identifier,
                 )
-                .await;
-                if let Err(error) = shutdown {
-                    failures.push(error.to_string());
-                }
-                break;
-            };
-            let endpoint = session.endpoint.clone();
-            let target_id = session.target_id.clone();
-            let (removal, retained, _) =
-                remove_init_script_from_session(session, &endpoint, &target_id, &identifier).await;
-            let removal_failed = removal.is_err();
-            match removal {
-                Ok(_) => removed = removed.saturating_add(1),
-                Err(error) => failures.push(format!(
-                    "remove init script {identifier:?} from target {target_id:?} on its exact owning session: {error}"
-                )),
+            }),
+            Err(error) => Err(error),
+        };
+        match removal {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) => {
+                failures.push(format!(
+                    "remove init script {:?} from target {:?}: {error}",
+                    entry.identifier, entry.target_id
+                ));
+                failed_entries.push((key, entry));
             }
-            let Some(retained) = retained else {
-                break;
-            };
-            session = retained;
-            if removal_failed {
-                if let Err(failure) = store_durable_init_script_session(session) {
-                    let (registry_error, retained) = *failure;
-                    let teardown = finish_durable_init_script_session(
-                        retained,
-                        Err::<(), _>(A11yError::CdpAttachFailed {
-                            detail: registry_error,
-                        }),
-                        "failed init-script drain retention",
-                    )
-                    .await;
-                    if let Err(error) = teardown {
-                        failures.push(error.to_string());
-                    }
-                }
-                break;
-            }
+        }
+    }
+    if !failed_entries.is_empty() {
+        match durable_init_script_registry().lock() {
+            Ok(mut registry) => registry.extend(failed_entries),
+            Err(_) => failures.push(
+                "durable init-script registry lock poisoned while retaining failed removals"
+                    .to_owned(),
+            ),
         }
     }
     let active_after = durable_init_script_active_count_readback().unwrap_or(usize::MAX);
@@ -4615,90 +4150,6 @@ fn format_evaluate_exception(
         "{detail} (line {}, column {})",
         exception.line_number, exception.column_number
     )
-}
-
-/// Prints an exact session-owned raw-CDP page target without activating its
-/// browser window or touching a normal authenticated Chrome profile.
-///
-/// # Errors
-///
-/// Returns a fail-loud CDP error when the endpoint/target cannot be reached,
-/// `Page.printToPDF` fails or times out, or the returned bytes are not a PDF.
-pub async fn cdp_print_to_pdf(
-    endpoint: &str,
-    target_id: &str,
-    options: CdpPrintToPdfOptions,
-) -> A11yResult<CdpPrintToPdfResult> {
-    let target_id = target_id.trim();
-    if target_id.is_empty() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "CDP target id must not be empty".to_owned(),
-        });
-    }
-    if options.timeout_ms == 0 {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: "Page.printToPDF timeout_ms must be greater than zero".to_owned(),
-        });
-    }
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|error| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {error}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-    let result = async {
-        let page = get_target_page_with_discovery(&browser, target_id).await?;
-        let params = PrintToPdfParams {
-            landscape: Some(options.landscape),
-            display_header_footer: Some(options.display_header_footer),
-            print_background: Some(options.print_background),
-            scale: options.scale,
-            paper_width: options.paper_width,
-            paper_height: options.paper_height,
-            margin_top: options.margin_top,
-            margin_bottom: options.margin_bottom,
-            margin_left: options.margin_left,
-            margin_right: options.margin_right,
-            page_ranges: options.page_ranges,
-            header_template: options.header_template,
-            footer_template: options.footer_template,
-            prefer_css_page_size: Some(options.prefer_css_page_size),
-            transfer_mode: None,
-            generate_tagged_pdf: None,
-            generate_document_outline: None,
-        };
-        let pdf_bytes = tokio::time::timeout(
-            Duration::from_millis(options.timeout_ms),
-            page.pdf(params),
-        )
-        .await
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.printToPDF timed out for target {target_id} after {} ms",
-                options.timeout_ms
-            ),
-        })?
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.printToPDF for target {target_id}: {error}"),
-        })?;
-        if !pdf_bytes.starts_with(b"%PDF-") {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "Page.printToPDF for target {target_id} returned {} bytes without a %PDF- header",
-                    pdf_bytes.len()
-                ),
-            });
-        }
-        let page_state = read_page_state(&page).await?;
-        Ok(CdpPrintToPdfResult {
-            target_id: target_id.to_owned(),
-            pdf_bytes,
-            page_state,
-        })
-    }
-    .await;
-    finish_chromiumoxide_handler(result, handler_task, "Page.printToPDF").await
 }
 
 /// Waits for a page lifecycle state on a specific CDP page target without
@@ -6442,484 +5893,6 @@ pub struct CdpNodeBitmap {
     pub bgra: Vec<u8>,
 }
 
-/// Maximum decoded screenshot surface retained in process memory. The gate is
-/// evaluated from page geometry before `Page.captureScreenshot` and again from
-/// the PNG header before allocating the decode buffer.
-pub const CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES: u64 = 384 * 1024 * 1024;
-const CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES_F64: f64 = 402_653_184.0;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CdpPageScreenshotRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CdpPageScreenshotScope {
-    Viewport,
-    FullPage,
-    Clip(synapse_core::Rect),
-    Element(i64),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CdpPageScreenshotMaskTarget {
-    Selector(String),
-    BackendNode(i64),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CdpPageScreenshotMaskSpec {
-    pub target: CdpPageScreenshotMaskTarget,
-    pub color: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CdpPageScreenshotMaskReadback {
-    pub index: usize,
-    pub rect: CdpPageScreenshotRect,
-    pub color_rgba: [u8; 4],
-}
-
-#[derive(Clone, Debug)]
-pub struct CdpPageScreenshotResult {
-    pub target_id: String,
-    pub bitmap: CdpNodeBitmap,
-    pub clip: CdpPageScreenshotRect,
-    pub device_pixel_ratio: f64,
-    pub viewport_width_css: f64,
-    pub viewport_height_css: f64,
-    pub document_width_css: f64,
-    pub document_height_css: f64,
-    pub document_generation: String,
-    pub page_state: CdpPageState,
-    pub masks: Vec<CdpPageScreenshotMaskReadback>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpPageScreenshotGeometry {
-    url: String,
-    device_pixel_ratio: f64,
-    viewport_width: f64,
-    viewport_height: f64,
-    page_x: f64,
-    page_y: f64,
-    document_width: f64,
-    document_height: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpSelectorScreenshotRect {
-    match_count: usize,
-    rect: Option<CdpPageScreenshotRectWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpPageScreenshotRectWire {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpCssColorReadback {
-    supported: bool,
-    rgba: Option<Vec<u8>>,
-}
-
-/// Captures an exact raw-CDP page target without activating its tab or touching
-/// the OS foreground. Geometry, masks, capture, and document-generation
-/// readback share one CDP connection, and navigation during the transaction
-/// fails closed before any artifact can be published.
-pub async fn cdp_capture_page_surface_bgra(
-    endpoint: &str,
-    target_id: &str,
-    scope: CdpPageScreenshotScope,
-    masks: &[CdpPageScreenshotMaskSpec],
-    omit_background: bool,
-    timeout_ms: u64,
-) -> A11yResult<CdpPageScreenshotResult> {
-    if timeout_ms == 0 {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: "page screenshot timeout_ms must be greater than zero".to_owned(),
-        });
-    }
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|error| A11yError::CdpAttachFailed {
-                detail: format!("page screenshot connect {endpoint}: {error}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-    let result = async {
-        let page = get_target_page_with_discovery(&browser, target_id).await?;
-        let loader_before = main_frame_loader_id(&page, "before screenshot").await?;
-        let geometry = page_screenshot_geometry(&page).await?;
-        validate_screenshot_geometry(&geometry)?;
-        let clip = match scope {
-            CdpPageScreenshotScope::Viewport => CdpPageScreenshotRect {
-                x: geometry.page_x,
-                y: geometry.page_y,
-                width: geometry.viewport_width,
-                height: geometry.viewport_height,
-            },
-            CdpPageScreenshotScope::FullPage => CdpPageScreenshotRect {
-                x: 0.0,
-                y: 0.0,
-                width: geometry.document_width,
-                height: geometry.document_height,
-            },
-            CdpPageScreenshotScope::Clip(rect) => CdpPageScreenshotRect {
-                x: f64::from(rect.x),
-                y: f64::from(rect.y),
-                width: f64::from(rect.w),
-                height: f64::from(rect.h),
-            },
-            CdpPageScreenshotScope::Element(backend_node_id) => {
-                backend_node_document_rect(&page, backend_node_id, &geometry).await?
-            }
-        };
-        validate_page_screenshot_rect(clip, "capture clip")?;
-        validate_page_screenshot_capture_budget(clip, geometry.device_pixel_ratio)?;
-        let mut mask_readbacks = Vec::with_capacity(masks.len());
-        for (index, mask) in masks.iter().enumerate() {
-            let rect = match &mask.target {
-                CdpPageScreenshotMaskTarget::Selector(selector) => {
-                    selector_document_rect(&page, selector).await?
-                }
-                CdpPageScreenshotMaskTarget::BackendNode(backend_node_id) => {
-                    backend_node_document_rect(&page, *backend_node_id, &geometry).await?
-                }
-            };
-            validate_page_screenshot_rect(rect, &format!("mask[{index}] rectangle"))?;
-            let color_rgba = resolve_page_screenshot_css_color(&page, &mask.color).await?;
-            mask_readbacks.push(CdpPageScreenshotMaskReadback {
-                index,
-                rect,
-                color_rgba,
-            });
-        }
-
-        let screenshot_params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .clip(Viewport {
-                x: clip.x,
-                y: clip.y,
-                width: clip.width,
-                height: clip.height,
-                scale: 1.0,
-            })
-            .from_surface(true)
-            .capture_beyond_viewport(true)
-            .build();
-        if omit_background {
-            page.execute(
-                SetDefaultBackgroundColorOverrideParams::builder()
-                    .color(Rgba::builder().r(0).g(0).b(0).a(0.0).build().map_err(|error| {
-                        A11yError::CdpAxtreeFailed {
-                            detail: format!("build transparent background override: {error}"),
-                        }
-                    })?)
-                    .build(),
-            )
-            .await
-            .map_err(|error| A11yError::CdpAxtreeFailed {
-                detail: format!("Emulation.setDefaultBackgroundColorOverride transparent: {error}"),
-            })?;
-        }
-        let capture_result = tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            page.screenshot(screenshot_params),
-        )
-        .await
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.captureScreenshot timed out after {timeout_ms} ms"),
-        })
-        .and_then(|result| {
-            result.map_err(|error| A11yError::CdpAxtreeFailed {
-                detail: format!("Page.captureScreenshot: {error}"),
-            })
-        });
-        let reset_result = if omit_background {
-            page.execute(SetDefaultBackgroundColorOverrideParams::default())
-                .await
-                .map(|_| ())
-                .map_err(|error| A11yError::CdpAxtreeFailed {
-                    detail: format!("clear Emulation.setDefaultBackgroundColorOverride: {error}"),
-                })
-        } else {
-            Ok(())
-        };
-        let png_bytes = match (capture_result, reset_result) {
-            (Ok(bytes), Ok(())) => bytes,
-            (Err(capture_error), Ok(())) => return Err(capture_error),
-            (Ok(_), Err(reset_error)) => return Err(reset_error),
-            (Err(capture_error), Err(reset_error)) => {
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "page screenshot failed and transparent-background cleanup also failed: capture_error={capture_error}; cleanup_error={reset_error}"
-                    ),
-                });
-            }
-        };
-        let bitmap = decode_png_to_bgra(&png_bytes)?;
-        let loader_after = main_frame_loader_id(&page, "after screenshot").await?;
-        if loader_after != loader_before {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "page navigated during screenshot transaction: loader_before={loader_before:?} loader_after={loader_after:?}"
-                ),
-            });
-        }
-        let after = page_screenshot_geometry(&page).await?;
-        if after.url != geometry.url {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "page URL changed during screenshot transaction: before={:?} after={:?}",
-                    geometry.url, after.url
-                ),
-            });
-        }
-        let page_state = read_page_state(&page).await?;
-        if page_state.url != geometry.url {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "independent page-state URL changed during screenshot transaction: before={:?} readback={:?}",
-                    geometry.url, page_state.url
-                ),
-            });
-        }
-        Ok(CdpPageScreenshotResult {
-            target_id: target_id.to_owned(),
-            bitmap,
-            clip,
-            device_pixel_ratio: geometry.device_pixel_ratio,
-            viewport_width_css: geometry.viewport_width,
-            viewport_height_css: geometry.viewport_height,
-            document_width_css: geometry.document_width,
-            document_height_css: geometry.document_height,
-            document_generation: format!("{loader_before}\n{}", geometry.url),
-            page_state,
-            masks: mask_readbacks,
-        })
-    }
-    .await;
-    finish_chromiumoxide_handler(result, handler_task, "page surface screenshot").await
-}
-
-async fn main_frame_loader_id(page: &Page, phase: &str) -> A11yResult<String> {
-    let tree = page
-        .execute(GetFrameTreeParams::default())
-        .await
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.getFrameTree {phase}: {error}"),
-        })?;
-    Ok(tree.frame_tree.frame.loader_id.inner().clone())
-}
-
-async fn page_screenshot_geometry(page: &Page) -> A11yResult<CdpPageScreenshotGeometry> {
-    page.evaluate_expression(
-        r#"(() => {
-          const root = document.documentElement;
-          const body = document.body;
-          const width = Math.max(root ? root.scrollWidth : 0, root ? root.offsetWidth : 0,
-            body ? body.scrollWidth : 0, body ? body.offsetWidth : 0, innerWidth || 0);
-          const height = Math.max(root ? root.scrollHeight : 0, root ? root.offsetHeight : 0,
-            body ? body.scrollHeight : 0, body ? body.offsetHeight : 0, innerHeight || 0);
-          return { url:String(location.href || ""), device_pixel_ratio:Number(devicePixelRatio || 1),
-            viewport_width:Number(innerWidth || 0), viewport_height:Number(innerHeight || 0),
-            page_x:Number(scrollX || 0), page_y:Number(scrollY || 0),
-            document_width:Number(width), document_height:Number(height) };
-        })()"#,
-    )
-    .await
-    .map_err(|error| A11yError::CdpAxtreeFailed {
-        detail: format!("Runtime.evaluate screenshot geometry: {error}"),
-    })?
-    .into_value::<CdpPageScreenshotGeometry>()
-    .map_err(|error| A11yError::CdpAxtreeFailed {
-        detail: format!("decode screenshot geometry: {error}"),
-    })
-}
-
-fn validate_screenshot_geometry(geometry: &CdpPageScreenshotGeometry) -> A11yResult<()> {
-    for (label, value) in [
-        ("device_pixel_ratio", geometry.device_pixel_ratio),
-        ("viewport_width", geometry.viewport_width),
-        ("viewport_height", geometry.viewport_height),
-        ("document_width", geometry.document_width),
-        ("document_height", geometry.document_height),
-    ] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!("invalid page screenshot {label}: {value}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_page_screenshot_rect(rect: CdpPageScreenshotRect, label: &str) -> A11yResult<()> {
-    if !rect.x.is_finite()
-        || !rect.y.is_finite()
-        || !rect.width.is_finite()
-        || !rect.height.is_finite()
-        || rect.x < 0.0
-        || rect.y < 0.0
-        || rect.width <= 0.0
-        || rect.height <= 0.0
-    {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "{label} is invalid: x={} y={} width={} height={}",
-                rect.x, rect.y, rect.width, rect.height
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_page_screenshot_capture_budget(
-    clip: CdpPageScreenshotRect,
-    device_pixel_ratio: f64,
-) -> A11yResult<()> {
-    let scale = device_pixel_ratio.max(1.0);
-    let width = (clip.width * scale).ceil();
-    let height = (clip.height * scale).ceil();
-    let decoded_bytes = width * height * 4.0;
-    if !width.is_finite() || !height.is_finite() || !decoded_bytes.is_finite() {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "page screenshot decoded dimensions are not representable: clip={}x{} device_pixel_ratio={device_pixel_ratio}",
-                clip.width, clip.height
-            ),
-        });
-    }
-    if decoded_bytes > CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES_F64 {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "page geometry preflight exceeds decoded screenshot hard limit: estimated_dimensions={width}x{height} estimated_decoded_bytes={decoded_bytes:.0} hard_limit_bytes={CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES} clip={}x{} device_pixel_ratio={device_pixel_ratio}",
-                clip.width, clip.height
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_screenshot_bitmap_budget(width: u32, height: u32, label: &str) -> A11yResult<()> {
-    let decoded_bytes = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| A11yError::CdpAxtreeFailed {
-            detail: format!("{label} BGRA byte count overflowed for {width}x{height}"),
-        })?;
-    if decoded_bytes > CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "{label} exceeds decoded screenshot hard limit: dimensions={width}x{height} decoded_bytes={decoded_bytes} hard_limit_bytes={CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-async fn backend_node_document_rect(
-    page: &Page,
-    backend_node_id: i64,
-    geometry: &CdpPageScreenshotGeometry,
-) -> A11yResult<CdpPageScreenshotRect> {
-    let rect = node_content_rect(page, backend_node_id).await?;
-    Ok(CdpPageScreenshotRect {
-        x: f64::from(rect.x) + geometry.page_x,
-        y: f64::from(rect.y) + geometry.page_y,
-        width: f64::from(rect.w),
-        height: f64::from(rect.h),
-    })
-}
-
-async fn selector_document_rect(page: &Page, selector: &str) -> A11yResult<CdpPageScreenshotRect> {
-    let selector = serde_json::to_string(selector).map_err(|error| A11yError::CdpAxtreeFailed {
-        detail: format!("serialize screenshot mask selector: {error}"),
-    })?;
-    let expression = format!(
-        r"(() => {{ const matches = document.querySelectorAll({selector});
-          const element = matches.length === 1 ? matches[0] : null;
-          const rect = element ? element.getBoundingClientRect() : null;
-          return {{ match_count: matches.length, rect: rect ? {{
-            x:Number(rect.left + scrollX), y:Number(rect.top + scrollY),
-            width:Number(rect.width), height:Number(rect.height) }} : null }}; }})()"
-    );
-    let readback = page
-        .evaluate_expression(expression)
-        .await
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Runtime.evaluate screenshot mask selector: {error}"),
-        })?
-        .into_value::<CdpSelectorScreenshotRect>()
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("decode screenshot mask selector geometry: {error}"),
-        })?;
-    if readback.match_count != 1 {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "screenshot mask selector must resolve exactly one element; match_count={}",
-                readback.match_count
-            ),
-        });
-    }
-    let rect = readback.rect.ok_or_else(|| A11yError::CdpAxtreeFailed {
-        detail: "screenshot mask selector returned no rectangle".to_owned(),
-    })?;
-    Ok(CdpPageScreenshotRect {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-    })
-}
-
-async fn resolve_page_screenshot_css_color(page: &Page, color: &str) -> A11yResult<[u8; 4]> {
-    let color = serde_json::to_string(color).map_err(|error| A11yError::CdpAxtreeFailed {
-        detail: format!("serialize screenshot mask color: {error}"),
-    })?;
-    let expression = format!(
-        r#"(() => {{ const color = {color};
-          if (!globalThis.CSS || !CSS.supports("color", color)) return {{supported:false, rgba:null}};
-          const canvas = new OffscreenCanvas(1, 1); const ctx = canvas.getContext("2d");
-          if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
-          ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
-          return {{supported:true, rgba:Array.from(ctx.getImageData(0, 0, 1, 1).data)}}; }})()"#
-    );
-    let readback = page
-        .evaluate_expression(expression)
-        .await
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Runtime.evaluate screenshot mask color: {error}"),
-        })?
-        .into_value::<CdpCssColorReadback>()
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("decode screenshot mask color: {error}"),
-        })?;
-    if !readback.supported {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!("screenshot mask color {color} is not a valid CSS color"),
-        });
-    }
-    let rgba = readback.rgba.ok_or_else(|| A11yError::CdpAxtreeFailed {
-        detail: "screenshot mask color returned no RGBA bytes".to_owned(),
-    })?;
-    rgba.try_into()
-        .map_err(|rgba: Vec<u8>| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "screenshot mask color returned {} bytes, expected 4",
-                rgba.len()
-            ),
-        })
-}
-
 /// Captures just a web node's rendered pixels and returns them as a BGRA8 bitmap
 /// for OCR (#703).
 ///
@@ -7485,9 +6458,7 @@ async fn wait_for_pages(browser: &chromiumoxide::Browser) -> A11yResult<Vec<chro
     })
 }
 
-/// Joins a chromiumoxide handler after an operation and combines failures
-/// without losing the primary error.
-pub async fn finish_chromiumoxide_handler<T>(
+async fn finish_chromiumoxide_handler<T>(
     result: A11yResult<T>,
     handler_task: tokio::task::JoinHandle<()>,
     operation: &str,
@@ -7940,11 +6911,6 @@ fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
         .map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("screenshot PNG header decode failed: {err}"),
         })?;
-    validate_screenshot_bitmap_budget(
-        reader.info().width,
-        reader.info().height,
-        "screenshot PNG header",
-    )?;
     let buf_size = reader
         .output_buffer_size()
         .ok_or_else(|| A11yError::CdpAxtreeFailed {
@@ -8003,4 +6969,631 @@ fn rgb8_to_bgra(rgb: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&[px[2], px[1], px[0], 0xFF]);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synapse_core::error_codes;
+
+    // Locks the manual FSV-discovered bug: leaving the `buttons` bit set on release
+    // makes Chrome think the button is still held and never fires a `click`
+    // event. Pressed → button bit; moved/released → 0.
+    #[test]
+    fn mouse_event_buttons_bitmask_is_set_only_while_pressed() {
+        let point = CdpActionPoint { x: 10.0, y: 20.0 };
+        let pressed = mouse_event(
+            DispatchMouseEventType::MousePressed,
+            point,
+            MouseButton::Left,
+            1,
+        );
+        let released = mouse_event(
+            DispatchMouseEventType::MouseReleased,
+            point,
+            MouseButton::Left,
+            1,
+        );
+        let moved = mouse_event(
+            DispatchMouseEventType::MouseMoved,
+            point,
+            MouseButton::Left,
+            0,
+        );
+        let hover = mouse_event(
+            DispatchMouseEventType::MouseMoved,
+            point,
+            MouseButton::None,
+            0,
+        );
+        println!(
+            "readback=mouse_event buttons pressed:{:?} released:{:?} moved:{:?} hover_button:{:?}",
+            pressed.buttons, released.buttons, moved.buttons, hover.button
+        );
+        assert_eq!(pressed.buttons, Some(1), "left press must hold bit 1");
+        assert_eq!(released.buttons, Some(0), "release must clear the bitmask");
+        assert_eq!(moved.buttons, Some(0), "move must not hold any button");
+        assert_eq!(hover.button, Some(MouseButton::None));
+        assert_eq!(pressed.click_count, Some(1));
+
+        let right = mouse_event(
+            DispatchMouseEventType::MousePressed,
+            point,
+            MouseButton::Right,
+            1,
+        );
+        assert_eq!(right.buttons, Some(2), "right press must hold bit 2");
+    }
+
+    #[test]
+    fn mouse_event_preserves_modifier_bitmask() {
+        let point = CdpActionPoint { x: 10.0, y: 20.0 };
+        let pressed = mouse_event_with_modifiers(
+            DispatchMouseEventType::MousePressed,
+            point,
+            MouseButton::Left,
+            2,
+            1 | 2 | 8,
+        );
+
+        assert_eq!(pressed.modifiers, Some(11));
+        assert_eq!(pressed.click_count, Some(2));
+        assert_eq!(pressed.buttons, Some(1));
+    }
+
+    #[test]
+    fn cdp_mouse_button_maps_to_cdp_enum() {
+        assert_eq!(CdpMouseButton::Left.to_cdp(), MouseButton::Left);
+        assert_eq!(CdpMouseButton::Right.to_cdp(), MouseButton::Right);
+        assert_eq!(CdpMouseButton::Middle.to_cdp(), MouseButton::Middle);
+    }
+
+    #[test]
+    fn cdp_page_websocket_url_maps_browser_endpoint_to_page_socket() {
+        let ws = cdp_page_websocket_url("http://127.0.0.1:64499/", "ABC123")
+            .unwrap_or_else(|err| panic!("valid CDP endpoint rejected: {err}"));
+
+        assert_eq!(ws, "ws://127.0.0.1:64499/devtools/page/ABC123");
+    }
+
+    #[test]
+    fn raw_mouse_event_message_uses_cdp_wire_values() {
+        let message = raw_mouse_event_message(
+            7,
+            DispatchMouseEventType::MousePressed,
+            CdpActionPoint { x: 52.0, y: 191.0 },
+            MouseButton::Left,
+            1,
+            1,
+        );
+
+        println!("readback=raw_cdp_mouse_event_message {message}");
+        assert_eq!(message["id"], json!(7));
+        assert_eq!(message["method"], json!("Input.dispatchMouseEvent"));
+        assert_eq!(message["params"]["type"], json!("mousePressed"));
+        assert_eq!(message["params"]["x"], json!(52.0));
+        assert_eq!(message["params"]["y"], json!(191.0));
+        assert_eq!(message["params"]["button"], json!("left"));
+        assert_eq!(message["params"]["buttons"], json!(1));
+        assert_eq!(message["params"]["clickCount"], json!(1));
+    }
+
+    #[test]
+    fn raw_cdp_ack_requires_the_exact_command_id_and_terminal_shape() {
+        let event = json!({"method": "Page.frameNavigated", "params": {}});
+        let other = json!({"id": 6, "result": {}});
+        let exact = json!({"id": 7, "result": {}});
+        let rejected = json!({"id": 7, "error": {"code": -32000, "message": "rejected"}});
+        let malformed = json!({"id": 7});
+
+        assert!(
+            !raw_cdp_ack_response_matches(&event, 7, "test", 0)
+                .unwrap_or_else(|error| panic!("event classification failed: {error}"))
+        );
+        assert!(
+            !raw_cdp_ack_response_matches(&other, 7, "test", 0)
+                .unwrap_or_else(|error| panic!("other-id classification failed: {error}"))
+        );
+        assert!(
+            raw_cdp_ack_response_matches(&exact, 7, "test", 0)
+                .unwrap_or_else(|error| panic!("exact acknowledgement rejected: {error}"))
+        );
+        assert!(raw_cdp_ack_response_matches(&rejected, 7, "test", 0).is_err());
+        assert!(raw_cdp_ack_response_matches(&malformed, 7, "test", 0).is_err());
+    }
+
+    #[test]
+    fn persisted_cdp_owner_moves_atomically_from_active_to_resolved() {
+        let temp = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("create temporary owner root failed: {error}"));
+        let root = temp.path().join("owners");
+        let owner = PersistedCdpMutationOwner {
+            schema_version: CDP_MUTATION_OWNER_SCHEMA_VERSION,
+            owner_id: "123-456-0".to_owned(),
+            endpoint: "http://127.0.0.1:9222".to_owned(),
+            target_id: "TARGET123".to_owned(),
+            created_unix_ms: 123,
+            mutation: PersistedCdpMutationKind::Mouse {
+                button: "left".to_owned(),
+                x: 10.0,
+                y: 20.0,
+                click_count: 1,
+                modifiers: 0,
+            },
+        };
+
+        persist_cdp_mutation_owner_at_root(&root, &owner)
+            .unwrap_or_else(|error| panic!("persist owner failed: {error}"));
+        let active = read_persisted_cdp_mutation_owner_snapshot_from_root(&root);
+        assert!(active.failures.is_empty(), "{:?}", active.failures);
+        assert_eq!(active.candidate_count, 1);
+        assert_eq!(active.rows.len(), 1);
+        assert_eq!(active.rows[0].owner, owner);
+
+        resolve_persisted_cdp_mutation_owner_at_root(&root, &owner)
+            .unwrap_or_else(|error| panic!("resolve owner failed: {error}"));
+        let after = read_persisted_cdp_mutation_owner_snapshot_from_root(&root);
+        assert!(after.failures.is_empty(), "{:?}", after.failures);
+        assert_eq!(after.candidate_count, 0);
+        assert!(after.rows.is_empty());
+        let archived =
+            read_persisted_cdp_mutation_owner_file(&root.join("resolved").join("123-456-0.json"))
+                .unwrap_or_else(|error| panic!("read resolved owner failed: {error}"));
+        assert_eq!(archived, owner);
+    }
+
+    #[test]
+    fn persisted_cdp_owner_scanner_fails_closed_on_incomplete_staging_file() {
+        let temp = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("create temporary owner root failed: {error}"));
+        let root = temp.path().join("owners");
+        fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create owner root failed: {error}"));
+        fs::write(root.join(".owner.json.tmp.1"), b"partial")
+            .unwrap_or_else(|error| panic!("write incomplete owner failed: {error}"));
+
+        let snapshot = read_persisted_cdp_mutation_owner_snapshot_from_root(&root);
+        assert_eq!(snapshot.candidate_count, 1);
+        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.failures.len(), 1);
+        assert!(snapshot.failures[0].contains("unexpected or incomplete"));
+    }
+
+    #[test]
+    fn persisted_cdp_owner_rejects_oversized_row_before_creating_candidate() {
+        let temp = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("create temporary owner root failed: {error}"));
+        let root = temp.path().join("owners");
+        let owner = PersistedCdpMutationOwner {
+            schema_version: CDP_MUTATION_OWNER_SCHEMA_VERSION,
+            owner_id: "123-456-1".to_owned(),
+            endpoint: "http://127.0.0.1:9222".to_owned(),
+            target_id: "TARGET123".to_owned(),
+            created_unix_ms: 123,
+            mutation: PersistedCdpMutationKind::Keys {
+                keys: vec![CdpKeyStroke {
+                    key: "x".repeat(
+                        usize::try_from(CDP_MUTATION_OWNER_MAX_BYTES)
+                            .unwrap_or(usize::MAX.saturating_sub(1)),
+                    ),
+                    code: "KeyX".to_owned(),
+                    windows_virtual_key_code: 88,
+                    native_virtual_key_code: 88,
+                    key_identifier: None,
+                    text: None,
+                    unmodified_text: None,
+                    modifier_bit: 0,
+                    location: None,
+                }],
+            },
+        };
+
+        let error = persist_cdp_mutation_owner_at_root(&root, &owner)
+            .err()
+            .unwrap_or_else(|| panic!("oversized owner unexpectedly persisted"));
+        assert!(error.to_string().contains("exceeds"));
+        let snapshot = read_persisted_cdp_mutation_owner_snapshot_from_root(&root);
+        assert_eq!(snapshot.candidate_count, 0);
+        assert!(snapshot.rows.is_empty());
+        assert!(snapshot.failures.is_empty(), "{:?}", snapshot.failures);
+    }
+
+    #[test]
+    fn persisted_cdp_owner_rejects_hard_linked_row() {
+        let temp = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("create temporary owner root failed: {error}"));
+        let root = temp.path().join("owners");
+        let owner = PersistedCdpMutationOwner {
+            schema_version: CDP_MUTATION_OWNER_SCHEMA_VERSION,
+            owner_id: "123-456-2".to_owned(),
+            endpoint: "http://127.0.0.1:9222".to_owned(),
+            target_id: "TARGET123".to_owned(),
+            created_unix_ms: 123,
+            mutation: PersistedCdpMutationKind::Touch { x: 10.0, y: 20.0 },
+        };
+        persist_cdp_mutation_owner_at_root(&root, &owner)
+            .unwrap_or_else(|error| panic!("persist owner failed: {error}"));
+        let owner_path = root.join("123-456-2.json");
+        fs::hard_link(&owner_path, root.join("unexpected-hard-link"))
+            .unwrap_or_else(|error| panic!("create owner hard link failed: {error}"));
+
+        let error = read_persisted_cdp_mutation_owner_file(&owner_path)
+            .err()
+            .unwrap_or_else(|| panic!("hard-linked owner unexpectedly accepted"));
+        assert!(error.contains("hard links"), "{error}");
+    }
+
+    #[test]
+    fn touch_event_message_uses_cdp_wire_values() {
+        let point = CdpActionPoint { x: 52.0, y: 191.0 };
+        let start = serde_json::to_value(
+            touch_event(DispatchTouchEventType::TouchStart, Some(point))
+                .expect("touch start params"),
+        )
+        .expect("serialize touch start");
+        let end = serde_json::to_value(
+            touch_event(DispatchTouchEventType::TouchEnd, None).expect("touch end params"),
+        )
+        .expect("serialize touch end");
+
+        println!("readback=touch_event start={start} end={end}");
+        assert_eq!(start["type"], json!("touchStart"));
+        assert_eq!(start["touchPoints"][0]["x"], json!(52.0));
+        assert_eq!(start["touchPoints"][0]["y"], json!(191.0));
+        assert_eq!(start["touchPoints"][0]["id"], json!(1.0));
+        assert_eq!(start["touchPoints"][0]["force"], json!(1.0));
+        assert_eq!(end["type"], json!("touchEnd"));
+        assert_eq!(end.get("touchPoints"), None);
+    }
+
+    #[test]
+    fn mouse_event_drag_move_can_hold_button_bit() {
+        let point = CdpActionPoint { x: 10.0, y: 20.0 };
+        let drag_move = mouse_event_with_buttons(
+            DispatchMouseEventType::MouseMoved,
+            point,
+            MouseButton::Left,
+            0,
+            Some(mouse_button_bit(&MouseButton::Left)),
+            0,
+        );
+        println!(
+            "readback=mouse_event drag_move buttons:{:?} button:{:?}",
+            drag_move.buttons, drag_move.button
+        );
+        assert_eq!(drag_move.buttons, Some(1));
+        assert_eq!(drag_move.button, Some(MouseButton::Left));
+    }
+
+    // ---- selector engine: pure helpers (#1110–#1118) ----
+
+    #[test]
+    fn normalize_ws_collapses_trims_and_drops_zero_width() {
+        let cases = [
+            ("  Apply   now \n", "Apply now"),
+            ("\tSubmit\u{200b} \u{00ad}order\t", "Submit order"),
+            ("single", "single"),
+            ("   ", ""),
+        ];
+        for (input, expected) in cases {
+            let got = normalize_ws(input);
+            println!("readback=normalize_ws before={input:?} after={got:?}");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn name_matcher_substring_is_case_insensitive_and_normalized() {
+        let matcher = NameMatcher::new("apply now", false, false).expect("valid substring");
+        println!("readback=name_matcher edge=substring");
+        assert!(matcher.matches("  Click  APPLY   NOW  please "));
+        assert!(!matcher.matches("apply"));
+    }
+
+    #[test]
+    fn name_matcher_exact_is_case_sensitive_after_normalization() {
+        let matcher = NameMatcher::new("Apply Now", true, false).expect("valid exact");
+        println!("readback=name_matcher edge=exact");
+        assert!(matcher.matches("Apply   Now"));
+        assert!(!matcher.matches("apply now"));
+        assert!(!matcher.matches("Apply Now please"));
+    }
+
+    #[test]
+    fn name_matcher_regex_runs_against_normalized_text() {
+        let matcher = NameMatcher::new("^Item \\d+$", false, true).expect("valid regex");
+        println!("readback=name_matcher edge=regex");
+        assert!(matcher.matches("Item   42"));
+        assert!(!matcher.matches("Item x"));
+    }
+
+    #[test]
+    fn name_matcher_invalid_regex_errors_loud() {
+        let err = NameMatcher::new("a(", false, true).expect_err("invalid regex must fail");
+        let detail = err.to_string();
+        println!("readback=name_matcher edge=invalid_regex err={detail:?}");
+        assert!(detail.contains("invalid"), "error should explain the cause");
+    }
+
+    #[test]
+    fn apply_nth_and_limit_picks_positions_and_caps() {
+        let ids = vec![10_i64, 20, 30, 40];
+        println!("readback=nth before={ids:?}");
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(0), 50), vec![10]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(2), 50), vec![30]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-1), 50), vec![40]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-2), 50), vec![30]);
+        // Out-of-range nth resolves to empty rather than panicking.
+        assert_eq!(
+            apply_nth_and_limit(ids.clone(), Some(9), 50),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            apply_nth_and_limit(ids.clone(), Some(-9), 50),
+            Vec::<i64>::new()
+        );
+        // No nth: cap by limit, preserve order.
+        assert_eq!(apply_nth_and_limit(ids.clone(), None, 2), vec![10, 20]);
+        assert_eq!(apply_nth_and_limit(ids, None, 50).len(), 4);
+    }
+
+    #[test]
+    fn engine_and_relation_wire_strings_match_playwright_tokens() {
+        assert_eq!(CdpLocateEngine::Css.as_str(), "css");
+        assert_eq!(CdpLocateEngine::AltText.as_str(), "alttext");
+        assert_eq!(CdpLocateEngine::TestId.as_str(), "testid");
+        assert!(CdpLocateEngine::Text.uses_injected_js());
+        assert!(!CdpLocateEngine::Role.uses_injected_js());
+        assert_eq!(CdpLayoutRelation::RightOf.as_str(), "right-of");
+        assert_eq!(CdpLayoutRelation::Near.as_str(), "near");
+    }
+
+    #[test]
+    fn locate_spec_json_carries_options_in_camel_case() {
+        let request = CdpLocateRequest {
+            engine: CdpLocateEngine::Layout,
+            query: "button".to_owned(),
+            relation: Some(CdpLayoutRelation::RightOf),
+            anchor: Some("#label".to_owned()),
+            max_distance: Some(120.0),
+            has_text: Some("Save".to_owned()),
+            nth: Some(-1),
+            limit: 25,
+            ..Default::default()
+        };
+        let spec = locate_spec_json(&request);
+        println!("readback=locate_spec_json spec={spec}");
+        assert_eq!(spec["engine"], "layout");
+        assert_eq!(spec["query"], "button");
+        assert_eq!(spec["relation"], "right-of");
+        assert_eq!(spec["anchor"], "#label");
+        assert_eq!(spec["maxDistance"], 120.0);
+        assert_eq!(spec["hasText"], "Save");
+        assert_eq!(spec["nth"], -1);
+        assert_eq!(spec["limit"], 25);
+        // Unset options serialize to JSON null (the engine treats null as unset).
+        assert!(spec["testidAttribute"].is_null());
+    }
+
+    #[test]
+    fn injected_engine_js_is_syntactically_self_contained() {
+        // Guards against an accidental unbalanced brace/paren in the engine body
+        // that would only surface as a runtime CDP exception against live Chrome.
+        let opens = SYNAPSE_LOCATE_JS.matches('{').count();
+        let closes = SYNAPSE_LOCATE_JS.matches('}').count();
+        let popen = SYNAPSE_LOCATE_JS.matches('(').count();
+        let pclose = SYNAPSE_LOCATE_JS.matches(')').count();
+        println!(
+            "readback=engine_js braces={opens}/{closes} parens={popen}/{pclose} len={}",
+            SYNAPSE_LOCATE_JS.len()
+        );
+        assert_eq!(opens, closes, "unbalanced braces in injected engine");
+        assert_eq!(popen, pclose, "unbalanced parens in injected engine");
+        assert!(SYNAPSE_LOCATE_JS.starts_with("function(scope, spec)"));
+        assert!(
+            !SYNAPSE_LOCATE_JS.contains('"'),
+            "engine must use single quotes"
+        );
+    }
+
+    #[test]
+    fn cdp_load_state_conditions_match_playwright_states() {
+        assert!(cdp_ready_state_satisfies_load_state(
+            CdpLoadState::DomContentLoaded,
+            "interactive"
+        ));
+        assert!(cdp_ready_state_satisfies_load_state(
+            CdpLoadState::DomContentLoaded,
+            "complete"
+        ));
+        assert!(!cdp_ready_state_satisfies_load_state(
+            CdpLoadState::DomContentLoaded,
+            "loading"
+        ));
+        assert!(!cdp_ready_state_satisfies_load_state(
+            CdpLoadState::Load,
+            "interactive"
+        ));
+        assert!(cdp_ready_state_satisfies_load_state(
+            CdpLoadState::Load,
+            "complete"
+        ));
+
+        assert!(cdp_load_state_satisfied(
+            CdpLoadState::DomContentLoaded,
+            "loading",
+            true,
+            false,
+            0,
+            Duration::from_millis(0),
+        ));
+        assert!(cdp_load_state_satisfied(
+            CdpLoadState::Load,
+            "loading",
+            false,
+            true,
+            0,
+            Duration::from_millis(0),
+        ));
+        assert!(!cdp_load_state_satisfied(
+            CdpLoadState::NetworkIdle,
+            "interactive",
+            true,
+            false,
+            0,
+            Duration::from_millis(600),
+        ));
+        assert!(!cdp_load_state_satisfied(
+            CdpLoadState::NetworkIdle,
+            "complete",
+            true,
+            true,
+            1,
+            Duration::from_millis(600),
+        ));
+        assert!(!cdp_load_state_satisfied(
+            CdpLoadState::NetworkIdle,
+            "complete",
+            true,
+            true,
+            0,
+            Duration::from_millis(499),
+        ));
+        assert!(cdp_load_state_satisfied(
+            CdpLoadState::NetworkIdle,
+            "complete",
+            true,
+            true,
+            0,
+            Duration::from_millis(500),
+        ));
+    }
+
+    #[test]
+    fn cdp_url_matcher_supports_exact_glob_and_regex() {
+        let exact = CdpUrlMatcher::new("https://example.test/path", CdpUrlMatchKind::Exact)
+            .expect("exact matcher");
+        assert!(exact.matches("https://example.test/path"));
+        assert!(!exact.matches("https://example.test/path?x=1"));
+
+        let glob = CdpUrlMatcher::new("https://example.test/*/done?x=?", CdpUrlMatchKind::Glob)
+            .expect("glob matcher");
+        assert!(glob.matches("https://example.test/a/b/done?x=1"));
+        assert!(glob.matches("https://example.test/route/done?x=z"));
+        assert!(!glob.matches("https://example.test/route/done?x=zz"));
+
+        let regex =
+            CdpUrlMatcher::new(r"^https://example\.test/items/\d+$", CdpUrlMatchKind::Regex)
+                .expect("regex matcher");
+        assert!(regex.matches("https://example.test/items/42"));
+        assert!(!regex.matches("https://example.test/items/new"));
+
+        let err =
+            CdpUrlMatcher::new("(", CdpUrlMatchKind::Regex).expect_err("invalid regex must fail");
+        println!("readback=wait_for_url invalid_regex err={err}");
+        assert!(err.to_string().contains("waitForURL regex"));
+    }
+
+    #[test]
+    fn scroll_into_view_change_detection_distinguishes_window_and_container() {
+        fn snapshot(window_y: f64, container_top: f64, is_root: bool) -> CdpScrollIntoViewSnapshot {
+            CdpScrollIntoViewSnapshot {
+                is_connected: true,
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+                node_rect: CdpScrollIntoViewRect {
+                    x: 10.0,
+                    y: 700.0 - window_y - container_top,
+                    width: 40.0,
+                    height: 20.0,
+                },
+                node_fully_in_viewport: false,
+                window_scroll_x: 0.0,
+                window_scroll_y: window_y,
+                container: CdpScrollIntoViewContainer {
+                    is_root,
+                    tag_name: "DIV".to_owned(),
+                    id: "scrollbox".to_owned(),
+                    scroll_left: 0.0,
+                    scroll_top: container_top,
+                    scroll_width: 800.0,
+                    scroll_height: 1400.0,
+                    client_width: 800.0,
+                    client_height: 300.0,
+                },
+                box_model_content: None,
+                box_model_error: None,
+            }
+        }
+
+        let before = snapshot(0.0, 0.0, false);
+        let container_after = snapshot(0.0, 320.0, false);
+        let window_after = snapshot(320.0, 0.0, true);
+
+        assert!(container_scroll_changed(&before, &container_after));
+        assert!(!container_scroll_changed(&before, &window_after));
+        assert!(scroll_value_changed(
+            before.window_scroll_y,
+            window_after.window_scroll_y
+        ));
+        assert!(!scroll_value_changed(10.0, 10.1));
+    }
+
+    #[test]
+    fn cdp_evaluate_timeout_error_maps_to_browser_evaluate_timeout_code() {
+        let error = A11yError::CdpEvaluateTimeout {
+            detail: "still running".to_owned(),
+        };
+        assert_eq!(error.code(), error_codes::BROWSER_EVALUATE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_fires_structured_timeout_when_expression_overruns() {
+        // A future that outlives the budget must convert into a structured
+        // CdpEvaluateTimeout carrying the operation, scope, and the budget ms —
+        // NOT a CdpAxtreeFailed (which is reserved for thrown JS exceptions).
+        let result: A11yResult<()> =
+            evaluate_within_budget("Runtime.evaluate", "page", Some(60), async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            })
+            .await;
+        let error = result.expect_err("an overrun must not resolve to Ok");
+        assert_eq!(error.code(), error_codes::BROWSER_EVALUATE_TIMEOUT);
+        let detail = error.to_string();
+        assert!(
+            detail.contains("Runtime.evaluate") && detail.contains("page scope"),
+            "detail must name the operation and scope: {detail}"
+        );
+        assert!(
+            detail.contains("60 ms timeout_ms budget"),
+            "detail must echo the caller budget: {detail}"
+        );
+        assert!(
+            detail.contains("await_promise=false"),
+            "detail must hint the await_promise escape hatch: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_returns_value_when_expression_finishes_in_time() {
+        let result: A11yResult<u32> =
+            evaluate_within_budget("Runtime.evaluate", "page", Some(5_000), async { Ok(7) }).await;
+        assert_eq!(result.expect("fast expression must resolve"), 7);
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_none_preserves_underlying_result_without_wall() {
+        // No caller budget: the inner error (e.g. a real exception mapped to
+        // CdpAxtreeFailed) is passed through untouched, never reclassified.
+        let result: A11yResult<()> =
+            evaluate_within_budget("Runtime.evaluate", "page", None, async {
+                Err(A11yError::CdpAxtreeFailed {
+                    detail: "threw ReferenceError".to_owned(),
+                })
+            })
+            .await;
+        let error = result.expect_err("inner error must pass through");
+        assert_eq!(error.code(), error_codes::A11Y_CDP_AXTREE_FAILED);
+    }
 }

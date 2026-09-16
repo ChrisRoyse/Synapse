@@ -13,11 +13,6 @@
 //! target but cannot seize the human foreground.
 
 use super::browser_field::BrowserSetValueParams;
-use super::input_provenance::{
-    InputProvenanceContext, InputProvenanceSpec, embedded_input_provenance, input_provenance_error,
-    required_any_result_string, required_result_bool, required_result_string, result_bool,
-    result_string,
-};
 use super::m1_tools::{
     chrome_debugger_default_endpoint, chrome_debugger_endpoint, validate_cdp_target_id,
 };
@@ -26,11 +21,11 @@ use super::{
 };
 use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
-    BrowserEvaluateParams, CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction,
-    CdpNavigateTabParams, CdpTargetInfoParams, ObserveParams, mcp_error,
+    CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
+    CdpTargetInfoParams, ObserveParams, mcp_error,
 };
 use crate::m2::{
-    ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollElementTarget, ActScrollParams,
+    ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
     ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
     default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
@@ -47,10 +42,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use synapse_core::{
-    AccessibleNode, BrowserDefaultActionSemantics, ElementId, InputDeliveryOrigin, InputProvenance,
-    InputTargetKind, Point, Rect, UiaPattern, error_codes,
-};
+use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern, error_codes};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
@@ -64,11 +56,10 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX: i32 = 1_000_000;
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
-const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "when raw foreground is truly required, explicitly focus the exact agent-owned session target, then call act operation=foreground with the same action payload and a non-empty reason; the facade binds that exact target, acquires the foreground input lease, temporarily sets break_glass, refuses if the real foreground differs, restores the prior profile, and releases the lease";
+const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "call act operation=foreground with the same action payload and a non-empty reason; the facade acquires the foreground input lease, temporarily sets break_glass, runs target_act, restores the prior profile, and releases the lease";
 const ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id> row + synapse_action::lease and persisted MCP session lease row";
 const ACT_FOREGROUND_CLEANUP_FAILED_DETAIL_CODE: &str =
     "ACT_FOREGROUND_CLEANUP_POSTCONDITION_FAILED";
@@ -84,8 +75,6 @@ enum ActOperation {
     LeaseAcquire,
     LeaseStatus,
     LeaseRelease,
-    OperatorPanicStatus,
-    OperatorPanicRecover,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -98,21 +87,10 @@ struct ActParams {
     #[serde(default)]
     reason: Option<String>,
     /// Foreground input lease lifetime for operation=foreground or
-    /// operation=lease_acquire. Must be in [100, 300000].
+    /// operation=lease_acquire. Must be in [100, 30000].
     #[serde(default)]
-    #[schemars(range(min = 100, max = 300000))]
+    #[schemars(range(min = 100, max = 30000))]
     ttl_ms: Option<u64>,
-    /// Exact extension-owner disable generation returned by
-    /// operation=operator_panic_status. Required for recovery.
-    #[serde(default)]
-    expected_extension_disable_sequence: Option<u64>,
-    /// Exact daemon browser-owner disable generation returned by
-    /// operation=operator_panic_status. Required for recovery.
-    #[serde(default)]
-    expected_browser_disable_sequence: Option<u64>,
-    /// Exact process-global operator-panic epoch returned by status.
-    #[serde(default)]
-    expected_operator_panic_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -126,8 +104,6 @@ struct ActResponse {
     foreground: Option<ActForegroundEscalation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease: Option<super::lease_tools::ControlLeaseResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    operator_panic: Option<Value>,
 }
 
 #[derive(Clone, Debug, JsonSchema)]
@@ -278,31 +254,9 @@ pub struct TargetActParams {
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
     /// Browser DOM action / delegated CDP field action: opt in to polling
-    /// actionability before dispatch. `false` (the default) means *do not wait
-    /// and do not poll*: actionability is probed exactly once and an unmet
-    /// predicate fails immediately with `CHROME_DOM_ELEMENT_NOT_ACTIONABLE`
-    /// naming the predicate, instead of burning the auto-wait budget (#1821).
+    /// actionability before dispatch. Default false preserves existing behavior.
     #[serde(default)]
     pub auto_wait: bool,
-    /// Playwright `locator.click({ force: true })` parity (#1821): dispatch even
-    /// when an actionability predicate is unmet — the case that matters is
-    /// `receives_events` returning a false negative because a transparent
-    /// full-viewport overlay (consent banner, chat widget, A/B mount point,
-    /// half-finished framework migration) sits over an element a human clicks
-    /// straight through.
-    ///
-    /// A real OS/CDP mouse event cannot bypass occlusion — by construction it
-    /// lands on whatever is painted on top — so `force` never silently degrades
-    /// a trusted click into one that hits the overlay. Instead it routes the
-    /// action to the synthetic in-page DOM dispatch lane, which delivers the
-    /// event sequence directly to the resolved node, and the readback reports
-    /// `forced_actionability_bypass: true` plus the full actionability snapshot
-    /// that was overridden so the trust downgrade is explicit and auditable.
-    ///
-    /// Rejected for coordinate clicks: with no resolved element there is nothing
-    /// to dispatch on and the request is a caller error, not a forceable action.
-    #[serde(default)]
-    pub force: bool,
     /// Browser action output mode for secret-producing pages. When true,
     /// Synapse suppresses page-text collection in the Chrome bridge and returns
     /// only structural state plus hashes/lengths for any redacted scalar fields.
@@ -470,7 +424,7 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
         "properties": {
             "operation": {
                 "type": "string",
-                "enum": ["invoke", "foreground", "lease_acquire", "lease_status", "lease_release", "operator_panic_status", "operator_panic_recover"],
+                "enum": ["invoke", "foreground", "lease_acquire", "lease_status", "lease_release"],
                 "default": "invoke",
                 "description": "Act facade operation. Omit only for the default invoke operation."
             },
@@ -484,7 +438,7 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
             "reason": {
                 "type": ["string", "null"],
                 "minLength": 1,
-                "description": "Required non-empty reason for operation=foreground and operation=operator_panic_recover; rejected by other operations."
+                "description": "Foreground escalation reason. Required by operation=foreground; rejected by invoke and lease operations."
             },
             "ttl_ms": {
                 "type": ["integer", "null"],
@@ -492,21 +446,6 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
                 "maximum": max_ttl_ms,
                 "default": default_ttl_ms,
                 "description": "Foreground input lease lifetime in milliseconds. Accepted by operation=foreground and operation=lease_acquire."
-            },
-            "expected_extension_disable_sequence": {
-                "type": ["integer", "null"],
-                "minimum": 0,
-                "description": "Exact extension-owner disable generation returned by operator_panic_status; required only by operator_panic_recover."
-            },
-            "expected_browser_disable_sequence": {
-                "type": ["integer", "null"],
-                "minimum": 0,
-                "description": "Exact daemon browser-owner disable generation returned by operator_panic_status; required only by operator_panic_recover."
-            },
-            "expected_operator_panic_epoch": {
-                "type": ["integer", "null"],
-                "minimum": 0,
-                "description": "Exact process-global operator-panic epoch returned by operator_panic_status; required only by operator_panic_recover."
             }
         },
         "oneOf": [
@@ -584,36 +523,6 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
                         "description": "Release this session's foreground input lease."
                     }
                 }
-            },
-            {
-                "title": "act operation=operator_panic_status",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["operation"],
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "const": "operator_panic_status",
-                        "description": "Independently read the process-global panic wave and both browser mutation-owner gates."
-                    }
-                }
-            },
-            {
-                "title": "act operation=operator_panic_recover",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["operation", "reason", "expected_extension_disable_sequence", "expected_browser_disable_sequence", "expected_operator_panic_epoch"],
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "const": "operator_panic_recover",
-                        "description": "Explicitly reopen healthy empty browser mutation gates using exact status generations."
-                    },
-                    "reason": { "$ref": "#/properties/reason" },
-                    "expected_extension_disable_sequence": { "$ref": "#/properties/expected_extension_disable_sequence" },
-                    "expected_browser_disable_sequence": { "$ref": "#/properties/expected_browser_disable_sequence" },
-                    "expected_operator_panic_epoch": { "$ref": "#/properties/expected_operator_panic_epoch" }
-                }
             }
         ]
     });
@@ -639,10 +548,6 @@ pub struct TargetActResponse {
     pub routing: String,
     /// The delegated tool's full response.
     pub result: Value,
-    /// Present for every input delivery. Successful input without this exact
-    /// typed record is an internal error, never a degraded response.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input_provenance: Vec<InputProvenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -694,12 +599,6 @@ struct ActCommandAuditGuard {
     service: SynapseService,
     operation_name: &'static str,
     actor_session_id: Option<String>,
-    /// Immutable target context captured before the durable intent row.
-    ///
-    /// The authority gate later proves this is still the session target before
-    /// dispatch. Both audit phases use these bytes; finalization never reads
-    /// mutable session state after the action or during a retry.
-    command_target: Option<SessionTarget>,
     command_payload: Value,
     command_before: Value,
     pending_final: Option<super::command_audit::CommandAuditInput>,
@@ -711,11 +610,10 @@ impl ActCommandAuditGuard {
         service: &SynapseService,
         operation_name: &'static str,
         actor_session_id: Option<String>,
-        command_target: Option<SessionTarget>,
         command_payload: Value,
         command_before: Value,
     ) -> Result<Self, ErrorData> {
-        let intent = super::command_audit::CommandAuditInput::mcp(
+        service.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "act",
             operation_name,
             actor_session_id.clone(),
@@ -724,13 +622,11 @@ impl ActCommandAuditGuard {
             command_before.clone(),
             Value::Null,
             "pending",
-        );
-        service.command_audit_intent(bind_act_command_target(intent, command_target.as_ref()))?;
+        ))?;
         Ok(Self {
             service: service.clone(),
             operation_name,
             actor_session_id,
-            command_target,
             command_payload,
             command_before,
             pending_final: None,
@@ -754,16 +650,11 @@ impl ActCommandAuditGuard {
             after,
             outcome,
         );
-        let input = bind_act_command_target(input, self.command_target.as_ref());
         error.map_or(input.clone(), |error| {
             input.with_error(super::command_audit::command_audit_error_from_error_data(
                 error,
             ))
         })
-    }
-
-    fn target(&self) -> Option<&SessionTarget> {
-        self.command_target.as_ref()
     }
 
     fn finalize(
@@ -793,61 +684,6 @@ impl ActCommandAuditGuard {
         self.armed = false;
         Ok(())
     }
-}
-
-fn bind_act_command_target(
-    input: super::command_audit::CommandAuditInput,
-    target: Option<&SessionTarget>,
-) -> super::command_audit::CommandAuditInput {
-    match target {
-        Some(target) => input.with_target(json!(super::target_claims::target_wire(target))),
-        None => input,
-    }
-}
-
-/// Resolve only targets the selected action can actually consume.
-///
-/// `run_shell` is deliberately target-independent even when its session has a
-/// bound window. Attaching that ambient target would manufacture a causal
-/// association. Every other `target_act` verb routes through the session target
-/// contract; unknown verbs are still bound to their attempted context and then
-/// fail the dispatcher instead of silently being classified as shell work.
-fn act_command_target_snapshot(
-    service: &SynapseService,
-    operation: ActOperation,
-    action: Option<&TargetActParams>,
-    actor_session_id: Option<&str>,
-) -> Result<Option<SessionTarget>, ErrorData> {
-    if !matches!(operation, ActOperation::Invoke | ActOperation::Foreground)
-        || action.is_none_or(|action| action.verb.as_str() == "run_shell")
-    {
-        return Ok(None);
-    }
-    service.session_target(actor_session_id)
-}
-
-fn act_command_target_changed_error(
-    operation: ActOperation,
-    intent_target: Option<&SessionTarget>,
-    admitted_target: Option<&SessionTarget>,
-) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act operation={} session target changed while the command waited for authority; no action was dispatched",
-            act_operation_name(operation)
-        ),
-        Some(json!({
-            "code": error_codes::ACTION_TARGET_INVALID,
-            "detail_code": "ACT_COMMAND_TARGET_CHANGED_BEFORE_DISPATCH",
-            "operation": act_operation_name(operation),
-            "intent_target": intent_target.map(super::target_claims::target_wire),
-            "admitted_target": admitted_target.map(super::target_claims::target_wire),
-            "foreground_work_dispatched": false,
-            "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
-            "remediation": "retry after target operation=get confirms the intended stable session target; do not reconstruct target context after execution",
-        })),
-    )
 }
 
 fn write_act_command_audit_final_with_retries(
@@ -942,6 +778,8 @@ struct ActForegroundAuthorityGuard {
     operator_panic_epoch_at_arm: u64,
     acquire_outcome_was_new: bool,
     armed: bool,
+    #[cfg(test)]
+    cleanup_panics_remaining: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1035,6 +873,8 @@ impl ActForegroundAuthorityGuard {
             operator_panic_epoch_at_arm,
             acquire_outcome_was_new: false,
             armed: true,
+            #[cfg(test)]
+            cleanup_panics_remaining: 0,
         })
     }
 
@@ -1143,19 +983,6 @@ impl ActForegroundAuthorityGuard {
     fn delete_operator_interrupted_lease_row(
         &self,
     ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
-        self.delete_persisted_lease_row_and_snapshot("operator_interrupted")
-    }
-
-    fn delete_expired_or_released_retained_lease_row(
-        &self,
-    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
-        self.delete_persisted_lease_row_and_snapshot("retained_lease_not_owned_in_memory")
-    }
-
-    fn delete_persisted_lease_row_and_snapshot(
-        &self,
-        reason: &'static str,
-    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
         super::session_continuity::delete_persisted_session_lease_row(
             &self.service.m3_state_handle(),
             &self.session_id,
@@ -1166,26 +993,11 @@ impl ActForegroundAuthorityGuard {
         )?;
         if after.row_exists() {
             return Err(format!(
-                "{reason} session lease row still exists for {}",
-                self.session_id,
+                "operator-interrupted session lease row still exists for {}",
+                self.session_id
             ));
         }
-        tracing::info!(
-            code = "ACT_FOREGROUND_PERSISTED_LEASE_ROW_REMOVED",
-            session_id = self.session_id,
-            reason,
-            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
-            "readback=CF_SESSIONS after=act_foreground_persisted_lease_row_removed"
-        );
         Ok(after)
-    }
-
-    fn retained_session_lease_not_owned_in_memory(
-        &self,
-        status: &synapse_action::LeaseStatus,
-    ) -> bool {
-        self.lease_owner_before.as_deref() == Some(self.session_id.as_str())
-            && status.owner_session_id.as_deref() != Some(self.session_id.as_str())
     }
 
     fn reconcile_persisted_lease_after_async_cleanup(
@@ -1200,10 +1012,6 @@ impl ActForegroundAuthorityGuard {
                 &self.session_id,
                 &self.prior_persisted_lease,
             );
-        }
-        let lease_after_async_cleanup = synapse_action::lease::status();
-        if self.retained_session_lease_not_owned_in_memory(&lease_after_async_cleanup) {
-            return self.delete_expired_or_released_retained_lease_row();
         }
         self.read_expected_retained_persisted_lease()
     }
@@ -1231,6 +1039,11 @@ impl ActForegroundAuthorityGuard {
 
     fn cleanup_now(&mut self, trigger: &'static str) -> ActForegroundAuthorityCleanupReadback {
         let profile_restore = self.restore_prior_profile_assignment();
+        #[cfg(test)]
+        if self.cleanup_panics_remaining > 0 {
+            self.cleanup_panics_remaining -= 1;
+            panic!("injected panic after exact profile restore");
+        }
         // Emergency Drop cleanup intentionally avoids rebuilding/sanitizing the
         // complete MCP schema. The byte-exact CF_SESSIONS row is the authority
         // Source of Truth and this narrow read keeps unwind latency bounded.
@@ -1277,15 +1090,9 @@ impl ActForegroundAuthorityGuard {
         } else {
             false
         };
-        let retained_session_lease_lost_at_cleanup = !operator_interrupt_at_cleanup
-            && !lease_release_attempted
-            && self.retained_session_lease_not_owned_in_memory(&lease_at_cleanup);
         // Re-assert the operator deletion or exact pre-call row after release.
         // A caller-owned renewed lease is intentionally kept with its renewed
-        // durable expiry while it is still held in memory. If it expired during
-        // the foreground transaction, memory is the authority and the durable
-        // continuity row must be removed so status cannot resurrect an expired
-        // input lease.
+        // durable expiry instead of mixing old persistence with new memory.
         let operator_interrupt_before_final = self.operator_panic_observed();
         let mut final_persisted_restore = if operator_interrupt_before_final {
             self.delete_operator_interrupted_lease_row()
@@ -1295,8 +1102,6 @@ impl ActForegroundAuthorityGuard {
                 &self.session_id,
                 &self.prior_persisted_lease,
             )
-        } else if retained_session_lease_lost_at_cleanup {
-            self.delete_expired_or_released_retained_lease_row()
         } else {
             self.read_expected_retained_persisted_lease()
         };
@@ -1312,8 +1117,6 @@ impl ActForegroundAuthorityGuard {
                     !after.row_exists()
                 } else if lease_release_attempted {
                     after == &self.prior_persisted_lease
-                } else if retained_session_lease_lost_at_cleanup {
-                    !after.row_exists()
                 } else {
                     lease_at_cleanup.owner_session_id.as_deref() != Some(self.session_id.as_str())
                         || (after.row_exists() && after == &self.expected_retained_persisted_lease)
@@ -1335,11 +1138,7 @@ impl ActForegroundAuthorityGuard {
         let lease_owner_restored = if operator_panic_observed {
             lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
         } else if self.lease_owner_before.as_deref() == Some(self.session_id.as_str()) {
-            if retained_session_lease_lost_at_cleanup {
-                lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
-            } else {
-                lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
-            }
+            lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
         } else {
             lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
         };
@@ -1537,7 +1336,7 @@ impl ActForegroundAuthorityGuard {
 
     /// Recover a foreground transaction panic while the tracked transaction
     /// still owns the session authority gate. This is the only path allowed to
-    /// perform the exact storage/profile rollback after an unwind; `Drop`
+    /// perform the exact RocksDB/profile rollback after an unwind; `Drop`
     /// remains storage-free.
     fn cleanup_with_bounded_retries(
         &mut self,
@@ -1593,7 +1392,7 @@ impl Drop for ActForegroundAuthorityGuard {
             return;
         }
         // An armed Drop means the tracked transaction failed to catch its own
-        // unwind. Do only bounded in-memory revocation here: no storage, schema,
+        // unwind. Do only bounded in-memory revocation here: no RocksDB, schema,
         // audit, runtime lookup, or task spawn is legal from this destructor.
         let lease_at_drop = synapse_action::lease::status();
         let newly_owned_during_call = self.lease_owner_before.as_deref()
@@ -1731,8 +1530,6 @@ fn act_operator_panic_prearm_error(
         ActOperation::LeaseAcquire => "ACT_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED",
         ActOperation::LeaseStatus => "ACT_LEASE_STATUS_OPERATOR_PANIC_PREARMED",
         ActOperation::LeaseRelease => "ACT_LEASE_RELEASE_OPERATOR_PANIC_PREARMED",
-        ActOperation::OperatorPanicStatus => "ACT_OPERATOR_PANIC_STATUS_PREARMED",
-        ActOperation::OperatorPanicRecover => "ACT_OPERATOR_PANIC_RECOVER_PREARMED",
     };
     let operator_panic = synapse_action::operator_panic_safety_readback();
     let operator_panic_epoch_after = operator_panic.epoch;
@@ -1916,7 +1713,7 @@ fn cleanup_act_foreground_after_shutdown_cancellation(
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease. operation=operator_panic_status independently reads the process, daemon browser-owner, and Chrome-extension owner gates. operation=operator_panic_recover explicitly reopens only healthy empty gates using all three exact generations from status plus a required reason; stale generations and pending panic work fail closed.",
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth.",
         input_schema = act_input_schema()
     )]
     pub async fn act(
@@ -1939,7 +1736,6 @@ impl SynapseService {
             | ActOperation::LeaseAcquire
             | ActOperation::LeaseStatus
             | ActOperation::LeaseRelease => true,
-            ActOperation::OperatorPanicStatus | ActOperation::OperatorPanicRecover => false,
         };
         let operator_panic_epoch_at_entry = if mutation_guarded_by_operator_panic {
             let epoch = synapse_action::operator_panic_epoch();
@@ -1976,13 +1772,8 @@ impl SynapseService {
             None
         };
         let service = self.clone();
-        let act_descriptor = crate::server::AuthorityTransactionDescriptor::new(
-            format!("act:{}", act_operation_name(operation)),
-            actor_session_id.clone(),
-        );
-        let handle = self.spawn_cooperative_authority_transaction(
-            act_descriptor,
-            move |cancellation| async move {
+        let handle =
+            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
                 let transaction = service.run_act_supervised_transaction(
                     params,
                     request_context,
@@ -1997,8 +1788,7 @@ impl SynapseService {
                     ),
                 )
                 .await
-            },
-        )?;
+            })?;
         match handle.await {
             Ok(result) => result,
             Err(join_error) => {
@@ -2054,17 +1844,10 @@ impl SynapseService {
         // mutation, independent readback, and final audit.
         let command_payload = act_command_audit_payload(&params);
         let command_before = act_command_audit_before(operation);
-        let command_target = act_command_target_snapshot(
-            self,
-            operation,
-            params.action.as_ref(),
-            actor_session_id.as_deref(),
-        )?;
         let mut command_audit_guard = ActCommandAuditGuard::begin(
             self,
             operation_name,
             actor_session_id.clone(),
-            command_target,
             command_payload.clone(),
             command_before.clone(),
         )?;
@@ -2111,35 +1894,6 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        let admitted_target = match act_command_target_snapshot(
-            self,
-            operation,
-            params.action.as_ref(),
-            actor_session_id.as_deref(),
-        ) {
-            Ok(target) => target,
-            Err(error) => {
-                command_audit_guard.finalize(
-                    act_command_audit_error_after(operation),
-                    "error",
-                    Some(&error),
-                )?;
-                return Err(error);
-            }
-        };
-        if admitted_target.as_ref() != command_audit_guard.target() {
-            let error = act_command_target_changed_error(
-                operation,
-                command_audit_guard.target(),
-                admitted_target.as_ref(),
-            );
-            command_audit_guard.finalize(
-                act_command_audit_error_after(operation),
-                "error",
-                Some(&error),
-            )?;
-            return Err(error);
-        }
 
         let transaction = std::panic::AssertUnwindSafe(Box::pin(async {
             if let Some(operator_panic_epoch) = operator_panic_epoch_at_entry {
@@ -2177,7 +1931,6 @@ impl SynapseService {
                         action: Some(action),
                         foreground: None,
                         lease: None,
-                        operator_panic: None,
                     })
                 }
                 ActOperation::Foreground => {
@@ -2222,7 +1975,6 @@ impl SynapseService {
                         action: Some(response.action),
                         foreground: Some(response.escalation),
                         lease: None,
-                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseAcquire => {
@@ -2231,21 +1983,9 @@ impl SynapseService {
                         .ttl_ms
                         .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
                     super::lease_tools::validate_lease_ttl_ms("act", ttl_ms)?;
-                    // #2078: this is the explicit lease verb, so a TTL the
-                    // caller actually named may deliberately shorten their own
-                    // window (#2071's carve-out). A *defaulted* TTL names
-                    // nothing, so it may only raise the window, never clamp a
-                    // live lease down to `DEFAULT_LEASE_TTL_MS`.
-                    let ttl_intent = if params.ttl_ms.is_some() {
-                        super::lease_tools::LeaseTtlIntent::CallerRequested
-                    } else {
-                        super::lease_tools::LeaseTtlIntent::ToolSized
-                    };
                     let lease = self
-                        .control_lease_acquire_authority_locked_sized(
-                            "act_lease_acquire",
-                            ttl_ms,
-                            ttl_intent,
+                        .control_lease_acquire_authority_locked(
+                            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
                             authority_session_id.clone().ok_or_else(|| {
                                 mcp_error(
                                     error_codes::TOOL_INTERNAL_ERROR,
@@ -2260,7 +2000,6 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
-                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseStatus => {
@@ -2281,7 +2020,6 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
-                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseRelease => {
@@ -2302,52 +2040,6 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
-                        operator_panic: None,
-                    })
-                }
-                ActOperation::OperatorPanicStatus => {
-                    validate_act_operator_panic_status_params(&params)?;
-                    let readback = crate::safety::operator_panic_browser_gate_status().await
-                        .map_err(|detail| act_operator_panic_recovery_error("ACT_OPERATOR_PANIC_STATUS_FAILED", detail))?;
-                    Ok(ActResponse {
-                        operation,
-                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                        action: None,
-                        foreground: None,
-                        lease: None,
-                        operator_panic: Some(readback),
-                    })
-                }
-                ActOperation::OperatorPanicRecover => {
-                    validate_act_operator_panic_recover_params(&params)?;
-                    let expected_operator_panic_epoch = params.expected_operator_panic_epoch
-                        .ok_or_else(|| act_operator_panic_recovery_error(
-                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
-                            "validated expected_operator_panic_epoch disappeared before dispatch".to_owned(),
-                        ))?;
-                    let expected_extension_disable_sequence = params.expected_extension_disable_sequence
-                        .ok_or_else(|| act_operator_panic_recovery_error(
-                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
-                            "validated expected_extension_disable_sequence disappeared before dispatch".to_owned(),
-                        ))?;
-                    let expected_browser_disable_sequence = params.expected_browser_disable_sequence
-                        .ok_or_else(|| act_operator_panic_recovery_error(
-                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
-                            "validated expected_browser_disable_sequence disappeared before dispatch".to_owned(),
-                        ))?;
-                    let readback = crate::safety::recover_operator_panic_browser_gates(
-                        expected_operator_panic_epoch,
-                        expected_extension_disable_sequence,
-                        expected_browser_disable_sequence,
-                    ).await.map_err(|detail| act_operator_panic_recovery_error(
-                        "ACT_OPERATOR_PANIC_RECOVERY_REFUSED", detail))?;
-                    Ok(ActResponse {
-                        operation,
-                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                        action: None,
-                        foreground: None,
-                        lease: None,
-                        operator_panic: Some(readback),
                     })
                 }
             }
@@ -2463,7 +2155,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with raw-CDP Input.dispatchTouchEvent touchStart/touchEnd and fails before Chrome mutation on a normal authenticated target; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -2584,8 +2276,6 @@ impl SynapseService {
     ) -> Result<Json<TargetActResponse>, ErrorData> {
         let params = params.0;
         let verb = params.verb.as_str().to_owned();
-        let input_provenance_context =
-            target_act_input_provenance_context(self, &request_context, &params)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "target_act",
@@ -2840,14 +2530,6 @@ impl SynapseService {
             }
             "set_selection" => target_act_set_selection(self, &params, &request_context).await?,
             action @ ("click" | "dblclick") => {
-                if params.force && target_act_coordinate(&params)?.is_some() {
-                    return Err(mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        format!(
-                            "target_act verb={action} force=true requires an element locator (element_id/selector/role/name): force bypasses element actionability by dispatching the event on the resolved node, and a coordinate click has no resolved node to dispatch on. Remediation: resolve the element with browser_dom operation=locate and pass its element_id, or drop force for a coordinate click."
-                        ),
-                    ));
-                }
                 if target_act_coordinate(&params)?.is_some() {
                     if target_act_has_any_locator(&params) {
                         return Err(mcp_error(
@@ -2949,14 +2631,6 @@ impl SynapseService {
                             delivery_state: target_act_delivery_state(ok, status).to_owned(),
                             delegated_tool: delegated_tool.to_owned(),
                             routing: target_act_routing_description(),
-                            input_provenance: target_act_input_provenance(
-                                &verb,
-                                delegated_tool,
-                                ok,
-                                status,
-                                &result,
-                                input_provenance_context.as_ref(),
-                            )?,
                             result,
                         }));
                     }
@@ -2997,9 +2671,8 @@ impl SynapseService {
                 if target_act_has_key_chord(&params) {
                     target_act_key_press(self, &params, &request_context).await?
                 } else {
-                    // A named button/link press uses Chrome-generated CDP input
-                    // (`isTrusted=true`, physical_device_origin=false). Keep the
-                    // synthetic "press" DOM-action only as
+                    // press a named button/link = a real trusted click on the
+                    // bridge target; keep the synthetic "press" DOM-action only as
                     // the raw-CDP/native fallback (#1348 headline #2).
                     target_act_dom_locator_pointer(
                         self,
@@ -3055,7 +2728,6 @@ impl SynapseService {
                             .to_owned(),
                             delegated_tool: "act_focus_window".to_owned(),
                             routing: target_act_routing_description(),
-                            input_provenance: Vec::new(),
                             result: target_act_error_result("act_focus_window", error),
                         }));
                     }
@@ -3078,7 +2750,6 @@ impl SynapseService {
                         .to_owned(),
                         delegated_tool: "act_focus_window".to_owned(),
                         routing: target_act_routing_description(),
-                        input_provenance: Vec::new(),
                         result: target_act_error_result("act_focus_window", error),
                     }));
                 }
@@ -3102,7 +2773,6 @@ impl SynapseService {
                             .to_owned(),
                             delegated_tool: "act_focus_window".to_owned(),
                             routing: target_act_routing_description(),
-                            input_provenance: Vec::new(),
                             result: target_act_error_result("act_focus_window", error),
                         }));
                     }
@@ -3118,14 +2788,6 @@ impl SynapseService {
             other => return Err(target_act_unknown_verb_error(other)),
         };
 
-        let input_provenance = target_act_input_provenance(
-            &verb,
-            delegated_tool,
-            ok,
-            status,
-            &result,
-            input_provenance_context.as_ref(),
-        )?;
         Ok(Json(TargetActResponse {
             verb: verb.as_str().to_owned(),
             ok,
@@ -3134,7 +2796,6 @@ impl SynapseService {
             delegated_tool: delegated_tool.to_owned(),
             routing: target_act_routing_description(),
             result,
-            input_provenance,
         }))
     }
 
@@ -3162,13 +2823,8 @@ impl SynapseService {
                 "raw_act_foreground_before_authority_transaction_spawn",
             )?;
         let service = self.clone();
-        let act_foreground_descriptor = crate::server::AuthorityTransactionDescriptor::new(
-            "act_foreground",
-            Some(session_id.clone()),
-        );
-        let handle = self.spawn_cooperative_authority_transaction(
-            act_foreground_descriptor,
-            move |cancellation| async move {
+        let handle =
+            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
                 let transaction = async move {
                     let _authority_gate = tokio::select! {
                         biased;
@@ -3204,8 +2860,7 @@ impl SynapseService {
                     ),
                 )
                 .await
-            },
-        )?;
+            })?;
         match handle.await {
             Ok(result) => result,
             Err(join_error) => {
@@ -3271,19 +2926,6 @@ impl SynapseService {
         }
         let ttl_ms = params.ttl_ms.unwrap_or(30_000);
         super::lease_tools::validate_lease_ttl_ms("act_foreground", ttl_ms)?;
-        // #2063 finding 3: a session that owns a hidden Win32 desktop can never
-        // make its target the input desktop's foreground, so the foreground lane
-        // is structurally unavailable to it. Refuse here — before the lease is
-        // acquired and before break_glass is entered — instead of escalating,
-        // failing at the click-level guard, and then unwinding the escalation.
-        // The refusal names the hidden desktop rather than blaming a foreground
-        // race that never happened.
-        if let Some(hidden_desktop) = self.session_hidden_desktop_readback(&session_id)? {
-            return Err(super::m2_tools::hidden_desktop_foreground_refusal(
-                "act_foreground",
-                &hidden_desktop,
-            ));
-        }
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_foreground",
@@ -3335,15 +2977,8 @@ impl SynapseService {
         // 1) Acquire/renew the foreground input lease. Do not use `?` here:
         // acquire can commit memory + persistence before a later audit error.
         // The already-armed guard reconciles actual ownership on every exit.
-        // #2078: `ttl_ms` here is this lane's *own* escalation window — the
-        // caller's `act operation=foreground` payload names an action to run,
-        // not a lease to buy, and when it omits `ttl_ms` the number is the
-        // facade-internal 30 000 above. Sized as a floor: it may raise the
-        // lease, and can never renew the caller's longer live lease downward.
-        let lease_acquire_result = self.control_lease_acquire_authority_locked_sized(
-            "act_foreground",
-            ttl_ms,
-            super::lease_tools::LeaseTtlIntent::ToolSized,
+        let lease_acquire_result = self.control_lease_acquire_authority_locked(
+            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
             session_id.clone(),
         );
         let lease_acquire = match lease_acquire_result {
@@ -3458,25 +3093,15 @@ impl SynapseService {
                     None,
                 ));
             }
-            // Bind the facade to this session's exact owned target without
-            // activating it. Background tiers remain free to act on the bound
-            // target; any eventual SendInput/cursor tier must separately prove
-            // that this exact root HWND is already the real foreground. Keep a
-            // binding failure in `action_result` so profile/lease cleanup still
-            // runs after authority mutations (#1830).
-            crate::m2::foreground_fence::disarm("act_foreground_before_target_binding");
-            Some(match arm_act_foreground_session_target(self, &session_id) {
-                Ok(()) => {
-                    self.target_act_authority_locked(
-                        Parameters(params.action),
-                        request_context.clone(),
-                        Some(operator_panic_epoch_at_entry),
-                        Some(session_id.clone()),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            })
+            Some(
+                self.target_act_authority_locked(
+                    Parameters(params.action),
+                    request_context.clone(),
+                    Some(operator_panic_epoch_at_entry),
+                    Some(session_id.clone()),
+                )
+                .await,
+            )
         } else {
             None
         };
@@ -3577,14 +3202,6 @@ impl SynapseService {
                 &self.m3_state_handle(),
                 &session_id,
             );
-        let default_expected_persisted_lease_after_cleanup = if acquired {
-            &authority_guard.prior_persisted_lease
-        } else {
-            &authority_guard.expected_retained_persisted_lease
-        };
-        let expected_persisted_lease_after_cleanup = persisted_lease_restore_result
-            .as_ref()
-            .unwrap_or(default_expected_persisted_lease_after_cleanup);
 
         let cleanup_error =
             act_foreground_cleanup_postcondition_error(ActForegroundCleanupEvidence {
@@ -3598,7 +3215,11 @@ impl SynapseService {
                 lease_release_result: lease_release_result.as_ref(),
                 persisted_lease_restore_result: &persisted_lease_restore_result,
                 persisted_lease_final_readback: &persisted_lease_final_readback,
-                expected_persisted_lease_after_cleanup,
+                expected_persisted_lease_after_cleanup: if acquired {
+                    &authority_guard.prior_persisted_lease
+                } else {
+                    &authority_guard.expected_retained_persisted_lease
+                },
                 operator_panic_observed,
                 exact_profile_restore_result: &exact_profile_restore_result,
                 prior_profile_value_sha256: &authority_guard.prior_profile_value_sha256,
@@ -3749,10 +3370,8 @@ fn act_foreground_cleanup_postconditions(
     lease_owner_after: Option<&str>,
 ) -> (bool, bool) {
     let profile_restored = profile_after == Some(prior_profile);
-    let retained_session_lease_no_longer_owned =
-        lease_owner_before == Some(session_id) && lease_owner_after != Some(session_id);
     let lease_cleanup_verified = lease_readback_ok
-        && if session_authority_must_be_released || retained_session_lease_no_longer_owned {
+        && if session_authority_must_be_released {
             lease_owner_after != Some(session_id)
         } else {
             lease_owner_after == lease_owner_before
@@ -3815,14 +3434,10 @@ fn act_foreground_cleanup_postcondition_error(
         .as_ref()
         .ok()
         .and_then(|snapshot| snapshot.owner_session_id.as_deref());
-    let retained_session_lease_no_longer_owned =
-        lease_owner_before == Some(session_id) && lease_owner_after != Some(session_id);
-    let session_must_not_own_lease =
-        acquired_lease || operator_panic_observed || retained_session_lease_no_longer_owned;
     let (profile_kind_restored, lease_cleanup_verified) = act_foreground_cleanup_postconditions(
         session_id,
         prior_profile,
-        session_must_not_own_lease,
+        acquired_lease || operator_panic_observed,
         lease_owner_before,
         profile_after,
         lease_readback_ok,
@@ -3904,7 +3519,6 @@ fn act_foreground_cleanup_postcondition_error(
         persisted_lease_final_readback_ok,
         persisted_lease_row_verified,
         operator_panic_observed,
-        retained_session_lease_no_longer_owned,
         readbacks_ok,
         profile_restored,
         lease_cleanup_verified,
@@ -3927,9 +3541,8 @@ fn act_foreground_cleanup_postcondition_error(
             "expected": {
                 "profile": prior_profile.as_str(),
                 "profile_value_sha256": prior_profile_value_sha256,
-                "session_must_not_own_lease": session_must_not_own_lease,
+                "session_must_not_own_lease": acquired_lease,
                 "lease_owner_before": lease_owner_before,
-                "retained_session_lease_no_longer_owned": retained_session_lease_no_longer_owned,
                 "persisted_lease_row_present": if operator_panic_observed {
                     false
                 } else {
@@ -5937,9 +5550,6 @@ async fn target_act_browser_dom_action(
     let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
     let click_count = target_act_dom_click_count(action, params.clicks)?;
     let click_position = target_act_click_position(params)?;
-    let scroll_deltas = (action == "scroll")
-        .then(|| target_act_scroll_deltas(params))
-        .transpose()?;
     let click_modifiers = target_act_click_modifiers_bridge_value(&params.modifiers)?;
     let request_details = json!({
         "session_id": &session_id,
@@ -5959,12 +5569,9 @@ async fn target_act_browser_dom_action(
         "modifiers": &click_modifiers,
         "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
         "clicks": click_count,
-        "scroll_delta_x": scroll_deltas.map(|(dx, _)| dx),
-        "scroll_delta_y": scroll_deltas.map(|(_, dy)| dy),
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
-        "force": params.force,
         "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
@@ -6024,12 +5631,9 @@ async fn target_act_browser_dom_action(
         "modifiers": &click_modifiers,
         "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
         "clicks": click_count,
-        "scroll_delta_x": scroll_deltas.map(|(dx, _)| dx),
-        "scroll_delta_y": scroll_deltas.map(|(_, dy)| dy),
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
-        "force": params.force,
         "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
@@ -6069,12 +5673,9 @@ async fn target_act_browser_dom_action(
             modifiers: Some(&click_modifiers),
             position_x: click_position.map(|(x, _)| x),
             position_y: click_position.map(|(_, y)| y),
-            scroll_delta_x: scroll_deltas.map(|(dx, _)| dx),
-            scroll_delta_y: scroll_deltas.map(|(_, dy)| dy),
             wait_timeout_ms,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,
-            force: params.force,
             suppress_page_text: params.secret_safe,
         },
     )
@@ -6357,38 +5958,6 @@ async fn target_act_coordinate_click(
             }
         }
         SessionTarget::Window { hwnd } => {
-            // #2063 finding 3: refuse the hidden-desktop case with its own
-            // reason BEFORE the generic foreground guard below. That guard is
-            // reached first today and always wins, because a hidden-desktop
-            // window can never *be* the OS foreground — so every hidden-desktop
-            // refusal came back as `foreground_moved_before_click` with
-            // remediation ("focus the target, then retry") that cannot work, and
-            // `hidden_desktop_foreground_tier_refused` was unreachable from the
-            // public facade.
-            if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
-                let error = super::m2_tools::hidden_desktop_coordinate_click_refusal(
-                    "target_act",
-                    &hidden_desktop,
-                    coordinate.x,
-                    coordinate.y,
-                    // Echo what the caller actually asked for. This refusal is
-                    // raised before the window->screen conversion below, so the
-                    // requested point is still in the caller's own space (#2063).
-                    coordinate.space.as_bridge_str(),
-                );
-                service.audit_action_denied_with_details_for_session(
-                    "target_act",
-                    &error,
-                    &request_details,
-                    &session_id,
-                );
-                return Ok((
-                    "act_click",
-                    false,
-                    target_act_error_status(&error),
-                    target_act_error_result("act_click", error),
-                ));
-            }
             let point = match target_act_window_coordinate_to_screen_point(hwnd, coordinate) {
                 Ok(point) => point,
                 Err(error) => {
@@ -6485,7 +6054,7 @@ async fn target_act_touch_tap(
         "role": params.role.as_deref(),
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "requires_cdp_input": true,
-        "delegated_tool": "synapse_a11y.cdp_touch_tap",
+        "delegated_tool": "synapse_a11y.cdp_touch_tap_or_chrome_debugger_bridge.cdpInput",
         "method": "Input.dispatchTouchEvent",
         "non_touch_fallback": "none; use verb=click explicitly for mouse behavior",
         "required_foreground": false,
@@ -6547,24 +6116,17 @@ async fn target_act_touch_tap(
         ));
     };
     let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-        let error = mcp_error(
-            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
-            format!(
-                "target_act verb=tap refused normal authenticated Chrome target {cdp_target_id:?} before Chrome mutation; trusted touch input requires a session-owned target in Synapse's dedicated non-default raw-CDP profile"
-            ),
-        );
-        service.audit_action_denied_with_details_for_session(
-            "target_act",
-            &error,
+        return target_act_bridge_cdp_input(
+            service,
+            "tap",
+            window_hwnd,
+            &cdp_target_id,
+            coordinate,
+            params,
             &request_details,
             &session_id,
-        );
-        return Ok((
-            "synapse_a11y.cdp_touch_tap",
-            false,
-            target_act_error_status(&error),
-            target_act_error_result("target_act", error),
-        ));
+        )
+        .await;
     };
 
     let mut request_details = request_details;
@@ -6799,7 +6361,7 @@ async fn target_act_hover(
         "role": params.role.as_deref(),
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "requires_cdp_input": true,
-        "delegated_tool": "synapse_a11y.cdp_aim_node",
+        "delegated_tool": "synapse_a11y.cdp_aim_node_or_chrome_debugger_bridge.cdpInput",
         "method": "Input.dispatchMouseEvent(mouseMoved)",
         "required_foreground": false,
     });
@@ -6860,24 +6422,17 @@ async fn target_act_hover(
         ));
     };
     let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-        let error = mcp_error(
-            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
-            format!(
-                "target_act verb=hover refused normal authenticated Chrome target {cdp_target_id:?} before Chrome mutation; real browser hover state requires a session-owned target in Synapse's dedicated non-default raw-CDP profile"
-            ),
-        );
-        service.audit_action_denied_with_details_for_session(
-            "target_act",
-            &error,
+        return target_act_bridge_cdp_input(
+            service,
+            "hover",
+            window_hwnd,
+            &cdp_target_id,
+            None,
+            params,
             &request_details,
             &session_id,
-        );
-        return Ok((
-            "synapse_a11y.cdp_aim_node",
-            false,
-            target_act_error_status(&error),
-            target_act_error_result("target_act", error),
-        ));
+        )
+        .await;
     };
 
     let mut request_details = request_details;
@@ -6926,10 +6481,14 @@ async fn target_act_hover(
     ))
 }
 
-/// Route a DOM-locator click/dblclick/press to trusted raw-CDP input when the
-/// target is an isolated automation profile. Normal authenticated Chrome uses
-/// its debugger-free typed DOM action, which preserves HTML activation behavior
-/// and verifies page state without attaching DevTools.
+/// Route a DOM-locator click/dblclick/press to the REAL trusted-input lane
+/// (#1348 headline #1/#2). For the normal Chrome bridge target this dispatches
+/// chrome.debugger `Input.dispatchMouseEvent` (isTrusted=true) instead of the
+/// synthetic `performClick` that guarded handlers ignore. Raw-CDP and
+/// native/window targets keep the existing path (raw-CDP real mouse click is a
+/// tracked follow-up). `bridge_action` is the cdpInput action ("click"/
+/// "dblclick"); `fallback_action` is the DOM-action verb used when the real lane
+/// does not apply (so verb=press keeps its named-button fallback semantics).
 #[cfg(windows)]
 async fn target_act_dom_locator_pointer(
     service: &SynapseService,
@@ -6939,17 +6498,6 @@ async fn target_act_dom_locator_pointer(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     let session_id = target_act_session_id(request_context, bridge_action)?;
-    // #1821: `force` means "dispatch even though a predicate is unmet". A real
-    // Chrome-generated mouse event cannot do that — it lands on whatever is
-    // painted at the action point — so the only honest implementation is the
-    // synthetic in-page DOM dispatch lane, which delivers the event sequence to
-    // the resolved node itself. Route there before the raw-CDP / bridge
-    // real-mouse lanes are considered, rather than letting a "forced" click
-    // silently activate an overlay.
-    if params.force {
-        return target_act_browser_dom_action(service, fallback_action, params, request_context)
-            .await;
-    }
     let Some(target) = service.session_target(Some(&session_id))? else {
         return target_act_browser_dom_action(service, fallback_action, params, request_context)
             .await;
@@ -6962,22 +6510,20 @@ async fn target_act_dom_locator_pointer(
         return target_act_browser_dom_action(service, fallback_action, params, request_context)
             .await;
     };
-    // Raw-CDP endpoint present → Chrome-generated mouse click via
+    // Raw-CDP endpoint present → real trusted mouse click via
     // synapse_a11y::cdp_click_node (Input.dispatchMouseEvent mouseMoved →
     // mousePressed → mouseReleased), NOT the bridge synthetic path (which rejects
     // a non-bridge raw-CDP target outright). #1348: closes the last
-    // synthetic/broken input lane — raw-CDP locator clicks now have
-    // `isTrusted=true` while remaining software-originated, mirroring the
-    // verb=tap raw-CDP path. Bridge-only targets use the typed debugger-free
-    // DOM action below.
+    // synthetic/broken input lane — raw-CDP locator clicks are now real and
+    // trusted, mirroring the verb=tap raw-CDP path. Bridge-only targets fall
+    // through to the cdpInput lane below.
     #[cfg(windows)]
     if let Some(endpoint) = synapse_a11y::endpoint_for_window(*window_hwnd) {
         let raw_details = json!({
             "session_id": &session_id,
             "verb": bridge_action,
             "lane": "synapse_a11y.cdp_click_node",
-            "dom_event_is_trusted": true,
-            "physical_device_origin": false,
+            "real_trusted_input": true,
             "required_foreground": false,
             "window_hwnd": *window_hwnd,
             "cdp_target_id": cdp_target_id,
@@ -7028,7 +6574,41 @@ async fn target_act_dom_locator_pointer(
             )),
         };
     }
-    target_act_browser_dom_action(service, fallback_action, params, request_context).await
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": bridge_action,
+        "fallback_verb": fallback_action,
+        "lane": "chrome_debugger_bridge.cdpInput",
+        "real_trusted_input": true,
+        "required_foreground": false,
+    });
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "chrome_debugger_bridge.cdpInput",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    target_act_bridge_cdp_input(
+        service,
+        bridge_action,
+        *window_hwnd,
+        cdp_target_id,
+        None,
+        params,
+        &request_details,
+        &session_id,
+    )
+    .await
 }
 
 #[cfg(not(windows))]
@@ -7040,6 +6620,167 @@ async fn target_act_dom_locator_pointer(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     target_act_browser_dom_action(service, fallback_action, params, request_context).await
+}
+
+#[cfg(windows)]
+async fn target_act_bridge_cdp_input(
+    service: &SynapseService,
+    action: &'static str,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    coordinate: Option<TargetActCoordinate>,
+    params: &TargetActParams,
+    request_details: &Value,
+    session_id: &str,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    target_act_validate_bridge_cdp_input(action, coordinate, params)?;
+    // Mouse-click options apply only to the real-mouse click/dblclick lane;
+    // hover/tap/drag ignore them (left None).
+    let is_click = matches!(action, "click" | "dblclick");
+    let click_count = if is_click {
+        Some(target_act_click_count_for_action(action, params.clicks)?)
+    } else {
+        None
+    };
+    let click_button = if is_click {
+        params.button.map(TargetActMouseButton::as_str)
+    } else {
+        None
+    };
+    let click_modifiers = if is_click {
+        Some(target_act_click_modifiers_bridge_value(&params.modifiers)?)
+    } else {
+        None
+    };
+    let mut request_details = request_details.clone();
+    if let Some(object) = request_details.as_object_mut() {
+        object.insert("window_hwnd".to_owned(), json!(window_hwnd));
+        object.insert("cdp_target_id".to_owned(), json!(cdp_target_id));
+        object.insert(
+            "delegated_tool".to_owned(),
+            json!("chrome_debugger_bridge.cdpInput"),
+        );
+        object.insert("bridge_debugger_lane".to_owned(), json!("chrome.debugger"));
+        object.insert("required_foreground".to_owned(), json!(false));
+        object.insert("secret_safe".to_owned(), json!(params.secret_safe));
+    }
+    service.audit_action_started_with_details_for_session(
+        "target_act",
+        &request_details,
+        session_id,
+    )?;
+    let coordinate_space = coordinate.map(|value| value.space.as_bridge_str());
+    ensure_target_act_operator_panic_boundary("bridge_cdp_input_before_dispatch")?;
+    let result = crate::chrome_debugger_bridge::cdp_input(
+        crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
+            hwnd: window_hwnd,
+            target_id: cdp_target_id,
+            action,
+            selector: params.selector.as_deref(),
+            element_id: params.element_id.as_deref(),
+            active_element: false,
+            role: params.role.as_deref(),
+            name: params.name.as_deref(),
+            value: params.value.as_deref(),
+            text: params.text.as_deref(),
+            x: coordinate.map(|value| value.x),
+            y: coordinate.map(|value| value.y),
+            coordinate_space,
+            source_selector: None,
+            target_selector: None,
+            drag_steps: None,
+            drag_duration_ms: None,
+            drag_data_mime_type: None,
+            drag_data_text: None,
+            button: click_button,
+            modifiers: click_modifiers.as_ref(),
+            clicks: click_count,
+            wait_timeout_ms: target_act_dom_wait_timeout(params.wait_timeout_ms)?,
+            auto_wait: params.auto_wait,
+            auto_wait_timeout_ms: params.auto_wait_timeout_ms,
+            suppress_page_text: params.secret_safe,
+        },
+    )
+    .await
+    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+    target_act_audit_result_for_session(
+        service,
+        "chrome_debugger_bridge.cdpInput",
+        &result,
+        session_id,
+        params.secret_safe,
+    )?;
+    match result {
+        Ok(value) => {
+            let value = target_act_maybe_secret_safe_result(
+                "chrome_debugger_bridge.cdpInput",
+                value,
+                params.secret_safe,
+            )?;
+            Ok((
+                "chrome_debugger_bridge.cdpInput",
+                true,
+                TARGET_ACT_STATUS_OK,
+                value,
+            ))
+        }
+        Err(error) => Ok((
+            "chrome_debugger_bridge.cdpInput",
+            false,
+            target_act_error_status(&error),
+            target_act_maybe_secret_safe_error_result(
+                "chrome_debugger_bridge.cdpInput",
+                error,
+                params.secret_safe,
+            ),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn target_act_validate_bridge_cdp_input(
+    action: &str,
+    coordinate: Option<TargetActCoordinate>,
+    params: &TargetActParams,
+) -> Result<(), ErrorData> {
+    if let Some(coordinate) = coordinate
+        && coordinate.space != TargetActCoordinateSpace::Viewport
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} coordinate input must use coordinate_space=viewport because CDP Input consumes viewport CSS pixels; got {}",
+                coordinate.space.as_bridge_str()
+            ),
+        ));
+    }
+    if coordinate.is_none() {
+        target_act_validate_dom_locator(action, params)?;
+    }
+    if let Some(raw) = params
+        .element_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if ElementId::parse(raw).is_ok() {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "target_act verb={action} observed raw-CDP element_id {raw:?} requires a raw CDP endpoint; re-resolve the element through browser_locate for a chrome-tab:... bridge element id or use selector/role/name"
+                ),
+            ));
+        }
+        if !target_act_click_element_id_can_be_dom_id(raw) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb={action} element_id must be a chrome-tab:... bridge element id or plain DOM id for the normal Chrome bridge cdpInput lane"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -7099,12 +6840,11 @@ fn target_act_click_modifiers_cdp_mask(modifiers: &[TargetActClickModifier]) -> 
     mask
 }
 
-/// Chrome-generated raw-CDP mouse click/dblclick on a DOM-locator/element_id target
+/// Real, TRUSTED raw-CDP mouse click/dblclick on a DOM-locator/element_id target
 /// via `synapse_a11y::cdp_click_node` (Input.dispatchMouseEvent
 /// mouseMoved→mousePressed→mouseReleased), mirroring `target_act_touch_tap_dispatch`
-/// but with mouse instead of touch. `isTrusted=true` while
-/// `physical_device_origin=false`, so activation-guarded handlers fire without
-/// claiming hardware input (#1348).
+/// but with mouse instead of touch. isTrusted=true, so activation-guarded handlers
+/// fire — the raw-CDP analogue of the bridge cdpInput real-click lane (#1348).
 #[cfg(windows)]
 async fn target_act_raw_cdp_click_dispatch(
     endpoint: &str,
@@ -7156,6 +6896,7 @@ async fn target_act_raw_cdp_click_dispatch(
         "readback_backend": "raw_cdp",
         "method": "Input.dispatchMouseEvent(mouseMoved,mousePressed,mouseReleased)",
         "click_count": click_count,
+        "real_trusted_input": true,
         "scrolled_into_view_before_click": true
     }))
 }
@@ -7622,441 +7363,75 @@ fn trimmed_non_empty_string(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// #1353/#2232: `verb=scroll` routes exclusively through the exact session
-/// target. Browser targets use same-target DOM/CDP scroll with physical
-/// before/after offset readback. Native targets require an observed element and
-/// use the background UIA scroll lane. It never emits a process-global wheel or
-/// falls back to the human foreground.
+/// #1353: `verb=scroll` routes to the real `act_scroll` wheel primitive (visible
+/// in break_glass), which the hidden-tool route guidance advertises. Wheel deltas
+/// come in `args` as `[dx, dy]` (e.g. `["0","120"]`); an optional screen-space
+/// `x`/`y` sets the wheel point, and omitting it scrolls the focused/claimed
+/// target window — the native egui/wgpu viewport case.
 async fn target_act_scroll(
     service: &SynapseService,
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    let (dx, dy) = target_act_scroll_deltas(params)?;
-    target_act_validate_dom_locator("scroll", params)?;
-    target_act_validate_scroll_only_fields(params)?;
-    if target_act_coordinate(params)?.is_some() {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=scroll is target-scoped and does not accept screen/window/viewport coordinates; bind the exact session target and optionally pass an element_id or selector",
-        ));
-    }
-    let session_id = target_act_session_id(request_context, "scroll")?;
-    let target = service.session_target(Some(&session_id))?.ok_or_else(|| {
-        mcp_error(
-            error_codes::TARGET_NOT_SET,
-            "target_act verb=scroll requires an exact session target; refusing process-global wheel input and human-foreground fallback",
-        )
-    })?;
-    match target {
-        SessionTarget::Cdp { cdp_target_id, .. }
-            if target_act_is_chrome_bridge_target_id(&cdp_target_id) =>
-        {
-            target_act_browser_dom_action(service, "scroll", params, request_context).await
-        }
-        SessionTarget::Cdp { .. } => {
-            let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
-            target_act_raw_cdp_scroll(service, params, dx, dy, wait_timeout_ms, request_context)
-                .await
-        }
-        SessionTarget::Window { hwnd } => {
-            let verify_timeout_ms = target_act_verify_timeout(params.wait_timeout_ms, "scroll")?;
-            let raw_element_id = params.element_id.as_deref().ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    "target_act verb=scroll on a native window requires an observed element_id with a background UIA ScrollPattern/ScrollItemPattern; refusing untargeted wheel input",
-                )
-            })?;
-            if target_act_has_dom_locator(params) {
-                return Err(mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    "target_act verb=scroll selector/role/name/value locators require a browser target; a native window requires only an observed element_id",
-                ));
-            }
-            let element_id = ElementId::parse(raw_element_id).map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    format!("target_act verb=scroll element_id is invalid: {error}"),
-                )
-            })?;
-            let element_hwnd = element_id
-                .parts()
-                .map_err(|error| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        format!("target_act verb=scroll element_id is invalid: {error}"),
-                    )
-                })?
-                .hwnd;
-            if element_hwnd != hwnd {
-                return Err(mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "target_act verb=scroll element_id belongs to hwnd={element_hwnd:#x}, but the session target is hwnd={hwnd:#x}"
-                    ),
-                ));
-            }
-            ensure_target_act_operator_panic_boundary("scroll_before_uia_delivery")?;
-            target_act_delegate_response(
-                "act_scroll",
-                service
-                    .act_scroll(
-                        Parameters(ActScrollParams {
-                            dx,
-                            dy,
-                            at: None,
-                            target: Some(ActScrollElementTarget { element_id }),
-                            smooth: false,
-                            verify_delta: true,
-                            verify_timeout_ms,
-                        }),
-                        request_context.clone(),
-                    )
-                    .await,
-            )
-        }
-    }
-}
-
-fn target_act_scroll_deltas(params: &TargetActParams) -> Result<(i32, i32), ErrorData> {
-    if params.args.len() != 2 {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "target_act verb=scroll requires exactly two integer args [dx, dy]; received {}",
-                params.args.len()
-            ),
-        ));
-    }
-    let parse_delta = |axis: &str, raw: &str| -> Result<i32, ErrorData> {
-        let value = raw.trim().parse::<i32>().map_err(|_| {
+    let parse_delta = |raw: &str| -> Result<i32, ErrorData> {
+        raw.trim().parse::<i32>().map_err(|_| {
             mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "target_act verb=scroll {axis} must be an integer within +/-{MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX}; got {raw:?}"
-                ),
+                format!("target_act verb=scroll args must be integer deltas [dx, dy]; got {raw:?}"),
             )
-        })?;
-        if value.unsigned_abs() > MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX.unsigned_abs() {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "target_act verb=scroll {axis} magnitude {} exceeds maximum {MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX}",
-                    value.unsigned_abs()
-                ),
-            ));
-        }
-        Ok(value)
+        })
     };
-    let dx = parse_delta("dx", &params.args[0])?;
-    let dy = parse_delta("dy", &params.args[1])?;
+    let dx = params
+        .args
+        .first()
+        .map(|s| parse_delta(s))
+        .transpose()?
+        .unwrap_or(0);
+    let dy = params
+        .args
+        .get(1)
+        .map(|s| parse_delta(s))
+        .transpose()?
+        .unwrap_or(0);
     if dx == 0 && dy == 0 {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=scroll requires at least one non-zero delta",
+            "target_act verb=scroll requires wheel deltas in args as [dx, dy] (e.g. args=[\"0\",\"120\"] to scroll down)",
         ));
     }
-    Ok((dx, dy))
-}
-
-fn target_act_validate_scroll_only_fields(params: &TargetActParams) -> Result<(), ErrorData> {
-    let supplied = [
-        ("url", params.url.is_some()),
-        ("path", params.path.is_some()),
-        ("text", params.text.is_some()),
-        ("key", params.key.is_some()),
-        ("keys", !params.keys.is_empty()),
-        ("selection_start", params.selection_start.is_some()),
-        ("selection_end", params.selection_end.is_some()),
-        ("automation_id", params.automation_id.is_some()),
-        ("option", params.option.is_some()),
-        ("option_label", params.option_label.is_some()),
-        ("option_index", params.option_index.is_some()),
-        ("options", !params.options.is_empty()),
-        ("event_type", params.event_type.is_some()),
-        ("event_init", params.event_init.is_some()),
-        ("width", params.width.is_some()),
-        ("height", params.height.is_some()),
-        ("command", params.command.is_some()),
-        ("working_dir", params.working_dir.is_some()),
-        ("timeout_ms", params.timeout_ms.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(field, present)| present.then_some(field))
-    .collect::<Vec<_>>();
-    if supplied.is_empty() {
-        Ok(())
-    } else {
-        Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "target_act verb=scroll does not accept unrelated fields {supplied:?}; use args=[dx,dy] plus at most one exact browser/native locator and wait_timeout_ms"
-            ),
-        ))
-    }
-}
-
-const RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX: &str = r#"async (locatorKind, locatorValue, deltaX, deltaY) => {
-  let target;
-  if (locatorKind === "document") {
-    target = document.scrollingElement;
-  } else if (locatorKind === "id") {
-    target = document.getElementById(locatorValue);
-  } else if (locatorKind === "selector") {
-    let matches;
-    try { matches = Array.from(document.querySelectorAll(locatorValue)); }
-    catch (error) { return { ok: false, error_code: "CHROME_DOM_SELECTOR_INVALID", error_detail: String(error) }; }
-    if (matches.length !== 1) {
-      return { ok: false, error_code: matches.length === 0 ? "CHROME_DOM_ELEMENT_NOT_FOUND" : "CHROME_DOM_ELEMENT_AMBIGUOUS", error_detail: `strict selector matched ${matches.length} elements`, matched_count: matches.length };
-    }
-    target = matches[0];
-  }
-"#;
-
-const RAW_CDP_SCROLL_ELEMENT_EXPRESSION_PREFIX: &str = "async (target, deltaX, deltaY) => {";
-
-const RAW_CDP_SCROLL_EXPRESSION_BODY: &str = r#"
-  if (!(target instanceof Element) || typeof target.scrollBy !== "function") {
-    return { ok: false, error_code: "CHROME_DOM_ELEMENT_NOT_ACTIONABLE", error_detail: "resolved target is absent or has no scrollBy() method" };
-  }
-  const snapshot = () => ({
-    scroll_left: Number(target.scrollLeft || 0),
-    scroll_top: Number(target.scrollTop || 0),
-    scroll_width: Number(target.scrollWidth || 0),
-    scroll_height: Number(target.scrollHeight || 0),
-    client_width: Number(target.clientWidth || 0),
-    client_height: Number(target.clientHeight || 0),
-    max_scroll_left: Math.max(0, Number(target.scrollWidth || 0) - Number(target.clientWidth || 0)),
-    max_scroll_top: Math.max(0, Number(target.scrollHeight || 0) - Number(target.clientHeight || 0))
-  });
-  const before = snapshot();
-  const expectedScrollLeft = before.scroll_left + deltaX;
-  const expectedScrollTop = before.scroll_top + deltaY;
-  const base = { requested_delta_x: deltaX, requested_delta_y: deltaY, expected_scroll_left: expectedScrollLeft, expected_scroll_top: expectedScrollTop, before };
-  if (expectedScrollLeft < 0 || expectedScrollLeft > before.max_scroll_left || expectedScrollTop < 0 || expectedScrollTop > before.max_scroll_top) {
-    return { ok: false, error_code: "CHROME_DOM_ACTION_POSTCONDITION_FAILED", error_detail: "requested scroll delta exceeds the exact target range", ...base, after: before, dispatched: false, verified: false };
-  }
-  target.scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
-  await new Promise((resolve) => {
-    if (typeof MessageChannel !== "function") { resolve(); return; }
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => resolve();
-    channel.port2.postMessage(0);
-  });
-  const after = snapshot();
-  const actualDeltaX = after.scroll_left - before.scroll_left;
-  const actualDeltaY = after.scroll_top - before.scroll_top;
-  const toleranceCssPx = 0.5;
-  const xDirectionVerified = deltaX === 0 || Math.sign(actualDeltaX) === Math.sign(deltaX);
-  const yDirectionVerified = deltaY === 0 || Math.sign(actualDeltaY) === Math.sign(deltaY);
-  const xMagnitudeVerified = Math.abs(actualDeltaX - deltaX) <= toleranceCssPx;
-  const yMagnitudeVerified = Math.abs(actualDeltaY - deltaY) <= toleranceCssPx;
-  const verified = xDirectionVerified && yDirectionVerified && xMagnitudeVerified && yMagnitudeVerified;
-  return {
-    ok: verified,
-    error_code: verified ? null : "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
-    error_detail: verified ? null : `scroll postcondition failed: requested=(${deltaX},${deltaY}) actual=(${actualDeltaX},${actualDeltaY})`,
-    ...base,
-    after,
-    actual_delta_x: actualDeltaX,
-    actual_delta_y: actualDeltaY,
-    x_direction_verified: xDirectionVerified,
-    y_direction_verified: yDirectionVerified,
-    x_magnitude_verified: xMagnitudeVerified,
-    y_magnitude_verified: yMagnitudeVerified,
-    tolerance_css_px: toleranceCssPx,
-    dispatched: true,
-    verified,
-    source_of_truth: "same-target Element.scrollLeft/scrollTop read before and after Runtime.evaluate Element.scrollBy"
-  };
-}"#;
-
-async fn target_act_raw_cdp_scroll(
-    service: &SynapseService,
-    params: &TargetActParams,
-    dx: i32,
-    dy: i32,
-    wait_timeout_ms: u64,
-    request_context: &RequestContext<RoleServer>,
-) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    if params
-        .role
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || params
-            .name
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-        || params
-            .value
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=scroll on a raw-CDP target accepts one exact selector, one raw-CDP element_id, one DOM id, or no locator for document.scrollingElement; semantic role/name/value scroll locators are unavailable and are never approximated",
-        ));
-    }
-    if params
-        .selector
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-        && params
-            .element_id
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=scroll raw-CDP target is ambiguous: pass selector or element_id, not both",
-        ));
-    }
-
-    let mut expression = String::new();
-    let mut element_id = None;
-    let args = if let Some(raw_element_id) = params
-        .element_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        match ElementId::parse(raw_element_id) {
-            Ok(parsed) if synapse_a11y::cdp_backend_from_element_id(&parsed).is_some() => {
-                expression.push_str(RAW_CDP_SCROLL_ELEMENT_EXPRESSION_PREFIX);
-                expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
-                element_id = Some(raw_element_id.to_owned());
-                vec![json!(dx), json!(dy)]
-            }
-            Ok(_) => {
+    let at = match target_act_coordinate(params)? {
+        Some(coordinate) => match coordinate.space {
+            TargetActCoordinateSpace::Screen => Some(ActScrollPoint {
+                x: coordinate.x,
+                y: coordinate.y,
+            }),
+            other => {
                 return Err(mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    "target_act verb=scroll raw-CDP element_id is not a CDP web element",
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "target_act verb=scroll supports coordinate_space=screen for the at-point (got {other:?}); omit x/y to scroll the focused target window"
+                    ),
                 ));
             }
-            Err(_) => {
-                expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
-                expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
-                vec![json!("id"), json!(raw_element_id), json!(dx), json!(dy)]
-            }
-        }
-    } else if let Some(selector) = params
-        .selector
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
-        expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
-        vec![json!("selector"), json!(selector), json!(dx), json!(dy)]
-    } else {
-        expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
-        expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
-        vec![json!("document"), Value::Null, json!(dx), json!(dy)]
-    };
-
-    ensure_target_act_operator_panic_boundary("raw_cdp_scroll_before_runtime_evaluate")?;
-    let evaluate_timeout_ms = u32::try_from(wait_timeout_ms).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "target_act validated raw-CDP scroll wait_timeout_ms={wait_timeout_ms} does not fit browser_evaluate timeout: {error}"
-            ),
-        )
-    })?;
-    let response = service
-        .browser_evaluate(
-            Parameters(BrowserEvaluateParams {
-                expression,
-                cdp_target_id: None,
-                window_hwnd: None,
-                element_id,
-                args: Some(args),
-                await_promise: Some(true),
-                return_by_value: Some(true),
-                timeout_ms: Some(evaluate_timeout_ms),
-            }),
-            request_context.clone(),
-        )
-        .await;
-    let response = match response {
-        Ok(response) => response.0,
-        Err(error) => {
-            return Ok((
-                "browser_evaluate.raw_cdp_scroll",
-                false,
-                target_act_error_status(&error),
-                target_act_error_result("browser_evaluate.raw_cdp_scroll", error),
-            ));
-        }
-    };
-    let mut result = response.value.as_object().cloned().ok_or_else(|| {
-        mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            "target_act raw-CDP scroll Runtime.evaluate returned a non-object readback",
-        )
-    })?;
-    let ok = result.get("ok").and_then(Value::as_bool).ok_or_else(|| {
-        mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            "target_act raw-CDP scroll readback omitted boolean ok",
-        )
-    })?;
-    let verified = result
-        .get("verified")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if ok && !verified {
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            "target_act raw-CDP scroll contradicted itself: ok=true but verified was absent or false",
-        ));
-    }
-    result.insert("session_id".to_owned(), json!(response.session_id));
-    result.insert("window_hwnd".to_owned(), json!(response.window_hwnd));
-    result.insert("transport".to_owned(), json!(response.transport));
-    result.insert("endpoint".to_owned(), json!(response.endpoint));
-    result.insert("cdp_target_id".to_owned(), json!(response.cdp_target_id));
-    result.insert("url".to_owned(), json!(response.url));
-    result.insert("title".to_owned(), json!(response.title));
-    result.insert("ready_state".to_owned(), json!(response.ready_state));
-    result.insert(
-        "readback_backend".to_owned(),
-        json!(response.readback_backend),
-    );
-    result.insert(
-        "required_foreground".to_owned(),
-        json!(response.required_foreground),
-    );
-    Ok((
-        "browser_evaluate.raw_cdp_scroll",
-        ok,
-        if ok {
-            TARGET_ACT_STATUS_OK
-        } else if result
-            .get("error_code")
-            .and_then(Value::as_str)
-            .is_some_and(|code| {
-                matches!(
-                    code,
-                    "CHROME_DOM_SELECTOR_INVALID"
-                        | "CHROME_DOM_ELEMENT_NOT_FOUND"
-                        | "CHROME_DOM_ELEMENT_AMBIGUOUS"
-                        | "CHROME_DOM_ELEMENT_NOT_ACTIONABLE"
-                )
-            })
-        {
-            TARGET_ACT_STATUS_REFUSED
-        } else {
-            TARGET_ACT_STATUS_ERROR
         },
-        Value::Object(result),
-    ))
-}
-
-fn target_act_is_chrome_bridge_target_id(target_id: &str) -> bool {
-    target_id
-        .strip_prefix("chrome-tab:")
-        .is_some_and(|suffix| suffix.parse::<u32>().is_ok())
+        None => None,
+    };
+    let scroll_params = ActScrollParams {
+        dx,
+        dy,
+        at,
+        target: None,
+        smooth: false,
+        verify_delta: false,
+        verify_timeout_ms: default_verify_timeout_ms(),
+    };
+    ensure_target_act_operator_panic_boundary("scroll_before_input_delivery")?;
+    target_act_delegate_response(
+        "act_scroll",
+        service
+            .act_scroll(Parameters(scroll_params), request_context.clone())
+            .await,
+    )
 }
 
 fn target_act_coordinate(
@@ -8265,22 +7640,13 @@ fn target_act_validate_dom_locator(
             .value
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty());
-    if action != "scroll" && !(has_element_id || has_selector || has_semantic) {
+    if !(has_element_id || has_selector || has_semantic) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "target_act verb={action} requires element_id, selector, or a semantic locator (role/name/value)"
             ),
         ));
-    }
-    if action == "scroll" {
-        let _ = target_act_scroll_deltas(params)?;
-        if params.force || params.auto_wait {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                "target_act verb=scroll does not accept force or auto_wait; exact target resolution and scroll-range/postcondition verification are mandatory",
-            ));
-        }
     }
     if action == "select" {
         target_act_validate_select_options(params)?;
@@ -8411,8 +7777,6 @@ fn act_operation_name(operation: ActOperation) -> &'static str {
         ActOperation::LeaseAcquire => "lease_acquire",
         ActOperation::LeaseStatus => "lease_status",
         ActOperation::LeaseRelease => "lease_release",
-        ActOperation::OperatorPanicStatus => "operator_panic_status",
-        ActOperation::OperatorPanicRecover => "operator_panic_recover",
     }
 }
 
@@ -8423,9 +7787,6 @@ fn act_command_audit_payload(params: &ActParams) -> Value {
         "action_verb": params.action.as_ref().map(|action| action.verb.as_str()),
         "reason_present": params.reason.as_ref().is_some_and(|reason| !reason.trim().is_empty()),
         "ttl_ms": params.ttl_ms,
-        "expected_extension_disable_sequence": params.expected_extension_disable_sequence,
-        "expected_browser_disable_sequence": params.expected_browser_disable_sequence,
-        "expected_operator_panic_epoch": params.expected_operator_panic_epoch,
     })
 }
 
@@ -8444,7 +7805,6 @@ fn act_command_audit_success_after(response: &ActResponse) -> Value {
         "lease": response.lease,
         "action_status": response.action.as_ref().map(|action| action.status.as_str()),
         "profile_restored": response.foreground.as_ref().map(|foreground| foreground.profile_restored),
-        "operator_panic": response.operator_panic,
     })
 }
 
@@ -8457,7 +7817,6 @@ fn act_command_audit_error_after(operation: ActOperation) -> Value {
 }
 
 fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
-    reject_act_operator_panic_generations(params, ActOperation::Invoke)?;
     require_act_action(params, ActOperation::Invoke)?;
     if params.reason.is_some() {
         return Err(act_facade_error(
@@ -8479,7 +7838,6 @@ fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
 }
 
 fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
-    reject_act_operator_panic_generations(params, ActOperation::Foreground)?;
     require_act_action(params, ActOperation::Foreground)?;
     if let Some(ttl_ms) = params.ttl_ms {
         super::lease_tools::validate_lease_ttl_ms("act operation=foreground", ttl_ms)?;
@@ -8500,7 +7858,6 @@ fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
 }
 
 fn validate_act_lease_acquire_params(params: &ActParams) -> Result<(), ErrorData> {
-    reject_act_operator_panic_generations(params, ActOperation::LeaseAcquire)?;
     reject_act_action(params, ActOperation::LeaseAcquire)?;
     reject_act_reason(params, ActOperation::LeaseAcquire)?;
     if let Some(ttl_ms) = params.ttl_ms {
@@ -8513,102 +7870,9 @@ fn validate_act_lease_read_params(
     params: &ActParams,
     operation: ActOperation,
 ) -> Result<(), ErrorData> {
-    reject_act_operator_panic_generations(params, operation)?;
     reject_act_action(params, operation)?;
     reject_act_reason(params, operation)?;
     reject_act_ttl(params, operation)?;
-    Ok(())
-}
-
-fn validate_act_operator_panic_status_params(params: &ActParams) -> Result<(), ErrorData> {
-    reject_act_action(params, ActOperation::OperatorPanicStatus)?;
-    reject_act_reason(params, ActOperation::OperatorPanicStatus)?;
-    reject_act_ttl(params, ActOperation::OperatorPanicStatus)?;
-    if params.expected_extension_disable_sequence.is_some()
-        || params.expected_browser_disable_sequence.is_some()
-        || params.expected_operator_panic_epoch.is_some()
-    {
-        return Err(act_facade_error(
-            ActOperation::OperatorPanicStatus,
-            "act operation=operator_panic_status rejects expected generations",
-            "remove expected_* fields; copy them from the returned status only when calling operator_panic_recover",
-            "expected_*",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_act_operator_panic_recover_params(params: &ActParams) -> Result<(), ErrorData> {
-    reject_act_action(params, ActOperation::OperatorPanicRecover)?;
-    reject_act_ttl(params, ActOperation::OperatorPanicRecover)?;
-    if params
-        .reason
-        .as_deref()
-        .is_none_or(|reason| reason.trim().is_empty())
-    {
-        return Err(act_facade_error(
-            ActOperation::OperatorPanicRecover,
-            "act operation=operator_panic_recover requires a non-empty reason",
-            "state why the operator is explicitly reopening browser mutation admission",
-            "reason",
-        ));
-    }
-    for (name, present) in [
-        (
-            "expected_extension_disable_sequence",
-            params.expected_extension_disable_sequence.is_some(),
-        ),
-        (
-            "expected_browser_disable_sequence",
-            params.expected_browser_disable_sequence.is_some(),
-        ),
-        (
-            "expected_operator_panic_epoch",
-            params.expected_operator_panic_epoch.is_some(),
-        ),
-    ] {
-        if !present {
-            return Err(act_facade_error(
-                ActOperation::OperatorPanicRecover,
-                format!("act operation=operator_panic_recover requires {name}"),
-                "call act operation=operator_panic_status, then pass all three exact generations unchanged",
-                name,
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn act_operator_panic_recovery_error(code: &'static str, detail: String) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        "operator-panic browser mutation recovery failed closed",
-        Some(json!({
-            "code": code,
-            "detail": detail,
-            "remediation": "inspect act operation=operator_panic_status; resolve pending safety work or non-empty/unhealthy owner registries, then retry with the newly read exact generations"
-        })),
-    )
-}
-
-fn reject_act_operator_panic_generations(
-    params: &ActParams,
-    operation: ActOperation,
-) -> Result<(), ErrorData> {
-    if params.expected_extension_disable_sequence.is_some()
-        || params.expected_browser_disable_sequence.is_some()
-        || params.expected_operator_panic_epoch.is_some()
-    {
-        return Err(act_facade_error(
-            operation,
-            format!(
-                "act operation={} rejects operator-panic expected generations",
-                act_operation_name(operation)
-            ),
-            "remove expected_* fields; they are valid only for operation=operator_panic_recover",
-            "expected_*",
-        ));
-    }
     Ok(())
 }
 
@@ -8706,701 +7970,6 @@ fn require_param(value: Option<String>, verb: &str, field: &str) -> Result<Strin
             format!("target_act verb={verb} requires a non-empty `{field}`"),
         )
     })
-}
-
-fn target_act_is_input_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "set_field"
-            | "insert_text"
-            | "append_text"
-            | "set_selection"
-            | "click"
-            | "dblclick"
-            | "tap"
-            | "hover"
-            | "dispatch_event"
-            | "dispatchevent"
-            | "clear"
-            | "focus"
-            | "blur"
-            | "select_text"
-            | "selecttext"
-            | "check"
-            | "uncheck"
-            | "type"
-            | "key"
-            | "key_chord"
-            | "press"
-            | "select"
-            | "submit"
-            | "scroll"
-    )
-}
-
-fn target_act_input_provenance_context(
-    service: &SynapseService,
-    request_context: &RequestContext<RoleServer>,
-    params: &TargetActParams,
-) -> Result<Option<InputProvenanceContext>, ErrorData> {
-    if !target_act_is_input_verb(params.verb.as_str()) {
-        return Ok(None);
-    }
-    let session_id = target_act_session_id(request_context, params.verb.as_str())?;
-    match service.session_target(Some(&session_id))? {
-        Some(SessionTarget::Cdp {
-            window_hwnd,
-            cdp_target_id,
-        }) => {
-            InputProvenanceContext::browser_tab(&session_id, window_hwnd, &cdp_target_id).map(Some)
-        }
-        Some(SessionTarget::Window { hwnd }) => {
-            InputProvenanceContext::native_window(&session_id, hwnd).map(Some)
-        }
-        None => Ok(None),
-    }
-}
-
-fn target_act_input_provenance(
-    verb: &str,
-    delegated_tool: &str,
-    ok: bool,
-    status: &str,
-    result: &Value,
-    context: Option<&InputProvenanceContext>,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    if !target_act_is_input_verb(verb) {
-        return Ok(Vec::new());
-    }
-    if !ok {
-        if status == TARGET_ACT_STATUS_REFUSED {
-            return Ok(Vec::new());
-        }
-        if status == TARGET_ACT_STATUS_VERIFY_NEEDED {
-            tracing::warn!(
-                code = "TARGET_ACT_DELIVERY_UNVERIFIED",
-                verb,
-                delegated_tool,
-                status,
-                target = ?context.map(InputProvenanceContext::target),
-                "input may have been delivered, but no validated provenance record is available; preserve the delegated result and require an independent Source-of-Truth readback"
-            );
-            return Ok(Vec::new());
-        }
-        return Err(input_provenance_error(
-            "target_act_failed_input_delivery",
-            format!(
-                "verb={verb:?} delegated_tool={delegated_tool:?} ended with status={status:?}; delivery was not proven absent and the error result carries no validated provenance"
-            ),
-            context.map(InputProvenanceContext::target),
-        ));
-    }
-    let context = context.ok_or_else(|| {
-        input_provenance_error(
-            "target_act_success_missing_target",
-            format!(
-                "successful input verb={verb:?} delegated_tool={delegated_tool:?} had no session target captured before dispatch"
-            ),
-            None,
-        )
-    })?;
-
-    super::input_provenance::reject_legacy_input_provenance_fragments(
-        result,
-        "target_act_legacy_input_provenance_fragment",
-        Some(context.target()),
-    )?;
-
-    if delegated_tool == "browser_set_value" {
-        return embedded_input_provenance(
-            result,
-            "input_provenance",
-            "target_act_browser_set_value",
-            context,
-        )
-        .map(|provenance| vec![provenance]);
-    }
-    if delegated_tool == "chrome_debugger_bridge.coordinateClick+act_type" {
-        let coordinate = result.get("coordinate_click").ok_or_else(|| {
-            input_provenance_error(
-                "target_act_coordinate_type",
-                "combined coordinate+type result omitted coordinate_click",
-                Some(context.target()),
-            )
-        })?;
-        let typed = result.get("type").ok_or_else(|| {
-            input_provenance_error(
-                "target_act_coordinate_type",
-                "combined coordinate+type result omitted type",
-                Some(context.target()),
-            )
-        })?;
-        let mut records = target_act_input_provenance(
-            "click",
-            "chrome_debugger_bridge.coordinateClick",
-            true,
-            TARGET_ACT_STATUS_OK,
-            coordinate,
-            Some(context),
-        )?;
-        records.extend(target_act_input_provenance(
-            "type",
-            "act_type",
-            true,
-            status,
-            typed,
-            Some(context),
-        )?);
-        return Ok(records);
-    }
-    if delegated_tool.starts_with("target_act.text_focus+") {
-        let steps = result
-            .get("steps")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                input_provenance_error(
-                    "target_act_text_composite",
-                    "successful text composite omitted steps[]",
-                    Some(context.target()),
-                )
-            })?;
-        let mut records = Vec::new();
-        for step in steps {
-            let step_ok = required_result_bool(step, "ok", "target_act_text_composite_step")?;
-            let step_status =
-                required_result_string(step, "status", "target_act_text_composite_step")?;
-            let step_tool =
-                required_result_string(step, "delegated_tool", "target_act_text_composite_step")?;
-            let step_result = step.get("result").ok_or_else(|| {
-                input_provenance_error(
-                    "target_act_text_composite_step",
-                    "step omitted result",
-                    Some(context.target()),
-                )
-            })?;
-            let step_verb = match result_string(step, "step") {
-                Some("move_caret_to_end") => "press",
-                Some("type") => "type",
-                Some("focus") => "click",
-                Some(other) => {
-                    return Err(input_provenance_error(
-                        "target_act_text_composite_step",
-                        format!("unclassified successful step {other:?}"),
-                        Some(context.target()),
-                    ));
-                }
-                None => {
-                    return Err(input_provenance_error(
-                        "target_act_text_composite_step",
-                        "step omitted non-empty step name",
-                        Some(context.target()),
-                    ));
-                }
-            };
-            records.extend(target_act_input_provenance(
-                step_verb,
-                step_tool,
-                step_ok,
-                step_status,
-                step_result,
-                Some(context),
-            )?);
-        }
-        return Ok(records);
-    }
-
-    match delegated_tool {
-        "chrome_debugger_bridge.domAction" => target_act_dom_action_provenance(result, context),
-        "browser_evaluate.raw_cdp_scroll" => target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlElementMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-            "raw_cdp_runtime",
-            "raw_cdp_websocket",
-            "Runtime.evaluate+Element.scrollBy",
-            false,
-            false,
-        ),
-        "chrome_debugger_bridge.coordinateClick" | "chrome_debugger_bridge.keyDispatch" => {
-            target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::DomDispatch,
-                Some(false),
-                BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
-                required_result_string(result, "readback_backend", "bridge_dom_dispatch")?,
-                "chrome_tabs_extension+chrome.scripting",
-                if delegated_tool.ends_with("coordinateClick") {
-                    "dispatchEvent(PointerEvent/MouseEvent sequence)"
-                } else {
-                    "dispatchEvent(KeyboardEvent sequence)"
-                },
-                false,
-                false,
-            )
-        }
-        "synapse_a11y.cdp_click_node"
-        | "synapse_a11y.cdp_aim_node"
-        | "synapse_a11y.cdp_touch_tap" => target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::CdpProtocol,
-            Some(true),
-            BrowserDefaultActionSemantics::UserAgentInput,
-            required_result_string(result, "readback_backend", "raw_cdp_input")?,
-            "raw_cdp_websocket",
-            required_result_string(result, "method", "raw_cdp_input")?,
-            false,
-            false,
-        ),
-        "synapse_a11y.cdp_dom_primitive_node" => {
-            target_act_cdp_dom_primitive_provenance(verb, result, context)
-        }
-        "synapse_a11y.cdp_evaluate_on_element" => {
-            target_act_selection_script_provenance(result, context)
-        }
-        "synapse_a11y.append_element_text"
-        | "synapse_a11y.replace_element_text_selection"
-        | "synapse_a11y.set_element_text_selection" => {
-            target_act_native_method_provenance(result, context)
-        }
-        "act_click" | "act_type" | "act_press" | "act_scroll" | "act_set_field_text" => {
-            target_act_delegated_lane_provenance(delegated_tool, result, context)
-        }
-        other => Err(input_provenance_error(
-            "target_act_success_unclassified",
-            format!("successful input verb={verb:?} used unclassified delegated_tool={other:?}"),
-            Some(context.target()),
-        )),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn target_act_one_provenance(
-    context: &InputProvenanceContext,
-    delivery_origin: InputDeliveryOrigin,
-    expected_dom_event_is_trusted: Option<bool>,
-    browser_default_actions: BrowserDefaultActionSemantics,
-    backend: &str,
-    transport: &str,
-    protocol_method: &str,
-    required_foreground: bool,
-    per_emission_fence_verified: bool,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    context
-        .finish(InputProvenanceSpec {
-            delivery_origin,
-            expected_dom_event_is_trusted,
-            browser_default_actions,
-            backend,
-            transport,
-            protocol_method: Some(protocol_method),
-            required_foreground,
-            per_emission_fence_verified,
-        })
-        .map(|provenance| vec![provenance])
-}
-
-fn target_act_dom_action_provenance(
-    result: &Value,
-    context: &InputProvenanceContext,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    let action = required_result_string(result, "action", "bridge_dom_action")?;
-    let events = result
-        .get("events_dispatched")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            input_provenance_error(
-                "bridge_dom_action",
-                "successful DOM action omitted events_dispatched[]",
-                Some(context.target()),
-            )
-        })?;
-    if events.is_empty() && action != "scroll" {
-        return Ok(Vec::new());
-    }
-    let backend = "chrome.scripting.executeScript";
-    let transport = "chrome_tabs_extension+chrome.scripting";
-    let has_focus = events.iter().any(|event| event.as_str() == Some("focus"));
-    let mut records = Vec::new();
-    if has_focus && !matches!(action, "click" | "press" | "dblclick") {
-        records.extend(target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlElementMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-            backend,
-            transport,
-            "HTMLElement.focus",
-            false,
-            false,
-        )?);
-    }
-    match action {
-        "click" | "press" | "dblclick" => {
-            let readback = result.get("action_readback").ok_or_else(|| {
-                input_provenance_error(
-                    "bridge_dom_action_click",
-                    "successful click omitted action_readback",
-                    Some(context.target()),
-                )
-            })?;
-            if result_bool(readback, "synthetic_press_sequence") == Some(true) {
-                records.extend(target_act_one_provenance(
-                    context,
-                    InputDeliveryOrigin::DomDispatch,
-                    Some(false),
-                    BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
-                    backend,
-                    transport,
-                    "dispatchEvent(PointerEvent/MouseEvent press sequence)",
-                    false,
-                    false,
-                )?);
-            }
-            if result_bool(readback, "native_click_method") == Some(true) {
-                records.extend(target_act_one_provenance(
-                    context,
-                    InputDeliveryOrigin::HtmlActivationMethod,
-                    Some(false),
-                    BrowserDefaultActionSemantics::SyntheticClickMayRunActivationBehavior,
-                    backend,
-                    transport,
-                    "HTMLElement.click",
-                    false,
-                    false,
-                )?);
-            } else {
-                records.extend(target_act_one_provenance(
-                    context,
-                    InputDeliveryOrigin::DomDispatch,
-                    Some(false),
-                    BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
-                    backend,
-                    transport,
-                    "dispatchEvent(PointerEvent/MouseEvent sequence)",
-                    false,
-                    false,
-                )?);
-            }
-        }
-        "check" | "uncheck" => records.extend(target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlActivationMethod,
-            Some(false),
-            BrowserDefaultActionSemantics::SyntheticClickMayRunActivationBehavior,
-            backend,
-            transport,
-            "HTMLElement.click",
-            false,
-            false,
-        )?),
-        "submit" => records.extend(target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlActivationMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlActivationBehavior,
-            backend,
-            transport,
-            "HTMLFormElement.requestSubmit",
-            false,
-            false,
-        )?),
-        "focus" | "blur" => records.extend(target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlElementMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-            backend,
-            transport,
-            if action == "focus" {
-                "HTMLElement.focus"
-            } else {
-                "HTMLElement.blur"
-            },
-            false,
-            false,
-        )?),
-        "select" | "dispatch_event" | "clear" | "select_text" => {
-            records.extend(target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::DomDispatch,
-                Some(false),
-                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-                backend,
-                transport,
-                "DOM mutation+dispatchEvent",
-                false,
-                false,
-            )?);
-        }
-        "scroll" => records.extend(target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlElementMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-            backend,
-            transport,
-            "Element.scrollBy",
-            false,
-            false,
-        )?),
-        other => {
-            return Err(input_provenance_error(
-                "bridge_dom_action",
-                format!("unclassified successful DOM action {other:?}"),
-                Some(context.target()),
-            ));
-        }
-    }
-    Ok(records)
-}
-
-fn target_act_cdp_dom_primitive_provenance(
-    verb: &str,
-    result: &Value,
-    context: &InputProvenanceContext,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    let _ = result;
-    let method = "Runtime.callFunctionOn";
-    match verb {
-        "focus" | "blur" => target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::HtmlElementMethod,
-            Some(true),
-            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-            "raw_cdp_runtime",
-            "raw_cdp_websocket",
-            method,
-            false,
-            false,
-        ),
-        "clear" | "select_text" | "selecttext" => target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::DomDispatch,
-            Some(false),
-            BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-            "raw_cdp_runtime",
-            "raw_cdp_websocket",
-            method,
-            false,
-            false,
-        ),
-        other => Err(input_provenance_error(
-            "raw_cdp_dom_primitive",
-            format!("unclassified successful primitive verb={other:?}"),
-            Some(context.target()),
-        )),
-    }
-}
-
-fn target_act_selection_script_provenance(
-    result: &Value,
-    context: &InputProvenanceContext,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    let method = required_result_string(result, "method", "raw_cdp_selection_script")?;
-    let mut records = target_act_one_provenance(
-        context,
-        InputDeliveryOrigin::HtmlElementMethod,
-        Some(true),
-        BrowserDefaultActionSemantics::HtmlElementMethodEffects,
-        "raw_cdp_runtime",
-        "raw_cdp_websocket",
-        "HTMLElement.focus",
-        false,
-        false,
-    )?;
-    records.extend(target_act_one_provenance(
-        context,
-        InputDeliveryOrigin::DomDispatch,
-        Some(false),
-        BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-        "raw_cdp_runtime",
-        "raw_cdp_websocket",
-        method,
-        false,
-        false,
-    )?);
-    Ok(records)
-}
-
-fn target_act_native_method_provenance(
-    result: &Value,
-    context: &InputProvenanceContext,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    let method = required_result_string(result, "method", "native_input_method")?;
-    let (origin, defaults, transport) = if method.to_ascii_lowercase().contains("uia")
-        || method.to_ascii_lowercase().contains("value_pattern")
-        || method.to_ascii_lowercase().contains("text_pattern")
-    {
-        (
-            InputDeliveryOrigin::UiaPattern,
-            BrowserDefaultActionSemantics::UiaProviderDefined,
-            "windows_uia_com",
-        )
-    } else if method.to_ascii_lowercase().contains("wm_")
-        || method.to_ascii_lowercase().contains("message")
-        || method.to_ascii_lowercase().starts_with("native_edit_")
-    {
-        (
-            InputDeliveryOrigin::Win32PostMessage,
-            BrowserDefaultActionSemantics::Win32MessageProcessing,
-            "win32_window_message",
-        )
-    } else {
-        return Err(input_provenance_error(
-            "native_input_method",
-            format!("unclassified successful native method={method:?}"),
-            Some(context.target()),
-        ));
-    };
-    target_act_one_provenance(
-        context, origin, None, defaults, method, transport, method, false, false,
-    )
-}
-
-fn target_act_delegated_lane_provenance(
-    delegated_tool: &str,
-    result: &Value,
-    context: &InputProvenanceContext,
-) -> Result<Vec<InputProvenance>, ErrorData> {
-    let tier = required_result_string(result, "backend_tier_used", "delegated_input_lane")?;
-    let required_foreground =
-        required_result_bool(result, "required_foreground", "delegated_input_lane")?;
-    match tier {
-        "cdp" => {
-            if !context.raw_cdp_endpoint_present() {
-                return Err(input_provenance_error(
-                    "delegated_cdp_input",
-                    "successful cdp tier lacked a raw-CDP endpoint; the normal authenticated Chrome profile is debugger-free",
-                    Some(context.target()),
-                ));
-            }
-            let method = match delegated_tool {
-                "act_click" => "Input.dispatchMouseEvent",
-                "act_press" => "Input.dispatchKeyEvent",
-                "act_scroll" => "Input.dispatchMouseEvent(mouseWheel)",
-                "act_type" | "act_set_field_text" => {
-                    required_result_string(result, "method", "delegated_cdp_input")?
-                }
-                other => {
-                    return Err(input_provenance_error(
-                        "delegated_cdp_input",
-                        format!("unclassified CDP delegated tool {other:?}"),
-                        Some(context.target()),
-                    ));
-                }
-            };
-            target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::CdpProtocol,
-                Some(true),
-                BrowserDefaultActionSemantics::UserAgentInput,
-                "raw_cdp",
-                "raw_cdp_websocket",
-                method,
-                false,
-                false,
-            )
-        }
-        "chrome_bridge_active_element" => {
-            let method = required_result_string(result, "method", "bridge_active_element_input")?;
-            target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::DomDispatch,
-                Some(false),
-                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-                required_result_string(result, "backend_used", "bridge_active_element_input")?,
-                "chrome_tabs_extension+chrome.scripting",
-                method,
-                false,
-                false,
-            )
-        }
-        "uia" | "uia_invoke_hidden_desktop_worker" => {
-            let method = required_any_result_string(
-                result,
-                &["method", "backend_used"],
-                "delegated_uia_input",
-            )?;
-            target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::UiaPattern,
-                None,
-                BrowserDefaultActionSemantics::UiaProviderDefined,
-                method,
-                "windows_uia_com",
-                method,
-                false,
-                false,
-            )
-        }
-        "postmessage" | "postmessage_hidden_desktop_worker" | "win32_message" | "wm_settext" => {
-            let method = required_any_result_string(
-                result,
-                &["method", "backend_used"],
-                "delegated_win32_message_input",
-            )?;
-            target_act_one_provenance(
-                context,
-                InputDeliveryOrigin::Win32PostMessage,
-                None,
-                BrowserDefaultActionSemantics::Win32MessageProcessing,
-                method,
-                "win32_window_message",
-                method,
-                false,
-                false,
-            )
-        }
-        "foreground" | "foreground_keys" => {
-            if !required_foreground {
-                return Err(input_provenance_error(
-                    "delegated_input_lane",
-                    format!("foreground tier {tier:?} contradicted required_foreground=false"),
-                    Some(context.target()),
-                ));
-            }
-            let backend = required_any_result_string(
-                result,
-                &["backend_used", "method"],
-                "delegated_foreground_input",
-            )?;
-            let (origin, transport, protocol_method) = if backend == "hardware" {
-                (
-                    InputDeliveryOrigin::VirtualHid,
-                    "synapse_action+virtual_hid",
-                    "virtual HID report",
-                )
-            } else {
-                (
-                    InputDeliveryOrigin::OsSendInput,
-                    "synapse_action+win32_sendinput",
-                    "SendInput",
-                )
-            };
-            let expected_trust =
-                (context.target().kind == InputTargetKind::BrowserTab).then_some(true);
-            target_act_one_provenance(
-                context,
-                origin,
-                expected_trust,
-                BrowserDefaultActionSemantics::OsInputPipeline,
-                backend,
-                transport,
-                protocol_method,
-                true,
-                true,
-            )
-        }
-        "none" if delegated_tool == "act_scroll" => Ok(Vec::new()),
-        other => Err(input_provenance_error(
-            "delegated_input_lane",
-            format!(
-                "successful {delegated_tool} returned unclassified backend_tier_used={other:?}"
-            ),
-            Some(context.target()),
-        )),
-    }
 }
 
 fn target_act_unknown_verb_error(verb: &str) -> ErrorData {
@@ -9518,50 +8087,6 @@ fn target_act_optional_session_target_window_hwnd(
     };
     let target = service.session_target(Some(&session_id))?;
     Ok(target_act_target_window_hwnd(target.as_ref()))
-}
-
-fn arm_act_foreground_session_target(
-    service: &SynapseService,
-    session_id: &str,
-) -> Result<(), ErrorData> {
-    let target = service.session_target(Some(session_id))?.ok_or_else(|| {
-        ErrorData::new(
-            ErrorCode(-32099),
-            "act operation=foreground requires an exact agent-owned session target; refusing implicit use of the human OS foreground",
-            Some(json!({
-                "code": error_codes::TARGET_NOT_SET,
-                "detail_code": "ACT_FOREGROUND_SESSION_TARGET_REQUIRED",
-                "refused_before_delivery": true,
-                "tool": "act",
-                "operation": "foreground",
-                "session_id": session_id,
-                "source_of_truth": "CF_SESSIONS session target row + in-process session target registry",
-                "remediation": "set or spawn an agent-owned window/CDP target for this MCP session, then retry; never use the human OS foreground as an implicit fallback",
-            })),
-        )
-    })?;
-    let target_hwnd = target_act_target_window_hwnd(Some(&target)).ok_or_else(|| {
-        mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            "act operation=foreground session target has no physical root window HWND",
-        )
-    })?;
-    let armed = crate::m2::foreground_fence::arm_expected_target(
-        target_hwnd,
-        "act_foreground_session_target",
-    )?;
-    tracing::info!(
-        code = "ACT_FOREGROUND_EXACT_TARGET_BOUND",
-        session_id,
-        requested_target_hwnd = target_hwnd,
-        target_root_hwnd = armed.hwnd,
-        target_pid = armed.pid,
-        target_process = %armed.process_name,
-        target_title = %armed.window_title,
-        source_of_truth = "live session target + IsWindow/GetAncestor/window identity readback",
-        "foreground facade bound to an exact agent-owned target without activation"
-    );
-    Ok(())
 }
 
 const fn target_act_target_window_hwnd(target: Option<&SessionTarget>) -> Option<i64> {
@@ -9754,10 +8279,7 @@ fn target_act_secret_safe_sanitize_value(
             let mut out = Map::new();
             for (key, child) in fields {
                 let child_path = format!("{path}.{}", target_act_secret_safe_path_segment(key));
-                if target_act_secret_safe_redact_key(key)
-                    && !target_act_secret_safe_already_redacted(child)
-                    && !child.is_null()
-                {
+                if target_act_secret_safe_redact_key(key) {
                     redactions.push(child_path);
                     out.insert(key.clone(), target_act_secret_safe_redacted_scalar(child)?);
                 } else {
@@ -9767,7 +8289,6 @@ fn target_act_secret_safe_sanitize_value(
                     );
                 }
             }
-            target_act_secret_safe_annotate_changed(&mut out);
             Ok(Value::Object(out))
         }
         Value::Array(items) => items
@@ -9786,64 +8307,8 @@ fn target_act_secret_safe_sanitize_value(
     }
 }
 
-/// #1827: the Chrome bridge already emits secret-safe structures for suppressed
-/// page text — `{redacted: true, text: null, text_len, text_sha256, ...}`.
-/// Blob-hashing those a second time destroys the very fields that let a caller
-/// verify an action's effect (and the outer hash is then a hash of a hash).
-/// Recurse into them instead; the payload already contains no content.
-fn target_act_secret_safe_already_redacted(value: &Value) -> bool {
-    value
-        .as_object()
-        .and_then(|object| object.get("redacted"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// #1827: structural readback fields are never content and must always survive
-/// `secret_safe`. Without this, `in_page_ready_state` ("complete"),
-/// `matched_count`, `resolved_by`, geometry, and the actionability predicates
-/// were hashed purely because their key contained `in_page` or ended in
-/// `_text`/`_value`, leaving the caller no way to verify the action's effect.
-fn target_act_secret_safe_structural_key(lower: &str) -> bool {
-    matches!(
-        lower,
-        "ready_state"
-            | "in_page_ready_state"
-            | "matched_count"
-            | "resolved_by"
-            | "visible"
-            | "enabled"
-            | "attached"
-            | "stable"
-            | "editable"
-            | "receives_events"
-            | "action_ready"
-            | "editable_action_ready"
-            | "requirement"
-            | "predicate"
-            | "predicate_detail"
-            | "dom_event_is_trusted"
-            | "physical_device_origin"
-            | "browser_default_actions"
-            | "forced_dom_dispatch"
-            | "forced_actionability_bypass"
-            | "auto_wait"
-            | "text_truncated"
-            | "max_chars"
-            | "available"
-            | "redacted"
-            | "redaction_policy"
-            | "readback_source"
-            | "original_type"
-            | "changed"
-    )
-}
-
 fn target_act_secret_safe_redact_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    if target_act_secret_safe_structural_key(&lower) {
-        return false;
-    }
     if lower.ends_with("_len")
         || lower.ends_with("_length")
         || lower.ends_with("_sha256")
@@ -9937,57 +8402,6 @@ fn target_act_secret_safe_redacted_scalar(value: &Value) -> Result<Value, ErrorD
         "sha256": target_act_secret_safe_sha256(&encoded),
         "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
     }))
-}
-
-/// #1827: give every redacted `after_*` field a redaction-safe change signal.
-///
-/// The digests are already computed; comparing the `before_*` sibling to the
-/// `after_*` sibling answers "did this action have an effect" without revealing
-/// a single character of content — the exact question that previously forced a
-/// second round-trip on every audited action.
-fn target_act_secret_safe_annotate_changed(object: &mut Map<String, Value>) {
-    const PREFIX_PAIRS: [(&str, &str); 2] =
-        [("before_", "after_"), ("in_page_before_", "in_page_after_")];
-    let mut updates: Vec<(String, bool)> = Vec::new();
-    for (key, after) in object.iter() {
-        let Some((before_prefix, suffix)) =
-            PREFIX_PAIRS.iter().find_map(|(before, after_prefix)| {
-                key.strip_prefix(after_prefix)
-                    .map(|suffix| (*before, suffix.to_owned()))
-            })
-        else {
-            continue;
-        };
-        let before_key = format!("{before_prefix}{suffix}");
-        let Some(before) = object.get(&before_key) else {
-            continue;
-        };
-        // Only meaningful when the comparison is actually decidable: two
-        // self-describing digests, or two blob-redacted scalars. A missing or
-        // errored digest must not be reported as "unchanged".
-        let comparable = target_act_secret_safe_comparable_digest(before);
-        let after_digest = target_act_secret_safe_comparable_digest(after);
-        if let (Some(before_digest), Some(after_digest)) = (comparable, after_digest) {
-            updates.push((key.clone(), before_digest != after_digest));
-        }
-    }
-    for (key, changed) in updates {
-        if let Some(Value::Object(entry)) = object.get_mut(&key) {
-            entry.insert("changed".to_owned(), Value::Bool(changed));
-        }
-    }
-}
-
-/// The digest that identifies a redacted field's content, when one exists.
-/// `text_sha256` is the in-page digest of real page text (#1827); `sha256` is
-/// the host-side blob digest of a redacted scalar. Anything else (including a
-/// digest the page could not compute) is not comparable.
-fn target_act_secret_safe_comparable_digest(value: &Value) -> Option<&str> {
-    let object = value.as_object()?;
-    object
-        .get("text_sha256")
-        .and_then(Value::as_str)
-        .or_else(|| object.get("sha256").and_then(Value::as_str))
 }
 
 fn target_act_secret_safe_sha256(bytes: &[u8]) -> String {
@@ -10204,134 +8618,12 @@ async fn target_act_key_press(
     }
     let verb = params.verb.as_str();
     let keys = target_act_key_chord_keys(params, verb)?;
-    // #1824: a background tab reached through the debugger-free Chrome bridge
-    // has no CDP endpoint, so act_press had no route at all and failed with
-    // A11Y_CDP_UNREACHABLE - while `click` on the identical target dispatched
-    // fine. An agent could therefore open a modal it had no way to leave.
-    // Route keyboard input through the same bridge, reporting the input-trust
-    // report its synthetic DOM semantics explicitly.
-    #[cfg(windows)]
-    if let Some(result) =
-        target_act_bridge_key_dispatch(service, params, request_context, &keys, verb).await?
-    {
-        return Ok(result);
-    }
     let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb)?;
     ensure_target_act_operator_panic_boundary("key_before_input_delivery")?;
     let response = service
         .act_press(Parameters(press_params), request_context.clone())
         .await;
     target_act_delegate_response("act_press", response)
-}
-
-/// Deliver `verb=key`/`verb=press` key input to a bridge-only background browser
-/// tab (#1824).
-///
-/// Returns `Ok(None)` when this is not a bridge-only CDP target - a raw-CDP
-/// endpoint or a native window target keeps the existing CDP/OS `act_press`
-/// path. Only the case that previously had no
-/// route at all is served here.
-#[cfg(windows)]
-async fn target_act_bridge_key_dispatch(
-    service: &SynapseService,
-    params: &TargetActParams,
-    request_context: &RequestContext<RoleServer>,
-    keys: &[String],
-    verb: &str,
-) -> Result<Option<(&'static str, bool, &'static str, Value)>, ErrorData> {
-    let session_id = target_act_session_id(request_context, verb)?;
-    let Some(SessionTarget::Cdp {
-        window_hwnd,
-        cdp_target_id,
-    }) = service.session_target(Some(&session_id))?
-    else {
-        return Ok(None);
-    };
-    if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
-        // A raw-CDP endpoint exists: Input.dispatchKeyEvent creates
-        // `isTrusted=true` DOM events while remaining software-originated.
-        return Ok(None);
-    }
-    let target = SessionTarget::Cdp {
-        window_hwnd,
-        cdp_target_id: cdp_target_id.clone(),
-    };
-    let request_details = json!({
-        "session_id": &session_id,
-        "verb": verb,
-        "lane": "chrome_debugger_bridge.keyDispatch",
-        "window_hwnd": window_hwnd,
-        "cdp_target_id": &cdp_target_id,
-        "keys": keys,
-        "dom_event_is_trusted": false,
-        "physical_device_origin": false,
-        "browser_default_actions": "synthetic_dispatch_no_user_agent_input_defaults",
-        "required_foreground": false,
-        "secret_safe": params.secret_safe,
-    });
-    if let Err(error) =
-        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
-    {
-        service.audit_action_denied_with_details_for_session(
-            "target_act",
-            &error,
-            &request_details,
-            &session_id,
-        );
-        return Ok(Some((
-            "chrome_debugger_bridge.keyDispatch",
-            false,
-            target_act_error_status(&error),
-            target_act_error_result("target_act", error),
-        )));
-    }
-    service.audit_action_started_with_details_for_session(
-        "target_act",
-        &request_details,
-        &session_id,
-    )?;
-    ensure_target_act_operator_panic_boundary("bridge_key_dispatch_before_delivery")?;
-    let result = crate::chrome_debugger_bridge::key_dispatch(
-        window_hwnd,
-        &cdp_target_id,
-        keys,
-        target_act_dom_wait_timeout(params.wait_timeout_ms)?,
-        params.secret_safe,
-    )
-    .await
-    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
-    target_act_audit_result_for_session(
-        service,
-        "chrome_debugger_bridge.keyDispatch",
-        &result,
-        &session_id,
-        params.secret_safe,
-    )?;
-    Ok(Some(match result {
-        Ok(value) => {
-            let value = target_act_maybe_secret_safe_result(
-                "chrome_debugger_bridge.keyDispatch",
-                value,
-                params.secret_safe,
-            )?;
-            (
-                "chrome_debugger_bridge.keyDispatch",
-                true,
-                TARGET_ACT_STATUS_OK,
-                value,
-            )
-        }
-        Err(error) => (
-            "chrome_debugger_bridge.keyDispatch",
-            false,
-            target_act_error_status(&error),
-            target_act_maybe_secret_safe_error_result(
-                "chrome_debugger_bridge.keyDispatch",
-                error,
-                params.secret_safe,
-            ),
-        ),
-    }))
 }
 
 async fn target_act_insert_or_append_text(
@@ -11620,20 +9912,6 @@ fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
 }
 
 fn target_act_error_status(error: &ErrorData) -> &'static str {
-    // A pre-dispatch foreground-fence refusal delivered nothing, so it is a
-    // refusal, not a verify-needed outcome. Post-action readbacks raise the
-    // same code after input *was* delivered and must keep verify_needed
-    // (#1830).
-    if target_act_error_code(error) == Some(error_codes::ACTION_FOREGROUND_LOST)
-        && error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("refused_before_delivery"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        return TARGET_ACT_STATUS_REFUSED;
-    }
     match target_act_error_code(error) {
         Some(
             error_codes::ACTION_NO_OBSERVED_DELTA
@@ -11675,3 +9953,6 @@ fn target_act_error_code(error: &ErrorData) -> Option<&str> {
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
 }
+
+#[cfg(test)]
+mod tests;

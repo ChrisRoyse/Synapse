@@ -1,0 +1,22 @@
+{
+  "cf_name": "CF_PROFILES",
+  "key": "profile_registry/v1/quality_link/synthetic.governance/1.0.0",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "quality_link",
+    "row_id": "synthetic.governance@1.0.0",
+    "created_at": "2026-05-27T02:05:00Z",
+    "updated_at": "2026-05-27T02:05:00Z",
+    "source_id": "registry.synthetic.local-fixture",
+    "state": "active",
+    "profile_id": "synthetic.governance",
+    "profile_version": "1.0.0",
+    "profile_quality_key": "profile_quality/v1/synthetic.governance",
+    "source_cf_ranges": [
+      "CF_ACTION_LOG:synthetic-range-0001..0004"
+    ],
+    "quality_score": 0.92,
+    "sample_count": 50,
+    "evidence_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  }
+}

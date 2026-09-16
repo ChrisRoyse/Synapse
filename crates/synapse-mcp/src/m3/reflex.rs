@@ -5,13 +5,15 @@ mod history;
 mod list;
 mod register;
 
+#[cfg(test)]
+mod tests;
+
 pub use cancel::{
     ReflexCancelParams, ReflexCancelResponse, cancel_reflex, required_permissions_cancel,
 };
 pub(crate) use file_jsonl_tail::{
-    FileJsonlTailWatcher, cancel_file_jsonl_tail_watcher, file_jsonl_tail_watcher_installed,
-    install_recovered_file_jsonl_tail_watcher, prepare_file_jsonl_tail_watcher,
-    prepare_file_jsonl_tail_watcher_cancellation,
+    FileJsonlTailWatcher, FileJsonlTailWatcherRequest, cancel_file_jsonl_tail_watcher,
+    install_file_jsonl_tail_watcher,
 };
 pub use history::{
     ReflexHistoryParams, ReflexHistoryResponse, history_reflexes, required_permissions_history,

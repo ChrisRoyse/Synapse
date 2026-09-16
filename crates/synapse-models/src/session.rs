@@ -336,28 +336,6 @@ pub struct ModelLoader {
     providers: Vec<ModelBackend>,
 }
 
-/// A descriptor whose exact file bytes have already been compared with its
-/// pinned SHA-256 in this process and have not been exposed for mutation.
-///
-/// This is intentionally constructed only inside `synapse-models`.  It lets a
-/// materialization boundary pass its cryptographic proof into session creation
-/// instead of immediately hashing the same large file a second time.
-#[derive(Debug)]
-pub struct VerifiedModelDescriptor {
-    descriptor: ModelDescriptor,
-}
-
-impl VerifiedModelDescriptor {
-    pub(crate) const fn new(descriptor: ModelDescriptor) -> Self {
-        Self { descriptor }
-    }
-
-    #[must_use]
-    pub fn into_descriptor(self) -> ModelDescriptor {
-        self.descriptor
-    }
-}
-
 impl Default for ModelLoader {
     fn default() -> Self {
         Self {
@@ -401,24 +379,6 @@ impl ModelLoader {
                 actual,
             });
         }
-
-        self.load_verified_with_factory(VerifiedModelDescriptor::new(descriptor), factory)
-    }
-
-    /// Creates a persistent runtime session from a descriptor whose exact file
-    /// bytes were already SHA-256 verified by the immediately preceding model
-    /// materialization boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns the session factory's structured error when runtime creation
-    /// fails. Callers cannot construct the proof wrapper outside this crate.
-    pub fn load_verified_with_factory(
-        &self,
-        verified: VerifiedModelDescriptor,
-        factory: &dyn SessionFactory,
-    ) -> ModelResult<LoadedModel> {
-        let descriptor = verified.into_descriptor();
 
         let build = factory.create_session(&descriptor, &self.providers)?;
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -476,16 +436,6 @@ impl ModelLoader {
     pub fn load(&self, descriptor: ModelDescriptor) -> ModelResult<LoadedModel> {
         self.load_with_factory(descriptor, &OrtSessionFactory)
     }
-
-    /// Uses the built-in ORT session factory without re-hashing a descriptor
-    /// already verified by `RegisteredModel::materialize_embedded_verified`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same runtime/provider errors as [`Self::load`].
-    pub fn load_verified(&self, descriptor: VerifiedModelDescriptor) -> ModelResult<LoadedModel> {
-        self.load_verified_with_factory(descriptor, &OrtSessionFactory)
-    }
 }
 
 pub struct OrtSessionFactory;
@@ -499,10 +449,6 @@ impl SessionFactory for OrtSessionFactory {
     ) -> ModelResult<SessionBuildResult> {
         Err(ModelError::BackendUnavailable {
             attempted: providers.to_vec(),
-            failures: vec![(
-                ModelBackend::Cpu,
-                "this build does not include the ONNX Runtime feature".to_owned(),
-            )],
         })
     }
 }
@@ -517,7 +463,6 @@ impl SessionFactory for OrtSessionFactory {
         if providers.is_empty() {
             return Err(ModelError::BackendUnavailable {
                 attempted: Vec::new(),
-                failures: Vec::new(),
             });
         }
 
@@ -545,7 +490,6 @@ impl SessionFactory for OrtSessionFactory {
         tracing::warn!(failures = ?backend_failures, "all model backends failed");
         Err(ModelError::BackendUnavailable {
             attempted: providers.to_vec(),
-            failures: backend_failures,
         })
     }
 }

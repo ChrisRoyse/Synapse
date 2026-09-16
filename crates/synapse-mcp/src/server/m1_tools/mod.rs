@@ -22,31 +22,28 @@ use super::{
     BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
     CaptureGifParams, CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
     CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
-    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse,
-    CdpCloseAcknowledgementFailure, CdpCloseTabParams, CdpCloseTabResponse,
-    CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse,
-    CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
-    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
-    FindParams, FindResponse, Health, HealthParams, HiddenDesktopPipFrameParams,
-    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
-    ReadTextParams, ScreenshotOperation, ScreenshotParams, ScreenshotResponse, SessionTarget,
-    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
-    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
-    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
-    mcp_error, observe_include, populate_audio_summary, populate_clipboard_summary,
-    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
-    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
-    set_target_input_schema, tool, tool_router,
+    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
+    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
+    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
+    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
+    ElementInspection, ErrorData, FindParams, FindResponse, Health, HealthParams,
+    HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json,
+    ObserveParams, Parameters, ReadTextParams, ScreenshotOperation, ScreenshotParams,
+    ScreenshotResponse, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
+    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
+    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
+    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
+    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
+    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
+    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
+    tool_router,
 };
 use crate::m1::{
-    BrowserScreenshotForegroundIdentityReadback, BrowserScreenshotForegroundTransactionReadback,
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
-    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, M1ObservationSnapshot,
-    build_find_input_from_snapshot, effective_ocr_backend, global_only_input_from_snapshot,
-    hidden_desktop_input_from_worker_snapshot, observe_input_from_snapshot,
+    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
+    hidden_desktop_input_from_worker_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
-use crate::m3::audio::{AudioTranscribeParams, transcribe_audio};
 use crate::server::session_continuity::PersistedCdpTargetOwner;
 use crate::server::target_claims::{
     DEFAULT_TARGET_CLAIM_TTL_MS, TargetClaimAdoptParams, TargetClaimAdoptResponse,
@@ -57,19 +54,20 @@ use crate::server::url_redaction::{
     redact_title_for_public_url_readback, redact_url_for_public_readback,
     redact_url_opt_for_public_readback,
 };
+use base64::Engine as _;
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 
 use std::{
     collections::HashMap,
-    io::{self, Read as _, Write as _},
+    io::Read as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(windows)]
 use chrono::{DateTime, Utc};
@@ -83,8 +81,8 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
 use synapse_core::{
     ForegroundContext, HudFieldError, HudReadings, InputBackendCapability, InputBackendDiagnostics,
-    OcrResult, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, SuspectedInjectionAnnotation, error_codes,
-    types::TimelineActor,
+    OcrResult, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Profile, Rect, SuspectedInjectionAnnotation,
+    error_codes, types::TimelineActor,
 };
 use synapse_perception::ObservationAssembler;
 #[cfg(windows)]
@@ -111,10 +109,7 @@ const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
     "target-scoped browser wait predicate readback from DOM/URL/load/network/function state";
 const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
-const PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS: u64 = 10_000;
-const PERCEPTION_CDP_ENRICH_TIMEOUT_MS: u64 = 10_000;
-const PERCEPTION_BROWSER_OCR_TIMEOUT_MS: u64 = 10_000;
-const PERCEPTION_DETECTION_TIMEOUT_MS: u64 = 130_000;
+const BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS: u64 = 3_000;
 
 type OperatorPanicCdpTargetOwnerRows = (
     Vec<(String, CdpTargetOwner)>,
@@ -145,122 +140,6 @@ fn operator_panic_rollback_failed(
             "source_of_truth": "exact browser target identity plus backend cleanup readback",
         })),
     )
-}
-
-fn perception_stage_timeout_error(
-    code: &'static str,
-    tool: &'static str,
-    phase: &'static str,
-    timeout_ms: u64,
-) -> ErrorData {
-    tracing::error!(
-        code = "MCP_PERCEPTION_STAGE_TIMEOUT",
-        tool,
-        phase,
-        timeout_ms,
-        "bounded perception stage timed out"
-    );
-    mcp_error(
-        code,
-        format!(
-            "{tool} {phase} timed out after {timeout_ms} ms; source_of_truth=daemon-tool-events.jsonl plus MCP_HTTP_HEALTH_DONE logs; remediation=inspect the timed stage, foreground app, and in-flight daemon tool ledger before retrying"
-        ),
-    )
-}
-
-fn perception_join_error(
-    tool: &'static str,
-    phase: &'static str,
-    error: tokio::task::JoinError,
-) -> ErrorData {
-    tracing::error!(
-        code = "MCP_PERCEPTION_STAGE_JOIN_ERROR",
-        tool,
-        phase,
-        error = %error,
-        "bounded perception stage task failed"
-    );
-    mcp_error(
-        error_codes::OBSERVE_INTERNAL,
-        format!("{tool} {phase} task failed before producing readback: {error}"),
-    )
-}
-
-async fn await_blocking_observation_gather(
-    tool: &'static str,
-    phase: &'static str,
-    task: tokio::task::JoinHandle<Result<synapse_perception::ObservationInput, ErrorData>>,
-) -> Result<Result<synapse_perception::ObservationInput, ErrorData>, ErrorData> {
-    let timeout = std::time::Duration::from_millis(PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS);
-    match tokio::time::timeout(timeout, task).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => Err(perception_join_error(tool, phase, error)),
-        Err(_elapsed) => Err(perception_stage_timeout_error(
-            error_codes::A11Y_UIA_WORKER_TIMEOUT,
-            tool,
-            phase,
-            PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS,
-        )),
-    }
-}
-
-async fn enrich_input_with_cdp_for_target_bounded(
-    input: &mut synapse_perception::ObservationInput,
-    max_depth: u32,
-    max_nodes: usize,
-    target_id_hint: Option<&str>,
-    tool: &'static str,
-) -> Result<(), ErrorData> {
-    let mut candidate = input.clone();
-    let timeout = std::time::Duration::from_millis(PERCEPTION_CDP_ENRICH_TIMEOUT_MS);
-    match tokio::time::timeout(
-        timeout,
-        super::enrich_input_with_cdp_for_target(
-            &mut candidate,
-            max_depth,
-            max_nodes,
-            target_id_hint,
-        ),
-    )
-    .await
-    {
-        Ok(()) => {
-            *input = candidate;
-            Ok(())
-        }
-        Err(_elapsed) => Err(perception_stage_timeout_error(
-            error_codes::A11Y_CDP_EXTENSION_TIMEOUT,
-            tool,
-            "cdp_enrich",
-            PERCEPTION_CDP_ENRICH_TIMEOUT_MS,
-        )),
-    }
-}
-
-async fn enrich_input_with_browser_ocr_bounded(
-    input: &mut synapse_perception::ObservationInput,
-    max_nodes: usize,
-    tool: &'static str,
-) -> Result<(), ErrorData> {
-    let mut candidate = input.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        super::enrich_input_with_browser_ocr(&mut candidate, max_nodes);
-        candidate
-    });
-    let timeout = std::time::Duration::from_millis(PERCEPTION_BROWSER_OCR_TIMEOUT_MS);
-    match tokio::time::timeout(timeout, task).await {
-        Ok(Ok(candidate)) => {
-            *input = candidate;
-            Ok(())
-        }
-        Ok(Err(error)) => Err(perception_join_error(tool, "browser_ocr_enrich", error)),
-        Err(_elapsed) => Err(perception_stage_timeout_error(
-            error_codes::A11Y_UIA_WORKER_TIMEOUT,
-            tool,
-            "browser_ocr_enrich",
-            PERCEPTION_BROWSER_OCR_TIMEOUT_MS,
-        )),
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +345,26 @@ impl SynapseService {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn observe_without_request_context_for_test(
+        &self,
+        params: Parameters<ObserveParams>,
+    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
+        let include = observe_include(&params.0);
+        self.observe_with_target(params, include, None, None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_for_mcp_session_id_for_test(
+        &self,
+        params: Parameters<ObserveParams>,
+        mcp_session_id: &str,
+    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
+        let include = observe_include(&params.0);
+        self.observe_with_target(params, include, None, Some(mcp_session_id))
+            .await
+    }
+
     async fn observe_with_target(
         &self,
         params: Parameters<ObserveParams>,
@@ -497,44 +396,37 @@ impl SynapseService {
             target_cdp_id(&target)
         };
         let mut fs_timeline_events = Vec::new();
-        let observation_snapshot = {
+        // Scope the (non-Send) state guard so it is released before any await.
+        let mut input = {
             let state = self.m1_state()?;
-            M1ObservationSnapshot::from_state(&state)
-        };
-        let mut input = if needs_window {
-            let snapshot = observation_snapshot.clone();
-            let params_for_gather = params.0.clone();
-            let gather = tokio::task::spawn_blocking(move || {
-                observe_input_from_snapshot(&snapshot, &params_for_gather, target_hwnd)
-            });
-            let gather =
-                await_blocking_observation_gather("observe", "snapshot_gather", gather).await?;
-            match gather {
-                Ok(input) => input,
-                Err(error) if params.0.subtree_root.is_none() => {
-                    let Some(hwnd) = target_hwnd else {
-                        return Err(error);
-                    };
-                    let Some(session_id) = mcp_session_id else {
-                        return Err(error);
-                    };
-                    self.hidden_desktop_observe_input(
-                        session_id,
-                        hwnd,
-                        crate::m1::observe_gather_depth(&params.0),
-                        observation_snapshot.perception_mode,
-                        error,
-                    )?
+            let mut input = if needs_window {
+                match observe_input(&state, &params.0, target_hwnd) {
+                    Ok(input) => input,
+                    Err(error) if params.0.subtree_root.is_none() => {
+                        let Some(hwnd) = target_hwnd else {
+                            return Err(error);
+                        };
+                        let Some(session_id) = mcp_session_id else {
+                            return Err(error);
+                        };
+                        self.hidden_desktop_observe_input(
+                            session_id,
+                            hwnd,
+                            crate::m1::observe_gather_depth(&params.0),
+                            state.perception_mode,
+                            error,
+                        )?
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+            } else {
+                crate::m1::global_only_input(&state)
+            };
+            if include.fs && input.fs_recent.is_empty() {
+                fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
             }
-        } else {
-            global_only_input_from_snapshot(&observation_snapshot)
+            input
         };
-        if include.fs && input.fs_recent.is_empty() {
-            let state = self.m1_state()?;
-            fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
-        }
         if let Some(since) = params.0.since_event_seq {
             input.recent_events.retain(|event| event.seq > since);
         }
@@ -552,38 +444,18 @@ impl SynapseService {
             } else {
                 include.max_subtree_nodes
             };
-            enrich_input_with_cdp_for_target_bounded(
+            super::enrich_input_with_cdp_for_target(
                 &mut input,
                 include.max_subtree_depth,
                 cdp_max_nodes,
                 cdp_target_id_hint.as_deref(),
-                "observe",
             )
-            .await?;
-            enrich_input_with_browser_ocr_bounded(&mut input, include.max_subtree_nodes, "observe")
-                .await?;
+            .await;
+            super::enrich_input_with_browser_ocr(&mut input, include.max_subtree_nodes);
         }
 
         if include.audio && input.audio == synapse_core::AudioContext::default() {
             populate_audio_summary(&self.m3_state, &mut input);
-        }
-        if let Some(seconds) = params.0.transcribe_audio_seconds {
-            let transcription_params = AudioTranscribeParams {
-                seconds,
-                language: params.0.transcribe_audio_language.clone(),
-            };
-            self.require_m3_permissions(
-                "observe.transcribe_audio",
-                &crate::m3::audio::required_permissions_transcribe(&transcription_params),
-            )?;
-            let transcription = transcribe_audio(&self.m3_state, &transcription_params)?;
-            input.audio.transcription = Some(synapse_core::AudioTranscription {
-                text: transcription.text,
-                confidence: transcription.confidence,
-                confidence_source: transcription.confidence_source,
-                latency_ms: transcription.latency_ms,
-                model_id: transcription.model_id,
-            });
         }
         if include.diagnostics {
             self.populate_input_backend_diagnostics(&mut input);
@@ -594,70 +466,9 @@ impl SynapseService {
             None
         };
         self.resolve_input_profile_and_hud(&mut input, include.hud);
-        // Detection is an entities producer, not an observation-wide
-        // prerequisite. In particular, global-only audio/clipboard/fs requests
-        // deliberately carry no window rectangle, so dispatching detection for
-        // them is both unnecessary work and a false DETECTION_NO_FRAME failure
-        // (#2186). Do not take the runtime or spawn uncancellable blocking work
-        // unless the caller requested the entities slot.
-        if include.entities {
-            let (mut detection_runtime, detection_config, perception_mode) = {
-                let mut state = self.m1_state()?;
-                let runtime = state.detection_runtime.take().ok_or_else(|| {
-                    mcp_error(
-                        error_codes::DETECTION_MODEL_INFER_FAILED,
-                        "detection runtime is already serving another observation; source_of_truth=M1 detection_runtime ownership; remediation=wait for the named in-flight observe lifecycle event to terminate before retrying",
-                    )
-                })?;
-                (
-                    runtime,
-                    state.detection_config.clone(),
-                    state.perception_mode,
-                )
-            };
-            let shared_m1_state = std::sync::Arc::clone(&self.m1_state);
-            let detection = tokio::task::spawn_blocking(move || {
-                let detection_result = populate_detection_from_state(
-                    &mut detection_runtime,
-                    &detection_config,
-                    perception_mode,
-                    &mut input,
-                );
-                let mut state = shared_m1_state.lock().map_err(|_error| {
-                    mcp_error(
-                        error_codes::OBSERVE_INTERNAL,
-                        "M1 state lock poisoned while restoring detection runtime",
-                    )
-                })?;
-                let reconciliation = detection_runtime
-                    .reconcile_config(&state.detection_config, state.perception_mode);
-                state.detection_runtime = Some(detection_runtime);
-                reconciliation.map_err(|error| {
-                    mcp_error(
-                        error_codes::DETECTION_MODEL_INFER_FAILED,
-                        format!(
-                            "observe could not reconcile the returned persistent detector with the current profile: {error}"
-                        ),
-                    )
-                })?;
-                Ok::<_, ErrorData>((detection_result, input))
-            });
-            let (detection_result, returned_input) = tokio::time::timeout(
-                std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
-                detection,
-            )
-            .await
-            .map_err(|_elapsed| {
-                perception_stage_timeout_error(
-                    error_codes::DETECTION_MODEL_INFER_FAILED,
-                    "observe",
-                    "detection",
-                    PERCEPTION_DETECTION_TIMEOUT_MS,
-                )
-            })?
-            .map_err(|error| perception_join_error("observe", "detection", error))??;
-            detection_result?;
-            input = returned_input;
+        {
+            let mut state = self.m1_state()?;
+            populate_detection_from_state(&mut state, &mut input);
         }
         let mut observation = ObservationAssembler::new()
             .assemble(include, input)
@@ -667,18 +478,7 @@ impl SynapseService {
         let mut state = self.m1_state()?;
         state.last_observed_foreground = Some(observation.foreground.clone());
         drop(state);
-        // #2064: the audit write mints the CF_OBSERVATIONS row key, and before
-        // this the key never left the write path — so no caller could name the
-        // row its own observe had just produced, and "read the persisted row"
-        // was unperformable at every grant level. Stamping it onto the response
-        // is what makes `storage operation=row_read` addressable. The size
-        // fields are recomputed because they describe this response, not the
-        // pre-persist assembly.
-        let persisted =
-            self.persist_observation_for_mcp_session(&observation, "observe", mcp_session_id)?;
-        observation.diagnostics.persisted = Some(persisted);
-        synapse_perception::refresh_size_fields(&mut observation)
-            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        self.persist_observation_for_mcp_session(&observation, "observe", mcp_session_id)?;
         self.record_timeline_enrichments(
             &observation,
             clipboard_timeline_sample.as_ref(),
@@ -735,7 +535,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Find things. Without `similar`: perception recall over visible accessibility nodes and detected entities (needs a bound/explicit target); if matched result text contains suspected prompt injection, the response includes perceived_text_notice and suspected_injection annotations. With `similar`: fused MEMORY recall (#1676) over the persisted Calyx search generation - per-slot dense (cosine) and sparse lexical recall fused by Reciprocal Rank Fusion (k=60, 1-based ranks), returning per-lens rank contributions, agreeing/dissenting lenses, verified ledger provenance, the generation manifest with each lane's exact scoring law, and an explicit Ward guard-state readback. Three query modes: `by_example` (a record id), `by_text` (LEXICAL only - BM25 over hashed word tokens; it matches records sharing literal tokens with the query and cannot match a paraphrase, because no Synapse lens is a semantic text embedding, see #1898), and `by_exact` (`exact_slot` + `exact_value`: whole-value hash-lane recall, each candidate confirmed against its authoritative source field so bucket collisions are dropped and reported). The two modes read different sources of truth and cannot be combined in one call."
+        description = "Search visible accessibility nodes and detected entities. If matched result text contains suspected prompt injection, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
     )]
     pub async fn find(
         &self,
@@ -747,25 +547,18 @@ impl SynapseService {
             kind = "find",
             "tool.invocation kind=find"
         );
-        // Fused memory recall is answered before any perception work: it reads
-        // the persisted vault generation, not the screen, so resolving a capture
-        // target first would reject a perfectly valid memory query with
-        // CAPTURE_TARGET_INVALID.
-        if let Some(similar) = params.0.similar.clone() {
-            let perception_fields = params.0.present_perception_fields();
-            if !perception_fields.is_empty() {
-                return Err(
-                    crate::server::operational_facades::find::reject_mixed_find_request(
-                        &perception_fields,
-                    ),
-                );
-            }
-            return crate::server::operational_facades::find::run_fused_find(self, similar).await;
-        }
         let target = self.request_session_target(&request_context)?;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         self.find_with_target(params, target, session_id.as_deref())
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn find_without_request_context_for_test(
+        &self,
+        params: Parameters<FindParams>,
+    ) -> Result<Json<FindResponse>, ErrorData> {
+        self.find_with_target(params, None, None).await
     }
 
     async fn find_with_target(
@@ -781,107 +574,43 @@ impl SynapseService {
         } else {
             target_cdp_id(&target)
         };
-        let observation_snapshot = {
-            let state = self.m1_state()?;
-            M1ObservationSnapshot::from_state(&state)
-        };
-        let snapshot = observation_snapshot.clone();
-        let params_for_gather = params.0.clone();
-        let gather = tokio::task::spawn_blocking(move || {
-            build_find_input_from_snapshot(&snapshot, &params_for_gather, target_hwnd)
-        });
-        let gather = await_blocking_observation_gather("find", "snapshot_gather", gather).await?;
-        let mut input = match gather {
-            Ok(input) => input,
-            Err(error) => {
-                let Some(hwnd) = target_hwnd else {
-                    return Err(error);
-                };
-                let Some(session_id) = mcp_session_id else {
-                    return Err(error);
-                };
-                self.hidden_desktop_find_input(
-                    session_id,
-                    hwnd,
-                    observation_snapshot.perception_mode,
-                    error,
-                )?
+        let mut input = {
+            let mut state = self.m1_state()?;
+            match super::build_find_input(&mut state, &params.0, target_hwnd) {
+                Ok(input) => input,
+                Err(error) => {
+                    let Some(hwnd) = target_hwnd else {
+                        return Err(error);
+                    };
+                    let Some(session_id) = mcp_session_id else {
+                        return Err(error);
+                    };
+                    let mut input = self.hidden_desktop_find_input(
+                        session_id,
+                        hwnd,
+                        state.perception_mode,
+                        error,
+                    )?;
+                    populate_detection_from_state(&mut state, &mut input);
+                    input
+                }
             }
         };
-        enrich_input_with_cdp_for_target_bounded(
+        super::enrich_input_with_cdp_for_target(
             &mut input,
             super::find_snapshot_depth(),
             super::find_cdp_max_nodes(),
             cdp_target_id_hint.as_deref(),
-            "find",
         )
-        .await?;
-        enrich_input_with_browser_ocr_bounded(&mut input, super::find_cdp_max_nodes(), "find")
-            .await?;
-        let (mut detection_runtime, detection_config, perception_mode) = {
-            let mut state = self.m1_state()?;
-            let runtime = state.detection_runtime.take().ok_or_else(|| {
-                mcp_error(
-                    error_codes::DETECTION_MODEL_INFER_FAILED,
-                    "detection runtime is already serving another perception request",
-                )
-            })?;
-            (
-                runtime,
-                state.detection_config.clone(),
-                state.perception_mode,
-            )
-        };
-        let shared_m1_state = std::sync::Arc::clone(&self.m1_state);
-        let detection = tokio::task::spawn_blocking(move || {
-            let detection_result = populate_detection_from_state(
-                &mut detection_runtime,
-                &detection_config,
-                perception_mode,
-                &mut input,
-            );
-            let mut state = shared_m1_state.lock().map_err(|_error| {
-                mcp_error(
-                    error_codes::OBSERVE_INTERNAL,
-                    "M1 state lock poisoned while restoring detection runtime",
-                )
-            })?;
-            let reconciliation =
-                detection_runtime.reconcile_config(&state.detection_config, state.perception_mode);
-            state.detection_runtime = Some(detection_runtime);
-            reconciliation.map_err(|error| {
-                mcp_error(
-                    error_codes::DETECTION_MODEL_INFER_FAILED,
-                    format!(
-                        "find could not reconcile the returned persistent detector with the current profile: {error}"
-                    ),
-                )
-            })?;
-            Ok::<_, ErrorData>((detection_result, input))
-        });
-        let (detection_result, returned_input) = tokio::time::timeout(
-            std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
-            detection,
-        )
-        .await
-        .map_err(|_elapsed| {
-            perception_stage_timeout_error(
-                error_codes::DETECTION_MODEL_INFER_FAILED,
-                "find",
-                "detection",
-                PERCEPTION_DETECTION_TIMEOUT_MS,
-            )
-        })?
-        .map_err(|error| perception_join_error("find", "detection", error))??;
-        detection_result?;
-        input = returned_input;
+        .await;
+        super::enrich_input_with_browser_ocr(&mut input, super::find_cdp_max_nodes());
         let mut response = super::match_find_input(&input, &params.0);
         attach_find_hygiene_annotations(&mut response);
         Ok(Json(response))
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window using no-explicit-GPU-API GDI physical-desktop pixels (Windows/the display driver may still accelerate GDI internally). With window_hwnd or this MCP session's active window target, region is window-client-relative; omitting region/element_id OCRs the complete DWM frame rectangle. Normal window targets must be visible, non-minimized, non-cloaked, and fully on-screen, and visible occluders remain in the pixels. With no target it uses screen-region/focused-element OCR. PrintWindow is reserved for an explicit bounded hidden-desktop worker. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words; pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. BROWSER TAB CONSTRAINT (#1823): window capture observes only the tab a browser window is currently rendering, so per-tab OCR of a background tab is impossible by construction. When this session is bound to a CDP tab and the capture window is that tab's window, read_text proves the bound tab is the rendered one and returns its identity in captured_target; if a different tab is rendered it fails closed with OCR_TARGET_NOT_FOREGROUND naming both tabs. Use browser_dom/browser_capture for tab-exact background-tab readback, or browser_tabs operation=activate first. Suspected prompt injection remains annotated."
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words (not an OCR_NO_TEXT error); pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
     )]
     pub async fn read_text(
         &self,
@@ -914,104 +643,15 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
         let target_hwnd = perception_window_hwnd("read_text", &target, params.0.window_hwnd)?;
-        // #1823: an explicit `window_hwnd` bypasses the CDP-target guard in
-        // `perception_window_hwnd`. Window capture renders only the tab that is
-        // active in the window, so a session bound to a background tab in that
-        // same window would silently receive OCR of a completely different page.
-        // Establish the physically-captured tab first and fail closed on a
-        // mismatch rather than returning confidently-wrong perception.
-        let captured_target = self
-            .resolve_ocr_captured_target("read_text", &target, target_hwnd)
-            .await?;
-        let mut result =
-            self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())?;
-        result.0.captured_target = captured_target;
-        Ok(result)
+        self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
     }
 
-    /// Resolve — and enforce — the physical tab identity behind a browser-window
-    /// OCR capture (#1823).
-    ///
-    /// Returns `None` when the capture surface is not a browser window bound to a
-    /// CDP tab in this session (nothing to reconcile). Returns the physical
-    /// capture provenance when the bound tab *is* the tab rendered in the window.
-    /// Fails closed with `OCR_TARGET_NOT_FOREGROUND` when the session is bound to
-    /// a tab that is not the one the window is rendering — the case that
-    /// previously returned another page's text as a plain success.
-    async fn resolve_ocr_captured_target(
+    #[cfg(test)]
+    pub(crate) fn read_text_without_request_context_for_test(
         &self,
-        tool: &str,
-        target: &Option<SessionTarget>,
-        capture_hwnd: Option<i64>,
-    ) -> Result<Option<synapse_core::OcrCapturedTarget>, ErrorData> {
-        let (
-            Some(capture_hwnd),
-            Some(SessionTarget::Cdp {
-                window_hwnd,
-                cdp_target_id,
-            }),
-        ) = (capture_hwnd, target.as_ref())
-        else {
-            return Ok(None);
-        };
-        if capture_hwnd != *window_hwnd {
-            // The caller explicitly aimed at a different window than the one that
-            // owns its bound tab. That is an intentional cross-window read, not a
-            // silent tab mixup, so it is permitted — but never claimed to be the
-            // bound tab.
-            return Ok(None);
-        }
-        let listed = crate::chrome_debugger_bridge::list_tabs(capture_hwnd, None, None, None)
-            .await
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "{tool} could not read back which tab Chrome window {capture_hwnd:#x} is rendering, so it cannot prove the OCR pixels belong to the session's bound tab {cdp_target_id:?}; refusing to guess: {}",
-                        error.detail()
-                    ),
-                )
-            })?;
-        let Some(active) = listed.tabs.iter().find(|tab| tab.active) else {
-            return Err(mcp_error(
-                error_codes::OCR_TARGET_NOT_FOREGROUND,
-                format!(
-                    "{tool} refuses to OCR Chrome window {capture_hwnd:#x}: chrome.tabs.query reported no active tab (target_count={}, active_tab_count={}), so the pixels cannot be attributed to the session's bound tab {cdp_target_id:?}",
-                    listed.target_count, listed.active_tab_count
-                ),
-            ));
-        };
-        if active.target_id != *cdp_target_id {
-            let bound = listed
-                .tabs
-                .iter()
-                .find(|tab| tab.target_id == *cdp_target_id);
-            return Err(mcp_error(
-                error_codes::OCR_TARGET_NOT_FOREGROUND,
-                format!(
-                    "{tool} refuses to OCR Chrome window {capture_hwnd:#x}: window capture renders only the active tab, and the active tab is {active_id:?} (url={active_url:?} title={active_title:?}), not this session's bound tab {cdp_target_id:?} (url={bound_url:?} title={bound_title:?}). Returning the active tab's text under the bound tab's identity would be confidently-wrong perception. Remediation: read the bound tab with a tab-scoped surface (browser_dom content/locate/inspect, browser_capture), or make the bound tab active first with browser_tabs operation=activate and re-read, or pass a window_hwnd for a different window to read that window intentionally.",
-                    active_id = active.target_id,
-                    active_url = active.url,
-                    active_title = active.title,
-                    bound_url = bound
-                        .map(|tab| tab.url.as_str())
-                        .unwrap_or("<tab absent from this window>"),
-                    bound_title = bound
-                        .map(|tab| tab.title.as_str())
-                        .unwrap_or("<tab absent from this window>"),
-                ),
-            ));
-        }
-        Ok(Some(synapse_core::OcrCapturedTarget {
-            window_hwnd: capture_hwnd,
-            captured_cdp_target_id: active.target_id.clone(),
-            captured_url: active.url.clone(),
-            captured_title: active.title.clone(),
-            session_bound_cdp_target_id: Some(cdp_target_id.clone()),
-            matches_session_target: true,
-            readback_source: "chrome.tabs.query active-tab readback for the capture window"
-                .to_owned(),
-        }))
+        params: Parameters<ReadTextParams>,
+    ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
+        self.read_text_with_target_hwnd(params, None, None)
     }
 
     fn read_text_with_target_hwnd(
@@ -1020,13 +660,11 @@ impl SynapseService {
         target_hwnd: Option<i64>,
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        let observation_snapshot = {
+        let normal_result = ({
             let state = self.m1_state()?;
-            M1ObservationSnapshot::from_state(&state)
-        };
-        let normal_result =
-            ({ resolve_read_text_request(&observation_snapshot, &params.0, target_hwnd) })
-                .and_then(|request| self.read_text_request_with_cache(request));
+            resolve_read_text_request(&state, &params.0, target_hwnd)
+        })
+        .and_then(|request| self.read_text_request_with_cache(request));
         match normal_result {
             Ok(mut result) => {
                 // #1557 fail-closed gate, applied to the final (post-cache)
@@ -1052,7 +690,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge remains debugger-free and refuses Page.captureScreenshot. With window_hwnd or a window target, captures no-explicit-GPU-API GDI pixels (Windows/the display driver may still accelerate GDI internally) from that window's physically visible desktop rectangle and interprets region as client-relative; minimized, hidden, cloaked, or partly off-screen targets fail closed, and visible occluders remain in the image. With no target, captures the foreground window or an absolute physical screen region. PrintWindow is reserved for an explicit bounded hidden-desktop worker. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving (Lanczos3) to fit a vision-model pixel budget. The response reports native_width/native_height and applied scale so written-image coordinates map back to native pixels. To inspect a small/dense region at native resolution, pass a tight client-relative region and omit the pixel budget."
+        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge is debugger-free and refuses Page.captureScreenshot before queueing any Chrome command, because Chrome's debugger infobar changes viewport/layout and breaks coordinate truth; use raw CDP on a dedicated silent automation profile or passive window capture instead. With window_hwnd or a window target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving (Lanczos3) to fit a vision-model pixel budget (e.g. max_long_edge=1568 / max_pixels=1150000 for the Claude 4.6 family, 2576 / 3750000 for Opus 4.7; the more restrictive wins). They are no-ops when the native capture already fits. The response always reports native_width/native_height and the applied scale (written_long_edge/native_long_edge, 1.0 when not downscaled) so a coordinate read off the written image maps back to native pixels by multiplying by 1.0/scale. To inspect a small or dense UI region at full native resolution (the computer-use 'zoom' affordance), pass a tight client-relative region and omit the pixel budget."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -1245,7 +883,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture the calling session's owned raw-CDP page on Synapse's dedicated non-default automation profile without activating a tab, focusing a window, or touching the human Chrome profile. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (raw-CDP element_id), PNG/JPEG quality, transparent background, selector/element masks, and aspect-preserving max_pixels/max_long_edge. Geometry, masks, capture, cleanup, and main-frame loader readback share one target connection; navigation or cleanup drift fails closed before the artifact is published. Normal authenticated Chrome bridge targets fail before any Chrome command."
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
     )]
     pub async fn browser_screenshot(
         &self,
@@ -1323,7 +961,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Render the calling session's owned raw-CDP tab to PDF on Synapse's dedicated non-default automation profile. Supports paper size, margins, landscape, print background, CSS page size, header/footer templates, page ranges, and scale. Writes a PDF file and returns byte count/hash plus an independent page-state readback. Normal authenticated Chrome bridge targets fail closed before any Chrome command because that profile permanently forbids the debugger permission."
+        description = "Render the calling session's owned normal Chrome tab to PDF through the already-open Chrome bridge using a narrow chrome.debugger Page.printToPDF lane. Supports paper size, margins, landscape, print background, CSS page size, header/footer templates, page ranges, and scale. Writes a PDF file, returns byte count/hash and target readback, and never launches another Chrome profile."
     )]
     pub async fn browser_pdf(
         &self,
@@ -1470,9 +1108,7 @@ impl SynapseService {
             .map(Json)
     }
 
-    #[tool(
-        description = "Set the active no-explicit-GPU-API GDI capture target (Windows/the display driver may still accelerate GDI internally). min_update_interval_ms must be 250..=60000; dirty_region_only and explicit GPU backends are unsupported and fail closed."
-    )]
+    #[tool(description = "Set the active capture target")]
     pub async fn set_capture_target(
         &self,
         params: Parameters<SetCaptureTargetParams>,
@@ -2133,12 +1769,6 @@ impl SynapseService {
         cdp_target_id: &str,
     ) -> Result<CaptureScreenshotResponse, ErrorData> {
         validate_cdp_target_id(cdp_target_id)?;
-        if cdp_target_id.starts_with("chrome-tab:") {
-            return Err(browser_raw_cdp_required_error(
-                "capture_screenshot",
-                window_hwnd,
-            ));
-        }
         if let Some(region) = params.region {
             validate_screenshot_region(region)?;
         }
@@ -2161,7 +1791,7 @@ impl SynapseService {
                 mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "capture_screenshot refused CDP target {cdp_target_id:?}: no session-owned raw CDP endpoint"
+                        "capture_screenshot refused CDP target {cdp_target_id:?}: no raw CDP endpoint and no session-owned Chrome bridge owner row"
                     ),
                 )
             })?;
@@ -2170,10 +1800,74 @@ impl SynapseService {
         ensure_screenshot_path_available(&output_path, params.overwrite)?;
         let target_context = resolve_capture_target_window_context(window_hwnd).ok();
         if is_chrome_debugger_endpoint(&endpoint) {
-            return Err(browser_raw_cdp_required_error(
-                "capture_screenshot",
+            let captured = crate::chrome_debugger_bridge::capture_visible_tab(
                 window_hwnd,
-            ));
+                cdp_target_id,
+                owner.as_ref().and_then(|owner| owner.chrome_window_id),
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "capture_screenshot popup-free Chrome bridge refused debugger screenshot/readback: {}",
+                        error.detail()
+                    ),
+                )
+            })?;
+            if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "capture_screenshot Chrome bridge returned target {:?} for requested target {:?}",
+                        captured.target_id, cdp_target_id
+                    ),
+                ));
+            }
+            if let Some(expected_window_id) =
+                owner.as_ref().and_then(|owner| owner.chrome_window_id)
+                && captured.chrome_window_id != Some(expected_window_id)
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "capture_screenshot Chrome bridge captured Chrome window {:?} for requested target {:?}, expected Chrome window {}",
+                        captured.chrome_window_id, cdp_target_id, expected_window_id
+                    ),
+                ));
+            }
+            let bitmap = chrome_capture_visible_tab_data_url_to_bgra(
+                &captured.image_data_url,
+                params.region,
+            )?;
+            let bitmap_sha256 = sha256_hex(&bitmap.bytes);
+            tracing::info!(
+                code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+                session_id = %session_id,
+                hwnd = window_hwnd,
+                endpoint = %endpoint,
+                cdp_target_id = %captured.target_id,
+                tab_id = captured.tab_id,
+                chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+                before_active = captured.before_active,
+                active_for_capture = captured.active_for_capture,
+                restored_previous_active = captured.restored_previous_active,
+                image_data_url_len = captured.image_data_url_len,
+                capture_attempt_count = captured.capture_attempt_count,
+                capture_attempts = ?captured.capture_attempts,
+                output_path = %output_path.display(),
+                "readback=chrome.debugger.Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+            );
+            return write_screenshot_bitmap(
+                params,
+                output_path,
+                format,
+                bitmap,
+                "chrome_debugger_page_capture_screenshot_bgra",
+                bitmap_sha256,
+                None,
+                None,
+            );
         }
         let page_bitmap =
             synapse_a11y::cdp_capture_page_bgra(&endpoint, cdp_target_id, params.region)
@@ -2231,124 +1925,125 @@ impl SynapseService {
         window_hwnd: i64,
         cdp_target_id: &str,
     ) -> Result<BrowserScreenshotResponse, ErrorData> {
-        if cdp_target_id.starts_with("chrome-tab:") {
-            return Err(browser_raw_cdp_required_error(
-                "browser_screenshot",
-                window_hwnd,
+        if !cdp_target_id.starts_with("chrome-tab:") {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_screenshot requires a normal Chrome bridge target shaped like chrome-tab:<id>; got {cdp_target_id:?}"
+                ),
             ));
         }
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
-            .ok_or_else(|| browser_raw_cdp_required_error("browser_screenshot", window_hwnd))?;
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
-        let scope = match params.scope {
-            BrowserScreenshotScope::Viewport => synapse_a11y::CdpPageScreenshotScope::Viewport,
-            BrowserScreenshotScope::FullPage => synapse_a11y::CdpPageScreenshotScope::FullPage,
-            BrowserScreenshotScope::Clip => {
-                synapse_a11y::CdpPageScreenshotScope::Clip(params.clip.ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        "browser_screenshot scope=clip requires clip",
+        let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        // #1359: serialize the brief foreground-capture critical section so
+        // concurrent browser_screenshot captures (multi-agent / batched) cannot
+        // interleave their Chrome-window activation and corrupt each other's
+        // foreground-restore tracking — which surfaced as a spurious
+        // "physical foreground drifted ... during capture" failure. This never
+        // fights the human: each capture still restores the human's foreground,
+        // and a genuine human-contention drift still fails loud (we never
+        // re-steal focus from an actively-used human window). The lock only
+        // makes concurrent agent captures queue.
+        let _foreground_serialization = BROWSER_SCREENSHOT_FOREGROUND_LOCK.lock().await;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_foreground_activation",
+        )?;
+        let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
+        let mut captured_result = match super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_bridge_capture",
+        ) {
+            Ok(()) => crate::chrome_debugger_bridge::page_screenshot(
+                window_hwnd,
+                cdp_target_id,
+                bridge_payload.clone(),
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "browser_screenshot Chrome bridge capture failed: {}",
+                        error.detail()
+                    ),
+                )
+            }),
+            Err(panic_error) => Err(panic_error),
+        };
+        if let Err(error) = &captured_result
+            && browser_screenshot_bridge_disconnected(error)
+        {
+            match super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_screenshot_before_bridge_retry",
+            ) {
+                Ok(()) => {
+                    captured_result = browser_screenshot_retry_after_bridge_disconnect(
+                        window_hwnd,
+                        cdp_target_id,
+                        bridge_payload.clone(),
+                        error,
                     )
-                })?)
+                    .await;
+                }
+                Err(panic_error) => captured_result = Err(panic_error),
             }
-            BrowserScreenshotScope::Element => {
-                let element_id = params.element_id.as_deref().ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        "browser_screenshot scope=element requires element_id",
-                    )
-                })?;
-                let (backend_node_id, target_id) =
-                    parse_browser_screenshot_element(element_id, "element_id")?;
-                if !cdp_target_ids_equal(&target_id, cdp_target_id) {
-                    return Err(mcp_error(
-                        error_codes::ACTION_TARGET_INVALID,
-                        format!(
-                            "browser_screenshot element target {target_id:?} does not match capture target {cdp_target_id:?}"
-                        ),
+        }
+        let foreground_readback = match finish_browser_screenshot_foreground(
+            window_hwnd,
+            foreground_guard,
+            captured_result.as_ref().err(),
+        ) {
+            Ok(readback) => readback,
+            Err(cleanup_error) => {
+                if let Err(panic_error) = captured_result {
+                    return Err(operator_panic_rollback_failed(
+                        "browser_screenshot_foreground_restore",
+                        panic_error,
+                        cleanup_error.message.to_string(),
                     ));
                 }
-                synapse_a11y::CdpPageScreenshotScope::Element(backend_node_id)
+                return Err(cleanup_error);
             }
         };
-        let masks = params
-            .masks
-            .iter()
-            .enumerate()
-            .map(|(index, mask)| {
-                let target = if let Some(selector) = mask.selector.as_ref() {
-                    synapse_a11y::CdpPageScreenshotMaskTarget::Selector(selector.clone())
-                } else {
-                    let element_id = mask.element_id.as_deref().ok_or_else(|| {
-                        mcp_error(
-                            error_codes::TOOL_PARAMS_INVALID,
-                            format!(
-                                "browser_screenshot masks[{index}] requires selector or element_id"
-                            ),
-                        )
-                    })?;
-                    let (backend_node_id, target_id) = parse_browser_screenshot_element(
-                        element_id,
-                        &format!("masks[{index}].element_id"),
-                    )?;
-                    if !cdp_target_ids_equal(&target_id, cdp_target_id) {
-                        return Err(mcp_error(
-                            error_codes::ACTION_TARGET_INVALID,
-                            format!(
-                                "browser_screenshot masks[{index}] target {target_id:?} does not match capture target {cdp_target_id:?}"
-                            ),
-                        ));
-                    }
-                    synapse_a11y::CdpPageScreenshotMaskTarget::BackendNode(backend_node_id)
-                };
-                Ok(synapse_a11y::CdpPageScreenshotMaskSpec {
-                    target,
-                    color: mask.color.clone().unwrap_or_else(|| "#ff00ff".to_owned()),
-                })
-            })
-            .collect::<Result<Vec<_>, ErrorData>>()?;
-
         super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_screenshot_before_raw_cdp_capture",
+            "browser_screenshot_after_bridge_capture_and_restore",
         )?;
-        let captured = synapse_a11y::cdp_capture_page_surface_bgra(
-            &endpoint,
-            cdp_target_id,
-            scope,
-            &masks,
-            params.omit_background,
-            params.wait_timeout_ms.unwrap_or(30_000),
-        )
-        .await
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("browser_screenshot raw-CDP capture failed: {error}"),
-            )
-        })?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_screenshot_after_raw_cdp_capture",
-        )?;
+        let captured = match captured_result {
+            Ok(captured) => captured,
+            Err(error) => return Err(error),
+        };
         if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
                 format!(
-                    "browser_screenshot raw-CDP target drifted: requested={cdp_target_id:?} captured={:?}",
-                    captured.target_id
+                    "browser_screenshot Chrome bridge returned target {:?} for requested target {:?}",
+                    captured.target_id, cdp_target_id
                 ),
             ));
         }
-        let native_width = captured.bitmap.width;
-        let native_height = captured.bitmap.height;
-        let native_bitmap_bytes = u64::try_from(captured.bitmap.bgra.len()).unwrap_or(u64::MAX);
-        let page_region = raw_page_screenshot_region(captured.clip)?;
-        let document_generation_sha256 = sha256_hex(captured.document_generation.as_bytes());
-        let (bitmap, mask_evidence) = apply_raw_page_screenshot_masks(
-            captured.bitmap,
-            captured.clip,
-            &captured.masks,
-            &captured.document_generation,
-        )?;
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_BRIDGE_CAPTURED",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            cdp_target_id = %captured.target_id,
+            tab_id = captured.tab_id,
+            chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+            before_active = captured.before_active,
+            active_for_capture = captured.active_for_capture,
+            restored_previous_active = captured.restored_previous_active,
+            required_foreground = foreground_readback.required_foreground || captured.required_foreground,
+            human_os_foreground_before_hwnd = foreground_readback.before_hwnd.unwrap_or_default(),
+            human_os_foreground_capture_hwnd = foreground_readback.capture_hwnd.unwrap_or_default(),
+            human_os_foreground_after_restore_hwnd = foreground_readback.after_restore_hwnd.unwrap_or_default(),
+            restored_human_os_foreground = foreground_readback.restored_human_os_foreground,
+            capture_attempt_count = captured.capture_attempt_count,
+            capture_attempts = ?captured.capture_attempts,
+            tile_count = captured.tile_count,
+            output_path = %validation.output_path.display(),
+            "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
+        );
+        let bitmap =
+            stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
+        let bitmap_sha256 = sha256_hex(&bitmap.bytes);
         let write_params = CaptureScreenshotParams {
             path: params.path.clone(),
             region: Some(bitmap.region),
@@ -2365,8 +2060,8 @@ impl SynapseService {
             validation.output_path.clone(),
             validation.format,
             bitmap,
-            "raw_cdp_page_capture_screenshot_bgra",
-            String::new(),
+            "chrome_tabs_capture_visible_tab_stitched_bgra",
+            bitmap_sha256,
             None,
             params.quality,
             None,
@@ -2374,35 +2069,7 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_screenshot_after_output_write",
         )?;
-        let foreground_transaction = BrowserScreenshotForegroundTransactionReadback {
-            required: false,
-            attempted: false,
-            restored: true,
-            operator_superseded: false,
-            outcome: "not_required_raw_cdp".to_owned(),
-            restore_method: "none".to_owned(),
-            initial_set_foreground_window_result: None,
-            alt_unlock_attempted: false,
-            alt_unlock_set_foreground_window_result: None,
-            prior_foreground: BrowserScreenshotForegroundIdentityReadback::default(),
-            acquired_chrome_foreground: BrowserScreenshotForegroundIdentityReadback::default(),
-            current_before_restore: BrowserScreenshotForegroundIdentityReadback::default(),
-            final_foreground: BrowserScreenshotForegroundIdentityReadback::default(),
-        };
-        tracing::info!(
-            code = "RAW_CDP_BACKGROUND_SCREENSHOT_CAPTURED",
-            session_id = %session_id,
-            hwnd = window_hwnd,
-            endpoint = %endpoint,
-            cdp_target_id = %captured.target_id,
-            output_path = %validation.output_path.display(),
-            native_width,
-            native_height,
-            mask_count = captured.masks.len(),
-            document_generation_sha256 = %document_generation_sha256,
-            required_foreground = false,
-            "readback=Page.captureScreenshot+main_frame_loader+artifact_disk outcome=screenshot_published"
-        );
+        let page_region = browser_screenshot_page_region(captured.clip_css)?;
         Ok(BrowserScreenshotResponse {
             path: screenshot.path,
             format: screenshot.format,
@@ -2411,51 +2078,36 @@ impl SynapseService {
             page_region,
             width: screenshot.width,
             height: screenshot.height,
-            native_width,
-            native_height,
+            native_width: screenshot.native_width,
+            native_height: screenshot.native_height,
             scale: screenshot.scale,
             bytes_written: screenshot.bytes_written,
             bitmap_sha256: screenshot.bitmap_sha256,
             cdp_target_id: captured.target_id,
-            tab_id: None,
-            chrome_window_id: None,
-            url: redact_url_for_public_readback(&captured.page_state.url),
-            title: captured.page_state.title,
+            tab_id: captured.tab_id,
+            chrome_window_id: captured.chrome_window_id,
+            url: redact_url_for_public_readback(&captured.url),
+            title: captured.title,
             device_pixel_ratio: captured.device_pixel_ratio,
             viewport_width_css: captured.viewport_width_css,
             viewport_height_css: captured.viewport_height_css,
-            scroll_width_css: captured.document_width_css,
-            scroll_height_css: captured.document_height_css,
-            tile_count: 1,
-            composition_mode: "raw_cdp_direct_page_surface".to_owned(),
-            capture_plan_schema: "raw_cdp_direct_v1".to_owned(),
-            capture_plan_hard_peak_budget_bytes:
-                synapse_a11y::CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES,
-            capture_plan_estimated_peak_bytes: native_bitmap_bytes,
-            capture_plan_native_message_budget_bytes: 0,
-            capture_plan_estimated_native_message_bytes: 0,
-            capture_plan_actual_native_message_bytes: 0,
-            capture_plan_actual_max_tile_data_url_bytes: 0,
-            capture_plan_actual_composite_blob_bytes: screenshot.bytes_written,
-            capture_plan_surface_released: true,
-            mask_count: captured.masks.len(),
-            mask_requested_count: params.masks.len(),
-            mask_resolved_count: captured.masks.len(),
-            mask_applied_count: mask_evidence.applied_count,
-            mask_partial_intersection_count: mask_evidence.partial_intersection_count,
-            mask_pixel_write_count: mask_evidence.pixel_write_count,
-            mask_backend: mask_evidence.backend.to_owned(),
-            mask_commitment_sha256: mask_evidence.commitment_sha256,
-            document_generation_sha256,
-            omit_background: params.omit_background,
-            required_foreground: false,
-            human_os_foreground_before_hwnd: None,
-            human_os_foreground_capture_hwnd: None,
-            human_os_foreground_after_restore_hwnd: None,
-            restored_human_os_foreground: true,
-            foreground_transaction,
-            backend_tier_used: "raw_cdp".to_owned(),
-            source_of_truth: "target-scoped raw CDP Page.captureScreenshot plus same-connection main-frame loader/URL readback; trusted Rust mask overwrite; atomic artifact write followed by independent disk metadata and SHA-256 readback".to_owned(),
+            scroll_width_css: captured.scroll_width_css,
+            scroll_height_css: captured.scroll_height_css,
+            tile_count: captured.tile_count,
+            mask_count: captured.mask_count,
+            omit_background: captured.omit_background,
+            required_foreground: foreground_readback.required_foreground || captured.required_foreground,
+            human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
+            human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
+            human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
+            restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
+            backend_tier_used: captured.backend_tier_used,
+            source_of_truth:
+                "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
+                    .to_owned(),
+            degradation_code: None,
+            fallback_metadata_source: None,
+            fallback_reason: None,
         })
     }
 
@@ -2466,59 +2118,52 @@ impl SynapseService {
         window_hwnd: i64,
         cdp_target_id: &str,
     ) -> Result<BrowserPdfResponse, ErrorData> {
-        if cdp_target_id.starts_with("chrome-tab:") {
+        if !cdp_target_id.starts_with("chrome-tab:") {
             return Err(mcp_error(
-                error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+                error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "browser_pdf refused normal authenticated Chrome bridge target {cdp_target_id:?} before queueing any Chrome command; the normal profile permanently forbids debugger permission because Page.printToPDF attachment can display a layout-shifting infobar. Launch a session-owned raw-CDP target in Synapse's dedicated non-default automation profile and retry the same operation"
+                    "browser_pdf requires a normal Chrome bridge target shaped like chrome-tab:<id>; got {cdp_target_id:?}"
                 ),
             ));
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
-        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            return Err(mcp_error(
-                error_codes::A11Y_CDP_UNREACHABLE,
-                format!(
-                    "browser_pdf requires a reachable raw-CDP endpoint for window {window_hwnd:#x} and target {cdp_target_id:?}; launch the browser with act_launch so Synapse owns a dedicated non-default automation profile"
-                ),
-            ));
-        };
-        let options = synapse_a11y::CdpPrintToPdfOptions {
-            landscape: params.landscape,
-            display_header_footer: params.display_header_footer,
-            print_background: params.print_background,
-            scale: params.scale,
-            paper_width: params.paper_width,
-            paper_height: params.paper_height,
-            margin_top: params.margin_top,
-            margin_bottom: params.margin_bottom,
-            margin_left: params.margin_left,
-            margin_right: params.margin_right,
-            page_ranges: params.page_ranges.clone(),
-            header_template: params.header_template.clone(),
-            footer_template: params.footer_template.clone(),
-            prefer_css_page_size: params.prefer_css_page_size,
-            timeout_ms: params.wait_timeout_ms.unwrap_or(30_000),
-        };
+        let bridge_payload = browser_pdf_bridge_payload(params);
         super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_before_print_to_pdf")?;
-        let captured = synapse_a11y::cdp_print_to_pdf(&endpoint, cdp_target_id, options)
-            .await
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("browser_pdf raw CDP Page.printToPDF failed: {error}"),
-                )
-            })?;
+        let captured =
+            crate::chrome_debugger_bridge::page_pdf(window_hwnd, cdp_target_id, bridge_payload)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_pdf Chrome bridge Page.printToPDF failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
         if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
                 format!(
-                    "browser_pdf raw CDP returned target {:?} for requested target {:?}",
+                    "browser_pdf Chrome bridge returned target {:?} for requested target {:?}",
                     captured.target_id, cdp_target_id
                 ),
             ));
         }
-        let pdf_bytes = captured.pdf_bytes;
+        let pdf_bytes = base64::engine::general_purpose::STANDARD
+            .decode(captured.data_base64.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("browser_pdf could not decode Page.printToPDF base64: {error}"),
+                )
+            })?;
+        if !pdf_bytes.starts_with(b"%PDF-") {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                "browser_pdf Page.printToPDF decoded bytes did not start with %PDF-",
+            ));
+        }
         let pdf_sha256 = sha256_hex(&pdf_bytes);
         super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_before_output_write")?;
         let bytes_written = write_pdf_bytes(&validation.output_path, &pdf_bytes, params.overwrite)?;
@@ -2527,28 +2172,28 @@ impl SynapseService {
             path: validation.output_path.to_string_lossy().into_owned(),
             bytes_written,
             pdf_sha256,
-            capture_backend: "raw_cdp_page_print_to_pdf".to_owned(),
+            capture_backend: "chrome_debugger_page_print_to_pdf".to_owned(),
             cdp_target_id: captured.target_id,
-            tab_id: None,
-            chrome_window_id: None,
-            url: redact_url_for_public_readback(&captured.page_state.url),
-            title: captured.page_state.title,
-            landscape: params.landscape,
-            print_background: params.print_background,
-            display_header_footer: params.display_header_footer,
-            scale: params.scale.unwrap_or(1.0),
-            paper_width: params.paper_width.unwrap_or(8.5),
-            paper_height: params.paper_height.unwrap_or(11.0),
-            margin_top: params.margin_top.unwrap_or(0.4),
-            margin_bottom: params.margin_bottom.unwrap_or(0.4),
-            margin_left: params.margin_left.unwrap_or(0.4),
-            margin_right: params.margin_right.unwrap_or(0.4),
-            page_ranges: params.page_ranges.clone().unwrap_or_default(),
-            prefer_css_page_size: params.prefer_css_page_size,
+            tab_id: captured.tab_id,
+            chrome_window_id: captured.chrome_window_id,
+            url: redact_url_for_public_readback(&captured.url),
+            title: captured.title,
+            landscape: captured.landscape,
+            print_background: captured.print_background,
+            display_header_footer: captured.display_header_footer,
+            scale: captured.scale,
+            paper_width: captured.paper_width,
+            paper_height: captured.paper_height,
+            margin_top: captured.margin_top,
+            margin_bottom: captured.margin_bottom,
+            margin_left: captured.margin_left,
+            margin_right: captured.margin_right,
+            page_ranges: captured.page_ranges,
+            prefer_css_page_size: captured.prefer_css_page_size,
             required_foreground: false,
-            backend_tier_used: "cdp".to_owned(),
+            backend_tier_used: captured.backend_tier_used,
             source_of_truth:
-                "raw CDP Page.printToPDF bytes plus a separate Runtime page-state readback and physical PDF file metadata/hash readback"
+                "normal Chrome bridge narrow chrome.debugger Page.printToPDF lane returning base64 PDF bytes written by synapse-mcp"
                 .to_owned(),
         })
     }
@@ -3041,7 +2686,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Atomically deploy the normal-profile Chrome bridge in a hidden process, signal the already-connected extension through chrome.runtime.reload(), then separately verify a new authenticated host plus the physical Chrome profile row and service-worker SHA. This operation never focuses, activates, restores, minimizes, unminimizes, navigates, clicks, types into, or mutates a human Chrome window. A missing or ineligible host fails before deployment or browser mutation with CHROME_BRIDGE_HOST_RELOAD_FAILED; first installation requires a separate explicit operator-authorized interaction."
+        description = "Ask the installed normal Chrome bridge extension to reload itself in the background via chrome.runtime.reload(), then wait for a new authenticated bridge host registration. This never opens chrome://extensions, never activates Chrome, and fails closed with CHROME_BRIDGE_EXTENSION_STALE when the loaded worker does not advertise reloadSelf."
     )]
     pub async fn cdp_bridge_reload(
         &self,
@@ -3063,21 +2708,18 @@ impl SynapseService {
             "wait_timeout_ms": wait_timeout_ms,
             "required_foreground": false,
             "trigger": "chrome.runtime.reload",
-            "foreground_api_calls": 0,
-            "tab_mutations": 0,
-            "synthetic_input_events": 0,
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         super::operator_panic_boundary::ensure_mcp_mutation(
-            "cdp_bridge_reload_before_background_lifecycle",
+            "cdp_bridge_reload_before_runtime_reload",
         )?;
-        let mut result = match crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms).await {
-            Ok(reload) => chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload),
-            Err(error) => Err(mcp_error(error.code(), error.detail().to_owned())),
-        };
+        let mut result = crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms)
+            .await
+            .map(|reload| chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload))
+            .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
         if result.is_ok()
             && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-                "cdp_bridge_reload_after_background_lifecycle",
+                "cdp_bridge_reload_after_runtime_reload",
             )
         {
             result = Err(panic_error);
@@ -3087,7 +2729,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=activate makes a listed tab active/highlighted only while its Chrome window is already in the background, refusing before mutation when that window is the human OS foreground and verifying afterward that foreground was not stolen; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; activate/new/close require an active/explicit background browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
+        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=activate makes a listed tab active/highlighted inside its existing Chrome window without session target binding and fails closed if the requested Chrome window becomes the human OS foreground during the background activation; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; activate/new/close require an active/explicit browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
     )]
     pub async fn browser_tabs(
         &self,
@@ -3348,7 +2990,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Make the calling session's CDP tab the active tab inside its own background Chrome window with required_foreground=false (the background-safe Playwright bringToFront analogue). Raw CDP uses Target.activateTarget; the normal Chrome extension bridge uses chrome.tabs.update({active:true}). Both refuse before mutation when the requested window is the human OS foreground and verify afterward that it was not foregrounded. Requires an active session CDP target or a target owned by this session; never uses the human foreground tab as a fallback. Use this instead of injecting global keystrokes (e.g. SendKeys) through act_run_shell."
+        description = "Make the calling session's CDP tab the active tab in its own Chrome window with required_foreground=false (the background-safe Playwright bringToFront analogue). Raw CDP uses Target.activateTarget; the normal Chrome extension bridge uses chrome.tabs.update({active:true}) and separately reads the human OS foreground before/after, failing closed if the requested Chrome window becomes foreground. Requires an active session CDP target or a target owned by this session; never uses the human foreground tab as a fallback. Use this instead of injecting global keystrokes (e.g. SendKeys) through act_run_shell."
     )]
     pub async fn cdp_activate_tab(
         &self,
@@ -3393,7 +3035,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Evaluate JavaScript in the calling session's owned raw-CDP browser tab, returning the JSON value plus Runtime.RemoteObject-like type metadata read back from the same target. Page scope (default): `expression` is evaluated directly; pass `args` to invoke it as a function with those args. Element scope: pass `element_id` and a function `expression`, called Playwright-style as fn(element, ...args) via Runtime.callFunctionOn. The debugger-free normal authenticated Chrome bridge refuses this operation before queueing any Chrome command; launch a session-owned target in Synapse's dedicated non-default raw-CDP profile. Requires an active session target or an explicit cdp_target_id/element owned by this session; never uses an unrelated human foreground tab as a fallback. JS exceptions are surfaced loudly. Target-scoped: never changes tab activation or uses OS foreground input."
+        description = "Evaluate JavaScript in the calling session's owned browser tab, returning the JSON value plus Runtime.RemoteObject-like type metadata read back from the same target. Raw CDP uses Runtime.evaluate / Runtime.callFunctionOn. The normal authenticated Chrome bridge supports page-scope evaluation through a narrow target-scoped chrome.debugger Runtime.evaluate lane in the already-open Chrome profile; element-scope evaluation still requires raw CDP because normal bridge element ids are DOM-path based. Page scope (default): `expression` is evaluated directly; pass `args` to invoke it as a function with those args. Element scope: pass `element_id` and a function `expression`, called Playwright-style as fn(element, ...args) via Runtime.callFunctionOn. Requires an active session target or an explicit cdp_target_id/element owned by this session; never uses an unrelated human foreground tab as a fallback. JS exceptions are surfaced loudly. Target-scoped: never changes tab activation or uses OS foreground input."
     )]
     pub async fn browser_evaluate(
         &self,
@@ -3483,7 +3125,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Expose, read, or remove a Playwright-style page binding on the calling session's owned raw-CDP browser tab. operation=add installs a string-argument function on window and arms a persistent per-target event listener; operation=read returns the buffered payloads without mutating the page; operation=remove unsubscribes this Synapse runtime agent so future calls stop being delivered to the buffer. CDP removeBinding does not delete the JavaScript function object from existing page globals, so removal is verified by no new Runtime.bindingCalled delivery. Pair with browser_add_init_script when page code should re-wire helper wrappers across navigation. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Read-only payload capture, no host callback execution."
+        description = "Expose, read, or remove a Playwright-style page binding on the calling session's owned browser tab via raw CDP or the normal Chrome bridge's target-scoped chrome.debugger Runtime.addBinding / Runtime.bindingCalled / Runtime.removeBinding lane. operation=add installs a string-argument function on window and arms a persistent per-target event listener; operation=read returns the buffered payloads without mutating the page; operation=remove unsubscribes this Synapse runtime agent so future calls stop being delivered to the buffer. CDP removeBinding does not delete the JavaScript function object from existing page globals, so removal is verified by no new Runtime.bindingCalled delivery. Pair with browser_add_init_script when page code should re-wire helper wrappers across navigation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Read-only payload capture, no host callback execution."
     )]
     pub async fn browser_expose_binding(
         &self,
@@ -3548,7 +3190,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Add or remove a Playwright-style init script for the calling session's owned raw-CDP browser tab. operation defaults to add: provide source, and the script runs before page scripts on every subsequent new document/navigation for that target. operation=remove requires the returned identifier. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Add or remove a Playwright-style init script for the calling session's owned browser tab via raw CDP or the normal Chrome bridge's narrow target-scoped chrome.debugger Page.addScriptToEvaluateOnNewDocument / Page.removeScriptToEvaluateOnNewDocument lane. operation defaults to add: provide source, and the script runs before page scripts on every subsequent new document/navigation for that target. operation=remove requires the returned identifier. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_add_init_script(
         &self,
@@ -3609,7 +3251,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Inject a Playwright-style <script> tag into the calling session's owned raw-CDP current document from exactly one source: url, content, or local UTF-8 path. URL sources wait for onload/onerror and surface load failures as structured MCP errors; inline/path sources append synchronously. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Inject a Playwright-style <script> tag into the calling session's owned current document from exactly one source: url, content, or local UTF-8 path. Raw CDP targets use Runtime.evaluate; normal Chrome bridge chrome-tab targets use the narrow target-scoped chrome.debugger Runtime.evaluate lane. URL sources wait for onload/onerror and surface load failures as structured MCP errors; inline/path sources append synchronously. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_add_script_tag(
         &self,
@@ -3682,7 +3324,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Inject a Playwright-style stylesheet into the calling session's owned raw-CDP current document from exactly one source: url, content, or local UTF-8 path. URL sources create <link rel=stylesheet> and wait for onload/onerror; inline/path sources create <style>. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Inject a Playwright-style stylesheet into the calling session's owned current document from exactly one source: url, content, or local UTF-8 path. Raw CDP targets use Runtime.evaluate; normal Chrome bridge chrome-tab targets use the narrow target-scoped chrome.debugger Runtime.evaluate lane. URL sources create <link rel=stylesheet> and wait for onload/onerror; inline/path sources create <style>. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_add_style_tag(
         &self,
@@ -3802,7 +3444,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait in the calling session's owned browser tab for one of seven predicates, selected by `condition` with the matching nested spec (#1348 — folds the former browser_wait_for_text/load_state/url/selector/function/request/response tools into one). condition=text waits for page text to appear/disappear or a plain timeout (spec `text`); condition=load_state waits for domcontentloaded/load/networkidle (spec `load_state`); condition=url waits until the tab URL matches an exact string/glob/regex (spec `url`); condition=selector waits for a Playwright-style selector to reach attached/visible/hidden/detached using the same engines/options as browser_locate (spec `selector`); condition=function polls a JavaScript predicate until truthy (spec `function`); condition=request/response wait for a captured network request/response matching url/method/status/resource_type predicates (spec `request`/`response`). Each spec object is exactly the former standalone tool's parameters. Text/load-state/url/selector/request/response use raw CDP when available or the debugger-free normal Chrome bridge; normal-bridge load/network waits use Chrome's native webNavigation/webRequest lifecycle and never wrap host fetch/XMLHttpRequest. Function is raw-CDP-only and fails before Chrome mutation on a normal bridge target. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. The response field matching `condition` carries that predicate's full result."
+        description = "Wait in the calling session's owned browser tab for one of seven predicates, selected by `condition` with the matching nested spec (#1348 — folds the former browser_wait_for_text/load_state/url/selector/function/request/response tools into one). condition=text waits for page text to appear/disappear or a plain timeout (spec `text`); condition=load_state waits for domcontentloaded/load/networkidle (spec `load_state`); condition=url waits until the tab URL matches an exact string/glob/regex (spec `url`); condition=selector waits for a Playwright-style selector to reach attached/visible/hidden/detached using the same engines/options as browser_locate (spec `selector`); condition=function polls a JavaScript predicate until truthy (spec `function`); condition=request/response wait for a captured network request/response matching url/method/status/resource_type predicates (spec `request`/`response`). Each spec object is exactly the former standalone tool's parameters. Raw CDP when available or the debugger-free normal Chrome bridge for chrome-tab:* targets. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. The response field matching `condition` carries that predicate's full result."
     )]
     pub async fn browser_wait_for(
         &self,
@@ -5507,7 +5149,7 @@ impl SynapseService {
                     let readback = self.reconcile_operator_panic_closed_cdp_target(
                         i64::from(closed.tab_id),
                         &closed.target_id,
-                        !closed.already_absent,
+                        true,
                     );
                     failures.extend(
                         readback
@@ -5518,7 +5160,10 @@ impl SynapseService {
                     targets.push(readback);
                 }
                 Err(close_error)
-                    if Self::chrome_bridge_close_target_already_absent(close_error.code()) =>
+                    if Self::chrome_bridge_close_target_already_absent(
+                        close_error.detail(),
+                        &target_id,
+                    ) =>
                 {
                     let listed = crate::chrome_debugger_bridge::list_tabs(
                         owner.window_hwnd,
@@ -6007,6 +5652,8 @@ impl SynapseService {
             &persisted.owner_session_id,
         ) {
             Ok(calls) => calls,
+            #[cfg(test)]
+            Err(error) if error.to_string().contains("ledger is not configured") => Vec::new(),
             Err(error) => {
                 return Err(mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
@@ -6742,11 +6389,6 @@ impl SynapseService {
                 session_id: session_id.to_owned(),
             },
             app: Some(process_name.to_owned()),
-            event_id: None,
-            initiator: Some("agent".to_owned()),
-            claim_id: None,
-            claim_status: None,
-            correlation_verdict: None,
             source: "cdp_open_tab".to_owned(),
             event: "tool_call".to_owned(),
             action: Some("open".to_owned()),
@@ -6761,17 +6403,6 @@ impl SynapseService {
             requested_url: Some(requested_url.to_owned()),
             before_url: None,
             before_title: None,
-            before_document_id: None,
-            frame_id: None,
-            parent_frame_id: None,
-            document_id: None,
-            parent_document_id: None,
-            document_lifecycle: None,
-            frame_type: None,
-            transition_type: None,
-            transition_qualifiers: Vec::new(),
-            navigation_error: None,
-            navigation_timestamp_ms: None,
             ready_state: None,
             observed_at_unix_ms: None,
             active: Some(false),
@@ -7192,7 +6823,6 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
-                    close_acknowledgement_failure: None,
                 });
                 Ok(response)
             }
@@ -7213,64 +6843,29 @@ impl SynapseService {
                         ),
                     ));
                 }
-                let expected_chrome_window_id = self
-                    .active_cdp_target_owner_for_window(
-                        "browser_tabs",
+                let before_response = self
+                    .browser_tabs_impl(
                         session_id,
-                        window_context.hwnd,
-                    )?
-                    .and_then(|owner| owner.chrome_window_id);
-                let before_info = crate::chrome_debugger_bridge::target_tab_state(
-                    window_context.hwnd,
-                    requested,
-                    expected_chrome_window_id,
-                    Some(window_context.window_bounds),
-                    Some(&window_context.window_title),
-                )
-                .await
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "browser_tabs operation=activate Chrome bridge exact pre-read chrome.tabs.get failed: {}",
-                            error.detail()
-                        ),
+                        window_context.clone(),
+                        used_human_os_foreground_window,
+                        BrowserTabsOperation::Activate,
+                        None,
                     )
-                })?;
-                if !before_info.target_id.eq_ignore_ascii_case(requested) {
-                    return Err(mcp_error(
-                        error_codes::ACTION_POSTCONDITION_FAILED,
-                        format!(
-                            "browser_tabs operation=activate exact pre-read returned target {:?}, expected {requested:?}",
-                            before_info.target_id
-                        ),
-                    ));
-                }
-                if let Some(expected_window_id) = expected_chrome_window_id
-                    && before_info.chrome_window_id != Some(expected_window_id)
-                {
-                    return Err(mcp_error(
-                        error_codes::ACTION_POSTCONDITION_FAILED,
-                        format!(
-                            "browser_tabs operation=activate exact pre-read returned Chrome window {:?} for target {requested:?}, expected Chrome window {}",
-                            before_info.chrome_window_id, expected_window_id
-                        ),
-                    ));
-                }
-                let before_tab =
-                    browser_tab_entry_from_target_info(window_context.hwnd, &before_info);
-                let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
-                if !before_tab.active
-                    && human_os_foreground_before_hwnd == Some(window_context.hwnd)
-                {
-                    return Err(mcp_error(
-                        error_codes::ACTION_TARGET_INVALID,
-                        format!(
-                            "browser_tabs operation=activate refused target {requested:?} before mutation because Chrome HWND {:#x} is the human OS foreground and switching its active tab would interrupt the user; move the Chrome window to the background or use a session-owned raw-CDP automation profile",
-                            window_context.hwnd
-                        ),
-                    ));
-                }
+                    .await?;
+                let before_tab = before_response
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
+                    .cloned()
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::ACTION_TARGET_INVALID,
+                            format!(
+                                "browser_tabs operation=activate could not find target {requested:?} in listed tabs for window {:#x}; refusing to activate a tab outside the requested Chrome window",
+                                before_response.window_hwnd
+                            ),
+                        )
+                    })?;
                 let visual_before = if before_tab.active {
                     None
                 } else {
@@ -7279,6 +6874,7 @@ impl SynapseService {
                         "before_activation",
                     )?)
                 };
+                let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
                 super::operator_panic_boundary::ensure_mcp_mutation(
                     "browser_tabs_activate_before_bridge_dispatch",
                 )?;
@@ -7286,9 +6882,6 @@ impl SynapseService {
                     window_context.hwnd,
                     requested,
                     DEFAULT_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
-                    before_tab.chrome_window_id.or(expected_chrome_window_id),
-                    Some(window_context.window_bounds),
-                    Some(&window_context.window_title),
                 )
                 .await
                 .map_err(|error| {
@@ -7347,13 +6940,33 @@ impl SynapseService {
                         ),
                     ));
                 }
-                let activated_tab =
-                    browser_tab_entry_from_activated(window_context.hwnd, &activated);
+                let mut response = self
+                    .browser_tabs_impl(
+                        session_id,
+                        window_context.clone(),
+                        used_human_os_foreground_window,
+                        BrowserTabsOperation::Activate,
+                        None,
+                    )
+                    .await?;
+                let activated_tab = response
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
+                    .cloned()
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::ACTION_POSTCONDITION_FAILED,
+                            format!(
+                                "browser_tabs operation=activate postcondition failed: target {requested:?} was absent from tabs.query readback after activation"
+                            ),
+                        )
+                    })?;
                 if !activated_tab.active || !activated_tab.highlighted {
                     return Err(mcp_error(
                         error_codes::ACTION_POSTCONDITION_FAILED,
                         format!(
-                            "browser_tabs operation=activate exact postcondition failed: target {requested:?} active={} highlighted={}",
+                            "browser_tabs operation=activate tabs.query postcondition failed: target {requested:?} active={} highlighted={}",
                             activated_tab.active, activated_tab.highlighted
                         ),
                     ));
@@ -7371,20 +6984,15 @@ impl SynapseService {
                         .await?,
                     )
                 };
-                let endpoint = activated
-                    .extension_id
-                    .as_deref()
-                    .map(chrome_debugger_endpoint)
-                    .unwrap_or_else(chrome_debugger_default_endpoint);
-                let mutation = BrowserTabsMutation {
+                response.mutation = Some(BrowserTabsMutation {
                     operation: BrowserTabsOperation::Activate,
                     requested_cdp_target_id: Some(requested.to_owned()),
                     requested_url: None,
                     previous: None,
                     current: None,
                     selected_tab: None,
-                    activated_cdp_target_id: Some(activated.target_id.clone()),
-                    activated_tab: Some(activated_tab.clone()),
+                    activated_cdp_target_id: Some(activated.target_id),
+                    activated_tab: Some(activated_tab),
                     before_active: activated.before_active,
                     active: Some(activated.active),
                     highlighted: activated.highlighted,
@@ -7392,23 +7000,8 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
-                    close_acknowledgement_failure: None,
-                };
-                Ok(browser_tabs_exact_mutation_response(
-                    session_id,
-                    &window_context,
-                    used_human_os_foreground_window,
-                    BrowserTabsOperation::Activate,
-                    endpoint,
-                    activated.chrome_window_id,
-                    None,
-                    None,
-                    activated.target_selection_reason,
-                    activated.target_candidate_count,
-                    0,
-                    mutation,
-                    vec![activated_tab],
-                ))
+                });
+                Ok(response)
             }
             BrowserTabsOperation::New => {
                 let url = params.url.clone().ok_or_else(|| {
@@ -7435,40 +7028,30 @@ impl SynapseService {
                         session_id,
                     )
                     .await?;
-                let opened_tab = browser_tab_entry_from_opened(&opened);
-                let mutation = BrowserTabsMutation {
-                    operation: BrowserTabsOperation::New,
-                    requested_cdp_target_id: None,
-                    requested_url: Some(redact_url_for_public_readback(&url)),
-                    previous: opened.previous,
-                    current: Some(opened.current),
-                    selected_tab: None,
-                    activated_cdp_target_id: None,
-                    activated_tab: None,
-                    before_active: None,
-                    active: None,
-                    highlighted: None,
-                    activation_visual_readback: None,
-                    opened_cdp_target_id: Some(opened.cdp_target_id.clone()),
-                    closed_cdp_target_id: None,
-                    closed: false,
-                    close_acknowledgement_failure: None,
-                };
-                Ok(browser_tabs_exact_mutation_response(
+                self.browser_tabs_impl(
                     session_id,
-                    &window_context,
+                    window_context,
                     used_human_os_foreground_window,
                     BrowserTabsOperation::New,
-                    opened.endpoint,
-                    opened.chrome_window_id,
-                    opened.chrome_window_focused,
-                    opened.chrome_window_state,
-                    "exact_open_tab_readback".to_owned(),
-                    1,
-                    0,
-                    mutation,
-                    vec![opened_tab],
-                ))
+                    Some(BrowserTabsMutation {
+                        operation: BrowserTabsOperation::New,
+                        requested_cdp_target_id: None,
+                        requested_url: Some(redact_url_for_public_readback(&url)),
+                        previous: opened.previous,
+                        current: Some(opened.current),
+                        selected_tab: None,
+                        activated_cdp_target_id: None,
+                        activated_tab: None,
+                        before_active: None,
+                        active: None,
+                        highlighted: None,
+                        activation_visual_readback: None,
+                        opened_cdp_target_id: Some(opened.cdp_target_id),
+                        closed_cdp_target_id: None,
+                        closed: false,
+                    }),
+                )
+                .await
             }
             BrowserTabsOperation::Close => {
                 let target_id = params.cdp_target_id.clone().ok_or_else(|| {
@@ -7505,47 +7088,33 @@ impl SynapseService {
                         ),
                     ));
                 }
-                let endpoint = owner.endpoint.clone();
-                let chrome_window_id = owner.chrome_window_id;
                 let closed = self
                     .cdp_close_tab_impl(session_id, &target_id, &owner_key, owner)
                     .await?;
-                let mutation = BrowserTabsMutation {
-                    operation: BrowserTabsOperation::Close,
-                    requested_cdp_target_id: Some(target_id.clone()),
-                    requested_url: None,
-                    previous: closed.previous,
-                    current: closed.current,
-                    selected_tab: None,
-                    activated_cdp_target_id: None,
-                    activated_tab: None,
-                    before_active: None,
-                    active: None,
-                    highlighted: None,
-                    activation_visual_readback: None,
-                    opened_cdp_target_id: None,
-                    closed_cdp_target_id: Some(target_id),
-                    closed: closed.closed,
-                    // #2032: surface a lost/failed closeTab acknowledgement as a
-                    // typed non-fatal detail. `closed` above is the chrome.tabs
-                    // verdict; this names what went wrong on the way back.
-                    close_acknowledgement_failure: closed.close_acknowledgement_failure,
-                };
-                Ok(browser_tabs_exact_mutation_response(
+                self.browser_tabs_impl(
                     session_id,
-                    &window_context,
+                    window_context,
                     used_human_os_foreground_window,
                     BrowserTabsOperation::Close,
-                    endpoint,
-                    chrome_window_id,
-                    None,
-                    None,
-                    "exact_close_absence_readback".to_owned(),
-                    1,
-                    0,
-                    mutation,
-                    Vec::new(),
-                ))
+                    Some(BrowserTabsMutation {
+                        operation: BrowserTabsOperation::Close,
+                        requested_cdp_target_id: Some(target_id.clone()),
+                        requested_url: None,
+                        previous: closed.previous,
+                        current: closed.current,
+                        selected_tab: None,
+                        activated_cdp_target_id: None,
+                        activated_tab: None,
+                        before_active: None,
+                        active: None,
+                        highlighted: None,
+                        activation_visual_readback: None,
+                        opened_cdp_target_id: None,
+                        closed_cdp_target_id: Some(target_id),
+                        closed: closed.closed,
+                    }),
+                )
+                .await
             }
         }
     }
@@ -7835,8 +7404,78 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_evaluate_before_runtime_dispatch",
         )?;
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
-            .ok_or_else(|| browser_raw_cdp_required_error("browser_evaluate", window_hwnd))?;
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if backend_node_id.is_some() {
+                return Err(mcp_error(
+                    error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+                    format!(
+                        "browser_evaluate element scope requires raw CDP for window {window_hwnd:#x}; the normal Chrome bridge exposes only page-scope Runtime.evaluate for chrome-tab targets"
+                    ),
+                ));
+            }
+            let evaluated = crate::chrome_debugger_bridge::evaluate_script(
+                window_hwnd,
+                cdp_target_id,
+                expression,
+                args,
+                await_promise,
+                return_by_value,
+                timeout_ms,
+            )
+            .await
+            .map_err(|error| classify_browser_evaluate_bridge_error(&error, "page", timeout_ms))?;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_evaluate_after_bridge_runtime_dispatch",
+            )?;
+            let endpoint = evaluated
+                .extension_id
+                .as_deref()
+                .map(chrome_debugger_endpoint)
+                .unwrap_or_else(chrome_debugger_default_endpoint);
+            tracing::info!(
+                code = "CDP_BACKGROUND_EVALUATE",
+                session_id = %session_id,
+                hwnd = window_hwnd,
+                endpoint = %endpoint,
+                cdp_target_id = %evaluated.target_id,
+                scope = "page",
+                element_id = element_id.unwrap_or(""),
+                arg_count = args.len(),
+                result_type = %evaluated.result_type,
+                returned_by_value = evaluated.returned_by_value,
+                target_url = %evaluated.url,
+                "readback=chrome.scripting.executeScript outcome=evaluated"
+            );
+            return Ok(BrowserEvaluateResponse {
+                session_id: session_id.to_owned(),
+                window_hwnd,
+                transport: "chrome_tabs_extension".to_owned(),
+                endpoint,
+                cdp_target_id: evaluated.target_id,
+                scope: if evaluated.scope.trim().is_empty() {
+                    "page".to_owned()
+                } else {
+                    evaluated.scope
+                },
+                element_id: None,
+                url: redact_url_for_public_readback(&evaluated.url),
+                title: evaluated.title,
+                ready_state: evaluated.ready_state,
+                result_type: evaluated.result_type,
+                result_subtype: evaluated.result_subtype,
+                returned_by_value: evaluated.returned_by_value,
+                value: evaluated.value,
+                description: evaluated.description,
+                unserializable_value: evaluated.unserializable_value,
+                readback_backend: if evaluated.readback_backend.trim().is_empty() {
+                    "chrome.scripting.executeScript".to_owned()
+                } else {
+                    evaluated.readback_backend
+                },
+                backend_tier_used: "chrome_tabs".to_owned(),
+                required_foreground: false,
+            });
+        };
         let (evaluated, scope, readback_backend) = if let Some(backend_node_id) = backend_node_id {
             // Element scope: callFunctionOn the resolved node with args; `this`
             // and the first parameter are bound to the element.
@@ -7958,127 +7597,21 @@ impl SynapseService {
     )]
     async fn browser_evaluate_impl(
         &self,
-        session_id: &str,
-        window_hwnd: i64,
-        cdp_target_id: &str,
-        expression: &str,
-        element_id: Option<&str>,
-        backend_node_id: Option<i64>,
-        args: &[Value],
-        await_promise: bool,
-        return_by_value: bool,
-        timeout_ms: u64,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _expression: &str,
+        _element_id: Option<&str>,
+        _backend_node_id: Option<i64>,
+        _args: &[Value],
+        _await_promise: bool,
+        _return_by_value: bool,
+        _timeout_ms: u64,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_evaluate_before_portable_runtime_dispatch",
-        )?;
-        let owner = self
-            .cdp_target_owner_for_readback("browser_evaluate", session_id, cdp_target_id)?
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "browser_evaluate exact raw-CDP target {cdp_target_id:?} has no session-owned endpoint record; refusing endpoint discovery from another window or process"
-                    ),
-                )
-            })?;
-        if owner.window_hwnd != window_hwnd {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "browser_evaluate owner/window mismatch for target {cdp_target_id:?}: owner hwnd={:#x}, resolved hwnd={window_hwnd:#x}",
-                    owner.window_hwnd
-                ),
-            ));
-        }
-        let (evaluated, scope, readback_backend) = if let Some(backend_node_id) = backend_node_id {
-            let evaluated = super::portable_cdp::runtime_call_function_on(
-                &owner.endpoint,
-                cdp_target_id,
-                backend_node_id,
-                expression,
-                args,
-                await_promise,
-                return_by_value,
-                timeout_ms,
-            )
-            .await?;
-            (
-                evaluated,
-                "element",
-                "DOM.resolveNode + Runtime.callFunctionOn + separate same-target page-state Runtime.evaluate",
-            )
-        } else {
-            let invocation = if args.is_empty() {
-                expression.to_owned()
-            } else {
-                let arg_list = args
-                    .iter()
-                    .map(serde_json::to_string)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        mcp_error(
-                            error_codes::TOOL_PARAMS_INVALID,
-                            format!("browser_evaluate could not serialize page-scope arg: {error}"),
-                        )
-                    })?
-                    .join(", ");
-                format!("({expression})({arg_list})")
-            };
-            let evaluated = super::portable_cdp::runtime_evaluate(
-                &owner.endpoint,
-                cdp_target_id,
-                &invocation,
-                await_promise,
-                return_by_value,
-                timeout_ms,
-            )
-            .await?;
-            (
-                evaluated,
-                "page",
-                "Runtime.evaluate + separate same-target page-state Runtime.evaluate",
-            )
-        };
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_evaluate_after_portable_runtime_dispatch",
-        )?;
-        tracing::info!(
-            code = "CDP_BACKGROUND_EVALUATE_PORTABLE",
-            session_id,
-            hwnd = window_hwnd,
-            endpoint = %evaluated.endpoint,
-            cdp_target_id = %evaluated.target_id,
-            scope,
-            element_id = element_id.unwrap_or(""),
-            arg_count = args.len(),
-            result_type = %evaluated.result_type,
-            returned_by_value = return_by_value,
-            target_url = %evaluated.url,
-            readback_backend,
-            "readback=portable_raw_cdp outcome=evaluated"
-        );
-        Ok(BrowserEvaluateResponse {
-            session_id: session_id.to_owned(),
-            window_hwnd,
-            transport: "portable_raw_cdp".to_owned(),
-            endpoint: evaluated.endpoint,
-            cdp_target_id: evaluated.target_id,
-            scope: scope.to_owned(),
-            element_id: element_id.map(ToOwned::to_owned),
-            url: redact_url_for_public_readback(&evaluated.url),
-            title: evaluated.title,
-            ready_state: evaluated.ready_state,
-            result_type: evaluated.result_type,
-            result_subtype: evaluated.result_subtype,
-            returned_by_value: return_by_value,
-            value: evaluated.value,
-            description: evaluated.description,
-            unserializable_value: evaluated.unserializable_value,
-            readback_backend: readback_backend.to_owned(),
-            backend_tier_used: "cdp".to_owned(),
-            required_foreground: false,
-        })
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_evaluate is only available on Windows in this build",
+        ))
     }
 
     #[cfg(windows)]
@@ -8095,8 +7628,135 @@ impl SynapseService {
                 "browser_expose_binding_before_add_or_remove",
             )?;
         }
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
-            .ok_or_else(|| browser_raw_cdp_required_error("browser_expose_binding", window_hwnd))?;
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let operation = browser_expose_binding_operation_name(params.operation);
+                let result = crate::chrome_debugger_bridge::expose_binding(
+                    window_hwnd,
+                    cdp_target_id,
+                    operation,
+                    &params.name,
+                    params.execution_context_name.as_deref(),
+                    params.since_seq,
+                    max_calls,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_expose_binding normal Chrome bridge Runtime.addBinding/bindingCalled failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if params.operation != BrowserExposeBindingOperation::Read
+                    && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_expose_binding_after_bridge_mutation",
+                    )
+                {
+                    if params.operation == BrowserExposeBindingOperation::Add {
+                        match crate::chrome_debugger_bridge::expose_binding(
+                            window_hwnd,
+                            cdp_target_id,
+                            "remove",
+                            &params.name,
+                            params.execution_context_name.as_deref(),
+                            None,
+                            max_calls,
+                        )
+                        .await
+                        {
+                            Ok(cleanup) if !cleanup.binding_active => return Err(panic_error),
+                            Ok(cleanup) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_expose_binding_after_bridge_mutation",
+                                    panic_error,
+                                    format!(
+                                        "binding {:?} remained active after exact remove readback",
+                                        cleanup.name
+                                    ),
+                                ));
+                            }
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_expose_binding_after_bridge_mutation",
+                                    panic_error,
+                                    cleanup_error.detail().to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(panic_error);
+                }
+                let endpoint = result
+                    .extension_id
+                    .as_deref()
+                    .map(chrome_debugger_endpoint)
+                    .unwrap_or_else(chrome_debugger_default_endpoint);
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_BINDING",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    endpoint = %endpoint,
+                    cdp_target_id = %result.target_id,
+                    operation = ?params.operation,
+                    name = %params.name,
+                    newly_armed = result.newly_armed,
+                    binding_newly_added = result.binding_newly_added,
+                    binding_removed = result.binding_removed,
+                    returned = result.returned,
+                    total_buffered = result.total_buffered,
+                    dropped = result.dropped,
+                    target_url = %result.url,
+                    "readback=chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding outcome=binding_buffer_read"
+                );
+                return Ok(BrowserExposeBindingResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint,
+                    cdp_target_id: result.target_id,
+                    operation: params.operation,
+                    name: result.name,
+                    newly_armed: result.newly_armed,
+                    binding_newly_added: result.binding_newly_added,
+                    binding_removed: result.binding_removed,
+                    armed_at_unix_ms: result.armed_at_unix_ms,
+                    binding_active: result.binding_active,
+                    active_binding_count: result.active_binding_count,
+                    active_binding_names: result.active_binding_names,
+                    url: redact_url_for_public_readback(&result.url),
+                    title: result.title,
+                    ready_state: result.ready_state,
+                    calls: result
+                        .calls
+                        .into_iter()
+                        .map(browser_binding_call_from_bridge)
+                        .collect(),
+                    next_cursor: result.next_cursor,
+                    returned: result.returned,
+                    total_buffered: result.total_buffered,
+                    dropped: result.dropped,
+                    readback_backend: if result.readback_backend.trim().is_empty() {
+                        "chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding"
+                            .to_owned()
+                    } else {
+                        result.readback_backend
+                    },
+                    backend_tier_used: if result.backend_tier_used.trim().is_empty() {
+                        "chrome_tabs_extension".to_owned()
+                    } else {
+                        result.backend_tier_used
+                    },
+                    required_foreground: result.required_foreground,
+                });
+            }
+            return Err(browser_raw_cdp_required_error(
+                "browser_expose_binding",
+                window_hwnd,
+            ));
+        };
         let mut status = synapse_a11y::CdpBindingCaptureStatus {
             newly_armed: false,
             binding_newly_added: false,
@@ -8290,9 +7950,103 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_add_init_script_before_page_command",
         )?;
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
-            browser_raw_cdp_required_error("browser_add_init_script", window_hwnd)
-        })?;
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let operation = browser_init_script_operation_name(params.operation);
+                let result = crate::chrome_debugger_bridge::init_script(
+                    window_hwnd,
+                    cdp_target_id,
+                    operation,
+                    params.source.as_deref(),
+                    params.identifier.as_deref(),
+                    params.world_name.as_deref(),
+                    params.include_command_line_api.unwrap_or(false),
+                    params.run_immediately.unwrap_or(false),
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_add_init_script normal Chrome bridge initScript failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_add_init_script_after_bridge_page_command",
+                ) {
+                    if params.operation == BrowserInitScriptOperation::Add {
+                        match crate::chrome_debugger_bridge::init_script(
+                            window_hwnd,
+                            cdp_target_id,
+                            "remove",
+                            None,
+                            Some(&result.identifier),
+                            params.world_name.as_deref(),
+                            false,
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(_) => return Err(panic_error),
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_add_init_script_after_bridge_page_command",
+                                    panic_error,
+                                    cleanup_error.detail().to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(panic_error);
+                }
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_INIT_SCRIPT",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %result.target_id,
+                    operation = ?params.operation,
+                    identifier = %result.identifier,
+                    source_len = params.source.as_deref().map(str::len),
+                    target_url = %result.url,
+                    "readback=chrome.debugger.Page.addScriptToEvaluateOnNewDocument/Page.removeScriptToEvaluateOnNewDocument outcome=init_script_mutated"
+                );
+                return Ok(BrowserAddInitScriptResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: result
+                        .extension_id
+                        .as_deref()
+                        .map(chrome_debugger_endpoint)
+                        .unwrap_or_else(chrome_debugger_default_endpoint),
+                    cdp_target_id: result.target_id,
+                    operation: params.operation,
+                    identifier: result.identifier,
+                    source_len: (params.operation == BrowserInitScriptOperation::Add)
+                        .then(|| params.source.as_deref().map(str::len))
+                        .flatten(),
+                    world_name: params.world_name.clone(),
+                    include_command_line_api: params.include_command_line_api,
+                    run_immediately: params.run_immediately,
+                    url: redact_url_for_public_readback(&result.url),
+                    title: result.title,
+                    ready_state: result.ready_state,
+                    readback_backend: if result.readback_backend.trim().is_empty() {
+                        "chrome.debugger.Page.addScriptToEvaluateOnNewDocument/Page.removeScriptToEvaluateOnNewDocument".to_owned()
+                    } else {
+                        result.readback_backend
+                    },
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
+            return Err(browser_raw_cdp_required_error(
+                "browser_add_init_script",
+                window_hwnd,
+            ));
+        };
         let result = match params.operation {
             BrowserInitScriptOperation::Add => {
                 let source = params.source.as_deref().ok_or_else(|| {
@@ -8430,8 +8184,119 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_add_tag_before_runtime_dispatch",
         )?;
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
-            .ok_or_else(|| browser_raw_cdp_required_error(tool, window_hwnd))?;
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let marker = browser_tag_marker(tool, cdp_target_id);
+                let expression =
+                    build_browser_add_tag_expression(tool, tag_kind, source, script_type, &marker)?;
+                let evaluated = crate::chrome_debugger_bridge::evaluate_script(
+                    window_hwnd,
+                    cdp_target_id,
+                    &expression,
+                    &[],
+                    true,
+                    true,
+                    synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "{tool} normal Chrome bridge Runtime.evaluate failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_add_tag_after_bridge_runtime_dispatch",
+                ) {
+                    let cleanup_expression = build_browser_remove_tag_expression(tool, &marker)
+                        .map_err(|cleanup_error| {
+                            operator_panic_rollback_failed(
+                                "browser_add_tag_after_bridge_runtime_dispatch",
+                                panic_error.clone(),
+                                cleanup_error.message.to_string(),
+                            )
+                        })?;
+                    match crate::chrome_debugger_bridge::evaluate_script(
+                        window_hwnd,
+                        cdp_target_id,
+                        &cleanup_expression,
+                        &[],
+                        true,
+                        true,
+                        synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS,
+                    )
+                    .await
+                    {
+                        Ok(cleanup) => match verify_browser_remove_tag_payload(cleanup.value) {
+                            Ok(()) => return Err(panic_error),
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_add_tag_after_bridge_runtime_dispatch",
+                                    panic_error,
+                                    cleanup_error,
+                                ));
+                            }
+                        },
+                        Err(cleanup_error) => {
+                            return Err(operator_panic_rollback_failed(
+                                "browser_add_tag_after_bridge_runtime_dispatch",
+                                panic_error,
+                                cleanup_error.detail().to_owned(),
+                            ));
+                        }
+                    }
+                }
+                let payload: BrowserAddTagPayload = serde_json::from_value(evaluated.value.clone())
+                    .map_err(|error| {
+                        mcp_error(
+                            error_codes::OBSERVE_INTERNAL,
+                            format!("{tool} bridge payload decode failed: {error}"),
+                        )
+                    })?;
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_TAG_INJECT",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %evaluated.target_id,
+                    tag_name = %payload.tag_name,
+                    source_kind = %payload.source_kind,
+                    content_len = payload.content_len,
+                    element_marker = %payload.element_marker,
+                    target_url = %evaluated.url,
+                    "readback=chrome.debugger.Runtime.evaluate+tag.onload/onerror outcome=tag_injected"
+                );
+                return Ok(BrowserAddTagResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: evaluated
+                        .extension_id
+                        .as_deref()
+                        .map(chrome_debugger_endpoint)
+                        .unwrap_or_else(chrome_debugger_default_endpoint),
+                    cdp_target_id: evaluated.target_id,
+                    tag_name: payload.tag_name,
+                    source_kind: payload.source_kind,
+                    requested_url: redact_url_opt_for_public_readback(payload.requested_url),
+                    resolved_url: redact_url_opt_for_public_readback(payload.resolved_url),
+                    path: source.path.clone(),
+                    script_type: script_type.map(ToOwned::to_owned),
+                    content_len: payload.content_len,
+                    element_marker: payload.element_marker,
+                    url: redact_url_for_public_readback(&evaluated.url),
+                    title: evaluated.title,
+                    ready_state: evaluated.ready_state,
+                    readback_backend: "chrome.debugger.Runtime.evaluate+tag.onload/onerror"
+                        .to_owned(),
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
+            return Err(browser_raw_cdp_required_error(tool, window_hwnd));
+        };
         let marker = browser_tag_marker(tool, cdp_target_id);
         let expression =
             build_browser_add_tag_expression(tool, tag_kind, source, script_type, &marker)?;
@@ -8763,7 +8628,7 @@ impl SynapseService {
                     max_in_flight_requests = waited.max_in_flight_requests,
                     in_flight_requests = waited.in_flight_requests,
                     target_url = %waited.url,
-                    "readback=chrome.tabs+chrome.webNavigation+chrome.webRequest(request lifecycle) outcome=wait_satisfied"
+                    "readback=chrome.webNavigation+chrome.scripting.executeScript(load-state polling) outcome=wait_satisfied"
                 );
                 return Ok(BrowserWaitForLoadStateResponse {
                     session_id: session_id.to_owned(),
@@ -9089,9 +8954,8 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
-                    readback_backend:
-                        "chrome.webRequest request lifecycle ring buffer(browser_wait_for_request)"
-                            .to_owned(),
+                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_request)"
+                        .to_owned(),
                     backend_tier_used: "chrome_tabs_extension".to_owned(),
                     required_foreground: false,
                 });
@@ -9237,9 +9101,8 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
-                    readback_backend:
-                        "chrome.webRequest request lifecycle ring buffer(browser_wait_for_response)"
-                            .to_owned(),
+                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_response)"
+                        .to_owned(),
                     backend_tier_used: "chrome_tabs_extension".to_owned(),
                     required_foreground: false,
                 });
@@ -9597,13 +9460,91 @@ impl SynapseService {
         cdp_target_id: &str,
         wait: &NormalizedBrowserWaitForFunctionParams,
     ) -> Result<BrowserWaitForFunctionResponse, ErrorData> {
+        const TOOL: &str = "browser_wait_for_function";
         // A predicate is caller-supplied JavaScript and can have side effects.
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_wait_for_function_before_runtime_dispatch",
         )?;
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
-            browser_raw_cdp_required_error("browser_wait_for_function", window_hwnd)
-        })?;
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let waited = crate::chrome_debugger_bridge::wait_for_function(
+                    window_hwnd,
+                    cdp_target_id,
+                    &wait.expression,
+                    wait.args.clone(),
+                    wait.timeout_ms,
+                    wait.polling_interval_ms,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_wait_for_function Chrome bridge wait failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if waited.timed_out {
+                    return Err(mcp_error(
+                        error_codes::BROWSER_WAIT_TIMEOUT,
+                        format!(
+                            "browser_wait_for_function timed out after {} ms; poll_count={} value_type={} value_description={:?}",
+                            wait.timeout_ms,
+                            waited.poll_count,
+                            waited.value_type,
+                            waited.value_description
+                        ),
+                    ));
+                }
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_WAIT_FOR_FUNCTION",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %waited.target_id,
+                    expression_len = wait.expression.len(),
+                    arg_count = wait.args.len(),
+                    elapsed_ms = waited.elapsed_ms,
+                    poll_count = waited.poll_count,
+                    value_type = %waited.value_type,
+                    target_url = %waited.url,
+                    "readback=chrome.scripting.executeScript(MAIN waitForFunction predicate polling) outcome=wait_satisfied"
+                );
+                return Ok(BrowserWaitForFunctionResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome_bridge".to_owned(),
+                    cdp_target_id: waited.target_id,
+                    condition_met: waited.condition_met,
+                    elapsed_ms: waited.elapsed_ms,
+                    timeout_ms: wait.timeout_ms,
+                    polling_interval_ms: wait.polling_interval_ms,
+                    poll_count: waited.poll_count,
+                    expression_len: if waited.expression_len > 0 {
+                        waited.expression_len
+                    } else {
+                        wait.expression.len()
+                    },
+                    arg_count: if waited.arg_count > 0 {
+                        waited.arg_count
+                    } else {
+                        wait.args.len()
+                    },
+                    value: waited.value,
+                    value_type: waited.value_type,
+                    value_description: waited.value_description,
+                    unserializable_value: waited.unserializable_value,
+                    url: redact_url_for_public_readback(&waited.url),
+                    title: waited.title,
+                    ready_state: waited.ready_state,
+                    readback_backend: waited.readback_backend,
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
+            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
+        };
         let expression = build_browser_wait_for_function_expression(wait)?;
         let evaluated = synapse_a11y::cdp_evaluate_expression(
             &endpoint,
@@ -9672,9 +9613,6 @@ impl SynapseService {
             value_type: payload.value_type,
             value_description: payload.value_description,
             unserializable_value: payload.unserializable_value,
-            initial_document_id: None,
-            final_document_id: None,
-            navigation_count: 0,
             url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
@@ -10712,11 +10650,6 @@ impl SynapseService {
                 session_id: session_id.to_owned(),
             },
             app: Some(process_name.to_owned()),
-            event_id: None,
-            initiator: Some("agent".to_owned()),
-            claim_id: None,
-            claim_status: None,
-            correlation_verdict: None,
             source: "cdp_open_tab".to_owned(),
             event: "tool_call".to_owned(),
             action: Some("open".to_owned()),
@@ -10731,17 +10664,6 @@ impl SynapseService {
             requested_url: Some(requested_url.to_owned()),
             before_url: None,
             before_title: None,
-            before_document_id: None,
-            frame_id: None,
-            parent_frame_id: None,
-            document_id: None,
-            parent_document_id: None,
-            document_lifecycle: None,
-            frame_type: None,
-            transition_type: None,
-            transition_qualifiers: Vec::new(),
-            navigation_error: None,
-            navigation_timestamp_ms: None,
             ready_state: None,
             observed_at_unix_ms: None,
             active: Some(false),
@@ -10820,7 +10742,12 @@ impl SynapseService {
             .await
             {
                 Ok(closed) => closed,
-                Err(error) if Self::chrome_bridge_close_target_already_absent(error.code()) => {
+                Err(error)
+                    if Self::chrome_bridge_close_target_already_absent(
+                        error.detail(),
+                        cdp_target_id,
+                    ) =>
+                {
                     let listed = crate::chrome_debugger_bridge::list_tabs(
                             owner.window_hwnd,
                             owner.chrome_window_id,
@@ -10903,115 +10830,16 @@ impl SynapseService {
                         target_count_after: listed.target_count,
                         previous,
                         current,
-                        // The extension DID acknowledge this command: it
-                        // reported the target already absent before touching
-                        // any tab. Nothing about the acknowledgement failed.
-                        close_acknowledgement_failure: None,
                     });
                 }
                 Err(error) => {
-                    // #2032: the close verdict is the PHYSICAL outcome, and the
-                    // Source of Truth for that is chrome.tabs — never the
-                    // arrival of the bridge acknowledgement. The extension runs
-                    // chrome.tabs.remove before any awaited readback, so a
-                    // delivered-but-unacknowledged closeTab (caller timeout,
-                    // transport loss, or the extension's own absence-readback
-                    // timing out after the remove already landed) can leave the
-                    // tab physically closed while the daemon sees only an
-                    // error. Adjudicate against chrome.tabs.query first, then
-                    // decide; the acknowledgement failure is reported either
-                    // way, never swallowed.
-                    let listed = crate::chrome_debugger_bridge::list_tabs(
-                            owner.window_hwnd,
-                            owner.chrome_window_id,
-                            None,
-                            None,
-                        )
-                        .await
-                        .map_err(|readback_error| {
-                            mcp_error(
-                                error.code(),
-                                format!(
-                                    "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}; the independent chrome.tabs.query adjudication readback for target {cdp_target_id:?} also failed, so the physical close is UNPROVEN and persisted owner row {owner_key:?} is left visible for retry: readback_error={}",
-                                    error.detail(),
-                                    readback_error.detail()
-                                ),
-                            )
-                        })?;
-                    if listed
-                        .tabs
-                        .iter()
-                        .any(|tab| tab.target_id.eq_ignore_ascii_case(cdp_target_id))
-                    {
-                        return Err(mcp_error(
-                            error.code(),
-                            format!(
-                                "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}; the independent chrome.tabs.query adjudication readback still returns target {cdp_target_id:?} in window {:#x}, so the tab is still open; leaving persisted owner row {owner_key:?} visible for retry",
-                                error.detail(),
-                                owner.window_hwnd
-                            ),
-                        ));
-                    }
-                    let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
-                        "cdp_close_tab_after_bridge_unacknowledged_absence_readback",
-                    )
-                    .err();
-                    let reconciliation = self.reconcile_closed_cdp_target_ledgers(
-                        session_id,
-                        owner_key,
-                        owner.window_hwnd,
-                        cdp_target_id,
-                    );
-                    let (previous, current, claim_released) = match reconciliation {
-                        Ok(readback) => readback,
-                        Err(reconciliation_error) => {
-                            if let Some(panic_error) = panic_error {
-                                return Err(operator_panic_rollback_failed(
-                                    "cdp_close_tab_after_bridge_unacknowledged_absence_readback",
-                                    panic_error,
-                                    reconciliation_error.message.to_string(),
-                                ));
-                            }
-                            return Err(reconciliation_error);
-                        }
-                    };
-                    if let Some(panic_error) = panic_error {
-                        return Err(panic_error);
-                    }
-                    tracing::error!(
-                        code = "CDP_BACKGROUND_TAB_CLOSED_WITHOUT_BRIDGE_ACKNOWLEDGEMENT",
-                        session_id = %session_id,
-                        hwnd = owner.window_hwnd,
-                        endpoint = %owner.endpoint,
-                        cdp_target_id = %cdp_target_id,
-                        cdp_owner_key = %owner_key,
-                        requested_url = %owner.requested_url,
-                        target_url = %owner.target_url,
-                        owner_created_at_unix_ms = owner.created_at_unix_ms,
-                        target_count_after = listed.target_count,
-                        target_claim_released = claim_released,
-                        close_error_code = %error.code(),
-                        close_error = %error.detail(),
-                        "readback=chrome.tabs.query outcome=target_absent_without_close_acknowledgement"
-                    );
-                    return Ok(CdpCloseTabResponse {
-                        session_id: session_id.to_owned(),
-                        window_hwnd: owner.window_hwnd,
-                        endpoint: owner.endpoint,
-                        cdp_target_id: cdp_target_id.to_owned(),
-                        closed: true,
-                        target_count_before: listed.target_count,
-                        target_count_after: listed.target_count,
-                        previous,
-                        current,
-                        close_acknowledgement_failure: Some(CdpCloseAcknowledgementFailure {
-                            code: error.code().to_owned(),
-                            detail: error.detail().to_owned(),
-                            absence_readback: "chrome.tabs.query via normal Synapse Chrome bridge"
-                                .to_owned(),
-                            target_count_before_unobserved: true,
-                        }),
-                    });
+                    return Err(mcp_error(
+                        error.code(),
+                        format!(
+                            "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}",
+                            error.detail()
+                        ),
+                    ));
                 }
             };
             let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
@@ -11053,7 +10881,6 @@ impl SynapseService {
                 owner_created_at_unix_ms = owner.created_at_unix_ms,
                 target_count_before = closed.target_count_before,
                 target_count_after = closed.target_count_after,
-                already_absent = closed.already_absent,
                 target_claim_released = claim_released,
                 "readback=chrome.tabs.query outcome=target_absent"
             );
@@ -11062,12 +10889,11 @@ impl SynapseService {
                 window_hwnd: owner.window_hwnd,
                 endpoint: owner.endpoint,
                 cdp_target_id: closed.target_id,
-                closed: !closed.already_absent,
+                closed: true,
                 target_count_before: closed.target_count_before,
                 target_count_after: closed.target_count_after,
                 previous,
                 current,
-                close_acknowledgement_failure: None,
             });
         }
 
@@ -11131,14 +10957,13 @@ impl SynapseService {
             target_count_after: closed.target_count_after,
             previous,
             current,
-            // Raw-CDP lane: Target.closeTarget already carries its own
-            // present/absent readback, so a failure there is a real failure.
-            close_acknowledgement_failure: None,
         })
     }
 
-    fn chrome_bridge_close_target_already_absent(code: &str) -> bool {
-        code == error_codes::CHROME_TAB_TARGET_ABSENT
+    fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
+        detail.contains("targetIdHint")
+            && detail.contains(target_id)
+            && detail.contains("did not match any chrome.tabs tab id")
     }
 
     fn chrome_bridge_tab_id_from_target_id(target_id: &str) -> Option<i64> {
@@ -11200,11 +11025,6 @@ impl SynapseService {
                     session_id: session_id.to_owned(),
                 },
                 app: Some("chrome.exe".to_owned()),
-                event_id: None,
-                initiator: Some("agent".to_owned()),
-                claim_id: None,
-                claim_status: None,
-                correlation_verdict: None,
                 source: source_tool.to_owned(),
                 event: "tool_call".to_owned(),
                 action: Some(navigated.action.clone()),
@@ -11219,17 +11039,6 @@ impl SynapseService {
                 requested_url: navigated.requested_url.clone(),
                 before_url: Some(navigated.before.url.clone()),
                 before_title: Some(navigated.before.title.clone()),
-                before_document_id: None,
-                frame_id: None,
-                parent_frame_id: None,
-                document_id: None,
-                parent_document_id: None,
-                document_lifecycle: None,
-                frame_type: None,
-                transition_type: None,
-                transition_qualifiers: Vec::new(),
-                navigation_error: None,
-                navigation_timestamp_ms: None,
                 ready_state: Some(navigated.after.ready_state.clone()),
                 observed_at_unix_ms: None,
                 active: Some(false),
@@ -11256,10 +11065,6 @@ impl SynapseService {
                     readback_backend: "Runtime.evaluate+Page.getNavigationHistory".to_owned(),
                     navigation_error_text: navigated.navigation_error_text,
                     is_download: navigated.is_download,
-                    navigation_claim_id: None,
-                    navigation_correlation_status: None,
-                    initial_document_id: None,
-                    final_document_id: None,
                     download_status: None,
                     download_id: None,
                     download_url: None,
@@ -11327,11 +11132,6 @@ impl SynapseService {
                 session_id: session_id.to_owned(),
             },
             app: Some("chrome.exe".to_owned()),
-            event_id: None,
-            initiator: Some("agent".to_owned()),
-            claim_id: None,
-            claim_status: None,
-            correlation_verdict: None,
             source: source_tool.to_owned(),
             event: "tool_call".to_owned(),
             action: Some(navigated.action.clone()),
@@ -11346,17 +11146,6 @@ impl SynapseService {
             requested_url: navigated.requested_url.clone(),
             before_url: Some(navigated.before_url.clone()),
             before_title: Some(navigated.before_title.clone()),
-            before_document_id: None,
-            frame_id: None,
-            parent_frame_id: None,
-            document_id: None,
-            parent_document_id: None,
-            document_lifecycle: None,
-            frame_type: None,
-            transition_type: None,
-            transition_qualifiers: Vec::new(),
-            navigation_error: None,
-            navigation_timestamp_ms: None,
             ready_state: Some(navigated.ready_state.clone()),
             observed_at_unix_ms: None,
             active: Some(false),
@@ -11383,10 +11172,6 @@ impl SynapseService {
                 readback_backend: navigated.readback_backend,
                 navigation_error_text: navigated.navigation_error_text,
                 is_download: navigated.is_download,
-                navigation_claim_id: navigated.navigation_claim_id,
-                navigation_correlation_status: navigated.navigation_correlation_status,
-                initial_document_id: navigated.initial_document_id,
-                final_document_id: navigated.final_document_id,
                 download_status: navigated.download_status,
                 download_id: navigated.download_id,
                 download_url: navigated.download_url,
@@ -11411,15 +11196,6 @@ impl SynapseService {
         wait_timeout_ms: u64,
     ) -> Result<CdpActivateTabResponse, ErrorData> {
         if let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) {
-            let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
-            if human_os_foreground_before_hwnd == Some(window_hwnd) {
-                return Err(mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "cdp_activate_tab refused raw target {cdp_target_id:?} before Target.activateTarget because HWND {window_hwnd:#x} is the human OS foreground and changing its active target could interrupt the user"
-                    ),
-                ));
-            }
             super::operator_panic_boundary::ensure_mcp_mutation(
                 "cdp_activate_tab_before_raw_activate_target",
             )?;
@@ -11436,19 +11212,6 @@ impl SynapseService {
             super::operator_panic_boundary::ensure_mcp_mutation(
                 "cdp_activate_tab_after_raw_activate_target",
             )?;
-            let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
-            if background_tab_activation_foregrounded_requested_window(
-                human_os_foreground_before_hwnd,
-                human_os_foreground_after_hwnd,
-                window_hwnd,
-            ) {
-                return Err(mcp_error(
-                    error_codes::ACTION_POSTCONDITION_FAILED,
-                    format!(
-                        "cdp_activate_tab raw Target.activateTarget changed the human OS foreground from {human_os_foreground_before_hwnd:?} to requested HWND {window_hwnd:#x} while required_foreground=false"
-                    ),
-                ));
-            }
             tracing::info!(
                 code = "CDP_BACKGROUND_TAB_ACTIVATED",
                 session_id = %session_id,
@@ -11477,14 +11240,6 @@ impl SynapseService {
         }
 
         let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
-        if human_os_foreground_before_hwnd == Some(window_hwnd) {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "cdp_activate_tab refused normal Chrome target {cdp_target_id:?} before chrome.tabs.update because HWND {window_hwnd:#x} is the human OS foreground and changing its active tab could interrupt the user"
-                ),
-            ));
-        }
         super::operator_panic_boundary::ensure_mcp_mutation(
             "cdp_activate_tab_before_bridge_activate_target",
         )?;
@@ -11492,9 +11247,6 @@ impl SynapseService {
             window_hwnd,
             cdp_target_id,
             wait_timeout_ms,
-            None,
-            None,
-            None,
         )
         .await
         .map_err(|error| {
@@ -11954,131 +11706,6 @@ fn browser_tab_entry(
         pinned: tab.pinned,
         target_attached: tab.target_attached,
     }
-}
-
-fn browser_tab_entry_from_opened(opened: &CdpOpenTabResponse) -> BrowserTabEntry {
-    let url = opened.target_url.clone();
-    BrowserTabEntry {
-        target: TargetWire::Cdp {
-            window_hwnd: opened.window_hwnd,
-            cdp_target_id: opened.cdp_target_id.clone(),
-        },
-        window_hwnd: opened.window_hwnd,
-        cdp_target_id: opened.cdp_target_id.clone(),
-        tab_id: chrome_bridge_tab_id_from_target_id_u32(&opened.cdp_target_id).unwrap_or_default(),
-        chrome_window_id: opened.chrome_window_id,
-        index: -1,
-        target_type: opened.target_type.clone(),
-        title: redact_title_for_public_url_readback(&url, opened.target_title.clone()),
-        url,
-        ready_state: String::new(),
-        active: opened.target_active,
-        highlighted: opened.target_highlighted,
-        pinned: false,
-        target_attached: opened.target_attached,
-    }
-}
-
-fn browser_tab_entry_from_target_info(
-    window_hwnd: i64,
-    info: &crate::chrome_debugger_bridge::ChromeDebuggerTargetInfo,
-) -> BrowserTabEntry {
-    let url = redact_url_for_public_readback(&info.url);
-    BrowserTabEntry {
-        target: TargetWire::Cdp {
-            window_hwnd,
-            cdp_target_id: info.target_id.clone(),
-        },
-        window_hwnd,
-        cdp_target_id: info.target_id.clone(),
-        tab_id: info.tab_id,
-        chrome_window_id: info.chrome_window_id,
-        index: -1,
-        target_type: info.target_type.clone(),
-        title: redact_title_for_public_url_readback(&url, info.title.clone()),
-        url,
-        ready_state: info.ready_state.clone(),
-        active: info.active,
-        highlighted: info.highlighted,
-        pinned: info.pinned,
-        target_attached: false,
-    }
-}
-
-fn browser_tab_entry_from_activated(
-    window_hwnd: i64,
-    activated: &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult,
-) -> BrowserTabEntry {
-    let url = redact_url_for_public_readback(&activated.url);
-    BrowserTabEntry {
-        target: TargetWire::Cdp {
-            window_hwnd,
-            cdp_target_id: activated.target_id.clone(),
-        },
-        window_hwnd,
-        cdp_target_id: activated.target_id.clone(),
-        tab_id: activated.tab_id,
-        chrome_window_id: activated.chrome_window_id,
-        index: -1,
-        target_type: "page".to_owned(),
-        title: redact_title_for_public_url_readback(&url, activated.title.clone()),
-        url,
-        ready_state: activated.ready_state.clone(),
-        active: activated.active,
-        highlighted: activated.highlighted.unwrap_or(false),
-        pinned: false,
-        target_attached: false,
-    }
-}
-
-#[cfg(windows)]
-fn browser_tabs_exact_mutation_response(
-    session_id: &str,
-    window_context: &ForegroundContext,
-    used_human_os_foreground_window: bool,
-    operation: BrowserTabsOperation,
-    endpoint: String,
-    chrome_window_id: Option<i64>,
-    chrome_window_focused: Option<bool>,
-    chrome_window_state: Option<String>,
-    chrome_window_selection_reason: String,
-    chrome_window_candidate_count: u32,
-    chrome_window_non_focused_count: u32,
-    mutation: BrowserTabsMutation,
-    tabs: Vec<BrowserTabEntry>,
-) -> BrowserTabsResponse {
-    let active_tab_count =
-        u32::try_from(tabs.iter().filter(|tab| tab.active).count()).unwrap_or(u32::MAX);
-    let target_count = u32::try_from(tabs.len()).unwrap_or(u32::MAX);
-    BrowserTabsResponse {
-        session_id: session_id.to_owned(),
-        operation,
-        window_hwnd: window_context.hwnd,
-        transport: "chrome_tabs_extension".to_owned(),
-        endpoint,
-        chrome_window_id,
-        chrome_window_focused,
-        chrome_window_state,
-        chrome_window_selection_reason,
-        chrome_window_candidate_count,
-        chrome_window_non_focused_count,
-        target_count,
-        active_tab_count,
-        used_human_os_foreground_window,
-        source_of_truth:
-            "exact chrome.tabs.get present/absent readback for the mutation target; tabs contains only the affected target when still present"
-                .to_owned(),
-        mutation: Some(redact_browser_tabs_mutation_urls(mutation)),
-        tabs,
-    }
-}
-
-fn chrome_bridge_tab_id_from_target_id_u32(target_id: &str) -> Option<u32> {
-    let tab_id = target_id.strip_prefix("chrome-tab:")?;
-    if tab_id.is_empty() || !tab_id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    tab_id.parse::<u32>().ok()
 }
 
 fn redact_browser_tabs_mutation_urls(mut mutation: BrowserTabsMutation) -> BrowserTabsMutation {
@@ -12567,6 +12194,22 @@ fn browser_binding_call_from_entry(
     }
 }
 
+#[cfg(windows)]
+fn browser_binding_call_from_bridge(
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerBindingCall,
+) -> super::BrowserBindingCall {
+    super::BrowserBindingCall {
+        seq: entry.seq,
+        name: entry.name,
+        payload: entry.payload,
+        payload_len: entry.payload_len,
+        payload_truncated: entry.payload_truncated,
+        payload_json: entry.payload_json,
+        execution_context_id: entry.execution_context_id,
+        timestamp_ms: entry.timestamp_ms,
+    }
+}
+
 /// Upper bound on the evaluated expression size. Generous enough for injected
 /// helper bundles, but bounded so a single tool call cannot ship an unbounded
 /// payload through the protocol.
@@ -12590,6 +12233,21 @@ enum BrowserTagSourceKind {
     Url,
     Content,
     Path,
+}
+
+fn browser_init_script_operation_name(operation: BrowserInitScriptOperation) -> &'static str {
+    match operation {
+        BrowserInitScriptOperation::Add => "add",
+        BrowserInitScriptOperation::Remove => "remove",
+    }
+}
+
+fn browser_expose_binding_operation_name(operation: BrowserExposeBindingOperation) -> &'static str {
+    match operation {
+        BrowserExposeBindingOperation::Add => "add",
+        BrowserExposeBindingOperation::Read => "read",
+        BrowserExposeBindingOperation::Remove => "remove",
+    }
 }
 
 impl BrowserTagSourceKind {
@@ -12784,6 +12442,46 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
 /// single, structured `BROWSER_EVALUATE_TIMEOUT` result that names the budget and
 /// tells the agent to retry with a larger `timeout_ms` — distinct from a thrown
 /// JS exception (issue #1596). All other errors keep the bridge's own code.
+fn classify_browser_evaluate_bridge_error(
+    error: &crate::chrome_debugger_bridge::ChromeDebuggerBridgeError,
+    scope: &str,
+    timeout_ms: u64,
+) -> ErrorData {
+    classify_browser_evaluate_error_parts(error.code(), error.detail(), scope, timeout_ms)
+}
+
+/// Pure classification of a Chrome-bridge evaluate failure by its `(code, detail)`
+/// pair. Factored out of [`classify_browser_evaluate_bridge_error`] so the timeout
+/// reclassification can be unit-tested without constructing a private bridge error
+/// type (issue #1596).
+fn classify_browser_evaluate_error_parts(
+    code: &'static str,
+    detail: &str,
+    scope: &str,
+    timeout_ms: u64,
+) -> ErrorData {
+    let is_timeout =
+        code == error_codes::BROWSER_EVALUATE_TIMEOUT || detail.contains("timed out after");
+    if is_timeout {
+        return mcp_error(
+            error_codes::BROWSER_EVALUATE_TIMEOUT,
+            format!(
+                "browser_evaluate ({scope} scope) Chrome bridge Runtime.evaluate was still running when the {timeout_ms} ms timeout_ms budget elapsed; the expression neither resolved nor threw. Retry with a larger timeout_ms (max {} ms) if the page work legitimately needs longer, or pass await_promise=false when evaluating a promise that never resolves. bridge_detail={detail}",
+                synapse_a11y::MAX_EVALUATE_TIMEOUT_MS
+            ),
+        );
+    }
+    mcp_error(
+        code,
+        format!("browser_evaluate normal Chrome bridge Runtime.evaluate failed: {detail}"),
+    )
+}
+
+/// Resolves the effective evaluate budget in milliseconds, applying the default
+/// when unset and enforcing the bounded `50..=120000` range. Returns a structured
+/// `TOOL_PARAMS_INVALID` error naming the offending value and the accepted range
+/// so an out-of-range request fails loudly instead of being silently clamped
+/// (issue #1596).
 fn resolve_browser_evaluate_timeout_ms(timeout_ms: Option<u32>) -> Result<u64, ErrorData> {
     let Some(requested) = timeout_ms else {
         return Ok(synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS);
@@ -15142,33 +14840,6 @@ fn parse_browser_evaluate_element(element_id: &str) -> Result<(i64, String), Err
     Ok((backend, target))
 }
 
-fn parse_browser_screenshot_element(
-    element_id: &str,
-    label: &str,
-) -> Result<(i64, String), ErrorData> {
-    let parsed = synapse_core::ElementId::parse(element_id).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("browser_screenshot {label} {element_id:?} is invalid: {error}"),
-        )
-    })?;
-    let backend_node_id = synapse_a11y::cdp_backend_from_element_id(&parsed).ok_or_else(|| {
-        mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!("browser_screenshot {label} {element_id:?} is not a raw-CDP DOM element"),
-        )
-    })?;
-    let target_id = synapse_a11y::cdp_target_from_element_id(&parsed).ok_or_else(|| {
-        mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!(
-                "browser_screenshot {label} {element_id:?} has no embedded CDP target id; re-resolve it against the owned raw-CDP tab"
-            ),
-        )
-    })?;
-    Ok((backend_node_id, target_id))
-}
-
 fn parse_chrome_bridge_element_target(element_id: &str) -> Result<Option<String>, ErrorData> {
     let trimmed = element_id.trim();
     let Some(after_prefix) = trimmed.strip_prefix("chrome-tab:") else {
@@ -15802,7 +15473,7 @@ fn browser_tabs_activation_visual_probe(
         width = bitmap.width,
         height = bitmap.height,
         bitmap_sha256 = %bitmap_sha256,
-        "readback=gdi_bitblt_visible_window_bgra outcome=activation_visual_probe"
+        "readback=passive_wgc_window_bgra outcome=activation_visual_probe"
     );
     Ok(BrowserTabsActivationVisualProbe {
         window_title: context.window_title,
@@ -15846,7 +15517,7 @@ async fn browser_tabs_verify_activation_visualized(
                 before_bitmap_sha256 = %before.bitmap_sha256,
                 after_bitmap_sha256 = %after.bitmap_sha256,
                 target_title_matched_window_title = title_match.unwrap_or(true),
-                "readback=gdi_bitblt_visible_window_bgra outcome=activation_visual_postcondition_verified"
+                "readback=passive_wgc_window_bgra outcome=activation_visual_postcondition_verified"
             );
             return Ok(browser_tabs_activation_visual_readback(
                 "verified_hwnd_pixels_changed",
@@ -15907,7 +15578,7 @@ fn browser_tabs_activation_visual_readback(
     BrowserTabsActivationVisualReadback {
         status: status.to_owned(),
         source_of_truth:
-            "CPU/GDI BitBlt of the owning Chrome HWND's physically visible desktop rectangle before and after chrome.tabs.update(active=true)"
+            "passive per-window WGC BGRA capture of the owning Chrome HWND before and after chrome.tabs.update(active=true)"
                 .to_owned(),
         before_window_title: Some(before.window_title.clone()),
         after_window_title: Some(after.window_title.clone()),
@@ -15949,12 +15620,381 @@ fn browser_tab_window_title_matches_target(
     )
 }
 
+#[derive(Clone, Debug, Default)]
+struct BrowserScreenshotForegroundReadback {
+    required_foreground: bool,
+    before_hwnd: Option<i64>,
+    capture_hwnd: Option<i64>,
+    after_restore_hwnd: Option<i64>,
+    restored_human_os_foreground: bool,
+}
+
 /// #1359: process-wide serialization of browser_screenshot's foreground-capture
 /// critical section. Concurrent captures otherwise interleave their Chrome-window
 /// activation/restore and one observes the other's foreground change as a
 /// spurious drift, failing the capture. Held across prepare → capture → finish
 /// (and the passive-window fallback), released on drop even on error.
-/// Validates a target HWND and returns the identity read from the live window.
+static BROWSER_SCREENSHOT_FOREGROUND_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct BrowserScreenshotForegroundGuard {
+    before: ForegroundContext,
+    readback: BrowserScreenshotForegroundReadback,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug, Default)]
+struct BrowserScreenshotForegroundGuard;
+
+#[cfg(windows)]
+fn prepare_browser_screenshot_foreground(
+    window_hwnd: i64,
+) -> Result<BrowserScreenshotForegroundGuard, ErrorData> {
+    const TOOL: &str = "browser_screenshot";
+    let before = read_browser_screenshot_current_foreground("before_capture")?;
+    let target = synapse_a11y::foreground_context(window_hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!(
+                "browser_screenshot target HWND {window_hwnd:#x} is not inspectable before capture: {error}"
+            ),
+        )
+    })?;
+    let required_foreground = before.hwnd != window_hwnd;
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_FOREGROUND_PREFLIGHT",
+        hwnd = window_hwnd,
+        human_os_foreground_before_hwnd = before.hwnd,
+        human_os_foreground_before_pid = before.pid,
+        human_os_foreground_before_process = %before.process_name,
+        human_os_foreground_before_title = %before.window_title,
+        target_hwnd = target.hwnd,
+        target_pid = target.pid,
+        target_process = %target.process_name,
+        target_title = %target.window_title,
+        required_foreground,
+        "readback=GetForegroundWindow outcome=foreground_precondition_evaluated"
+    );
+
+    if required_foreground {
+        synapse_a11y::focus_window_with_intent(
+            window_hwnd,
+            synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
+        )
+        .map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+                format!(
+                    "browser_screenshot could not foreground Chrome HWND {window_hwnd:#x} before captureVisibleTab; before foreground was {}; focus error: {error}",
+                    browser_screenshot_foreground_summary(&before)
+                ),
+            )
+        })?;
+    }
+
+    let capture_foreground = match read_browser_screenshot_current_foreground("capture_ready") {
+        Ok(capture_foreground) => capture_foreground,
+        Err(error) => {
+            let guard = BrowserScreenshotForegroundGuard {
+                readback: BrowserScreenshotForegroundReadback {
+                    required_foreground,
+                    before_hwnd: Some(before.hwnd),
+                    capture_hwnd: None,
+                    after_restore_hwnd: None,
+                    restored_human_os_foreground: !required_foreground,
+                },
+                before,
+            };
+            return Err(browser_screenshot_prepare_failure_with_restore(
+                window_hwnd,
+                guard,
+                error,
+            ));
+        }
+    };
+    if capture_foreground.hwnd != window_hwnd {
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            before_process = %before.process_name,
+            capture_hwnd = capture_foreground.hwnd,
+            capture_pid = capture_foreground.pid,
+            capture_process = %capture_foreground.process_name,
+            capture_title = %capture_foreground.window_title,
+            required_foreground,
+            "browser_screenshot foreground precondition failed after explicit activation"
+        );
+        let error = mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot refused captureVisibleTab because Chrome HWND {window_hwnd:#x} was not the physical OS foreground after activation; actual foreground was {}",
+                browser_screenshot_foreground_summary(&capture_foreground)
+            ),
+        );
+        let guard = BrowserScreenshotForegroundGuard {
+            readback: BrowserScreenshotForegroundReadback {
+                required_foreground,
+                before_hwnd: Some(before.hwnd),
+                capture_hwnd: Some(capture_foreground.hwnd),
+                after_restore_hwnd: None,
+                restored_human_os_foreground: !required_foreground,
+            },
+            before,
+        };
+        return Err(browser_screenshot_prepare_failure_with_restore(
+            window_hwnd,
+            guard,
+            error,
+        ));
+    }
+
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_FOREGROUND_VERIFIED",
+        hwnd = window_hwnd,
+        human_os_foreground_before_hwnd = before.hwnd,
+        human_os_foreground_capture_hwnd = capture_foreground.hwnd,
+        human_os_foreground_capture_pid = capture_foreground.pid,
+        human_os_foreground_capture_process = %capture_foreground.process_name,
+        required_foreground,
+        "readback=GetForegroundWindow outcome=target_chrome_foreground_verified"
+    );
+
+    Ok(BrowserScreenshotForegroundGuard {
+        readback: BrowserScreenshotForegroundReadback {
+            required_foreground,
+            before_hwnd: Some(before.hwnd),
+            capture_hwnd: Some(capture_foreground.hwnd),
+            after_restore_hwnd: None,
+            restored_human_os_foreground: !required_foreground,
+        },
+        before,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_browser_screenshot_foreground(
+    _window_hwnd: i64,
+) -> Result<BrowserScreenshotForegroundGuard, ErrorData> {
+    Ok(BrowserScreenshotForegroundGuard)
+}
+
+#[cfg(windows)]
+fn finish_browser_screenshot_foreground(
+    window_hwnd: i64,
+    guard: BrowserScreenshotForegroundGuard,
+    capture_error: Option<&ErrorData>,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    const TOOL: &str = "browser_screenshot";
+    let mut readback = guard.readback;
+    let before = guard.before;
+    let current = read_browser_screenshot_current_foreground("after_bridge_capture")?;
+    readback.after_restore_hwnd = Some(current.hwnd);
+
+    if !readback.required_foreground {
+        if current.hwnd == before.hwnd && current.pid == before.pid {
+            readback.restored_human_os_foreground = true;
+            return Ok(readback);
+        }
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            current_hwnd = current.hwnd,
+            current_pid = current.pid,
+            current_process = %current.process_name,
+            current_title = %current.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot detected unexpected physical foreground drift while target was already foreground"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot physical foreground drifted from {} to {} during capture",
+                browser_screenshot_foreground_summary(&before),
+                browser_screenshot_foreground_summary(&current)
+            ),
+        ));
+    }
+
+    if current.hwnd == before.hwnd && current.pid == before.pid {
+        readback.restored_human_os_foreground = true;
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_FOREGROUND_ALREADY_RESTORED",
+            hwnd = window_hwnd,
+            human_os_foreground_before_hwnd = before.hwnd,
+            human_os_foreground_after_restore_hwnd = current.hwnd,
+            capture_error = ?capture_error,
+            "readback=GetForegroundWindow outcome=foreground_already_back_at_pre_capture_hwnd"
+        );
+        return Ok(readback);
+    }
+
+    if current.hwnd != window_hwnd {
+        tracing::error!(
+            code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            current_hwnd = current.hwnd,
+            current_pid = current.pid,
+            current_process = %current.process_name,
+            current_title = %current.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot refused to restore because physical foreground changed away from the capture HWND"
+        );
+        return Err(mcp_error(
+            error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+            format!(
+                "browser_screenshot captured with Chrome HWND {window_hwnd:#x}, but physical foreground changed to {} before restore; refusing to overwrite that foreground state",
+                browser_screenshot_foreground_summary(&current)
+            ),
+        ));
+    }
+
+    let prior = synapse_a11y::foreground_context(before.hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot could not inspect prior foreground HWND {:#x} before restore: {error}",
+                before.hwnd
+            ),
+        )
+    })?;
+    if prior.pid != before.pid {
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            prior_actual_pid = prior.pid,
+            prior_actual_process = %prior.process_name,
+            prior_actual_title = %prior.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot refused foreground restore because the prior HWND now belongs to another process"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot refused to restore prior foreground HWND {:#x}: expected pid {}, actual pid {}",
+                before.hwnd, before.pid, prior.pid
+            ),
+        ));
+    }
+
+    synapse_a11y::focus_window_with_intent(
+        before.hwnd,
+        synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: TOOL },
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot captured with Chrome HWND {window_hwnd:#x} but failed to restore prior foreground {}; restore error: {error}",
+                browser_screenshot_foreground_summary(&before)
+            ),
+        )
+    })?;
+
+    let restored = read_browser_screenshot_current_foreground("after_restore")?;
+    readback.after_restore_hwnd = Some(restored.hwnd);
+    if restored.hwnd == before.hwnd && restored.pid == before.pid {
+        readback.restored_human_os_foreground = true;
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_FOREGROUND_RESTORED",
+            hwnd = window_hwnd,
+            human_os_foreground_before_hwnd = before.hwnd,
+            human_os_foreground_before_pid = before.pid,
+            human_os_foreground_after_restore_hwnd = restored.hwnd,
+            human_os_foreground_after_restore_pid = restored.pid,
+            capture_error = ?capture_error,
+            "readback=GetForegroundWindow outcome=foreground_restored_to_pre_capture_hwnd"
+        );
+        Ok(readback)
+    } else {
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            restored_hwnd = restored.hwnd,
+            restored_pid = restored.pid,
+            restored_process = %restored.process_name,
+            restored_title = %restored.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot foreground restore readback did not match the pre-capture foreground"
+        );
+        Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot restore readback mismatch: expected {}, actual {}",
+                browser_screenshot_foreground_summary(&before),
+                browser_screenshot_foreground_summary(&restored)
+            ),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn browser_screenshot_prepare_failure_with_restore(
+    window_hwnd: i64,
+    guard: BrowserScreenshotForegroundGuard,
+    prepare_error: ErrorData,
+) -> ErrorData {
+    match finish_browser_screenshot_foreground(window_hwnd, guard, Some(&prepare_error)) {
+        Ok(_) => prepare_error,
+        Err(cleanup_error) => {
+            synapse_action::record_operator_panic_safety_incident();
+            tracing::error!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                prepare_error = %prepare_error.message,
+                cleanup_error = %cleanup_error.message,
+                "browser_screenshot foreground acquisition failed and exact restore could not be verified"
+            );
+            cleanup_error
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn finish_browser_screenshot_foreground(
+    _window_hwnd: i64,
+    _guard: BrowserScreenshotForegroundGuard,
+    _capture_error: Option<&ErrorData>,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    Ok(BrowserScreenshotForegroundReadback::default())
+}
+
+#[cfg(windows)]
+fn read_browser_screenshot_current_foreground(
+    phase: &'static str,
+) -> Result<ForegroundContext, ErrorData> {
+    synapse_a11y::current_foreground_context().map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "browser_screenshot could not read physical OS foreground during {phase}: {error}"
+            ),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String {
+    format!(
+        "hwnd={:#x} pid={} process={:?} title={:?}",
+        context.hwnd, context.pid, context.process_name, context.window_title
+    )
+}
+
+/// Validates a `set_target` window HWND is live and snapshottable, returning its
+/// (title, process_name) so the response confirms exactly which window was bound.
+/// Fail-loud: a nonpositive HWND is `TOOL_PARAMS_INVALID`; a positive but
+/// dead/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
 pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
     let context = validate_target_window_context(hwnd)?;
     Ok((context.window_title, context.process_name))
@@ -16572,7 +16612,127 @@ fn capture_context_looks_like_transient_startup_hwnd(context: &ForegroundContext
         || context.window_bounds.h <= TRANSIENT_HWND_MAX_EDGE_PX
 }
 
+/// #1341/#1343/#1517: true when a browser_screenshot bridge capture failed
+/// because the normal Chrome bridge direct-HTTP host disconnected mid-command.
+/// The only accepted recovery is a primary-lane retry after the bridge host
+/// reconnects; passive HWND capture is not an equivalent substitute.
+fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
+    error
+        .message
+        .contains("disconnected before command response")
+        || error
+            .message
+            .contains("client closed direct HTTP WebSocket")
+}
+
+async fn browser_screenshot_retry_after_bridge_disconnect(
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    bridge_payload: Value,
+    first_error: &ErrorData,
+) -> Result<crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult, ErrorData> {
+    tracing::warn!(
+        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY",
+        hwnd = window_hwnd,
+        cdp_target_id = %cdp_target_id,
+        wait_timeout_ms = BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
+        first_error = %first_error.message,
+        "browser_screenshot primary Chrome bridge disconnected mid-capture; waiting for bridge reconnect before one primary-lane retry"
+    );
+    let reconnect = crate::chrome_debugger_bridge::wait_for_active_bridge_host(
+        BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
+    )
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "browser_screenshot Chrome bridge disconnected during capture and did not expose a usable reconnected host within {BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS} ms; first_error={}; reconnect_error={}. remediation=check health chrome_bridge last_disconnect_detail, reload the installed Synapse Chrome Bridge, then retry the same target-scoped browser_capture. No passive WGC fallback was used.",
+                first_error.message,
+                error.detail()
+            ),
+        )
+    })?;
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECTED_FOR_RETRY",
+        hwnd = window_hwnd,
+        cdp_target_id = %cdp_target_id,
+        host_id = %reconnect.host_id,
+        registered_unix_ms = reconnect.registered_unix_ms,
+        last_seen_unix_ms = reconnect.last_seen_unix_ms,
+        "readback=chrome_bridge_active_host_snapshot outcome=reconnected_before_screenshot_retry"
+    );
+    crate::chrome_debugger_bridge::page_screenshot(window_hwnd, cdp_target_id, bridge_payload)
+        .await
+        .map_err(|retry_error| {
+            let retry_detail = retry_error.detail().to_owned();
+            let retry_code = retry_error.code().to_owned();
+            let code = retry_error.code();
+            mcp_error(
+                code,
+                format!(
+                    "browser_screenshot Chrome bridge capture failed after reconnect retry; first_error={}; retry_code={retry_code}; retry_error={retry_detail}; host_id={}. No passive WGC fallback was used; the screenshot artifact was not written from a substitute capture lane.",
+                    first_error.message,
+                    reconnect.host_id
+                ),
+            )
+        })
+}
+
 #[cfg(windows)]
+fn chrome_capture_visible_tab_data_url_to_bgra(
+    data_url: &str,
+    region: Option<Rect>,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    let (header, encoded) = data_url.split_once(',').ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "capture_screenshot Chrome bridge returned malformed image data URL",
+        )
+    })?;
+    let header_lower = header.to_ascii_lowercase();
+    if !header_lower.starts_with("data:image/") || !header_lower.contains(";base64") {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            format!(
+                "capture_screenshot Chrome bridge returned unsupported image data URL header {header:?}"
+            ),
+        ));
+    }
+    let image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("capture_screenshot could not decode bridge screenshot base64: {error}"),
+            )
+        })?;
+    let rgba = image::load_from_memory(&image_bytes)
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("capture_screenshot could not decode bridge screenshot image: {error}"),
+            )
+        })?
+        .to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let mut bgra = rgba.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let bitmap = synapse_capture::CapturedBgraBitmap {
+        region: bitmap_full_region(width, height)?,
+        width,
+        height,
+        bytes: bgra,
+    };
+    match region {
+        Some(region) => crop_bgra_bitmap(bitmap, region),
+        None => Ok(bitmap),
+    }
+}
+
 #[cfg(windows)]
 fn cdp_page_bitmap_to_captured_bgra(
     page_bitmap: synapse_a11y::CdpNodeBitmap,
@@ -16596,7 +16756,6 @@ struct BrowserScreenshotValidation {
 fn validate_browser_screenshot_params(
     params: &BrowserScreenshotParams,
 ) -> Result<BrowserScreenshotValidation, ErrorData> {
-    const MAX_MASKS: usize = 32;
     let output_path = screenshot_output_path(&params.path)?;
     let path_format = screenshot_format_from_path(&output_path)?;
     let format = params.format.unwrap_or(path_format);
@@ -16623,38 +16782,10 @@ fn validate_browser_screenshot_params(
             "browser_screenshot max_pixels must be greater than zero",
         ));
     }
-    if params
-        .max_pixels
-        .is_some_and(|value| value > 9_007_199_254_740_991)
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "browser_screenshot max_pixels must not exceed JavaScript's exact safe-integer maximum 9007199254740991",
-        ));
-    }
     if params.max_long_edge == Some(0) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "browser_screenshot max_long_edge must be greater than zero",
-        ));
-    }
-    if let Some(wait_timeout_ms) = params.wait_timeout_ms
-        && !(100..=60_000).contains(&wait_timeout_ms)
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "browser_screenshot wait_timeout_ms must be in 100..=60000; got {wait_timeout_ms}"
-            ),
-        ));
-    }
-    if params.masks.len() > MAX_MASKS {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "browser_screenshot supports at most {MAX_MASKS} masks; got {}",
-                params.masks.len()
-            ),
         ));
     }
     match params.scope {
@@ -16699,9 +16830,9 @@ fn validate_browser_screenshot_params(
     let element_target = params
         .element_id
         .as_deref()
-        .map(|element_id| parse_browser_screenshot_element(element_id, "element_id"))
+        .map(parse_chrome_bridge_element_target)
         .transpose()?
-        .map(|(_, target_id)| target_id);
+        .flatten();
     let mut mask_target: Option<String> = None;
     for (index, mask) in params.masks.iter().enumerate() {
         let has_selector = mask
@@ -16737,10 +16868,14 @@ fn validate_browser_screenshot_params(
             ));
         }
         if let Some(element_id) = mask.element_id.as_deref() {
-            let (_, target) = parse_browser_screenshot_element(
-                element_id,
-                &format!("masks[{index}].element_id"),
-            )?;
+            let target = parse_chrome_bridge_element_target(element_id)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "browser_screenshot masks[{index}].element_id must be a normal Chrome bridge element id"
+                    ),
+                )
+            })?;
             if let Some(existing) = mask_target.as_ref() {
                 if !cdp_target_ids_equal(existing, &target) {
                     return Err(mcp_error(
@@ -16830,6 +16965,26 @@ fn validate_browser_pdf_number(
     Ok(())
 }
 
+fn browser_pdf_bridge_payload(params: &BrowserPdfParams) -> Value {
+    json!({
+        "landscape": params.landscape,
+        "printBackground": params.print_background,
+        "displayHeaderFooter": params.display_header_footer,
+        "headerTemplate": params.header_template.as_deref(),
+        "footerTemplate": params.footer_template.as_deref(),
+        "scale": params.scale,
+        "paperWidth": params.paper_width,
+        "paperHeight": params.paper_height,
+        "marginTop": params.margin_top,
+        "marginBottom": params.margin_bottom,
+        "marginLeft": params.margin_left,
+        "marginRight": params.margin_right,
+        "pageRanges": params.page_ranges.as_deref(),
+        "preferCSSPageSize": params.prefer_css_page_size,
+        "waitTimeoutMs": params.wait_timeout_ms,
+    })
+}
+
 fn validate_browser_screenshot_clip(clip: Rect) -> Result<(), ErrorData> {
     if clip.x < 0 || clip.y < 0 || clip.w <= 0 || clip.h <= 0 {
         return Err(mcp_error(
@@ -16865,13 +17020,57 @@ fn validate_browser_screenshot_target_ids(
     Ok(())
 }
 
-fn raw_page_screenshot_region(
-    clip: synapse_a11y::CdpPageScreenshotRect,
+fn browser_screenshot_bridge_payload(
+    params: &BrowserScreenshotParams,
+    format: CaptureScreenshotFormat,
+) -> Result<Value, ErrorData> {
+    let masks = params
+        .masks
+        .iter()
+        .map(|mask| {
+            json!({
+                "selector": mask.selector.as_deref(),
+                "elementId": mask.element_id.as_deref(),
+                "color": mask.color.as_deref(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "scope": browser_screenshot_scope_str(params.scope),
+        "clip": params.clip.map(|clip| json!({
+            "x": clip.x,
+            "y": clip.y,
+            "w": clip.w,
+            "h": clip.h,
+        })),
+        "elementId": params.element_id.as_deref(),
+        "masks": masks,
+        "format": match format {
+            CaptureScreenshotFormat::Png => "png",
+            CaptureScreenshotFormat::Jpeg => "jpeg",
+        },
+        "quality": params.quality.unwrap_or(90),
+        "omitBackground": params.omit_background,
+        "waitTimeoutMs": params.wait_timeout_ms,
+    }))
+}
+
+fn browser_screenshot_scope_str(scope: BrowserScreenshotScope) -> &'static str {
+    match scope {
+        BrowserScreenshotScope::Viewport => "viewport",
+        BrowserScreenshotScope::FullPage => "full_page",
+        BrowserScreenshotScope::Clip => "clip",
+        BrowserScreenshotScope::Element => "element",
+    }
+}
+
+fn browser_screenshot_page_region(
+    clip: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotRect,
 ) -> Result<Rect, ErrorData> {
     let x = f64_to_i32_rounded(clip.x, "browser_screenshot clip.x")?;
     let y = f64_to_i32_rounded(clip.y, "browser_screenshot clip.y")?;
-    let w = f64_to_i32_rounded(clip.width, "browser_screenshot clip.width")?;
-    let h = f64_to_i32_rounded(clip.height, "browser_screenshot clip.height")?;
+    let w = f64_to_i32_rounded(clip.w, "browser_screenshot clip.w")?;
+    let h = f64_to_i32_rounded(clip.h, "browser_screenshot clip.h")?;
     validate_browser_screenshot_clip(Rect { x, y, w, h })?;
     Ok(Rect { x, y, w, h })
 }
@@ -16886,154 +17085,209 @@ fn f64_to_i32_rounded(value: f64, label: &str) -> Result<i32, ErrorData> {
     Ok(value.round() as i32)
 }
 
-struct BrowserScreenshotMaskEvidence {
-    applied_count: usize,
-    partial_intersection_count: usize,
-    pixel_write_count: u64,
-    backend: &'static str,
-    commitment_sha256: String,
-}
-
-fn apply_raw_page_screenshot_masks(
-    bitmap: synapse_a11y::CdpNodeBitmap,
-    clip: synapse_a11y::CdpPageScreenshotRect,
-    masks: &[synapse_a11y::CdpPageScreenshotMaskReadback],
-    document_generation: &str,
-) -> Result<
-    (
-        synapse_capture::CapturedBgraBitmap,
-        BrowserScreenshotMaskEvidence,
-    ),
-    ErrorData,
-> {
-    const BACKEND: &str = "trusted_rust_raw_cdp_exact_bgra_overwrite";
-    if bitmap.width == 0 || bitmap.height == 0 || clip.width <= 0.0 || clip.height <= 0.0 {
+fn stitch_browser_screenshot_tiles(
+    captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
+    format: CaptureScreenshotFormat,
+    omit_background: bool,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    if captured.tiles.is_empty() {
         return Err(mcp_error(
-            error_codes::CAPTURE_TARGET_INVALID,
-            "browser_screenshot raw-CDP capture returned empty bitmap or clip",
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "browser_screenshot Chrome bridge returned no screenshot tiles",
         ));
     }
-    let expected_len = u64::from(bitmap.width)
-        .checked_mul(u64::from(bitmap.height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or_else(|| {
-            mcp_error(
-                error_codes::CAPTURE_TARGET_INVALID,
-                "browser_screenshot raw-CDP bitmap dimensions overflow",
-            )
-        })?;
-    if bitmap.bgra.len() != expected_len {
+    let first = &captured.tiles[0];
+    let first_image = browser_screenshot_data_url_to_rgba(&first.image_data_url)?;
+    let scale_x = browser_screenshot_tile_scale(
+        first_image.width(),
+        first.viewport_width_css,
+        "viewport_width_css",
+    )?;
+    let scale_y = browser_screenshot_tile_scale(
+        first_image.height(),
+        first.viewport_height_css,
+        "viewport_height_css",
+    )?;
+    let output_width = f64_to_u32_ceil(captured.clip_css.w * scale_x, "output width")?;
+    let output_height = f64_to_u32_ceil(captured.clip_css.h * scale_y, "output height")?;
+    let mut output = RgbaImage::new(output_width, output_height);
+    blit_browser_screenshot_tile(
+        &mut output,
+        &first_image,
+        first,
+        captured.clip_css,
+        scale_x,
+        scale_y,
+    )?;
+    for tile in captured.tiles.iter().skip(1) {
+        let image = browser_screenshot_data_url_to_rgba(&tile.image_data_url)?;
+        blit_browser_screenshot_tile(
+            &mut output,
+            &image,
+            tile,
+            captured.clip_css,
+            scale_x,
+            scale_y,
+        )?;
+    }
+    if omit_background && matches!(format, CaptureScreenshotFormat::Png) {
+        browser_screenshot_omit_background_by_corner(&mut output);
+    }
+    let mut bgra = output.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(synapse_capture::CapturedBgraBitmap {
+        region: Rect {
+            x: 0,
+            y: 0,
+            w: i32::try_from(output_width).map_err(|_| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    format!("browser_screenshot output width {output_width} exceeds i32"),
+                )
+            })?,
+            h: i32::try_from(output_height).map_err(|_| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    format!("browser_screenshot output height {output_height} exceeds i32"),
+                )
+            })?,
+        },
+        width: output_width,
+        height: output_height,
+        bytes: bgra,
+    })
+}
+
+fn browser_screenshot_tile_scale(
+    image_extent: u32,
+    viewport_extent_css: f64,
+    label: &str,
+) -> Result<f64, ErrorData> {
+    if image_extent == 0 || !viewport_extent_css.is_finite() || viewport_extent_css <= 0.0 {
         return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
+            error_codes::A11Y_CDP_AXTREE_FAILED,
             format!(
-                "browser_screenshot raw-CDP BGRA length mismatch: expected={expected_len} actual={}",
-                bitmap.bgra.len()
+                "browser_screenshot tile has invalid {label}: image_extent={image_extent} viewport_extent_css={viewport_extent_css}"
             ),
         ));
     }
-    let scale_x = f64::from(bitmap.width) / clip.width;
-    let scale_y = f64::from(bitmap.height) / clip.height;
-    let clip_right = clip.x + clip.width;
-    let clip_bottom = clip.y + clip.height;
-    let mut bgra = bitmap.bgra;
-    let mut commitment = Vec::with_capacity(64 + masks.len() * 48);
-    commitment.extend_from_slice(b"synapse/raw-cdp-browser-screenshot-mask/v1\0");
-    commitment.extend_from_slice(document_generation.as_bytes());
-    commitment.push(0);
-    let mut partial_intersection_count = 0usize;
-    let mut pixel_write_count = 0u64;
-    for (expected_index, mask) in masks.iter().enumerate() {
-        if mask.index != expected_index {
-            return Err(mcp_error(
-                error_codes::ACTION_POSTCONDITION_FAILED,
-                format!(
-                    "browser_screenshot raw-CDP mask order mismatch: expected={expected_index} actual={}",
-                    mask.index
-                ),
-            ));
-        }
-        let rect = mask.rect;
-        let rect_right = rect.x + rect.width;
-        let rect_bottom = rect.y + rect.height;
-        let left = rect.x.max(clip.x);
-        let top = rect.y.max(clip.y);
-        let right = rect_right.min(clip_right);
-        let bottom = rect_bottom.min(clip_bottom);
-        if right <= left || bottom <= top {
-            return Err(mcp_error(
-                error_codes::ACTION_POSTCONDITION_FAILED,
-                format!(
-                    "browser_screenshot raw-CDP mask[{expected_index}] is outside capture clip"
-                ),
-            ));
-        }
-        if left > rect.x || top > rect.y || right < rect_right || bottom < rect_bottom {
-            partial_intersection_count = partial_intersection_count.saturating_add(1);
-        }
-        let x0 = ((left - clip.x) * scale_x).floor().max(0.0) as u32;
-        let y0 = ((top - clip.y) * scale_y).floor().max(0.0) as u32;
-        let x1 = ((right - clip.x) * scale_x)
-            .ceil()
-            .min(f64::from(bitmap.width)) as u32;
-        let y1 = ((bottom - clip.y) * scale_y)
-            .ceil()
-            .min(f64::from(bitmap.height)) as u32;
-        if x1 <= x0 || y1 <= y0 {
-            return Err(mcp_error(
-                error_codes::ACTION_POSTCONDITION_FAILED,
-                format!(
-                    "browser_screenshot raw-CDP mask[{expected_index}] resolved to no bitmap pixels"
-                ),
-            ));
-        }
-        commitment.extend_from_slice(&(mask.index as u64).to_le_bytes());
-        for value in [rect.x, rect.y, rect.width, rect.height] {
-            commitment.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        commitment.extend_from_slice(&mask.color_rgba);
-        let writes = u64::from(x1 - x0)
-            .checked_mul(u64::from(y1 - y0))
-            .and_then(|writes| pixel_write_count.checked_add(writes))
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::CAPTURE_TARGET_INVALID,
-                    "browser_screenshot raw-CDP mask write count overflow",
-                )
-            })?;
-        pixel_write_count = writes;
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let offset = (u64::from(y) * u64::from(bitmap.width) + u64::from(x)) * 4;
-                let offset = usize::try_from(offset).map_err(|_| {
-                    mcp_error(
-                        error_codes::CAPTURE_TARGET_INVALID,
-                        "browser_screenshot raw-CDP mask offset overflow",
-                    )
-                })?;
-                bgra[offset] = mask.color_rgba[2];
-                bgra[offset + 1] = mask.color_rgba[1];
-                bgra[offset + 2] = mask.color_rgba[0];
-                bgra[offset + 3] = mask.color_rgba[3];
-            }
+    Ok(f64::from(image_extent) / viewport_extent_css)
+}
+
+fn f64_to_u32_ceil(value: f64, label: &str) -> Result<u32, ErrorData> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("browser_screenshot {label} is invalid: {value}"),
+        ));
+    }
+    Ok(value.ceil() as u32)
+}
+
+fn browser_screenshot_data_url_to_rgba(data_url: &str) -> Result<RgbaImage, ErrorData> {
+    let (header, encoded) = data_url.split_once(',').ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "browser_screenshot Chrome bridge returned malformed image data URL",
+        )
+    })?;
+    let header_lower = header.to_ascii_lowercase();
+    if !header_lower.starts_with("data:image/") || !header_lower.contains(";base64") {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            format!(
+                "browser_screenshot Chrome bridge returned unsupported image data URL header {header:?}"
+            ),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("browser_screenshot could not decode tile base64: {error}"),
+            )
+        })?;
+    Ok(image::load_from_memory(&bytes)
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("browser_screenshot could not decode tile image: {error}"),
+            )
+        })?
+        .to_rgba8())
+}
+
+fn blit_browser_screenshot_tile(
+    output: &mut RgbaImage,
+    tile_image: &RgbaImage,
+    tile: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotTile,
+    clip: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotRect,
+    output_scale_x: f64,
+    output_scale_y: f64,
+) -> Result<(), ErrorData> {
+    let tile_scale_x = browser_screenshot_tile_scale(
+        tile_image.width(),
+        tile.viewport_width_css,
+        "tile viewport_width_css",
+    )?;
+    let tile_scale_y = browser_screenshot_tile_scale(
+        tile_image.height(),
+        tile.viewport_height_css,
+        "tile viewport_height_css",
+    )?;
+    let left = clip.x.max(tile.scroll_x_css);
+    let top = clip.y.max(tile.scroll_y_css);
+    let right = (clip.x + clip.w).min(tile.scroll_x_css + tile.viewport_width_css);
+    let bottom = (clip.y + clip.h).min(tile.scroll_y_css + tile.viewport_height_css);
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let dest_x0 = ((left - clip.x) * output_scale_x).floor().max(0.0) as u32;
+    let dest_y0 = ((top - clip.y) * output_scale_y).floor().max(0.0) as u32;
+    let dest_x1 = ((right - clip.x) * output_scale_x)
+        .ceil()
+        .min(f64::from(output.width())) as u32;
+    let dest_y1 = ((bottom - clip.y) * output_scale_y)
+        .ceil()
+        .min(f64::from(output.height())) as u32;
+    for dest_y in dest_y0..dest_y1 {
+        let css_y = clip.y + (f64::from(dest_y) + 0.5) / output_scale_y;
+        let source_y = ((css_y - tile.scroll_y_css) * tile_scale_y)
+            .floor()
+            .clamp(0.0, f64::from(tile_image.height().saturating_sub(1)))
+            as u32;
+        for dest_x in dest_x0..dest_x1 {
+            let css_x = clip.x + (f64::from(dest_x) + 0.5) / output_scale_x;
+            let source_x = ((css_x - tile.scroll_x_css) * tile_scale_x)
+                .floor()
+                .clamp(0.0, f64::from(tile_image.width().saturating_sub(1)))
+                as u32;
+            let pixel = *tile_image.get_pixel(source_x, source_y);
+            output.put_pixel(dest_x, dest_y, pixel);
         }
     }
-    let captured = synapse_capture::CapturedBgraBitmap {
-        region: bitmap_full_region(bitmap.width, bitmap.height)?,
-        width: bitmap.width,
-        height: bitmap.height,
-        bytes: bgra,
-    };
-    Ok((
-        captured,
-        BrowserScreenshotMaskEvidence {
-            applied_count: masks.len(),
-            partial_intersection_count,
-            pixel_write_count,
-            backend: BACKEND,
-            commitment_sha256: sha256_hex(&commitment),
-        },
-    ))
+    Ok(())
+}
+
+fn browser_screenshot_omit_background_by_corner(image: &mut RgbaImage) {
+    if image.width() == 0 || image.height() == 0 {
+        return;
+    }
+    let bg = *image.get_pixel(0, 0);
+    if bg[3] < 255 {
+        return;
+    }
+    for pixel in image.pixels_mut() {
+        let close = pixel[0].abs_diff(bg[0]) <= 2
+            && pixel[1].abs_diff(bg[1]) <= 2
+            && pixel[2].abs_diff(bg[2]) <= 2;
+        if close {
+            pixel[3] = 0;
+        }
+    }
 }
 
 fn bitmap_full_region(width: u32, height: u32) -> Result<Rect, ErrorData> {
@@ -17052,6 +17306,137 @@ fn bitmap_full_region(width: u32, height: u32) -> Result<Rect, ErrorData> {
                 format!("capture_screenshot bitmap height {height} exceeds i32"),
             )
         })?,
+    })
+}
+
+fn crop_bgra_bitmap(
+    bitmap: synapse_capture::CapturedBgraBitmap,
+    region: Rect,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    validate_screenshot_region(region)?;
+    if region.x < 0 || region.y < 0 {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot region for browser target must be viewport-relative and non-negative: bbox=({}, {}, {}, {})",
+                region.x, region.y, region.w, region.h
+            ),
+        ));
+    }
+    let x = usize::try_from(region.x).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region x {} is invalid", region.x),
+        )
+    })?;
+    let y = usize::try_from(region.y).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region y {} is invalid", region.y),
+        )
+    })?;
+    let w = usize::try_from(region.w).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region width {} is invalid", region.w),
+        )
+    })?;
+    let h = usize::try_from(region.h).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region height {} is invalid", region.h),
+        )
+    })?;
+    let bitmap_width = usize::try_from(bitmap.width).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap width {} exceeds usize",
+                bitmap.width
+            ),
+        )
+    })?;
+    let bitmap_height = usize::try_from(bitmap.height).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap height {} exceeds usize",
+                bitmap.height
+            ),
+        )
+    })?;
+    if x.checked_add(w).is_none_or(|right| right > bitmap_width)
+        || y.checked_add(h).is_none_or(|bottom| bottom > bitmap_height)
+    {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot browser target region bbox=({}, {}, {}, {}) exceeds captured bitmap {}x{}",
+                region.x, region.y, region.w, region.h, bitmap.width, bitmap.height
+            ),
+        ));
+    }
+    let row_bytes = bitmap_width.checked_mul(4).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap row width {} overflows",
+                bitmap.width
+            ),
+        )
+    })?;
+    let crop_row_bytes = w.checked_mul(4).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot crop row width {} overflows", region.w),
+        )
+    })?;
+    let capacity = crop_row_bytes.checked_mul(h).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            "capture_screenshot crop byte length overflows",
+        )
+    })?;
+    let mut cropped = Vec::with_capacity(capacity);
+    for row in y..(y + h) {
+        let start = row
+            .checked_mul(row_bytes)
+            .and_then(|offset| offset.checked_add(x * 4))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    "capture_screenshot crop offset overflows",
+                )
+            })?;
+        let end = start.checked_add(crop_row_bytes).ok_or_else(|| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                "capture_screenshot crop end offset overflows",
+            )
+        })?;
+        let slice = bitmap.bytes.get(start..end).ok_or_else(|| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                "capture_screenshot crop range exceeds bitmap byte buffer",
+            )
+        })?;
+        cropped.extend_from_slice(slice);
+    }
+    Ok(synapse_capture::CapturedBgraBitmap {
+        region,
+        width: u32::try_from(w).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot crop width {w} exceeds u32"),
+            )
+        })?,
+        height: u32::try_from(h).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot crop height {h} exceeds u32"),
+            )
+        })?,
+        bytes: cropped,
     })
 }
 
@@ -17111,16 +17496,9 @@ fn write_screenshot_bitmap_with_quality(
     let native_width = captured.width;
     let native_height = captured.height;
     let (captured, scale) =
-        prepare_screenshot_rgba_bitmap(captured, params.max_pixels, params.max_long_edge)?;
-    let width = captured.width;
-    let height = captured.height;
-    save_screenshot_bitmap_with_quality(captured, &temp_path, format, jpeg_quality)?;
-    let (published_bytes, published_sha256) = publish_atomic_artifact(
-        &temp_path,
-        &output_path,
-        params.overwrite,
-        "capture_screenshot",
-    )?;
+        downscale_captured_bitmap(captured, params.max_pixels, params.max_long_edge)?;
+    save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
+    install_screenshot_file(&temp_path, &output_path, params.overwrite)?;
     let metadata = std::fs::metadata(&output_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
@@ -17139,31 +17517,34 @@ fn write_screenshot_bitmap_with_quality(
             ),
         ));
     }
-    let (readback_bytes, bitmap_sha256) = sha256_artifact_file(&output_path, "capture_screenshot")?;
-    if readback_bytes != metadata.len()
-        || published_bytes != metadata.len()
-        || published_sha256 != bitmap_sha256
-    {
+    let file_bytes = std::fs::read(&output_path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "capture_screenshot file hash readback failed for {}: {error}",
+                output_path.display()
+            ),
+        )
+    })?;
+    if u64::try_from(file_bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
         return Err(mcp_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
-                "capture_screenshot file readback mismatch for {}: metadata={} published_bytes={} readback_bytes={} published_sha256={} readback_sha256={}",
+                "capture_screenshot file readback length mismatch for {}: metadata={} read={}",
                 output_path.display(),
                 metadata.len(),
-                published_bytes,
-                readback_bytes,
-                published_sha256,
-                bitmap_sha256
+                file_bytes.len()
             ),
         ));
     }
+    let bitmap_sha256 = sha256_hex(&file_bytes);
     Ok(CaptureScreenshotResponse {
         path: output_path.to_string_lossy().into_owned(),
         format,
         capture_backend: capture_backend.to_owned(),
         region: source_region,
-        width,
-        height,
+        width: captured.width,
+        height: captured.height,
         native_width,
         native_height,
         scale,
@@ -17220,45 +17601,30 @@ fn screenshot_downscale_scale(
     Ok(scale.min(1.0))
 }
 
-/// Encoder-ready screenshot pixels. Screenshot capture is BGRA, while the
-/// image codecs are RGBA. Owning this buffer makes the channel conversion an
-/// in-place pass and prevents the encoder from cloning and converting it again.
-struct ScreenshotRgbaBitmap {
-    width: u32,
-    height: u32,
-    bytes: Vec<u8>,
-}
-
-/// Convert one owned BGRA capture to encoder-ready RGBA and, when requested,
-/// downscale it aspect-preserving. The source conversion happens in place;
-/// resized output remains RGBA, so the scaled path performs no swap-back pass.
-/// Triangle is the image crate's linear filter and is materially cheaper than
-/// the six-tap Lanczos3 kernel for model/preview screenshots.
-fn prepare_screenshot_rgba_bitmap(
-    mut captured: synapse_capture::CapturedBgraBitmap,
+/// Downscale a captured BGRA bitmap (aspect-preserving) to fit the optional vision
+/// pixel budget, returning the possibly-resized bitmap and the applied scale
+/// (`written_long_edge / native_long_edge`). A scale of `1.0` returns the bitmap
+/// untouched. Uses Lanczos3 resampling via the `image` crate already linked here.
+fn downscale_captured_bitmap(
+    captured: synapse_capture::CapturedBgraBitmap,
     max_pixels: Option<u64>,
     max_long_edge: Option<u32>,
-) -> Result<(ScreenshotRgbaBitmap, f64), ErrorData> {
+) -> Result<(synapse_capture::CapturedBgraBitmap, f64), ErrorData> {
     let scale =
         screenshot_downscale_scale(captured.width, captured.height, max_pixels, max_long_edge)?;
-    validate_screenshot_pixel_bytes(captured.width, captured.height, &captured.bytes)?;
-    for pixel in captured.bytes.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
     if scale >= 1.0 {
-        return Ok((
-            ScreenshotRgbaBitmap {
-                width: captured.width,
-                height: captured.height,
-                bytes: captured.bytes,
-            },
-            1.0,
-        ));
+        return Ok((captured, 1.0));
     }
     let native_long_edge = captured.width.max(captured.height);
     let target_width = ((f64::from(captured.width) * scale).round() as u32).max(1);
     let target_height = ((f64::from(captured.height) * scale).round() as u32).max(1);
-    let source = RgbaImage::from_raw(captured.width, captured.height, captured.bytes).ok_or_else(|| {
+    // Build an RgbaImage from the BGRA source, resize, then swap back to BGRA so the
+    // downstream encoder (which expects BGRA) keeps working unchanged.
+    let mut rgba = captured.bytes;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let source = RgbaImage::from_raw(captured.width, captured.height, rgba).ok_or_else(|| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
@@ -17271,44 +17637,22 @@ fn prepare_screenshot_rgba_bitmap(
         &source,
         target_width,
         target_height,
-        image::imageops::FilterType::Triangle,
+        image::imageops::FilterType::Lanczos3,
     );
     let resized_width = resized.width();
     let resized_height = resized.height();
+    let mut bgra = resized.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
     let applied_scale = f64::from(resized_width.max(resized_height)) / f64::from(native_long_edge);
-    let bitmap = ScreenshotRgbaBitmap {
+    let bitmap = synapse_capture::CapturedBgraBitmap {
+        region: bitmap_full_region(resized_width, resized_height)?,
         width: resized_width,
         height: resized_height,
-        bytes: resized.into_raw(),
+        bytes: bgra,
     };
     Ok((bitmap, applied_scale))
-}
-
-fn validate_screenshot_pixel_bytes(width: u32, height: u32, bytes: &[u8]) -> Result<(), ErrorData> {
-    let expected_len = usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| {
-            mcp_error(
-                error_codes::CAPTURE_TARGET_INVALID,
-                format!("capture_screenshot bitmap dimensions overflow: {width}x{height}"),
-            )
-        })?;
-    if bytes.len() != expected_len {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "capture_screenshot BGRA byte length mismatch: expected {expected_len}, got {}",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn hidden_desktop_pip_ended_response(
@@ -17535,517 +17879,75 @@ fn ensure_download_output_path_available(path: &Path, overwrite: bool) -> Result
     Ok(())
 }
 
-const ARTIFACT_QUARANTINE_PREFIX: &str = ".synapse-publish-quarantine.";
-const ARTIFACT_QUARANTINE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-const ARTIFACT_QUARANTINE_SCAN_LIMIT: usize = 256;
-
-#[derive(Debug)]
-struct ArtifactPublishFailure {
-    error: io::Error,
-    attempts: u32,
-    elapsed_ms: u128,
-}
-
-fn cleanup_expired_artifact_quarantines(parent: &Path, label: &'static str) {
-    let now = SystemTime::now();
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::error!(
-                code = "SYNAPSE_ARTIFACT_QUARANTINE_SCAN_FAILED",
-                label,
-                parent = %parent.display(),
-                error = %error,
-                "age-bounded artifact quarantine cleanup could not scan its exact parent"
-            );
-            return;
-        }
-    };
-    let mut candidates = 0_usize;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::error!(
-                    code = "SYNAPSE_ARTIFACT_QUARANTINE_ENTRY_FAILED",
-                    label,
-                    parent = %parent.display(),
-                    error = %error,
-                    "age-bounded artifact quarantine cleanup could not read a directory entry"
-                );
-                continue;
-            }
-        };
-        let name = entry.file_name();
-        if !name
-            .to_string_lossy()
-            .starts_with(ARTIFACT_QUARANTINE_PREFIX)
-        {
-            continue;
-        }
-        candidates = candidates.saturating_add(1);
-        if candidates > ARTIFACT_QUARANTINE_SCAN_LIMIT {
-            tracing::error!(
-                code = "SYNAPSE_ARTIFACT_QUARANTINE_SCAN_LIMIT_EXCEEDED",
-                label,
-                parent = %parent.display(),
-                scan_limit = ARTIFACT_QUARANTINE_SCAN_LIMIT,
-                "artifact quarantine population exceeds the bounded cleanup scan; inspect and archive the exact directory"
-            );
-            break;
-        }
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::error!(
-                    code = "SYNAPSE_ARTIFACT_QUARANTINE_METADATA_FAILED",
-                    label,
-                    path = %path.display(),
-                    error = %error,
-                    "artifact quarantine cleanup could not read file age"
-                );
-                continue;
-            }
-        };
-        if !metadata.is_file() {
-            tracing::error!(
-                code = "SYNAPSE_ARTIFACT_QUARANTINE_NOT_FILE",
-                label,
-                path = %path.display(),
-                "artifact quarantine namespace contains a non-file entry; refusing removal"
-            );
-            continue;
-        }
-        let old_enough = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age.as_secs() >= ARTIFACT_QUARANTINE_MAX_AGE_SECS);
-        if !old_enough {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(
-                code = "SYNAPSE_ARTIFACT_QUARANTINE_EXPIRED_REMOVED",
-                label,
-                path = %path.display(),
-                max_age_secs = ARTIFACT_QUARANTINE_MAX_AGE_SECS,
-                "removed expired atomic-publication evidence"
-            ),
-            Err(error) => tracing::error!(
-                code = "SYNAPSE_ARTIFACT_QUARANTINE_EXPIRED_REMOVE_FAILED",
-                label,
-                path = %path.display(),
-                error = %error,
-                max_age_secs = ARTIFACT_QUARANTINE_MAX_AGE_SECS,
-                "expired atomic-publication evidence could not be removed"
-            ),
-        }
-    }
-}
-
-fn create_artifact_staging_file(
-    path: &Path,
-    label: &'static str,
-) -> Result<std::fs::File, ErrorData> {
-    let parent = path.parent().ok_or_else(|| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!("{label} staging path has no parent: {}", path.display()),
-        )
-    })?;
-    if !parent.is_dir() {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "{label} staging parent is not a directory: {}",
-                parent.display()
-            ),
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_SHARE_READ_DELETE: u32 = 0x1 | 0x4;
-        options.share_mode(FILE_SHARE_READ_DELETE);
-    }
-    options.open(path).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "{label} failed to create exclusive staging file {} with share-delete semantics: {error}",
-                path.display()
-            ),
-        )
-    })
-}
-
-fn open_artifact_file_for_read(
-    path: &Path,
-    label: &'static str,
-) -> Result<std::fs::File, ErrorData> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_SHARE_READ_DELETE: u32 = 0x1 | 0x4;
-        options.share_mode(FILE_SHARE_READ_DELETE);
-    }
-    options.open(path).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "{label} failed to open artifact {} with share-delete semantics: {error}",
-                path.display()
-            ),
-        )
-    })
-}
-
-fn flush_artifact_staging_file(
-    file: std::fs::File,
-    path: &Path,
-    label: &'static str,
-) -> Result<(), ErrorData> {
-    file.sync_all().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "{label} failed to flush encoded staging bytes at {}: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    drop(file);
-    Ok(())
-}
-
-#[cfg(windows)]
-fn path_to_nul_terminated_wide(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt as _;
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
-}
-
-#[cfg(windows)]
-fn move_artifact_write_through(
-    source: &Path,
-    destination: &Path,
-    overwrite: bool,
-    label: &'static str,
-) -> Result<(u32, u128), ArtifactPublishFailure> {
-    use windows::{
-        Win32::{
-            Foundation::ERROR_SHARING_VIOLATION,
-            Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
-        },
-        core::PCWSTR,
-    };
-
-    const MAX_ATTEMPTS: u32 = 24;
-    const BACKOFF_START_MS: u64 = 1;
-    const BACKOFF_CAP_MS: u64 = 50;
-    let source_wide = path_to_nul_terminated_wide(source);
-    let destination_wide = path_to_nul_terminated_wide(destination);
-    let flags = if overwrite {
-        MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING
-    } else {
-        MOVEFILE_WRITE_THROUGH
-    };
-    let started = Instant::now();
-    let mut backoff_ms = BACKOFF_START_MS;
-    for attempt in 1..=MAX_ATTEMPTS {
-        // SAFETY: both path buffers are NUL-terminated and remain alive for the call.
-        match unsafe {
-            MoveFileExW(
-                PCWSTR(source_wide.as_ptr()),
-                PCWSTR(destination_wide.as_ptr()),
-                flags,
-            )
-        } {
-            Ok(()) => return Ok((attempt, started.elapsed().as_millis())),
-            Err(error) => {
-                let low_code = (error.code().0 as u32) & 0xFFFF;
-                let retryable = low_code == ERROR_SHARING_VIOLATION.0;
-                tracing::warn!(
-                    code = "SYNAPSE_ARTIFACT_PUBLISH_MOVE_FAILED",
-                    label,
-                    source = %source.display(),
-                    destination = %destination.display(),
-                    overwrite,
-                    attempt,
-                    max_attempts = MAX_ATTEMPTS,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    os_error = low_code,
-                    retryable,
-                    destination_exists = destination.try_exists().ok(),
-                    "write-through atomic artifact publication attempt failed"
-                );
-                if retryable && attempt < MAX_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                    backoff_ms = backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
-                    continue;
-                }
-                return Err(ArtifactPublishFailure {
-                    error: io::Error::from_raw_os_error(low_code as i32),
-                    attempts: attempt,
-                    elapsed_ms: started.elapsed().as_millis(),
-                });
-            }
-        }
-    }
-    Err(ArtifactPublishFailure {
-        error: io::Error::other("atomic publication exhausted without terminal result"),
-        attempts: MAX_ATTEMPTS,
-        elapsed_ms: started.elapsed().as_millis(),
-    })
-}
-
-#[cfg(not(windows))]
-fn move_artifact_write_through(
-    source: &Path,
-    destination: &Path,
-    overwrite: bool,
-    _label: &'static str,
-) -> Result<(u32, u128), ArtifactPublishFailure> {
-    let started = std::time::Instant::now();
-    let result = if overwrite {
-        std::fs::rename(source, destination)
-    } else {
-        std::fs::hard_link(source, destination).and_then(|()| std::fs::remove_file(source))
-    };
-    result
-        .map(|()| (1, started.elapsed().as_millis()))
-        .map_err(|error| ArtifactPublishFailure {
-            error,
-            attempts: 1,
-            elapsed_ms: started.elapsed().as_millis(),
-        })
-}
-
-fn artifact_quarantine_path(output_path: &Path) -> PathBuf {
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    output_path.with_file_name(format!(
-        "{ARTIFACT_QUARANTINE_PREFIX}{}.{}.bin",
-        std::process::id(),
-        now_ns
-    ))
-}
-
-fn artifact_path_state(path: &Path, label: &'static str) -> String {
-    match path.try_exists() {
-        Ok(false) => "absent".to_owned(),
-        Err(error) => format!("existence_error={error}"),
-        Ok(true) => match sha256_artifact_file(path, label) {
-            Ok((bytes, sha256)) => format!("present bytes={bytes} sha256={sha256}"),
-            Err(error) => format!("present readback_error={}", error.message),
-        },
-    }
-}
-
-fn quarantine_artifact_publish_failure(
-    temp_path: &Path,
-    output_path: &Path,
-    overwrite: bool,
-    label: &'static str,
-    expected_bytes: u64,
-    expected_sha256: &str,
-    failure: ArtifactPublishFailure,
-) -> ErrorData {
-    if let Some(parent) = output_path.parent() {
-        // Keep the hot publication path scan-free. Cleanup runs only after a
-        // real terminal publication failure, and only for evidence older than
-        // the documented retention window.
-        cleanup_expired_artifact_quarantines(parent, label);
-    }
-    let quarantine_path = artifact_quarantine_path(output_path);
-    let quarantine_transition = match std::fs::rename(temp_path, &quarantine_path) {
-        Ok(()) => format!(
-            "retained path={} state={}",
-            quarantine_path.display(),
-            artifact_path_state(&quarantine_path, label)
-        ),
-        Err(error) => format!(
-            "retain_failed error={error} original_temp_path={} original_temp_state={}",
-            temp_path.display(),
-            artifact_path_state(temp_path, label)
-        ),
-    };
-    let destination_state = artifact_path_state(output_path, label);
-    tracing::error!(
-        code = "SYNAPSE_ARTIFACT_PUBLISH_TERMINAL",
-        label,
-        source = %temp_path.display(),
-        destination = %output_path.display(),
-        overwrite,
-        attempts = failure.attempts,
-        elapsed_ms = failure.elapsed_ms,
-        error = %failure.error,
-        os_error = failure.error.raw_os_error(),
-        expected_bytes,
-        expected_sha256,
-        quarantine = %quarantine_transition,
-        destination_state = %destination_state,
-        "atomic artifact publication failed and encoded evidence was retained"
-    );
-    mcp_error(
-        error_codes::STORAGE_WRITE_FAILED,
-        format!(
-            concat!(
-                "SYNAPSE_ARTIFACT_PUBLISH_TERMINAL label={} source={} destination={} ",
-                "overwrite={} attempts={} elapsed_ms={} os_error={} error={} ",
-                "encoded_bytes={} encoded_sha256={} ",
-                "destination_state=[{}] quarantine=[{}]; ",
-                "remediation=close or reopen the exact destination handle with FILE_SHARE_DELETE, ",
-                "then inspect the retained encoded artifact before retrying; quarantine files are ",
-                "removed only after {} seconds by the bounded publication cleanup"
-            ),
-            label,
-            temp_path.display(),
-            output_path.display(),
-            overwrite,
-            failure.attempts,
-            failure.elapsed_ms,
-            failure
-                .error
-                .raw_os_error()
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-            failure.error,
-            expected_bytes,
-            expected_sha256,
-            destination_state,
-            quarantine_transition,
-            ARTIFACT_QUARANTINE_MAX_AGE_SECS,
-        ),
-    )
-}
-
-pub(super) fn publish_atomic_artifact(
-    temp_path: &Path,
-    output_path: &Path,
-    overwrite: bool,
-    label: &'static str,
-) -> Result<(u64, String), ErrorData> {
-    let (expected_bytes, expected_sha256) = sha256_artifact_file(temp_path, label)?;
-    if expected_bytes == 0 {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "{label} refused to publish empty encoded staging file {}",
-                temp_path.display()
-            ),
-        ));
-    }
-    let (attempts, elapsed_ms) =
-        match move_artifact_write_through(temp_path, output_path, overwrite, label) {
-            Ok(readback) => readback,
-            Err(failure) => {
-                return Err(quarantine_artifact_publish_failure(
-                    temp_path,
-                    output_path,
-                    overwrite,
-                    label,
-                    expected_bytes,
-                    &expected_sha256,
-                    failure,
-                ));
-            }
-        };
-    if temp_path.try_exists().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "{label} could not verify staging-path absence after atomic publish {}: {error}",
-                temp_path.display()
-            ),
-        )
-    })? {
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            format!(
-                "{label} atomic publication left staging path present after success: {}",
-                temp_path.display()
-            ),
-        ));
-    }
-    let (actual_bytes, actual_sha256) = sha256_artifact_file(output_path, label)?;
-    if actual_bytes != expected_bytes || actual_sha256 != expected_sha256 {
-        tracing::error!(
-            code = "SYNAPSE_ARTIFACT_PUBLISH_READBACK_MISMATCH",
-            label,
-            destination = %output_path.display(),
-            overwrite,
-            attempts,
-            elapsed_ms,
-            expected_bytes,
-            actual_bytes,
-            expected_sha256,
-            actual_sha256,
-            "atomic artifact destination did not match encoded staging evidence"
-        );
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            format!(
-                concat!(
-                    "SYNAPSE_ARTIFACT_PUBLISH_READBACK_MISMATCH label={} destination={} ",
-                    "expected_bytes={} actual_bytes={} ",
-                    "expected_sha256={} actual_sha256={}"
-                ),
-                label,
-                output_path.display(),
-                expected_bytes,
-                actual_bytes,
-                expected_sha256,
-                actual_sha256
-            ),
-        ));
-    }
-    tracing::info!(
-        code = "SYNAPSE_ARTIFACT_PUBLISH_VERIFIED",
-        label,
-        destination = %output_path.display(),
-        overwrite,
-        attempts,
-        elapsed_ms,
-        bytes = actual_bytes,
-        sha256 = %actual_sha256,
-        "atomic artifact publication physically matched encoded staging evidence"
-    );
-    Ok((actual_bytes, actual_sha256))
-}
-
 fn save_screenshot_bitmap_with_quality(
-    captured: ScreenshotRgbaBitmap,
+    captured: &synapse_capture::CapturedBgraBitmap,
     path: &Path,
     format: CaptureScreenshotFormat,
     jpeg_quality: Option<u8>,
 ) -> Result<(), ErrorData> {
-    validate_screenshot_pixel_bytes(captured.width, captured.height, &captured.bytes)?;
-    let image =
-        RgbaImage::from_raw(captured.width, captured.height, captured.bytes).ok_or_else(|| {
+    let expected_len = usize::try_from(captured.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(captured.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
             mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
+                error_codes::CAPTURE_TARGET_INVALID,
                 format!(
-                    "capture_screenshot could not create image buffer from {}x{} bitmap",
+                    "capture_screenshot bitmap dimensions overflow: {}x{}",
                     captured.width, captured.height
                 ),
             )
         })?;
-    let mut file = create_artifact_staging_file(path, "capture_screenshot")?;
+    if captured.bytes.len() != expected_len {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "capture_screenshot BGRA byte length mismatch: expected {expected_len}, got {}",
+                captured.bytes.len()
+            ),
+        ));
+    }
+    let mut rgba = captured.bytes.clone();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let image = RgbaImage::from_raw(captured.width, captured.height, rgba).ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "capture_screenshot could not create image buffer from {}x{} bitmap",
+                captured.width, captured.height
+            ),
+        )
+    })?;
     let result = match format {
-        CaptureScreenshotFormat::Png => {
-            DynamicImage::ImageRgba8(image).write_to(&mut file, ImageFormat::Png)
-        }
+        CaptureScreenshotFormat::Png => image.save_with_format(path, ImageFormat::Png),
         CaptureScreenshotFormat::Jpeg => {
             let rgb = DynamicImage::ImageRgba8(image).to_rgb8();
+            let file = std::fs::File::create(path).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to create {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
             let quality = jpeg_quality.unwrap_or(90);
-            let mut encoder = JpegEncoder::new_with_quality(&mut file, quality);
-            encoder.encode_image(&rgb)
+            let mut encoder = JpegEncoder::new_with_quality(file, quality);
+            return encoder.encode_image(&rgb).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to encode {}: {error}",
+                        path.display()
+                    ),
+                )
+            });
         }
     };
     result.map_err(|error| {
@@ -18056,8 +17958,7 @@ fn save_screenshot_bitmap_with_quality(
                 path.display()
             ),
         )
-    })?;
-    flush_artifact_staging_file(file, path, "capture_screenshot")
+    })
 }
 
 fn browser_download_source_path(selected: &BrowserDownloadEntry) -> Result<PathBuf, ErrorData> {
@@ -18137,9 +18038,7 @@ fn copy_or_move_download_file(
             ),
         ));
     }
-    let mut source = open_artifact_file_for_read(source_path, "browser_downloads")?;
-    let mut staging = create_artifact_staging_file(&temp_path, "browser_downloads")?;
-    std::io::copy(&mut source, &mut staging).map_err(|error| {
+    std::fs::copy(source_path, &temp_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
@@ -18149,10 +18048,8 @@ fn copy_or_move_download_file(
             ),
         )
     })?;
-    flush_artifact_staging_file(staging, &temp_path, "browser_downloads")?;
-    drop(source);
-    publish_atomic_artifact(&temp_path, output_path, overwrite, "browser_downloads")?;
-    let (saved_bytes, saved_sha256) = sha256_artifact_file(output_path, "browser_downloads")?;
+    install_download_file(&temp_path, output_path, overwrite)?;
+    let (saved_bytes, saved_sha256) = sha256_file(output_path)?;
     if saved_bytes != source_metadata.len() {
         return Err(mcp_error(
             error_codes::ACTION_POSTCONDITION_FAILED,
@@ -18178,8 +18075,46 @@ fn copy_or_move_download_file(
     Ok((saved_bytes, saved_sha256))
 }
 
-fn sha256_artifact_file(path: &Path, label: &'static str) -> Result<(u64, String), ErrorData> {
-    let mut file = open_artifact_file_for_read(path, label)?;
+fn install_download_file(
+    temp_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+) -> Result<(), ErrorData> {
+    if overwrite && output_path.exists() {
+        std::fs::remove_file(output_path).map_err(|error| {
+            let _ = std::fs::remove_file(temp_path);
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "browser_downloads failed to replace existing file {}: {error}",
+                    output_path.display()
+                ),
+            )
+        })?;
+    }
+    std::fs::rename(temp_path, output_path).map_err(|error| {
+        let _ = std::fs::remove_file(temp_path);
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "browser_downloads failed to move {} to {}: {error}",
+                temp_path.display(),
+                output_path.display()
+            ),
+        )
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "browser_downloads failed to open {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -18188,7 +18123,7 @@ fn sha256_artifact_file(path: &Path, label: &'static str) -> Result<(u64, String
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
                 format!(
-                    "{label} failed to read {} for SHA-256 readback: {error}",
+                    "browser_downloads failed to read {}: {error}",
                     path.display()
                 ),
             )
@@ -18206,6 +18141,36 @@ fn sha256_artifact_file(path: &Path, label: &'static str) -> Result<(u64, String
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok((total, hex))
+}
+
+fn install_screenshot_file(
+    temp_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+) -> Result<(), ErrorData> {
+    if overwrite && output_path.exists() {
+        std::fs::remove_file(output_path).map_err(|error| {
+            let _ = std::fs::remove_file(temp_path);
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "capture_screenshot failed to replace existing file {}: {error}",
+                    output_path.display()
+                ),
+            )
+        })?;
+    }
+    std::fs::rename(temp_path, output_path).map_err(|error| {
+        let _ = std::fs::remove_file(temp_path);
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "capture_screenshot failed to move {} to {}: {error}",
+                temp_path.display(),
+                output_path.display()
+            ),
+        )
+    })
 }
 
 fn write_pdf_bytes(
@@ -18240,8 +18205,7 @@ fn write_pdf_bytes(
             ),
         ));
     }
-    let mut staging = create_artifact_staging_file(&temp_path, "browser_pdf")?;
-    staging.write_all(pdf_bytes).map_err(|error| {
+    std::fs::write(&temp_path, pdf_bytes).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
@@ -18250,8 +18214,7 @@ fn write_pdf_bytes(
             ),
         )
     })?;
-    flush_artifact_staging_file(staging, &temp_path, "browser_pdf")?;
-    publish_atomic_artifact(&temp_path, output_path, overwrite, "browser_pdf")?;
+    install_screenshot_file(&temp_path, output_path, overwrite)?;
     let metadata = std::fs::metadata(output_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
@@ -18314,11 +18277,9 @@ impl SynapseService {
                     );
                     return;
                 };
-                match runtime.loaded_profile(&profile_id) {
-                    Ok(Some(loaded)) => {
-                        if let Err(error) =
-                            self.apply_m1_runtime_config_for_profile(&loaded.profile)
-                        {
+                match runtime.profile(&profile_id) {
+                    Ok(Some(profile)) => {
+                        if let Err(error) = self.apply_m1_runtime_config_for_profile(&profile) {
                             tracing::warn!(
                                 code = "PROFILE_M1_RUNTIME_CONFIG_FAILED",
                                 profile_id = %profile_id,
@@ -18331,7 +18292,7 @@ impl SynapseService {
                             input.capture_runtime = Some(state.capture_runtime_readback());
                         }
                         if include_hud {
-                            populate_profile_hud(input, &loaded, runtime.profile_dir());
+                            populate_profile_hud(input, &profile, runtime.profile_dir());
                         }
                     }
                     Ok(None) => {
@@ -19218,17 +19179,17 @@ fn chrome_bridge_reload_response(
     session_id: &str,
     wait_timeout_ms: u64,
     reload: crate::chrome_debugger_bridge::ChromeBridgeReloadResult,
-) -> Result<CdpBridgeReloadResponse, ErrorData> {
-    Ok(CdpBridgeReloadResponse {
+) -> CdpBridgeReloadResponse {
+    CdpBridgeReloadResponse {
         session_id: session_id.to_owned(),
         required_foreground: false,
         wait_timeout_ms,
-        before: reload.before.map(chrome_bridge_host_readback),
-        command_ack: chrome_bridge_reload_ack_readback(reload.command_ack)?,
+        before: chrome_bridge_host_readback(reload.before),
+        command_ack: chrome_bridge_reload_ack_readback(reload.command_ack),
         after: chrome_bridge_host_readback(reload.after),
         reconnected: reload.reconnected,
         waited_ms: reload.waited_ms,
-    })
+    }
 }
 
 fn chrome_bridge_host_readback(
@@ -19267,65 +19228,26 @@ fn chrome_bridge_host_readback(
 
 fn chrome_bridge_reload_ack_readback(
     ack: crate::chrome_debugger_bridge::ChromeBridgeReloadCommandAck,
-) -> Result<CdpBridgeReloadAckReadback, ErrorData> {
-    let background_evidence_valid = ack.ok
-        && ack.control_surface == "chrome.runtime.reload"
-        && !ack.required_foreground
-        && ack.installer_exit_code == 0
-        && ack.extension_service_worker_sha256.len() == 64
-        && ack.profile_before_installed
-        && ack.profile_before_ready
-        && ack.profile_after_installed
-        && ack.profile_after_ready
-        && !ack.loaded_build_id.trim().is_empty()
-        && !ack.deployed_build_id.trim().is_empty()
-        && ack.scheduled_at_unix_ms > 0
-        && (250..=5_000).contains(&ack.reload_delay_ms)
-        && ack.foreground_api_calls == 0
-        && ack.tab_mutations == 0
-        && ack.synthetic_input_events == 0;
-    if !background_evidence_valid {
-        return Err(chrome_bridge_reload_evidence_error(
-            "/command_ack",
-            "a successful chrome.runtime.reload acknowledgement with ready physical profile rows and exact zero foreground/tab/input mutation counters",
-        ));
-    }
-    Ok(CdpBridgeReloadAckReadback {
+) -> CdpBridgeReloadAckReadback {
+    CdpBridgeReloadAckReadback {
         ok: ack.ok,
-        control_surface: ack.control_surface,
-        required_foreground: ack.required_foreground,
-        installer_path: ack.installer_path,
-        installer_sha256: ack.installer_sha256,
-        installer_exit_code: ack.installer_exit_code,
-        installer_stdout_sha256: ack.installer_stdout_sha256,
-        installer_stderr_sha256: ack.installer_stderr_sha256,
-        installer_duration_ms: ack.installer_duration_ms,
         extension_id: ack.extension_id,
-        extension_dir: ack.extension_dir,
-        extension_service_worker_sha256: ack.extension_service_worker_sha256,
-        active_profile: ack.active_profile,
-        reason: ack.reason,
-        profile_before_installed: ack.profile_before_installed,
-        profile_before_ready: ack.profile_before_ready,
-        profile_after_installed: ack.profile_after_installed,
-        profile_after_ready: ack.profile_after_ready,
-        loaded_build_id: ack.loaded_build_id,
-        deployed_build_id: ack.deployed_build_id,
-        scheduled_at_unix_ms: ack.scheduled_at_unix_ms,
+        version: ack.version,
+        protocol_version: ack.protocol_version,
+        build_id: ack.build_id,
+        build_sha256: ack.build_sha256,
+        declared_build_sha256: ack.declared_build_sha256,
+        service_worker_sha256: ack.service_worker_sha256,
+        service_worker_sha256_status: ack.service_worker_sha256_status,
+        service_worker_sha256_source: ack.service_worker_sha256_source,
+        service_worker_byte_length: ack.service_worker_byte_length,
+        service_worker_sha256_error: ack.service_worker_sha256_error,
+        debugger_api_available: ack.debugger_api_available,
+        capabilities: ack.capabilities,
+        host_id: ack.host_id,
+        reload_requested_at_unix_ms: ack.reload_requested_at_unix_ms,
         reload_delay_ms: ack.reload_delay_ms,
-        foreground_api_calls: ack.foreground_api_calls,
-        tab_mutations: ack.tab_mutations,
-        synthetic_input_events: ack.synthetic_input_events,
-    })
-}
-
-fn chrome_bridge_reload_evidence_error(pointer: &str, expected: &str) -> ErrorData {
-    mcp_error(
-        error_codes::CHROME_BRIDGE_HOST_RELOAD_FAILED,
-        format!(
-            "SYNAPSE_CHROME_BRIDGE_RELOAD_PUBLIC_EVIDENCE_INVALID field={pointer:?} expected={expected:?} remediation=the background deploy, extension lifecycle acknowledgement, and independent daemon readback must return complete bounded typed evidence; inspect the structured payload and repair the named producer field"
-        ),
-    )
+    }
 }
 
 fn non_empty_text_sha256(value: &str) -> Option<String> {
@@ -19504,38 +19426,13 @@ fn vigem_capability() -> InputBackendCapability {
 #[cfg(windows)]
 fn populate_profile_hud(
     input: &mut synapse_perception::ObservationInput,
-    loaded: &synapse_profiles::LoadedProfile,
+    profile: &Profile,
     profile_dir: &Path,
 ) {
-    if loaded.profile.hud.len() != loaded.compiled_hud_parsers.len() {
-        tracing::error!(
-            code = "PROFILE_HUD_COMPILED_PARSER_CARDINALITY_MISMATCH",
-            profile_id = %loaded.profile.id,
-            field_count = loaded.profile.hud.len(),
-            compiled_parser_count = loaded.compiled_hud_parsers.len(),
-            "refusing HUD extraction because accepted profile/parser state is internally inconsistent"
-        );
-        for field in &loaded.profile.hud {
-            input.hud.by_name.remove(&field.name);
-            record_hud_error(
-                &mut input.hud,
-                &field.name,
-                error_codes::HUD_EXTRACTION_FAILED,
-                format!(
-                    "compiled HUD parser cardinality mismatch for profile {:?}: fields={} parsers={}",
-                    loaded.profile.id,
-                    loaded.profile.hud.len(),
-                    loaded.compiled_hud_parsers.len()
-                ),
-            );
-        }
-        return;
-    }
-    for (field, parser) in loaded.profile.hud.iter().zip(&loaded.compiled_hud_parsers) {
+    for field in &profile.hud {
         input.hud.by_name.remove(&field.name);
         input.hud.errors.remove(&field.name);
-        match extract_profile_hud_field(field, parser, input.foreground.window_bounds, profile_dir)
-        {
+        match extract_profile_hud_field(field, input.foreground.window_bounds, profile_dir) {
             Ok(reading) => {
                 input.hud.by_name.insert(field.name.clone(), reading);
             }
@@ -19549,10 +19446,10 @@ fn populate_profile_hud(
 #[cfg(not(windows))]
 fn populate_profile_hud(
     input: &mut synapse_perception::ObservationInput,
-    loaded: &synapse_profiles::LoadedProfile,
+    profile: &Profile,
     _profile_dir: &std::path::Path,
 ) {
-    for field in &loaded.profile.hud {
+    for field in &profile.hud {
         input.hud.by_name.remove(&field.name);
         input.hud.errors.remove(&field.name);
         record_hud_error(
@@ -19567,7 +19464,6 @@ fn populate_profile_hud(
 #[cfg(windows)]
 fn extract_profile_hud_field(
     field: &HudFieldSpec,
-    parser: &synapse_core::CompiledHudParser,
     window_bounds: Rect,
     profile_dir: &Path,
 ) -> PerceptionResult<HudReading> {
@@ -19577,13 +19473,12 @@ fn extract_profile_hud_field(
         HudExtractor::ColorRatio {
             sample_points: _,
             mapping,
-        } => color_ratio_reading(field, parser, screen_region, &region_image, mapping),
+        } => color_ratio_reading(field, screen_region, &region_image, mapping),
         HudExtractor::TemplateMatch { templates } => {
             let loaded_templates = load_templates(&field.name, templates, profile_dir)?;
             let provider = SystemOcrProvider;
             extract_field(&FieldExtractionRequest {
                 field,
-                parser,
                 screen_region,
                 region_image: &region_image,
                 templates: &loaded_templates,
@@ -19596,7 +19491,6 @@ fn extract_profile_hud_field(
             let provider = HudTextProvider;
             extract_field(&FieldExtractionRequest {
                 field,
-                parser,
                 screen_region,
                 region_image: &region_image,
                 templates: &[],
@@ -19722,7 +19616,6 @@ fn bgra_to_gray(width: u32, height: u32, bytes: &[u8]) -> PerceptionResult<GrayI
 #[cfg(windows)]
 fn color_ratio_reading(
     field: &HudFieldSpec,
-    parser: &synapse_core::CompiledHudParser,
     screen_region: Rect,
     region_image: &GrayImage,
     mapping: &str,
@@ -19735,7 +19628,7 @@ fn color_ratio_reading(
     }
     let score = gray_luma_stddev_0_1(region_image);
     let raw_text = format!("{score:.6}");
-    let parsed = parse_hud_text(parser, &raw_text)?;
+    let parsed = parse_hud_text(&field.parser, &raw_text)?;
     Ok(HudReading {
         raw_text: format!(
             "{raw_text} region={}x{}@{},{}",
@@ -20011,6 +19904,9 @@ fn refresh_observation_size_fields(
 fn escape_json_pointer(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
+
+#[cfg(all(test, windows))]
+mod tests;
 
 #[cfg(windows)]
 fn gray_luma_stddev_0_1(region_image: &GrayImage) -> f32 {

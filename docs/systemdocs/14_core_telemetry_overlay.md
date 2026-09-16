@@ -133,7 +133,7 @@ All types below are re-exported flat from `synapse_core::types` (and most from `
 #### Health (`types/health.rs`)
 
 - **`Health`** — `ok`, `version`, `build`, `pid:u32`, `uptime_s:u64`, `tool_count`, `tool_surface_sha256`, `tool_names: Vec<String>`, `subsystems: BTreeMap<String, SubsystemHealth>`.
-- **`SubsystemHealth`** — `status`, `detail`, plus a large set of optional per-subsystem fields (profile/capture/reflex/storage/HTTP/audio/shell-policy diagnostics), including storage `db_path`, `storage_backend`, `schema_version`, CF sizes, and maintenance readbacks.
+- **`SubsystemHealth`** — `status`, `detail`, plus a large set of optional per-subsystem fields (profile/capture/reflex/storage/HTTP/audio/shell-policy diagnostics).
 
 ### 1.3 Error-code catalog — `error_codes.rs`
 
@@ -188,9 +188,6 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `HUD_EXTRACTION_FAILED` | HUD extraction failed. |
 | `AUDIO_DEVICE_LOST` | Audio device lost. |
 | `AUDIO_LOOPBACK_INIT_FAILED` | Audio loopback init failed. |
-| `AUDIO_TIMELINE_INVALID` | WASAPI packet positions/timestamps cannot form one trustworthy capture timeline. |
-| `AUDIO_TIMELINE_DISCONTINUITY` | Observable WASAPI capture gap; exact missed frames were preserved as silence and counted in audio health. |
-| `AUDIO_TIMELINE_GAP` | Device-position delta exposed missed capture frames without a discontinuity flag; exact gap was preserved as silence and counted. |
 | `AUDIO_STT_MODEL_NOT_LOADED` | STT model not loaded. |
 
 #### Action (§8.2)
@@ -290,7 +287,6 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `TOOL_PROFILE_POLICY_DENIED` | Tool denied by profile policy. |
 | `TOOL_PARAMS_INVALID` | Tool params invalid. |
 | `TOOL_INTERNAL_ERROR` | Tool internal error. |
-| `HTTP_BIND_ADDRESS_INVALID` | HTTP bind is not a valid IP socket address. |
 | `HTTP_BIND_NON_LOOPBACK_REFUSED` | Non-loopback HTTP bind refused. |
 | `HTTP_TOKEN_INVALID` | HTTP bearer token invalid. |
 | `HTTP_ORIGIN_REFUSED` | HTTP origin refused. |
@@ -304,8 +300,6 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | Code | Meaning |
 | --- | --- |
 | `STORAGE_OPEN_FAILED` | Storage open failed. |
-| `STORAGE_BACKEND_INVALID_CONFIG` | Storage backend config value was not recognized. |
-| `STORAGE_BACKEND_UNIMPLEMENTED` | Selected storage backend is known but unavailable in this binary. |
 | `STORAGE_WRITE_FAILED` | Storage write failed. |
 | `STORAGE_READ_FAILED` | Storage read failed. |
 | `STORAGE_CORRUPTED` | Storage corrupted. |

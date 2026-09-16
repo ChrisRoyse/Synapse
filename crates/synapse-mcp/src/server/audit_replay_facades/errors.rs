@@ -148,6 +148,40 @@ pub(super) fn lifecycle_corrupt_error(
     )
 }
 
+pub(super) fn lifecycle_oversized_error(
+    path: &Path,
+    line_no: u64,
+    line_bytes: usize,
+    max_line_bytes: usize,
+    tool: &Option<String>,
+    status: &Option<String>,
+    event_kind: &Option<String>,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "audit operation=lifecycle_tail found oversized daemon lifecycle row {}:{}",
+            path.display(),
+            line_no
+        ),
+        Some(json!({
+            "code": error_codes::STORAGE_READ_FAILED,
+            "tool": AUDIT_TOOL,
+            "operation": "lifecycle_tail",
+            "source_id": path.display().to_string(),
+            "source_of_truth": AUDIT_SOT,
+            "line_no": line_no,
+            "reason": "oversized_row",
+            "line_bytes": line_bytes,
+            "max_line_bytes": max_line_bytes,
+            "row_tool": tool,
+            "row_status": status,
+            "row_event_kind": event_kind,
+            "remediation": "raise max_line_bytes for this matching row, or rotate/repair the lifecycle ledger after preserving forensic evidence; filtered reads skip only valid oversized rows that do not match the requested filters",
+        })),
+    )
+}
+
 pub(super) fn replay_artifact_corrupt_error(
     path: &Path,
     line_no: u64,

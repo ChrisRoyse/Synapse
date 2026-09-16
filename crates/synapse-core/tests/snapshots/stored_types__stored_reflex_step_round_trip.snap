@@ -1,0 +1,15 @@
+---
+source: crates/synapse-core/tests/stored_types.rs
+expression: "round_trip(\"StoredReflexStep\", \"snapshot\", full_reflex_step())?"
+---
+{
+  "index": 1,
+  "action": {
+    "kind": "mouse_button",
+    "button": "left",
+    "action": "press",
+    "hold_ms": 16,
+    "backend": "software"
+  },
+  "status": "completed"
+}

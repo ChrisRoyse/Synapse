@@ -16,6 +16,8 @@ use windows::Win32::{
 mod element;
 mod record;
 mod schema;
+#[cfg(test)]
+mod tests;
 
 pub use schema::{
     ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget, ActClickTierAttempt,
@@ -96,6 +98,23 @@ impl ForegroundClickPolicy {
             })),
         ))
     }
+}
+
+#[cfg(test)]
+pub async fn act_click_with_handle(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    params: ActClickParams,
+) -> Result<ActClickResponse, ErrorData> {
+    let boundary = super::OperatorPanicActionBoundary::arm("act_click", "direct_call_entry")?;
+    act_click_with_handle_and_lease(
+        handle,
+        recording,
+        params,
+        ForegroundClickPolicy::default(),
+        boundary,
+    )
+    .await
 }
 
 pub(crate) async fn act_click_with_handle_and_lease(
@@ -239,8 +258,6 @@ pub(crate) async fn act_click_with_handle_and_lease(
         backend_used: backend_used_name(params.backend).to_owned(),
         backend_tier_used,
         required_foreground,
-        desktop_route: None,
-        desktop_route_hwnds: None,
         tier_attempts,
         postcondition: schema::postcondition_not_requested(),
         press_hold_ms: params.hold_ms,
@@ -248,309 +265,6 @@ pub(crate) async fn act_click_with_handle_and_lease(
         inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
-}
-
-/// Ledger tier name for the #2063 hidden-desktop click route. Distinct from the
-/// plain `uia` tier precisely so a `CF_ACTION_LOG` reader can tell a
-/// hidden-desktop click from a visible-desktop one.
-pub(crate) const CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER: &str = "uia_invoke_hidden_desktop_worker";
-const HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH: &str =
-    "session_owned_desktop_worker_uia_subtree_readback";
-/// Enough depth to see the state change a click produces (pressed/checked
-/// state, selection, the dialog it opened) without snapshotting a whole app.
-///
-/// Depth is measured from the target's **top-level** window (`route.root_hwnd`),
-/// never from the clicked control: see [`act_click_hidden_desktop_worker`].
-const HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH: u32 = 4;
-
-/// #2063 finding 1: performs the semantic UIA click on the session-owned hidden
-/// desktop that physically owns the element's window.
-///
-/// The #2056 FSV showed a daemon-desktop `InvokePattern` call reaching a
-/// hidden-desktop button, so the previous behaviour was a real delivery — but an
-/// unattributable one: no `desktop_route`, and its verification readback ran on
-/// the daemon's desktop, where `IsWindow` for that HWND is false. That readback
-/// can therefore never witness the click it is supposed to verify. Rather than
-/// annotate the daemon-desktop call, the whole click is rerouted through the
-/// owning desktop's worker, for three reasons:
-///
-/// 1. Microsoft documents client-side UIA *proxy* providers as communicating
-///    "across the process boundary by sending and receiving Windows messages",
-///    which cannot cross desktops. Cross-desktop UIA reach is therefore a
-///    per-provider accident, not a capability; relying on it would make the tier
-///    silently work for some controls and silently fail for others.
-/// 2. Only a worker on the owning desktop can take an honest before/after
-///    Source-of-Truth readback, and it does so in processes distinct from the
-///    one that performed the click — the mutation is never its own witness.
-/// 3. It keeps exactly one canonical hidden-desktop action path (#2056), so the
-///    route label, the audit row, and the refusal vocabulary are uniform across
-///    `set_field`, `click`, and `key`.
-///
-/// # Two HWNDs, two jobs (#2063 FSV of `be7386d1`)
-///
-/// The element id carries the HWND that *owns the clicked element*. In a classic
-/// Win32 dialog every control is a separate window, so for charmap's `Select`
-/// button that is the button itself (`0x21134`), not the dialog (`0x58e0a78`).
-/// Rooting the before/after verification subtree there made the two signatures
-/// identical **by construction**: a depth-capped subtree of the button can never
-/// contain the sibling edit the click actually mutates. Two physically delivered
-/// clicks (the "characters to copy" edit went `"" -> "!\r" -> "!!\r"`) were both
-/// reported as `ok:false` / `ACTION_NO_OBSERVED_DELTA`.
-///
-/// So the two handles are used for different jobs and never interchanged:
-///
-/// - `route.hwnd` — the addressed control. Membership/staleness oracle, the
-///   worker dispatch HWND, and the invoke target. Unchanged.
-/// - `route.root_hwnd` — `GA_ROOT` of that control, resolved *inside* the
-///   worker, because `GetAncestor` walks a parent chain that only exists on the
-///   desktop that owns the window; the daemon cannot resolve the ancestry of an
-///   HWND it cannot even see. This roots the before/after snapshots, which is
-///   what makes the readback able to witness the click it verifies — the same
-///   scope the visible-desktop tier verifies against (`target_window_ui_or_pixels`).
-///
-/// Both are recorded on the response and in the log row so an auditor can see
-/// exactly what was clicked and exactly what was watched.
-pub(crate) async fn act_click_hidden_desktop_worker(
-    params: &ActClickParams,
-    element_id: &ElementId,
-    route: super::hidden_desktop::HiddenDesktopWindowRoute,
-    boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActClickResponse, ErrorData> {
-    validate_click_params(params)?;
-    let started = Instant::now();
-    let double_click_timing = cached_double_click_timing();
-    let route_label = route.route_label();
-
-    // Worker process #1: the "before" Source of Truth, taken on the owning
-    // desktop and rooted at the target's top-level window so a sibling control's
-    // change is inside the observed scope. Doubles as the desktop-membership
-    // re-check immediately before delivery.
-    let before = crate::desktop_worker::hidden_desktop_window_snapshot(
-        &route.desktop_name,
-        route.root_hwnd,
-        HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
-    )
-    .map_err(|error| hidden_desktop_click_stage_error(element_id, &route, "before_read", error))?;
-    let before_signature = super::postcondition::hash_json(&before.tree)?;
-
-    // Worker process #2..N: one worker per requested click, each attached to the
-    // owning desktop. No daemon-desktop UIA call, no foreground activation, no
-    // raw input, no desktop switch.
-    let mut outcomes = Vec::with_capacity(usize::from(params.clicks));
-    for click_index in 0..params.clicks {
-        boundary.ensure("immediately_before_hidden_desktop_uia_element_click")?;
-        let action =
-            crate::desktop_worker::hidden_desktop_invoke_element(&route.desktop_name, element_id)
-                .map_err(|error| {
-                hidden_desktop_click_stage_error(element_id, &route, "invoke", error)
-            })?;
-        outcomes.push(action);
-        if click_index + 1 < params.clicks {
-            tokio::time::sleep(std::time::Duration::from_millis(u64::from(
-                double_click_timing.inter_click_delay_ms,
-            )))
-            .await;
-        }
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(u64::from(
-        params.verify_timeout_ms,
-    )))
-    .await;
-
-    // Worker process #N+1: a fresh desktop connection, fresh COM/UIA client and
-    // fresh element resolution read the "after" state — from the same top-level
-    // root as the "before" read, so the two signatures are comparable.
-    let after = crate::desktop_worker::hidden_desktop_window_snapshot(
-        &route.desktop_name,
-        route.root_hwnd,
-        HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
-    )
-    .map_err(|error| hidden_desktop_click_stage_error(element_id, &route, "after_read", error))?;
-    let after_signature = super::postcondition::hash_json(&after.tree)?;
-    let observed_delta = before_signature != after_signature;
-
-    let outcome_labels = outcomes
-        .iter()
-        .map(|outcome| {
-            serde_json::to_value(outcome)
-                .ok()
-                .and_then(|value| match value {
-                    Value::String(name) => Some(name),
-                    Value::Object(map) => map.keys().next().cloned(),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "unknown".to_owned())
-        })
-        .collect::<Vec<_>>();
-
-    tracing::info!(
-        code = "M2_ACT_CLICK_HIDDEN_DESKTOP_READBACK",
-        tool = "act_click",
-        element_id = %element_id,
-        hwnd = route.hwnd,
-        snapshot_root_hwnd = route.root_hwnd,
-        desktop_route = route_label.as_str(),
-        backend_tier_used = CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
-        required_foreground = false,
-        clicks = params.clicks,
-        outcomes = ?outcome_labels,
-        before_signature = before_signature.as_str(),
-        after_signature = after_signature.as_str(),
-        observed_delta,
-        source_of_truth = HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH,
-        "readback=act_click route={route_label} outcomes={outcome_labels:?} observed_delta={observed_delta}"
-    );
-
-    if params.verify_delta && !observed_delta {
-        return Err(attach_click_tier_attempts(
-            super::postcondition::no_observed_delta_error(
-                "act_click",
-                HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH,
-                params.verify_timeout_ms,
-                before_signature,
-                after_signature,
-                json!({
-                    "desktop_route": route_label,
-                    "hwnd": route.hwnd,
-                    "snapshot_root_hwnd": route.root_hwnd,
-                    "snapshot_depth": HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
-                    "element_id": element_id.to_string(),
-                    "uia_outcomes": outcome_labels,
-                }),
-            ),
-            vec![click_tier_delivered(
-                CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
-                false,
-                format!(
-                    "UI Automation semantic click delivered on {route_label}; outcomes={}",
-                    outcome_labels.join(",")
-                ),
-            )],
-        ));
-    }
-
-    let postcondition = if observed_delta {
-        super::postcondition::postcondition_observed_delta(
-            "act_click",
-            HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH,
-            before_signature,
-            after_signature,
-            format!(
-                "separate worker process on session-owned desktop {route_label} observed a UIA subtree change after the click; invoked hwnd {:#x}, subtree rooted at top-level hwnd {:#x} (depth {HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH})",
-                route.hwnd, route.root_hwnd
-            ),
-        )
-    } else {
-        schema::postcondition_not_requested()
-    };
-
-    Ok(ActClickResponse {
-        ok: true,
-        used_invoke_pattern: true,
-        backend_used: "uia".to_owned(),
-        backend_tier_used: CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER.to_owned(),
-        required_foreground: false,
-        desktop_route: Some(route_label.clone()),
-        desktop_route_hwnds: Some(schema::ActClickDesktopRouteHwnds {
-            invoked_hwnd: route.hwnd,
-            verify_root_hwnd: route.root_hwnd,
-            verify_subtree_depth: HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
-        }),
-        tier_attempts: vec![click_tier_delivered(
-            CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
-            false,
-            format!(
-                "UI Automation semantic click delivered by a worker process on session-owned desktop {route_label}; outcomes={}",
-                outcome_labels.join(",")
-            ),
-        )],
-        postcondition,
-        press_hold_ms: params.hold_ms,
-        double_click_window_ms: double_click_timing.window_ms,
-        inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
-        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-    })
-}
-
-/// Re-frames a hidden-desktop worker failure with the exact route, stage, and
-/// element so a refusal is never mistaken for a daemon-desktop failure (#2063).
-fn hidden_desktop_click_stage_error(
-    element_id: &ElementId,
-    route: &super::hidden_desktop::HiddenDesktopWindowRoute,
-    stage: &'static str,
-    error: ErrorData,
-) -> ErrorData {
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    let route_label = route.route_label();
-    tracing::error!(
-        code = code.as_str(),
-        tool = "act_click",
-        element_id = %element_id,
-        hwnd = route.hwnd,
-        snapshot_root_hwnd = route.root_hwnd,
-        desktop_route = route_label.as_str(),
-        stage,
-        required_foreground = false,
-        detail = %error.message,
-        "act_click hidden-desktop worker stage failed"
-    );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act_click hidden-desktop {stage} failed for element {element_id} on session-owned desktop {}: {}",
-            route.desktop_name, error.message
-        ),
-        Some(json!({
-            "code": code,
-            "tool": "act_click",
-            "operation": stage,
-            "desktop_route": route_label,
-            "desktop_name": route.desktop_name,
-            "element_id": element_id.to_string(),
-            "hwnd": route.hwnd,
-            "snapshot_root_hwnd": route.root_hwnd,
-            "required_foreground": false,
-            "backend_tier_used": CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
-            "source_of_truth": HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH,
-            "worker_error": error.data,
-        })),
-    )
-}
-
-/// #2063 finding 4: the top-level window the OS would actually hit-test at
-/// `point`, read on the daemon's desktop — which is the input desktop, and the
-/// only desktop a physical cursor click can ever land on.
-///
-/// `None` means no window is under the point at all. Callers must treat that as
-/// evidence, never as permission.
-#[cfg(windows)]
-pub(crate) fn window_root_at_screen_point(point: Point) -> Option<i64> {
-    use windows::Win32::{Foundation::POINT as WinPoint, UI::WindowsAndMessaging::WindowFromPoint};
-
-    let hwnd = unsafe {
-        WindowFromPoint(WinPoint {
-            x: point.x,
-            y: point.y,
-        })
-    };
-    if hwnd.0.is_null() {
-        return None;
-    }
-    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    let resolved = if root.0.is_null() { hwnd } else { root };
-    Some(synapse_core::win32_hwnd::hwnd_to_wire(resolved.0 as isize))
-}
-
-#[cfg(not(windows))]
-pub(crate) const fn window_root_at_screen_point(_point: Point) -> Option<i64> {
-    None
 }
 
 pub(crate) async fn act_click_postmessage_with_params(
@@ -720,8 +434,6 @@ async fn execute_cdp_click(
         backend_used: "cdp".to_owned(),
         backend_tier_used: CLICK_TIER_CDP.to_owned(),
         required_foreground: false,
-        desktop_route: None,
-        desktop_route_hwnds: None,
         tier_attempts: vec![click_tier_delivered(
             CLICK_TIER_CDP,
             false,
@@ -1030,21 +742,10 @@ pub(super) fn acquire_click_foreground_lease(
         ));
         return Err(attach_click_tier_attempts(error, tier_attempts.clone()));
     }
-    // #2071 non-reducing rule, applied at this out-of-funnel acquisition site
-    // too: an action must never renew a live same-owner lease DOWN below its
-    // remaining TTL. The hold-derived TTL stays the floor; a caller-held longer
-    // lease survives; the ceiling stays hard.
-    let lease_ttl_ms = crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
-        .max(
-            foreground_click_policy
-                .session_id()
-                .map_or(0, synapse_action::lease::owner_remaining_ttl_ms),
-        )
-        .min(synapse_action::MAX_LEASE_TTL_MS);
     match crate::m2::acquire_foreground_input_lease_with_ttl(
         "act_click",
         foreground_click_policy.session_id(),
-        lease_ttl_ms,
+        crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms),
     ) {
         Ok(guard) => Ok(guard),
         Err(error) => {

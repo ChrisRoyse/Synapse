@@ -1,12 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/synapse-chrome-bridge",
     "crates/synapse-mcp",
     "crates/synapse-core",
     "crates/synapse-capture",
     "crates/synapse-a11y",
-    "crates/synapse-calyx",
     "crates/synapse-perception",
     "crates/synapse-audio",
     "crates/synapse-action",
@@ -15,12 +13,11 @@ members = [
     "crates/synapse-profiles",
     "crates/synapse-models",
     "crates/synapse-telemetry",
+    "crates/synapse-test-utils",
     "crates/synapse-overlay",
 ]
 default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]
-# The vendored Calyx workspace (calyx/) is its own nested workspace; Synapse
-# crates reach it via path dependencies (issue #1652 / docs/calyx/).
-exclude = ["calyx"]
+exclude = []
 
 [workspace.package]
 version = "0.1.0"
@@ -29,35 +26,8 @@ rust-version = "1.95"
 license-file = "LICENSE.md"
 authors = ["Synapse contributors"]
 repository = "https://github.com/ChrisRoyse/Synapse"
-# LICENSE.md is PolyForm-Noncommercial-1.0.0 — source-available, NOT open source,
-# and commercial use requires a separate paid licence. These crates must therefore
-# never reach crates.io, and `cargo publish` is the only thing that could put them
-# there by accident. Declaring it here also makes the crates *private* in
-# cargo-deny's sense, which is what `[licenses] private.ignore = true` in deny.toml
-# keys off: the licence gate exists to audit third-party licences, and our own
-# licence is a policy decision rather than a compliance finding. (#1930)
-publish = false
 
 [workspace.dependencies]
-# Vendored calyx crates reached by path (the calyx workspace is `exclude`d).
-# Same reason as calyx/Cargo.toml: a bare `{ path = ... }` is a `*` requirement
-# and `deny.toml` bans wildcards (#1930).
-calyx-assay = { version = "0.1.0", path = "calyx/crates/calyx-assay" }
-calyx-anneal = { version = "0.1.0", path = "calyx/crates/calyx-anneal" }
-calyx-aster = { version = "0.1.0", path = "calyx/crates/calyx-aster" }
-calyx-core = { version = "0.1.0", path = "calyx/crates/calyx-core" }
-calyx-forge = { version = "0.1.0", path = "calyx/crates/calyx-forge" }
-calyx-ledger = { version = "0.1.0", path = "calyx/crates/calyx-ledger" }
-calyx-lenses = { version = "0.1.0", path = "calyx/crates/calyx-lenses" }
-calyx-lodestar = { version = "0.1.0", path = "calyx/crates/calyx-lodestar" }
-calyx-loom = { version = "0.1.0", path = "calyx/crates/calyx-loom" }
-calyx-oracle = { version = "0.1.0", path = "calyx/crates/calyx-oracle" }
-calyx-paths = { version = "0.1.0", path = "calyx/crates/calyx-paths" }
-calyx-registry = { version = "0.1.0", path = "calyx/crates/calyx-registry", default-features = false }
-calyx-search = { version = "0.1.0", path = "calyx/crates/calyx-search" }
-calyx-sextant = { version = "0.1.0", path = "calyx/crates/calyx-sextant" }
-calyx-ward = { version = "0.1.0", path = "calyx/crates/calyx-ward", default-features = false }
-
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
 tokio-tungstenite = "0.29.0"
@@ -67,13 +37,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.2"
 thiserror = "2.0.18"
-# >= 1.0.103: RUSTSEC-2026-0190 (unsoundness in `Error::downcast_mut()`).
-# Held here rather than only in Cargo.lock so a fresh resolve cannot go back.
-anyhow = "1.0.103"
+anyhow = "1.0.102"
 async-trait = "0.1.89"
 arboard = { version = "3.6.1", default-features = false }
 base64 = "0.22.1"
-bincode = { package = "bincode_reloaded", version = "3.1.6", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing-appender = "0.2.5"
@@ -81,6 +48,8 @@ futures-util = "0.3.32"
 http = "1.4.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
 axum = { version = "0.8.9", features = ["ws"] }
 hyper = "1.9.0"
@@ -91,7 +60,6 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
-    "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
     "Win32_System_Com",
@@ -103,18 +71,18 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_WindowsProgramming",
     "Wdk_System_SystemInformation",
-    "Wdk_System_SystemServices",
-    "Win32_System_Kernel",
-    "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_XboxController",
     "Win32_System_LibraryLoader",
     "Win32_Networking_WinSock",
-    "Win32_NetworkManagement_IpHelper",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
@@ -125,19 +93,17 @@ windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
     "Foundation_Collections",
 ] }
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-capture = "2.0.0"
 uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
 chromiumoxide = "0.9.1"
 wasapi = "0.23.0"
-# crates.io 0.1.4 enables winapi/xinput solely for XINPUT_GAMEPAD's layout, which
-# injects the unused SDK xinput.lib into every final link. Pin upstream PR #6's
-# windows-sys migration until it is released: https://github.com/CasualX/vigem-client/pull/6
-vigem-client = { version = "0.1.4", git = "https://github.com/rofferom/vigem-client", rev = "c24e58a258d56bc8cc68156face90e330ecbe155" }
+enigo = { version = "0.6.1", default-features = false }
+vigem-client = "0.1.4"
 ort = { version = "2.0.0-rc.12", default-features = false }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "zstd", "multi-threaded-cf"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
-ulid = { version = "1", features = ["serde"] }
 # Pinned to an exact version: schemars output IS the published MCP tool-schema
 # contract surface (see tests/snapshots/*.snap). A transparent minor/patch bump
 # can silently change schema emission (e.g. `items: true` -> `items: {}`) and
@@ -149,13 +115,15 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
 notify = "9.0.0-rc.4"
-num-traits = "0.2.19"
 fs2 = "0.4.3"
-rayon = "1.11.0"
 reqwest = "0.13.3"
 sse-stream = "0.2.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
+proptest = "1.11.0"
+criterion = "0.8.2"
+insta = { version = "1.47.2", features = ["json"] }
 tempfile = "3.27.0"
+mockall = "0.14.0"
 x11rb = "0.13.2"
 
 [workspace.lints.rust]
@@ -194,84 +162,24 @@ lto = false
 debug = false
 
 # release is the SHIPPED profile: the daemon-reinstall flow copies
-# target/release/synapse-mcp.exe into ~/.cargo/bin. Tuned for FAST rebuilds (the
-# iteration loop is build-the-daemon -> reinstall -> verify) while staying a
-# fully optimized binary:
-#   codegen-units = 16 permits parallel LLVM backend work. It does not parallelize
-#                      stable rustc's largely serial front end; high-cohesion
-#                      ownership seams (for example synapse-chrome-bridge) are
-#                      separate crates so Cargo can schedule those front ends
-#                      independently and avoid recompiling them for MCP-only edits.
+# target/release/synapse-mcp.exe into ~/.cargo/bin. Re-tuned 2026-06-14 for FAST
+# rebuilds (the iteration loop is build-the-daemon -> reinstall -> test), while
+# staying a fully optimized binary:
+#   lto = "thin"       parallel, near-fat runtime (<~3% on this IO/perception
+#                      daemon; RocksDB is C++ and unaffected by Rust LTO) but a
+#                      fraction of fat-LTO's serial link time.
+#   codegen-units = 16 parallel codegen across all cores. fat + cgu=1 forced the
+#                      whole synapse-mcp crate through ONE thread at the end,
+#                      idling 28+ of 32 threads for the long tail of every build.
 #   debug = false      we strip(true) anyway, so don't spend time emitting a PDB.
+# Result: release build dropped from ~15-30 min to a few minutes. For the rare
+# "ship the absolute-fastest binary" case use `--profile release-max` below.
 # Day-to-day, iterate with `cargo build` (dev, ~45s incremental) or `cargo check`.
-#
-# lto: "thin" -> false on 2026-08-07 (#2029). THIS IS AN EXPERIMENTAL ARM, and
-# the reasoning is recorded here because the next person to read this line will
-# otherwise assume LTO was dropped for build speed.
-#
-# Every toolchain crash this repo has archived died in the ONE rustc invocation
-# that ran ThinLTO. 16 archived release-build failures under
-# %LOCALAPPDATA%\synapse\logs\setup-build-failures\ (2026-07-17 .. 2026-08-06):
-# 12 are toolchain crashes, and all 12 are `could not compile synapse-mcp (bin
-# "synapse-mcp")` under `-C lto=thin -C codegen-units=16` -- 11 with exit
-# 0xc0000005 STATUS_ACCESS_VIOLATION and one with 0xc0000409
-# STATUS_STACK_BUFFER_OVERRUN (an abort/__fastfail, same crate, same stage).
-# The other 4 are ordinary compiler errors that never reached the LTO step. The
-# several hundred non-LTO rustc invocations in every one of those builds have
-# never crashed once.
-#
-# The three cheaper arms are all spent and all falsified (#2029):
-#   compiler swap    1.96.1 -> 1.97.1 (c9a6b85a)   crash recurred 2026-08-04
-#   RUST_MIN_STACK   8 MiB -> 64 MiB (9ec0b6b0)    crash recurred 11 h later
-#   CARGO_BUILD_JOBS 8, then 32                    crashed at BOTH, 46-72 GB free
-# There is no fourth toolchain to try: 1.97.1 IS the newest stable as of
-# 2026-08-07 (channel-rust-stable.toml, date 2026-07-16), and nothing in the
-# 1.95 -> 1.97.1 release notes touches LTO, lld, codegen crashes or stack sizes.
-# ThinLTO is what is left.
-#
-# HONEST CONFOUND: that invocation is also the largest crate, the only one that
-# links, and the only whole-program codegen job in the build, so "ThinLTO" is
-# not yet separated from "biggest codegen job". `lto = false` is precisely the
-# experiment that separates them -- the crate still compiles and still links,
-# only the cross-crate LTO stage disappears.
-#
-# FALSIFICATION: if a `SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED` archive appears
-# with `-C lto=off` in its recorded invocation, ThinLTO is NOT the cause, this
-# line should go straight back to "thin", and the investigation moves to the
-# host toolchain, which is the strongest remaining lead and is already staged:
-# the 2026-08-06 build log links against VS 18 (VS 2026) MSVC 14.50.35717, and
-# upstream has three separate 2026 reports of rustc exiting 0xc0000005 on
-# Windows (rust-lang/rust#151060, #150195, #150280) that ALL resolved to a
-# VS 2026 Build Tools mismatch rather than to any rustc bug. vswhere on this
-# host lists VS 18.0.2 Community alongside VS 2022 BuildTools 17.14.30, so that
-# arm is a one-line environment change, not an install. It is deliberately NOT
-# being run concurrently with this one -- two changes at once settles nothing.
-# Confirmation is
-# statistical, not a single green build: at the observed ~57% crash rate
-# (#1975), ~5 consecutive clean release builds are needed before absence of the
-# crash means anything.
-#
-# COST, measured on this host rather than assumed -- see #2029 for the numbers.
-# The runtime cost is small and bounded: this daemon is IO/perception bound and
-# its hot storage path is native code that Rust LTO never touched, which is why
-# the 2026-06-14 note above already scored ThinLTO at "<~3%". Nothing loses the
-# capability: `--profile release-max` below still ships whole-program fat LTO
-# for the case where the last few percent genuinely matter.
 [profile.release]
-# The installed daemon is deliberately built at basic optimization.  This
-# keeps the source-install compiler inside the lightweight-host envelope; the
-# monolithic synapse-mcp crate made LLVM's level-3 optimizer consume multiple
-# gigabytes even with Cargo concurrency capped. Runtime-critical native Calyx
-# storage remains in its separately compiled crates. Use release-max only for
-# an explicitly measured, operator-approved maximum-runtime artifact.
-opt-level = 1
+opt-level = 3
 debug = false
 incremental = false
-lto = false
-# Keep the documented non-incremental default. One unit did not lower the
-# measured hard-capped peak: calyx-aster still exhausted the 998,998,016-byte
-# Job, while serializing code generation made the build slower. The setup-owned
-# Windows Job remains the actual fail-closed memory boundary.
+lto = "thin"
 codegen-units = 16
 strip = true
 panic = "abort"
@@ -281,7 +189,6 @@ panic = "abort"
 # last few % of runtime matters: `cargo build --profile release-max`.
 [profile.release-max]
 inherits = "release"
-opt-level = 3
 codegen-units = 1
 lto = "fat"
 

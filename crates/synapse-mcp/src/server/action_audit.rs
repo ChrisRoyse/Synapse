@@ -6,7 +6,6 @@ use std::{
 use rmcp::{ErrorData, RoleServer, service::RequestContext};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::SynapseService;
 use crate::m1::mcp_error;
@@ -15,34 +14,6 @@ use crate::server::url_redaction::redact_url_fields_for_public_readback;
 static ACTION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl SynapseService {
-    pub(super) fn audit_action_preflight_candidate(
-        &self,
-        tool: &str,
-        details: &Value,
-        action_session_id: Option<&str>,
-    ) -> Result<String, ErrorData> {
-        let row = self.write_action_audit_row_readback(
-            tool,
-            "preflight",
-            None,
-            details,
-            action_session_id,
-        )?;
-        let db = self.m3_storage()?;
-        let constellation = db
-            .put_action_constellation(&row.audit_key, &row.encoded, &row.value)
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "STEERING_PREFLIGHT_CONSTELLATION_FAILED: tool={tool} source_key_hex={} detail={error}; remediation=repair the action-panel projection before retrying the risky call",
-                        synapse_storage::constellations::hex_encode(&row.audit_key)
-                    ),
-                )
-            })?;
-        Ok(constellation.cx_id)
-    }
-
     pub(super) fn audit_action_started_for_request(
         &self,
         tool: &'static str,
@@ -145,32 +116,6 @@ impl SynapseService {
                 "action audit write failed after denied action"
             );
         }
-    }
-
-    /// Persists a policy refusal whose external action was never attempted.
-    /// This is causal-decision provenance, not a failed execution outcome, so
-    /// the distinct status is deliberately outside the grounded
-    /// `ok|error|denied` terminal roster.
-    pub(super) fn audit_action_refused_unobserved_with_details_for_session(
-        &self,
-        tool: &'static str,
-        error: &ErrorData,
-        details: &Value,
-        session_id: &str,
-    ) -> Result<(), ErrorData> {
-        self.write_action_audit_row(
-            tool,
-            "causal_refused_unobserved",
-            error_data_code(error),
-            &json!({
-                "message": error.message.to_string(),
-                "data": error.data.clone(),
-                "request": details,
-                "external_action_attempted": false,
-                "grounded_execution_outcome": false,
-            }),
-            Some(session_id),
-        )
     }
 
     pub(super) fn audit_action_denied_with_details_for_request(
@@ -379,18 +324,6 @@ impl SynapseService {
         details: &Value,
         action_session_id: Option<&str>,
     ) -> Result<(), ErrorData> {
-        self.write_action_audit_row_readback(tool, status, error_code, details, action_session_id)?;
-        Ok(())
-    }
-
-    fn write_action_audit_row_readback(
-        &self,
-        tool: &str,
-        status: &'static str,
-        error_code: Option<&str>,
-        details: &Value,
-        action_session_id: Option<&str>,
-    ) -> Result<ActionAuditRowReadback, ErrorData> {
         let (ts_ns, seq) = next_audit_key_parts();
         let active_profile = self.action_audit_active_profile();
         let mut audit_context = self.current_action_audit_context()?;
@@ -416,40 +349,6 @@ impl SynapseService {
         redactions.sort();
         redactions.dedup();
         let redacted = !redactions.is_empty();
-        // Only pre-execution rows own a request snapshot. Terminal details are
-        // responses/errors and must never be reinterpreted as predictors. The
-        // field exists as null on every terminal outcome, so slot presence does
-        // not distinguish success from failure.
-        let request_snapshot = matches!(status, "preflight" | "started").then(|| details.clone());
-        let (request_snapshot_sha256, request_snapshot_bytes) = if let Some(snapshot) =
-            request_snapshot.as_ref()
-        {
-            let bytes = serde_json::to_vec(snapshot).map_err(|error| {
-                    mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "ACTION_AUDIT_REQUEST_SNAPSHOT_ENCODE_FAILED: tool={tool} status={status} detail={error}; remediation=repair the pre-action request projection before retrying"
-                        ),
-                    )
-                })?;
-            let byte_count = u64::try_from(bytes.len()).map_err(|error| {
-                    mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "ACTION_AUDIT_REQUEST_SNAPSHOT_LENGTH_OVERFLOW: tool={tool} status={status} detail={error}; remediation=bound the request before retrying"
-                        ),
-                    )
-                })?;
-            (
-                Some(format!(
-                    "sha256:{}",
-                    synapse_storage::constellations::hex_encode(&Sha256::digest(&bytes))
-                )),
-                Some(byte_count),
-            )
-        } else {
-            (None, None)
-        };
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
@@ -472,9 +371,6 @@ impl SynapseService {
             "active_profile_schema_version": active_profile.schema_version,
             "redacted": redacted,
             "redactions": redactions,
-            "request_snapshot": request_snapshot,
-            "request_snapshot_sha256": request_snapshot_sha256,
-            "request_snapshot_bytes": request_snapshot_bytes,
             "details": details,
         });
         let encoded = synapse_storage::encode_json(&value).map_err(|error| {
@@ -490,67 +386,9 @@ impl SynapseService {
                 "reflex runtime lock poisoned while writing action audit",
             )
         })?;
-        let audit_key = action_audit_key(ts_ns, seq);
-        if matches!(status, "ok" | "error" | "denied") {
-            let outcome = matches!(status, "ok");
-            let oracle_context = serde_json::to_vec(&json!({
-                "action_id": tool,
-                "outcome_anchor": {
-                    "value": { "bool": outcome }
-                },
-                "ground_truth_anchor": {
-                    "value": { "bool": outcome }
-                },
-                "consequence": {
-                    "action_or_event": "terminal_outcome",
-                    "domain": "synapse.action",
-                    "outcome": { "value": { "bool": outcome } },
-                    "grounded": true,
-                    "provisional": false
-                },
-                "source_action_audit_key_hex": synapse_storage::constellations::hex_encode(&audit_key),
-            }))
-            .map_err(|error| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    format!("Oracle action outcome context encode failed: {error}"),
-                )
-            })?;
-            let publication = runtime
-                .storage_put_action_oracle_publication(
-                    &audit_key,
-                    &encoded,
-                    ts_ns,
-                    &audit_key,
-                    &oracle_context,
-                )
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "CALYX_ORACLE_ACTION_PUBLICATION_FAILED: terminal action source/constellation/recurrence commit failed before source visibility: tool={tool} status={status} source_key_hex={} detail={error}; remediation: inspect the named Calyx commit failure, repair the invariant, and retry the action only after confirming its external side effect state",
-                            synapse_storage::constellations::hex_encode(&audit_key)
-                        ),
-                    )
-                })?;
-            tracing::info!(
-                code = "ACTION_AUDIT_ORACLE_ATOMIC_COMMITTED",
-                tool,
-                status,
-                source_key_hex = %synapse_storage::constellations::hex_encode(&audit_key),
-                subject_cx_id = %publication.subject_cx_id,
-                constellation_cx_id = %publication.constellation_cx_id,
-                occurrence_id = publication.occurrence_id,
-                committed_seq = publication.committed_seq,
-                latest_seq = publication.latest_seq,
-                source_row_count = publication.source_row_count,
-                "terminal action source, constellation, and Oracle occurrence committed atomically"
-            );
-        } else {
-            runtime
-                .storage_put_action_log_rows(vec![(audit_key.clone(), encoded.clone())])
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        }
+        runtime
+            .storage_put_action_log_rows(vec![(action_audit_key(ts_ns, seq), encoded)])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         drop(runtime);
         tracing::info!(
             code = "ACTION_AUDIT_RECORDED",
@@ -560,11 +398,7 @@ impl SynapseService {
             seq,
             "action audit row written"
         );
-        Ok(ActionAuditRowReadback {
-            audit_key,
-            encoded,
-            value,
-        })
+        Ok(())
     }
 
     fn action_audit_foreground(&self) -> Value {
@@ -722,7 +556,7 @@ impl SynapseService {
     /// this shared human OS foreground tier.
     fn action_audit_foreground_tier(
         &self,
-        tool: &str,
+        tool: &'static str,
         status: &str,
         session_id: Option<&str>,
         details: &Value,
@@ -818,12 +652,6 @@ impl SynapseService {
                 .map(|profile| profile.schema_version)
         })
     }
-}
-
-struct ActionAuditRowReadback {
-    audit_key: Vec<u8>,
-    encoded: Vec<u8>,
-    value: Value,
 }
 
 fn action_audit_detail_redactions(details: &Value) -> Vec<String> {
@@ -936,4 +764,159 @@ fn error_data_code(error: &ErrorData) -> Option<&str> {
 fn non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{num::NonZeroUsize, path::Path};
+
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+
+    fn service_with_db(path: &Path) -> SynapseService {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+        .expect("construct service")
+    }
+
+    #[test]
+    fn detail_required_foreground_reads_direct_flag_and_tier_attempts() {
+        assert!(detail_required_foreground(
+            &json!({ "required_foreground": true })
+        ));
+        assert!(!detail_required_foreground(
+            &json!({ "required_foreground": false })
+        ));
+        assert!(!detail_required_foreground(&json!({})));
+        // any foreground-requiring tier attempt makes the whole action foreground-tier
+        assert!(detail_required_foreground(&json!({
+            "tier_attempts": [
+                { "tier": "uia", "required_foreground": false },
+                { "tier": "foreground_sendinput", "required_foreground": true },
+            ]
+        })));
+        assert!(!detail_required_foreground(&json!({
+            "tier_attempts": [{ "tier": "cdp", "required_foreground": false }]
+        })));
+    }
+
+    #[test]
+    fn detail_backend_tier_prefers_explicit_then_last_attempt() {
+        assert_eq!(
+            detail_backend_tier(&json!({ "backend_tier_used": "cdp" })).as_deref(),
+            Some("cdp")
+        );
+        assert_eq!(
+            detail_backend_tier(&json!({ "backend_tier": "uia" })).as_deref(),
+            Some("uia")
+        );
+        assert_eq!(
+            detail_backend_tier(&json!({
+                "tier_attempts": [{ "tier": "uia" }, { "tier": "postmessage" }]
+            }))
+            .as_deref(),
+            Some("postmessage")
+        );
+        assert_eq!(detail_backend_tier(&json!({})), None);
+    }
+
+    #[test]
+    fn profile_foreground_allowance_matches_break_glass_only() {
+        use super::super::tool_profiles::ToolProfileKind;
+        assert!(!ToolProfileKind::NormalAgent.allows_foreground_tier());
+        assert!(!ToolProfileKind::BrowserControl.allows_foreground_tier());
+        assert!(ToolProfileKind::BreakGlass.allows_foreground_tier());
+        assert!(ToolProfileKind::FullCapability.allows_foreground_tier());
+    }
+
+    #[test]
+    fn foreground_tier_block_flags_normal_agent_foreground_as_violation() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "issue1006-normal-session";
+
+        // A normal_agent session that records a real foreground-tier action is
+        // a human OS foreground policy violation. The profile is resolved from
+        // the real CF_SESSIONS row (default normal_agent for a non-local
+        // session).
+        let violation = service.action_audit_foreground_tier(
+            "act_type",
+            "ok",
+            Some(session_id),
+            &json!({ "required_foreground": true, "backend_tier_used": "foreground_sendinput" }),
+        );
+        assert_eq!(violation["session_foreground_policy"], "normal_agent");
+        assert_eq!(violation["required_foreground"], true);
+        assert_eq!(violation["backend_tier"], "foreground_sendinput");
+        assert_eq!(violation["policy_allows_foreground"], false);
+        assert_eq!(violation["foreground_policy_violation"], true);
+        assert_eq!(violation["allowed"], false);
+
+        // A background action from the same session is allowed and not flagged.
+        let ok = service.action_audit_foreground_tier(
+            "cdp_target_info",
+            "ok",
+            Some(session_id),
+            &json!({ "required_foreground": false }),
+        );
+        assert_eq!(ok["required_foreground"], false);
+        assert_eq!(ok["foreground_policy_violation"], false);
+        assert_eq!(ok["allowed"], true);
+
+        // A denied foreground request never touched the foreground -> not a violation.
+        let denied = service.action_audit_foreground_tier(
+            "act_type",
+            "denied",
+            Some(session_id),
+            &json!({ "required_foreground": true }),
+        );
+        assert_eq!(denied["foreground_policy_violation"], false);
+    }
+
+    #[test]
+    fn audit_rows_separate_human_and_agent_foreground_concepts() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "issue1216-session";
+
+        let agent = service.action_audit_agent_logical_foreground(Some(session_id));
+        assert_eq!(agent["status"], "missing");
+        assert_eq!(agent["no_human_os_foreground_fallback"], true);
+        assert_eq!(
+            agent["persisted_row_key"],
+            format!("mcp/session-target/v1/{session_id}")
+        );
+
+        let lane = service.action_audit_foreground_lane(Some(session_id));
+        assert_eq!(lane["status"], "missing");
+        assert_eq!(lane["explicit_real_foreground_lease"], false);
+        assert_eq!(lane["no_human_os_foreground_fallback"], true);
+
+        let no_session_agent = service.action_audit_agent_logical_foreground(None);
+        assert_eq!(no_session_agent["status"], "missing_session");
+        assert_eq!(
+            no_session_agent["missing_reason"],
+            "action audit row has no MCP session id"
+        );
+    }
 }

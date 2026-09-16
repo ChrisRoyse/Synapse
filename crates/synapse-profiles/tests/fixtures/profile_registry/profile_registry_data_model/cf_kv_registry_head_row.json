@@ -1,0 +1,13 @@
+{
+  "cf_name": "CF_KV",
+  "key": "profile_registry/v1/head/registry.synthetic.local-fixture",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "registry_head",
+    "source_id": "registry.synthetic.local-fixture",
+    "head_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "updated_at": "2026-05-27T02:06:00Z",
+    "package_count": 1,
+    "latest_package_key": "profile_registry/v1/package/profile.synthetic.governance/0.1.0"
+  }
+}

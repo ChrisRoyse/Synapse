@@ -20,11 +20,11 @@ The `synapse-models` crate manages the lifecycle of ONNX detection models. The p
 1. **Registry** (`registry.rs`) — A compile-time table (`REGISTERED_MODELS`) declares each known model with its filename, expected SHA-256, download URL, license, and input shape. The default detection model is `rtdetr_v2_s_coco_onnx`.
 2. **Download** (`download.rs`) — Models live on disk under `default_model_dir()`. **Automated download is disabled in M1**; `model_download_failed` returns a `DownloadFailed` error directing the operator to side-load a verified file. There is no network fetch implemented in this crate.
 3. **Verify** (`verify.rs`) — Before a session is built, the on-disk file's SHA-256 is computed via a streaming 64 KiB-chunked hash and compared against the descriptor's expected hash. A mismatch yields `HashMismatch`.
-4. **Session** (`session.rs` + `ep.rs`) — `ModelLoader::load` verifies the file, then asks a `SessionFactory` to build a persistent ONNX Runtime session. The default provider list is exactly CPU. A successful build produces a `LoadedModel` that implements the `Detector` trait for inference.
+4. **Session** (`session.rs` + `ep.rs`) — `ModelLoader::load` verifies the file, then asks a `SessionFactory` to build a persistent ONNX Runtime session, trying execution providers in order (CUDA → DirectML → CPU). A successful build produces a `LoadedModel` that implements the `Detector` trait for inference.
 
 The `ort` (ONNX Runtime) integration is **feature-gated**. Without the `ort` feature compiled in, sessions fall back to a `Placeholder` handle and `OrtSessionFactory` returns `BackendUnavailable`.
 
-The ONNX Runtime binding is **`ort` version `2.0.0-rc.12`** (workspace pin in `Cargo.toml`), used with API level `api-24` and `load-dynamic` (`crates/synapse-models/Cargo.toml`). The build never downloads or copies an ORT distribution. Setup owns acquisition of the pinned, hash-verified Microsoft runtime bundle and installs its DLLs beside the daemon; ORT resolves that deployed runtime when the first session is created.
+The ONNX Runtime binding is **`ort` version `2.0.0-rc.12`** (workspace pin in `Cargo.toml`), used with API level `api-24` (`crates/synapse-models/Cargo.toml`).
 
 Cross-references:
 - Whisper audio transcription using ONNX Runtime extensions — see [08_audio_subsystem.md](08_audio_subsystem.md). The `whisper_tiny_int8` model receives special handling in `create_ort_session` (operator-library registration).
@@ -50,82 +50,28 @@ A `Copy`-able compile-time descriptor of a known model (`crates/synapse-models/s
 | `source_repo` | `&'static str` | Upstream repository URL |
 | `input_shape` | `[usize; 4]` | NCHW input tensor shape |
 | `class_map` | `&'static [&'static str]` | Class-index → label table |
-| `required` | `bool` | Whether an install may complete without this model (#1863) |
 
 `RegisteredModel::descriptor(self)` converts the static entry into a runtime `ModelDescriptor`, resolving `path` to `default_model_dir().join(filename)`.
 
 ### 13.2.2 Registered models table
 
-`REGISTERED_MODELS` contains three entries, in the order below. **This order is
-the wire order of the embedded model bundle's slot table** (§13.2.5) — the
-installer writes slots positionally and the daemon reads them positionally, so
-reordering this table is a format change.
+`REGISTERED_MODELS` contains a single entry. There is **one registered model** (`crates/synapse-models/src/registry.rs:144`).
 
-| # | `id` | `filename` | `required` | Source |
-|---|------|-----------|-----------|--------|
-| 0 | `rtdetr_v2_s_coco_onnx` | `rtdetr_v2_s_coco.onnx` | yes | [HF onnx-community/rtdetr_v2_r18vd-ONNX `model.onnx`](https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx) |
-| 1 | `rtdetr_v2_s_coco_int8_cpu_onnx` | `rtdetr_v2_s_coco_int8_cpu.onnx` | yes | same repo, `model_int8.onnx` |
-| 2 | `whisper_tiny_int8` | `whisper-tiny-int8.onnx` | **no** | `recipe://scripts/build-whisper-e2e-onnx.ps1` |
+| Property | Value |
+|----------|-------|
+| `id` | `rtdetr_v2_s_coco_onnx` |
+| `label` | `RT-DETRv2-S COCO ONNX` |
+| `filename` | `rtdetr_v2_s_coco.onnx` |
+| `sha256` | `sha256:583a236ac21c95a7fd94f284fc21485e42355bfef82c27011ba78fbc09ee87e2` |
+| `download_url` | `https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx` |
+| `license_spdx` | `Apache-2.0` |
+| `source_model` | `PekingU/rtdetr_v2_r18vd` |
+| `source_repo` | `https://github.com/lyuwenyu/RT-DETR` |
+| `input_shape` | `[1, 3, 640, 640]` (`DEFAULT_DETECTION_INPUT_SHAPE`) |
+| `class_map` | `COCO80_CLASS_MAP` (80 COCO classes) |
+| **File size** | Not determined from source (no size field exists in the registry) |
 
 The default detection model id is `DEFAULT_DETECTION_MODEL_ID = "rtdetr_v2_s_coco_onnx"` (= `RTDETR_V2_S_COCO_ONNX_ID`).
-
-### 13.2.5 Embedded model bundle (`SYNMODEL_BUNDLE2`)
-
-`scripts/synapse-setup.ps1` appends the pinned models to the built executable and
-the daemon reads them back out of its own image. The format is self-describing:
-
-```text
-[slot payloads, concatenated in REGISTERED_MODELS order]
-[slot table: for each registered model]
-    u64  length_le            0 == the model is positively ABSENT
-    [32] sha256 raw digest    all-zero when absent
-u32  slot_count_le
-u32  format_version_le  (= 2)
-[16] magic "SYNMODEL_BUNDLE2"
-```
-
-Two properties matter:
-
-- **Absence is recorded, not inferred.** A zero-length slot is the packager
-  stating "this optional model is not in this build", which is distinguishable
-  from a truncated image. This is what allows an install to succeed without the
-  optional STT model.
-- **Each slot carries its own digest.** The executable states what it contains,
-  so the installer does not keep a second hardcoded copy of the hashes — that
-  duplication is where pin drift comes from.
-
-Readers: `synapse_models::embedded_model_bundle()` (running image) and
-`embedded_model_bundle_at(path)` (arbitrary binary). `RegisteredModel::embedded_bytes()`
-verifies the payload against the slot digest before returning it, and yields
-`ModelError::EmbeddedSlotAbsent` for an absent optional model. A pre-#1863
-`SYNMODEL_BUNDLE1` image is recognized and refused with
-`MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT` rather than being mistaken for an
-unpackaged binary.
-
-### 13.2.6 Required vs optional models (#1863)
-
-A **required** model missing is a build defect: packaging fails closed. An
-**optional** model missing is a capability gap: the install completes, and the
-dependent subsystem reports itself unavailable with the exact remediation.
-
-`whisper_tiny_int8` is the only optional model. It is an ONNX Runtime Extensions
-*end-to-end* graph (raw container bytes on `audio_stream` → text on `str`, with
-audio decode, log-mel, beam search and BPE detokenize fused in). No public
-repository publishes that artifact — every HuggingFace `whisper-tiny` ONNX repo
-ships the split encoder/decoder export, which does not satisfy the contract. It
-is therefore produced by the committed recipe `scripts/build-whisper-e2e-onnx.ps1`.
-
-Its pin lives in **one authored place**, `models/whisper-tiny-int8.pin.json`.
-`WHISPER_TINY_INT8_ONNX_SHA256` in `registry.rs` must equal it; setup verifies
-this and fails with `SYNAPSE_OPTIONAL_MODEL_PIN_DRIFT` if they disagree, so the
-installer can never package bytes the daemon would refuse at load time.
-
-Acquisition order used by setup: `$env:SYNAPSE_WHISPER_ONNX_SOURCE`, then
-`%LOCALAPPDATA%\synapse\models\`, then `<checkout>\models\`. If none holds a
-verified artifact, setup records the gap in
-`<LogDir>\synapse-setup-capability-gaps.json`, warns, and continues. Health then
-reports `audio.stt_model_available=false` with
-`stt_model_unavailable_reason`.
 
 ### 13.2.3 Class map
 
@@ -246,27 +192,29 @@ Serde-serialized as `snake_case` (`crates/synapse-models/src/ep.rs`):
 
 | Variant | serde name | Notes |
 |---------|-----------|-------|
-| `Cuda` | `cuda` | NVIDIA CUDA EP only when the crate is separately built with its optional `cuda` feature; the installed daemon does not compile it |
+| `Cuda` | `cuda` | NVIDIA CUDA EP |
+| `DirectMl` | `direct_ml` | Windows DirectML EP |
 | `Cpu` | `cpu` | CPU EP (`#[default]`) |
 
 ### 13.5.2 Default provider order
 
 ```rust
 pub fn default_provider_order() -> Vec<ModelBackend> {
-    vec![Cpu]
+    vec![Cuda, DirectMl, Cpu]
 }
 ```
 
-**Default provider: CPU only.** `Cpu` is the enum's `#[default]` and the only entry returned by `default_provider_order`; the installed runtime does not probe an accelerator and does not silently fall back from one.
+**Order: CUDA → DirectML → CPU.** The loader tries each in sequence and selects the first that successfully builds a session. `Cpu` is the default single-variant fallback and the enum's `#[default]`.
 
 ### 13.5.3 `create_ort_session` (`ort` feature only)
 
 Builds one `ort::session::Session` for a descriptor and a single provider:
 
 1. Creates a `Session::builder()`; failures → `LoadFailed`.
-2. **Whisper special case:** if `descriptor.id == "whisper_tiny_int8"`, resolves the pinned local ONNX Runtime Extensions library through `local_ort_extensions_library()` and registers it via `with_operator_library`. Either failure → `LoadFailed`. See [08_audio_subsystem.md](08_audio_subsystem.md).
+2. **Whisper special case:** if `descriptor.id == "whisper_tiny_int8"`, registers the ONNX Runtime extensions operator library — preferring a local library from `local_ort_extensions_library()` via `with_operator_library`, otherwise falling back to `with_extensions()`. Either failure → `LoadFailed`. See [08_audio_subsystem.md](08_audio_subsystem.md).
 3. Selects the EP and builds it with `.error_on_failure()`:
-   - `Cuda` → `ep::CUDA::default()` only under the optional crate feature; otherwise returns `SYNAPSE_MODELS_CUDA_NOT_COMPILED`
+   - `Cuda` → `ep::CUDA::default()`
+   - `DirectMl` → `ep::DirectML::default()`
    - `Cpu` → `ep::CPU::default().with_arena_allocator(false)`
 4. `builder.with_execution_providers([execution_provider])` — on error logs a `warn` and returns `BackendUnavailable { attempted: vec![provider] }`.
 5. `builder.commit_from_file(&descriptor.path)` loads the model; failure → `LoadFailed`.
@@ -276,10 +224,11 @@ Builds one `ort::session::Session` for a descriptor and a single provider:
 | Feature | Enables |
 |---------|---------|
 | `default` | (none) — ORT not compiled, `Placeholder` sessions only |
-| `ort` | `dep:ort`, `ort/api-24`, `ort/load-dynamic`, `ort/std` |
+| `ort` | `dep:ort`, `ort/api-24`, `ort/copy-dylibs`, `ort/download-binaries`, `ort/std`, `ort/tls-native` |
 | `cuda` | `ort` + `ort/cuda` |
+| `directml` | `ort` + `ort/directml` |
 
-ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`. `download-binaries`, its TLS client, and `copy-dylibs` are deliberately absent: a development build has no authority to acquire a runtime, while the installer verifies and deploys the one supported runtime bundle. `synapse-mcp` enables only `synapse-models/ort`; its compile-time feature guard rejects `synapse-models/cuda`, and no DirectML feature or backend exists.
+ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`.
 
 ---
 

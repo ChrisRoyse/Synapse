@@ -58,7 +58,7 @@ Before any compression technique, draw the boundary. The following have **no mod
 | Error codes / sentinel strings | `MEJEPA_INSTRUMENT_GRADIENT_LEAK`, `CCREALITY_ENGINE_RETIRED` | These are protocol; paraphrase breaks the contract |
 | Named entities | issue numbers (`#406`), commit hashes, model IDs (`claude-opus-4-7`) | Single identity; any drift renders the reference useless |
 | Deny-lists and allow-lists | `.env`, `swebench/**`, `tests/oracle_**` | The model's prior says "be cautious of .env"; it does *not* know the specific paths your project bans |
-| Verbatim API names | `gh issue edit`, `cargo clippy --no-deps`, `calyx::CF_MEJEPA_*` | These are spellings the LLM must reproduce exactly |
+| Verbatim API names | `gh issue edit`, `cargo clippy --no-deps`, `rocksdb::CF_MEJEPA_*` | These are spellings the LLM must reproduce exactly |
 | Direct quotations and required phrasings | structured comment headers, the words a tool's output must contain | Substitution breaks downstream parsing |
 | Decision boundaries | "fail closed", "never use `git push --force`" | Inverting one word flips the rule |
 

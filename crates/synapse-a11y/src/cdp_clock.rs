@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{A11yError, A11yResult};
 
-const CLOCK_VERSION: &str = "synapse-clock-2026-08-20-v2";
+const CLOCK_VERSION: &str = "synapse-clock-2026-06-21-v1";
 const MAX_CLOCK_MS: u64 = 8_640_000_000_000_000;
 const DEFAULT_LOOP_LIMIT: u32 = 10_000;
 
@@ -22,7 +22,6 @@ const DEFAULT_LOOP_LIMIT: u32 = 10_000;
 pub enum CdpClockOperation {
     Status,
     Install,
-    Uninstall,
     SetFixedTime,
     FastForward,
     PauseAt,
@@ -33,7 +32,6 @@ impl CdpClockOperation {
         match self {
             Self::Status => "status",
             Self::Install => "install",
-            Self::Uninstall => "uninstall",
             Self::SetFixedTime => "setFixedTime",
             Self::FastForward => "fastForward",
             Self::PauseAt => "pauseAt",
@@ -119,41 +117,26 @@ pub async fn cdp_clock(
 
     match operation {
         CdpClockOperation::Install => install_clock(endpoint, target_id, time_unix_ms).await,
-        CdpClockOperation::Uninstall => uninstall_clock(endpoint, target_id).await,
         CdpClockOperation::Status => clock_status(endpoint, target_id).await,
         CdpClockOperation::SetFixedTime => {
             let time = time_unix_ms.ok_or_else(|| A11yError::CdpAxtreeFailed {
                 detail: "setFixedTime requires time_unix_ms".to_owned(),
             })?;
-            validate_clock_ms("setFixedTime time_unix_ms", time)?;
             run_clock_command(endpoint, target_id, operation, json!({ "timeMs": time })).await
         }
         CdpClockOperation::FastForward => {
             let delta = delta_ms.ok_or_else(|| A11yError::CdpAxtreeFailed {
                 detail: "fastForward requires delta_ms".to_owned(),
             })?;
-            validate_clock_ms("fastForward delta_ms", delta)?;
             run_clock_command(endpoint, target_id, operation, json!({ "deltaMs": delta })).await
         }
         CdpClockOperation::PauseAt => {
             let time = time_unix_ms.ok_or_else(|| A11yError::CdpAxtreeFailed {
                 detail: "pauseAt requires time_unix_ms".to_owned(),
             })?;
-            validate_clock_ms("pauseAt time_unix_ms", time)?;
             run_clock_command(endpoint, target_id, operation, json!({ "timeMs": time })).await
         }
     }
-}
-
-fn validate_clock_ms(field: &str, value: u64) -> A11yResult<()> {
-    if value > MAX_CLOCK_MS {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "browser clock {field}={value} exceeds the ECMAScript Date maximum {MAX_CLOCK_MS}; refusing a state that Date would expose as Invalid Date"
-            ),
-        });
-    }
-    Ok(())
 }
 
 async fn install_clock(
@@ -161,35 +144,21 @@ async fn install_clock(
     target_id: &str,
     time_unix_ms: Option<u64>,
 ) -> A11yResult<CdpClockResult> {
-    if let Some(time) = time_unix_ms {
-        validate_clock_ms("install time_unix_ms", time)?;
-    }
-    let now_ms = time_unix_ms.unwrap_or_else(now_unix_ms);
+    let now_ms = time_unix_ms.unwrap_or_else(now_unix_ms).min(MAX_CLOCK_MS);
     let mut newly_added = false;
     let slot = {
         let existing = registry()
             .lock()
-            .map_err(|_| A11yError::CdpAxtreeFailed {
-                detail: "browser clock registry lock is poisoned during install".to_owned(),
-            })?
-            .get(target_id)
-            .cloned();
+            .ok()
+            .and_then(|slots| slots.get(target_id).cloned())
+            .filter(|slot| slot.endpoint == endpoint);
         if let Some(slot) = existing {
-            if slot.endpoint != endpoint {
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "browser clock target {target_id:?} is already owned by endpoint {:?}, not requested endpoint {endpoint:?}",
-                        slot.endpoint
-                    ),
-                });
-            }
             slot
         } else {
-            let init_script = clock_install_script(now_ms);
             let added = crate::cdp_action::cdp_add_init_script_target(
                 endpoint,
                 target_id,
-                &init_script,
+                clock_init_script(),
                 None,
                 None,
                 Some(false),
@@ -201,46 +170,14 @@ async fn install_clock(
                 init_script_identifier: added.identifier,
                 installed_at_unix_ms: now_unix_ms(),
             };
-            let owner_result = match registry().lock() {
-                Ok(mut slots) if !slots.contains_key(target_id) => {
-                    slots.insert(target_id.to_owned(), slot.clone());
-                    Ok(())
-                }
-                Ok(_) => Err("a concurrent durable owner appeared".to_owned()),
-                Err(_) => Err(
-                    "browser clock registry lock is poisoned after init-script installation"
-                        .to_owned(),
-                ),
-            };
-            if let Err(owner_error) = owner_result {
-                let cleanup = crate::cdp_action::cdp_remove_init_script_target(
-                    endpoint,
-                    target_id,
-                    &slot.init_script_identifier,
-                )
-                .await;
-                let effect_cleanup = if cleanup.is_ok() {
-                    crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
-                        endpoint,
-                        target_id,
-                        &slot.init_script_identifier,
-                    )
-                    .map(|()| "resolved".to_owned())
-                    .unwrap_or_else(|error| format!("failed: {error}"))
-                } else {
-                    "not_attempted_without_future-removal_ack".to_owned()
-                };
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "browser clock init-script owner commit failed for target {target_id:?}: {owner_error}; future_cleanup={cleanup:?}; effect_cleanup={effect_cleanup}"
-                    ),
-                });
+            if let Ok(mut slots) = registry().lock() {
+                slots.insert(target_id.to_owned(), slot.clone());
             }
             slot
         }
     };
 
-    let readback_result = run_clock_js(
+    let readback = run_clock_js(
         endpoint,
         target_id,
         "install",
@@ -249,58 +186,7 @@ async fn install_clock(
             "loopLimit": DEFAULT_LOOP_LIMIT,
         }),
     )
-    .await;
-    let readback = match readback_result {
-        Ok(readback) => readback,
-        Err(install_error) if newly_added => {
-            let current_cleanup =
-                run_existing_clock_js(endpoint, target_id, "uninstall", json!({})).await;
-            let current_owned_after_cleanup = match &current_cleanup {
-                Ok(readback) => Ok(readback.installed),
-                Err(_) => current_document_has_owned_clock(endpoint, target_id).await,
-            };
-            let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
-                endpoint,
-                target_id,
-                &slot.init_script_identifier,
-            )
-            .await;
-            let effect_cleanup = if current_owned_after_cleanup
-                .as_ref()
-                .is_ok_and(|owned| !owned)
-                && future_cleanup.is_ok()
-            {
-                crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
-                    endpoint,
-                    target_id,
-                    &slot.init_script_identifier,
-                )
-                .map(|()| "resolved".to_owned())
-                .unwrap_or_else(|error| format!("failed: {error}"))
-            } else {
-                "not_attempted_without_current+future_ack".to_owned()
-            };
-            let owner_cleanup = match registry().lock() {
-                Ok(mut slots)
-                    if slots.get(target_id).is_some_and(|owner| {
-                        owner.endpoint == slot.endpoint
-                            && owner.init_script_identifier == slot.init_script_identifier
-                    }) =>
-                {
-                    slots.remove(target_id);
-                    true
-                }
-                Ok(_) => false,
-                Err(_) => false,
-            };
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "browser clock current-document install failed for target {target_id:?}: {install_error}; rollback_current={current_cleanup:?}; current_owned_after_cleanup={current_owned_after_cleanup:?}; rollback_future={future_cleanup:?}; rollback_effect={effect_cleanup}; rollback_owner={owner_cleanup}"
-                ),
-            });
-        }
-        Err(install_error) => return Err(install_error),
-    };
+    .await?;
     Ok(CdpClockResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: target_id.to_owned(),
@@ -315,13 +201,10 @@ async fn install_clock(
 async fn clock_status(endpoint: &str, target_id: &str) -> A11yResult<CdpClockResult> {
     let slot = registry()
         .lock()
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: "browser clock registry lock is poisoned during status".to_owned(),
-        })?
-        .get(target_id)
-        .cloned()
+        .ok()
+        .and_then(|slots| slots.get(target_id).cloned())
         .filter(|slot| slot.endpoint == endpoint);
-    let readback = run_existing_clock_js(endpoint, target_id, "status", json!({})).await?;
+    let readback = run_clock_js(endpoint, target_id, "status", json!({})).await?;
     Ok(CdpClockResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: target_id.to_owned(),
@@ -335,95 +218,6 @@ async fn clock_status(endpoint: &str, target_id: &str) -> A11yResult<CdpClockRes
     })
 }
 
-async fn uninstall_clock(endpoint: &str, target_id: &str) -> A11yResult<CdpClockResult> {
-    let slot = registry()
-        .lock()
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: "browser clock registry lock is poisoned during uninstall".to_owned(),
-        })?
-        .get(target_id)
-        .cloned();
-    let Some(slot) = slot else {
-        let readback = run_existing_clock_js(endpoint, target_id, "status", json!({})).await?;
-        if readback.installed {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "browser clock target {target_id:?} is installed in the page but has no durable init-script owner; refusing unowned teardown"
-                ),
-            });
-        }
-        return Ok(CdpClockResult {
-            endpoint: endpoint.to_owned(),
-            cdp_target_id: target_id.to_owned(),
-            operation: CdpClockOperation::Uninstall.wire().to_owned(),
-            init_script_identifier: None,
-            init_script_newly_added: false,
-            installed_at_unix_ms: 0,
-            readback,
-        });
-    };
-    if slot.endpoint != endpoint {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "browser clock target {target_id:?} is owned by endpoint {:?}, not requested endpoint {endpoint:?}",
-                slot.endpoint
-            ),
-        });
-    }
-
-    let current = run_existing_clock_js(endpoint, target_id, "uninstall", json!({})).await;
-    let future = crate::cdp_action::cdp_remove_init_script_target(
-        endpoint,
-        target_id,
-        &slot.init_script_identifier,
-    )
-    .await;
-    let readback = match (current, future) {
-        (Ok(readback), Ok(_)) if !readback.installed => {
-            crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
-                endpoint,
-                target_id,
-                &slot.init_script_identifier,
-            )?;
-            readback
-        }
-        (current, future) => {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "browser clock uninstall did not prove current+future teardown for target {target_id:?}: current={:?}; future={:?}",
-                    current.err(),
-                    future.err()
-                ),
-            });
-        }
-    };
-    let removed = registry()
-        .lock()
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: "browser clock registry lock is poisoned after physical uninstall".to_owned(),
-        })?
-        .remove(target_id);
-    if removed.as_ref().is_none_or(|owner| {
-        owner.endpoint != slot.endpoint
-            || owner.init_script_identifier != slot.init_script_identifier
-    }) {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "browser clock durable owner changed during uninstall for target {target_id:?}; physical teardown completed but ownership reconciliation failed"
-            ),
-        });
-    }
-    Ok(CdpClockResult {
-        endpoint: endpoint.to_owned(),
-        cdp_target_id: target_id.to_owned(),
-        operation: CdpClockOperation::Uninstall.wire().to_owned(),
-        init_script_identifier: Some(slot.init_script_identifier),
-        init_script_newly_added: false,
-        installed_at_unix_ms: slot.installed_at_unix_ms,
-        readback,
-    })
-}
-
 async fn run_clock_command(
     endpoint: &str,
     target_id: &str,
@@ -432,32 +226,19 @@ async fn run_clock_command(
 ) -> A11yResult<CdpClockResult> {
     let slot = registry()
         .lock()
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: "browser clock registry lock is poisoned during mutation".to_owned(),
-        })?
-        .get(target_id)
-        .cloned()
-        .ok_or_else(|| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "browser clock target {target_id:?} has no durable init-script owner; install it before mutation"
-            ),
-        })?;
-    if slot.endpoint != endpoint {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "browser clock target {target_id:?} is owned by endpoint {:?}, not requested endpoint {endpoint:?}",
-                slot.endpoint
-            ),
-        });
-    }
-    let readback = run_existing_clock_js(endpoint, target_id, operation.wire(), args).await?;
+        .ok()
+        .and_then(|slots| slots.get(target_id).cloned())
+        .filter(|slot| slot.endpoint == endpoint);
+    let readback = run_clock_js(endpoint, target_id, operation.wire(), args).await?;
     Ok(CdpClockResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: target_id.to_owned(),
         operation: operation.wire().to_owned(),
-        init_script_identifier: Some(slot.init_script_identifier),
+        init_script_identifier: slot
+            .as_ref()
+            .map(|slot| slot.init_script_identifier.clone()),
         init_script_newly_added: false,
-        installed_at_unix_ms: slot.installed_at_unix_ms,
+        installed_at_unix_ms: slot.as_ref().map_or(0, |slot| slot.installed_at_unix_ms),
         readback,
     })
 }
@@ -477,11 +258,9 @@ async fn run_clock_js(
     })?;
     let expression = format!(
         "(() => {{
-            const existing = globalThis.__synapseClock;
-            if (existing !== undefined && (!existing || existing.version !== {version:?} || typeof existing.call !== \"function\")) {{
-                throw new Error(\"Synapse browser clock marker collision: globalThis.__synapseClock is owned by incompatible page state\");
-            }}
-            const clock = existing || ({shim});
+            const clock = (globalThis.__synapseClock && globalThis.__synapseClock.version === {version:?})
+                ? globalThis.__synapseClock
+                : ({shim});
             const result = clock.call({method_json}, {args_json});
             return result;
         }})()",
@@ -498,69 +277,8 @@ async fn run_clock_js(
     })
 }
 
-async fn current_document_has_owned_clock(endpoint: &str, target_id: &str) -> A11yResult<bool> {
-    let expression = format!(
-        "(() => {{
-            const clock = globalThis.__synapseClock;
-            return Boolean(clock && clock.version === {CLOCK_VERSION:?} && typeof clock.call === \"function\");
-        }})()"
-    );
-    let evaluated =
-        crate::cdp_action::cdp_evaluate_expression(endpoint, target_id, &expression, false, true)
-            .await?;
-    evaluated
-        .value
-        .as_bool()
-        .ok_or_else(|| A11yError::CdpAxtreeFailed {
-            detail: "browser clock ownership probe did not return a boolean".to_owned(),
-        })
-}
-
-async fn run_existing_clock_js(
-    endpoint: &str,
-    target_id: &str,
-    method: &str,
-    args: Value,
-) -> A11yResult<CdpClockReadback> {
-    let method_json =
-        serde_json::to_string(method).map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("serialize browser clock method: {error}"),
-        })?;
-    let args_json = serde_json::to_string(&args).map_err(|error| A11yError::CdpAxtreeFailed {
-        detail: format!("serialize browser clock args: {error}"),
-    })?;
-    let expression = format!(
-        "(() => {{
-            const clock = globalThis.__synapseClock;
-            if (clock === undefined) return {{ installed: false }};
-            if (!clock || clock.version !== {CLOCK_VERSION:?} || typeof clock.call !== \"function\") {{
-                throw new Error(\"Synapse browser clock marker collision: globalThis.__synapseClock is owned by incompatible page state\");
-            }}
-            return clock.call({method_json}, {args_json});
-        }})()",
-    );
-    let evaluated =
-        crate::cdp_action::cdp_evaluate_expression(endpoint, target_id, &expression, false, true)
-            .await?;
-    serde_json::from_value::<CdpClockReadback>(evaluated.value).map_err(|error| {
-        A11yError::CdpAxtreeFailed {
-            detail: format!("browser clock readback decode: {error}"),
-        }
-    })
-}
-
 const fn clock_init_script() -> &'static str {
     CLOCK_INIT_SCRIPT
-}
-
-fn clock_install_script(now_ms: u64) -> String {
-    format!(
-        "(() => {{
-            const clock = ({shim});
-            return clock.call(\"install\", {{ nowMs: {now_ms}, loopLimit: {DEFAULT_LOOP_LIMIT} }});
-        }})()",
-        shim = clock_init_script(),
-    )
 }
 
 pub fn durable_clock_active_count_readback() -> Result<usize, String> {
@@ -588,10 +306,7 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
     for (target_id, slot) in slots {
         let current_cleanup =
             run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({})).await;
-        // The outer operator-panic drain already owns the global durable
-        // mutation guard. Use the exact-session removal body directly to avoid
-        // recursively acquiring the same non-reentrant guard.
-        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target_while_guarded(
+        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
             &slot.endpoint,
             &target_id,
             &slot.init_script_identifier,
@@ -599,19 +314,6 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
         .await;
         match (current_cleanup, future_cleanup) {
             (Ok(readback), Ok(_)) if !readback.installed => {
-                if let Err(error) =
-                    crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
-                        &slot.endpoint,
-                        &target_id,
-                        &slot.init_script_identifier,
-                    )
-                {
-                    failures.push(format!(
-                        "resolve browser clock init-script effect for target {target_id:?}: {error}"
-                    ));
-                    failed_slots.push((target_id, slot));
-                    continue;
-                }
                 uninstalled = uninstalled.saturating_add(1);
             }
             (current, future) => {
@@ -643,8 +345,7 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
 
 const CLOCK_INIT_SCRIPT: &str = r#"
 (() => {
-  const VERSION = "synapse-clock-2026-08-20-v2";
-  const MAX_CLOCK_MS = 8640000000000000;
+  const VERSION = "synapse-clock-2026-06-21-v1";
   if (globalThis.__synapseClock && globalThis.__synapseClock.version === VERSION) {
     return globalThis.__synapseClock;
   }
@@ -674,17 +375,10 @@ const CLOCK_INIT_SCRIPT: &str = r#"
     const n = Number(value);
     return Number.isFinite(n) ? Math.max(0, n) : fallback;
   }
-  function requireClockMs(value, field) {
-    const n = Number(value);
-    if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CLOCK_MS) {
-      throw new Error(`Synapse browser clock ${field} must be a safe integer from 0 through ${MAX_CLOCK_MS}`);
-    }
-    return n;
-  }
   function timerDelay(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 0;
-    return Math.max(0, Math.floor(n));
+    return Math.max(0, n);
   }
   function status() {
     let next = null;
@@ -733,19 +427,13 @@ const CLOCK_INIT_SCRIPT: &str = r#"
         throw new Error("Synapse browser clock loop limit exceeded while draining timers");
       }
       state.nowMs = next.due;
+      state.timers.delete(next.id);
       state.firedTimerCount += 1;
       runHandler(next);
-      const stillOwned = state.timers.get(next.id) === next;
-      if (next.kind === "interval" && stillOwned && !next.cancelled) {
+      if (next.kind === "interval" && !next.cancelled) {
         const step = Math.max(1, next.delay);
-        const nextDue = state.nowMs + step;
-        if (!Number.isSafeInteger(nextDue) || nextDue > MAX_CLOCK_MS) {
-          throw new Error(`Synapse browser clock interval ${next.id} cannot be rescheduled beyond ${MAX_CLOCK_MS}`);
-        }
-        next.due = nextDue;
+        next.due = state.nowMs + step;
         state.timers.set(next.id, next);
-      } else if (stillOwned) {
-        state.timers.delete(next.id);
       }
     }
     state.nowMs = target;
@@ -753,17 +441,13 @@ const CLOCK_INIT_SCRIPT: &str = r#"
   function schedule(kind, handler, delay, args) {
     const id = state.nextTimerId++;
     const normalizedDelay = timerDelay(delay);
-    const due = state.nowMs + normalizedDelay;
-    if (!Number.isSafeInteger(due) || due > MAX_CLOCK_MS) {
-      throw new Error(`Synapse browser clock timer due time must not exceed ${MAX_CLOCK_MS}`);
-    }
     state.timers.set(id, {
       id,
       kind,
       handler,
       args,
       delay: normalizedDelay,
-      due,
+      due: state.nowMs + normalizedDelay,
       cancelled: false
     });
     return id;
@@ -787,7 +471,7 @@ const CLOCK_INIT_SCRIPT: &str = r#"
   SynapseDate.UTC = NativeDate.UTC.bind(NativeDate);
   function install(args) {
     if (args && Object.prototype.hasOwnProperty.call(args, "nowMs")) {
-      state.nowMs = requireClockMs(args.nowMs, "install nowMs");
+      state.nowMs = toFiniteMs(args.nowMs, state.nowMs);
     }
     if (args && Object.prototype.hasOwnProperty.call(args, "loopLimit")) {
       state.loopLimit = Math.max(1, Math.floor(Number(args.loopLimit) || state.loopLimit));
@@ -840,22 +524,18 @@ const CLOCK_INIT_SCRIPT: &str = r#"
   }
   function setFixedTime(args) {
     if (!state.installed) throw new Error("Synapse browser clock is not installed");
-    state.nowMs = requireClockMs(args && args.timeMs, "setFixedTime timeMs");
+    state.nowMs = toFiniteMs(args && args.timeMs, state.nowMs);
     return status();
   }
   function fastForward(args) {
     if (!state.installed) throw new Error("Synapse browser clock is not installed");
-    const delta = requireClockMs(args && args.deltaMs, "fastForward deltaMs");
-    const target = state.nowMs + delta;
-    if (!Number.isSafeInteger(target) || target > MAX_CLOCK_MS) {
-      throw new Error(`Synapse browser clock fastForward target must not exceed ${MAX_CLOCK_MS}`);
-    }
-    drainUntil(target);
+    const delta = toFiniteMs(args && args.deltaMs, 0);
+    drainUntil(state.nowMs + delta);
     return status();
   }
   function pauseAt(args) {
     if (!state.installed) throw new Error("Synapse browser clock is not installed");
-    const target = requireClockMs(args && args.timeMs, "pauseAt timeMs");
+    const target = toFiniteMs(args && args.timeMs, state.nowMs);
     if (target < state.nowMs) throw new Error("Synapse browser clock pauseAt cannot move backwards");
     drainUntil(target);
     return status();
@@ -915,5 +595,38 @@ impl<'de> Deserialize<'de> for CdpClockReadback {
             error_count: wire.error_count,
             last_error: wire.last_error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_readback_accepts_status_payload() {
+        let readback: CdpClockReadback = serde_json::from_value(json!({
+            "installed": true,
+            "version": CLOCK_VERSION,
+            "now_ms": 1234,
+            "pending_timer_count": 2,
+            "fired_timer_count": 1,
+            "last_timer_id": 3,
+            "next_timer_ms": 1300,
+            "error_count": 0,
+            "last_error": null,
+        }))
+        .expect("clock readback");
+        assert!(readback.installed);
+        assert_eq!(readback.now_ms, Some(1234));
+        assert_eq!(readback.pending_timer_count, Some(2));
+        assert_eq!(readback.next_timer_ms, Some(1300));
+    }
+
+    #[test]
+    fn clock_script_contains_expected_surface() {
+        assert!(CLOCK_INIT_SCRIPT.contains("setFixedTime"));
+        assert!(CLOCK_INIT_SCRIPT.contains("fastForward"));
+        assert!(CLOCK_INIT_SCRIPT.contains("pauseAt"));
+        assert!(CLOCK_INIT_SCRIPT.contains("requestAnimationFrame"));
     }
 }

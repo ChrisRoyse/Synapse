@@ -1,0 +1,22 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: sample_event()
+---
+{
+  "seq": 10,
+  "at": "2026-05-23T00:00:00Z",
+  "source": "perception_hud",
+  "kind": "hud-value-changed",
+  "data": {
+    "confidence": 0.98,
+    "field": "hp",
+    "new": 15,
+    "old": 25
+  },
+  "correlations": [
+    {
+      "seq": 9,
+      "relation": "supersedes"
+    }
+  ]
+}

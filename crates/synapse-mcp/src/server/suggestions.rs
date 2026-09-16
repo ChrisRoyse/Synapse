@@ -31,14 +31,12 @@ use crate::m3::plan_execution::{
     build_plan_execution_record, plan_execution_id, write_plan_execution,
 };
 use crate::m3::suggestions::{
-    SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionDeclineParams,
-    SuggestionDeclineResponse, SuggestionListParams, SuggestionListResponse, SuggestionRecord,
-    SuggestionSource, SuggestionTickParams, SuggestionTickResponse,
-    accept_suggestion_for_execution, assist_plan_for_suggestion, decline_suggestion,
-    list_suggestions, load_suggestion_by_id, next_action_plan_for_suggestion,
-    record_suggestion_execution_feedback, required_permissions_accept,
-    required_permissions_decline, required_permissions_list, required_permissions_tick,
-    suggestion_tick, validate_stored_assist_target_hwnd,
+    SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionListParams, SuggestionListResponse,
+    SuggestionRecord, SuggestionSource, SuggestionTickParams, SuggestionTickResponse,
+    accept_suggestion_for_execution, assist_plan_for_suggestion, list_suggestions,
+    load_suggestion_by_id, record_suggestion_execution_feedback, required_permissions_accept,
+    required_permissions_list, required_permissions_tick, suggestion_tick,
+    validate_stored_assist_target_hwnd,
 };
 use crate::m4::{ActLaunchParams, LaunchWindowState};
 
@@ -240,27 +238,6 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Dismiss ONE suggestion by its EXACT durable suggestion/v1 id (#2046). Unlike the routine-scoped feedback operation, this resolves the precise offer that was shown: it flips the persisted CF_KV row to declined, records the explicit #856 Declined feedback (a strong negative signal, never conflated with ignored_timeout/abandoned), and writes a grounded Calyx outcome anchor bound to that exact row — plus, for a kernel/graph-composed next action, anchors on the CF_EPISODES rows that generated it so future composition sees the dismissal. Idempotent on replay: a duplicate dismiss of the same suggestion_id performs no side effect and rebuilds the identical response by reading the persisted row and rescanning the physical Anchors CF. A resolved-but-not-declined suggestion, or the same id with a different note, is refused with a structured mismatch."
-    )]
-    pub async fn suggestion_decline(
-        &self,
-        params: Parameters<SuggestionDeclineParams>,
-    ) -> Result<Json<SuggestionDeclineResponse>, ErrorData> {
-        tracing::info!(
-            code = "MCP_TOOL_INVOCATION",
-            kind = "suggestion_decline",
-            suggestion_id = %params.0.suggestion_id,
-            "tool.invocation kind=suggestion_decline"
-        );
-        self.require_m3_permissions(
-            "suggestion_decline",
-            &required_permissions_decline(&params.0),
-        )?;
-        let db = self.m3_storage()?;
-        decline_suggestion(&db, &params.0).map(Json)
-    }
-
-    #[tool(
         description = "Run ONE armed-routine pass (#862). Evaluates enabled armed_routine/v1 rows for due schedule windows and/or live intent matches, claims each trigger before execution so restarts do not double-fire, runs the installed automation plan through the same background-first executor as suggestion_accept, persists plan_execution/v1 plus armed_routine_run/v1 audit rows, queues an armed_run_review approval for human outcome review, and self-disarms after the configured consecutive failure threshold. dry_run computes due runs and routing reports without mutating storage or launching/opening anything."
     )]
     pub async fn armed_routine_tick(
@@ -309,29 +286,12 @@ impl SynapseService {
                 .assist_suggestion_accept_impl(db, existing, params, session_id)
                 .await;
         }
+        let plan = load_or_compile_plan(&db, &existing.routine_id, !params.dry_run)?;
         let accepted_ts_ns = now_ts_ns();
-        // A kernel/graph-composed next action has no mined routine to compile a
-        // plan from: its plan is the composition's own grounded evidence.
-        let (plan, plan_ref) = if existing.source == SuggestionSource::KernelNextAction {
-            let plan = next_action_plan_for_suggestion(&existing, accepted_ts_ns)?;
-            let plan_ref = format!(
-                "assist-next-action/v1/{}",
-                existing
-                    .next_action
-                    .as_ref()
-                    .map_or(existing.routine_id.as_str(), |grounding| grounding
-                        .artifact_sha256
-                        .as_str())
-            );
-            (plan, plan_ref)
-        } else {
-            let plan = load_or_compile_plan(&db, &existing.routine_id, !params.dry_run)?;
-            let plan_ref = format!("{PLAN_REF_PREFIX}{}", plan.routine_id);
-            (plan, plan_ref)
-        };
         let started_ts_ns = accepted_ts_ns;
         let execution_id = plan_execution_id(&existing.suggestion_id, started_ts_ns);
-        let (accepted, outcome_anchor) = accept_suggestion_for_execution(
+        let plan_ref = format!("{PLAN_REF_PREFIX}{}", plan.routine_id);
+        let accepted = accept_suggestion_for_execution(
             &db,
             &existing.suggestion_id,
             accepted_ts_ns,
@@ -385,7 +345,6 @@ impl SynapseService {
             suggestion: accepted,
             plan,
             execution,
-            outcome_anchor,
         })
     }
 
@@ -407,7 +366,7 @@ impl SynapseService {
                 .as_deref()
                 .unwrap_or(&existing.routine_id)
         );
-        let (accepted, outcome_anchor) = accept_suggestion_for_execution(
+        let accepted = accept_suggestion_for_execution(
             &db,
             &existing.suggestion_id,
             accepted_ts_ns,
@@ -452,7 +411,6 @@ impl SynapseService {
             suggestion: accepted,
             plan,
             execution,
-            outcome_anchor,
         })
     }
 
@@ -835,7 +793,6 @@ impl SynapseService {
             force_renderer_accessibility: None,
             windows_console_window_state: Some(LaunchWindowState::Hidden),
             desktop: session_id.map(|_| "agent:session".to_owned()),
-            output: None,
         };
         let result = self
             .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned), &preflight)
@@ -1192,4 +1149,35 @@ fn url_host_matches(url: &str, expected_host: &str) -> bool {
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestion_accept_enforces_canonical_browser_hwnd_before_plan_execution() {
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let params = SuggestionAcceptParams {
+                suggestion_id: "suggestion-1".to_owned(),
+                browser_window_hwnd: Some(invalid),
+                ..SuggestionAcceptParams::default()
+            };
+            let error = validate_suggestion_accept_params(&params)
+                .expect_err("noncanonical browser HWND must fail before plan execution");
+            let data = error.data.as_ref().expect("structured HWND error data");
+            assert_eq!(
+                data.get("field").and_then(Value::as_str),
+                Some("browser_window_hwnd")
+            );
+        }
+
+        let params = SuggestionAcceptParams {
+            suggestion_id: "suggestion-1".to_owned(),
+            browser_window_hwnd: Some(i64::from(u32::MAX)),
+            ..SuggestionAcceptParams::default()
+        };
+        validate_suggestion_accept_params(&params)
+            .expect("u32::MAX is a canonical HWND wire value");
+    }
 }

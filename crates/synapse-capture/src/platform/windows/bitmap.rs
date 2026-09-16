@@ -1,4 +1,10 @@
-use std::{ffi::c_void, mem::size_of, slice, time::Instant};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    mem::size_of,
+    slice, thread,
+    time::{Duration, Instant},
+};
 
 use synapse_core::Rect;
 use windows::{
@@ -7,26 +13,34 @@ use windows::{
     Win32::Graphics::{
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
-            CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ,
-            RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, ROP_CODE, RedrawWindow, ReleaseDC,
-            SRCCOPY, SelectObject,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, RDW_ALLCHILDREN,
+            RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY, SelectObject,
         },
     },
     Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
+    Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
     Win32::UI::WindowsAndMessaging::{
-        CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetClientRect, GetCursorInfo,
-        GetIconInfo, HICON, IsIconic, PW_RENDERFULLCONTENT,
+        GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetMenu, GetWindowLongW, GetWindowPlacement,
+        GetWindowRect, IsIconic, PW_RENDERFULLCONTENT, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WINDOWPLACEMENT,
     },
 };
 
 use crate::{
-    CaptureError, CapturedBgraBitmap, CapturedFrame, CapturedSoftwareBitmap,
-    CapturedWindowBgraBitmap, DxgiFormat, MAX_CAPTURE_BYTES,
+    CaptureBackendPreference, CaptureConfig, CaptureError, CaptureTarget, CapturedBgraBitmap,
+    CapturedFrame, CapturedSoftwareBitmap, CapturedWindowBgraBitmap, DxgiFormat,
+    spawn_capture_loop,
 };
 
 use super::common::{capture_unsupported, hwnd_from_i64};
-use super::target::{validate_region_on_virtual_screen, visible_window_screen_region};
+
+thread_local! {
+    static SCREEN_CAPTURE_SCRATCH: RefCell<Option<GdiCaptureScratch>> = const { RefCell::new(None) };
+}
+
+const WGC_WINDOW_FRAME_MAX_ATTEMPTS: u32 = 3;
+const WGC_WINDOW_FRAME_RETRY_BACKOFF_MS: u64 = 75;
 
 pub fn captured_frame_region_to_software_bitmap(
     frame: &CapturedFrame,
@@ -55,22 +69,15 @@ pub fn captured_frame_region_to_bgra_bitmap(
 pub fn screen_region_to_software_bitmap(
     region: Rect,
 ) -> Result<CapturedSoftwareBitmap, CaptureError> {
-    validate_screen_region(region)?;
-    let bytes = copy_screen_region_bgra(region, false)?;
+    validate_bitmap_region(region)?;
+    let bytes = copy_screen_region_bgra(region)?;
     let bitmap = software_bitmap_from_bgra(&bytes, region.w, region.h)?;
     Ok(CapturedSoftwareBitmap { region, bitmap })
 }
 
 pub fn screen_region_to_bgra_bitmap(region: Rect) -> Result<CapturedBgraBitmap, CaptureError> {
-    screen_region_to_bgra_bitmap_with_cursor(region, false)
-}
-
-pub(super) fn screen_region_to_bgra_bitmap_with_cursor(
-    region: Rect,
-    cursor_visible: bool,
-) -> Result<CapturedBgraBitmap, CaptureError> {
-    validate_screen_region(region)?;
-    let bytes = copy_screen_region_bgra(region, cursor_visible)?;
+    validate_bitmap_region(region)?;
+    let bytes = copy_screen_region_bgra(region)?;
     Ok(CapturedBgraBitmap {
         region,
         width: u32::try_from(region.w).unwrap_or_default(),
@@ -82,57 +89,95 @@ pub(super) fn screen_region_to_bgra_bitmap_with_cursor(
 pub fn window_region_to_bgra_bitmap(
     hwnd: i64,
     region: Rect,
-    _timeout_ms: u64,
+    timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
-    let started = Instant::now();
-    let window_screen_region = visible_window_screen_region(hwnd)?;
-    validate_region_inside_window(region, window_screen_region.w, window_screen_region.h)?;
-    let screen_region = Rect {
-        x: window_screen_region.x.saturating_add(region.x),
-        y: window_screen_region.y.saturating_add(region.y),
-        w: region.w,
-        h: region.h,
-    };
-    let mut bitmap = screen_region_to_bgra_bitmap_with_cursor(screen_region, false)?;
-    bitmap.region = region;
-    Ok(CapturedWindowBgraBitmap {
-        bitmap,
-        capture_backend: "gdi_bitblt_visible_window_bgra",
-        capture_attempts: 1,
-        capture_retry_count: 0,
-        capture_elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        capture_retry_backoff_ms: 0,
-    })
+    match graphics_capture_window_region_to_bgra_bitmap(hwnd, region, timeout_ms) {
+        Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
+            bitmap: capture.bitmap,
+            capture_backend: "graphics_capture_window_bgra",
+            capture_attempts: capture.attempts,
+            capture_retry_count: capture.retry_count,
+            capture_elapsed_ms: capture.elapsed_ms,
+            capture_retry_backoff_ms: capture.retry_backoff_ms,
+        }),
+        Ok(_bitmap) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_ALL_ZERO_PRINTWINDOW_DISABLED",
+                hwnd,
+                region = ?region,
+                "WGC window capture returned all-zero pixels; refusing target-reentering PrintWindow fallback"
+            );
+            Err(CaptureError::PrintWindowDisabled {
+                detail: format!(
+                    "WGC window capture for hwnd {hwnd:#x} region {region:?} returned all-zero pixels; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
+                ),
+            })
+        }
+        Err(wgc_error) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_FAILED_PRINTWINDOW_DISABLED",
+                hwnd,
+                region = ?region,
+                error = %wgc_error,
+                "WGC window capture failed; refusing target-reentering PrintWindow fallback"
+            );
+            Err(CaptureError::PrintWindowDisabled {
+                detail: format!(
+                    "WGC window capture failed for hwnd {hwnd:#x} region {region:?}: {wgc_error}; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
+                ),
+            })
+        }
+    }
 }
 
-/// Captures the entire physically visible window rectangle through CPU/GDI.
+/// Captures the entire window using the WGC frame's own native dimensions.
 ///
-/// The dimensions come from DWM extended-frame bounds, while pixels come from
-/// the composited virtual desktop. Occluding windows are therefore present in
-/// the returned physical-reality snapshot. Minimized, hidden, cloaked, or
-/// partly off-screen windows fail closed.
+/// Unlike [`window_region_to_bgra_bitmap`], this performs no client/window
+/// coordinate math: the returned bitmap is exactly the captured DWM surface, so
+/// it is immune to the `GetWindowRect` vs WGC-frame size mismatch caused by
+/// invisible resize borders (#1203).
 ///
 /// # Errors
 ///
-/// Returns [`CaptureError`] when the HWND is invalid or CPU/GDI cannot truthfully
-/// observe its complete visible rectangle. There is no GPU or `PrintWindow`
-/// fallback.
+/// Returns [`CaptureError`] when the HWND is invalid, no WGC frame arrives, WGC
+/// returns blank output, or the bitmap copy fails. `PrintWindow` fallback stays
+/// disabled, identical to [`window_region_to_bgra_bitmap`].
 pub fn window_full_frame_to_bgra_bitmap(
     hwnd: i64,
-    _timeout_ms: u64,
+    timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
-    let full = visible_window_screen_region(hwnd)?;
-    window_region_to_bgra_bitmap(
-        hwnd,
-        Rect {
-            x: 0,
-            y: 0,
-            w: full.w,
-            h: full.h,
-        },
-        0,
-    )
+    match graphics_capture_window_full_frame_to_bgra_bitmap(hwnd, timeout_ms) {
+        Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
+            bitmap: capture.bitmap,
+            capture_backend: "graphics_capture_window_bgra",
+            capture_attempts: capture.attempts,
+            capture_retry_count: capture.retry_count,
+            capture_elapsed_ms: capture.elapsed_ms,
+            capture_retry_backoff_ms: capture.retry_backoff_ms,
+        }),
+        Ok(_bitmap) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_ALL_ZERO_PRINTWINDOW_DISABLED",
+                hwnd,
+                "WGC whole-window capture returned all-zero pixels; refusing target-reentering PrintWindow fallback"
+            );
+            Err(CaptureError::PrintWindowDisabled {
+                detail: format!(
+                    "WGC whole-window capture for hwnd {hwnd:#x} returned all-zero pixels; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
+                ),
+            })
+        }
+        Err(wgc_error) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_FAILED_PRINTWINDOW_DISABLED",
+                hwnd,
+                error = %wgc_error,
+                "WGC whole-window capture failed; refusing target-reentering PrintWindow fallback"
+            );
+            Err(wgc_error)
+        }
+    }
 }
 
 pub fn window_region_to_bgra_bitmap_printwindow(
@@ -174,14 +219,6 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
-    let screen_region = visible_window_screen_region(hwnd)?;
-    let (w, h) = (screen_region.w, screen_region.h);
-    let region = Rect { x: 0, y: 0, w, h };
-    validate_bitmap_region(region)?;
-    Ok(region)
-}
-
-pub fn window_printwindow_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
     let hwnd = hwnd_from_i64(hwnd)?;
     let (w, h) = window_capture_extent(hwnd)?;
     let region = Rect { x: 0, y: 0, w, h };
@@ -191,8 +228,26 @@ pub fn window_printwindow_capture_region(hwnd: i64) -> Result<Rect, CaptureError
 
 pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, CaptureError> {
     validate_bitmap_region(region)?;
-    visible_window_screen_region(hwnd)?;
     let hwnd = hwnd_from_i64(hwnd)?;
+
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        let (window_width, window_height) = window_capture_extent(hwnd)?;
+        let Some((offset_x, offset_y)) =
+            minimized_client_offset_in_window_bitmap(hwnd, window_width, window_height)?
+        else {
+            return Err(CaptureError::TargetInvalid {
+                detail: "minimized target has no client extent for region conversion".to_owned(),
+            });
+        };
+        let window_region = Rect {
+            x: region.x.saturating_add(offset_x),
+            y: region.y.saturating_add(offset_y),
+            w: region.w,
+            h: region.h,
+        };
+        validate_region_inside_window(window_region, window_width, window_height)?;
+        return Ok(window_region);
+    }
 
     let mut client_rect = windows::Win32::Foundation::RECT::default();
     unsafe { GetClientRect(hwnd, &raw mut client_rect) }.map_err(capture_unsupported)?;
@@ -222,16 +277,248 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
     Ok(window_region)
 }
 
+#[derive(Debug)]
+struct WgcWindowFrameCapture {
+    bitmap: CapturedBgraBitmap,
+    attempts: u32,
+    retry_count: u32,
+    elapsed_ms: u64,
+    retry_backoff_ms: u64,
+}
+
+enum WgcWindowFrameAttemptError {
+    Timeout { detail: String },
+    Other(CaptureError),
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn graphics_capture_window_frame<F>(
+    hwnd: i64,
+    timeout_ms: u64,
+    select_region: F,
+) -> Result<WgcWindowFrameCapture, CaptureError>
+where
+    F: Fn(&CapturedFrame) -> Rect,
+{
+    let started = Instant::now();
+    for attempt in 1..=WGC_WINDOW_FRAME_MAX_ATTEMPTS {
+        match graphics_capture_window_frame_once(hwnd, timeout_ms, &select_region) {
+            Ok(bitmap) => {
+                let retry_count = attempt.saturating_sub(1);
+                if retry_count > 0 {
+                    tracing::info!(
+                        code = "CAPTURE_WGC_WINDOW_FRAME_RETRY_SUCCEEDED",
+                        hwnd,
+                        attempts = attempt,
+                        retry_count,
+                        elapsed_ms = elapsed_ms(started),
+                        "WGC window frame arrived after bounded retry"
+                    );
+                }
+                return Ok(WgcWindowFrameCapture {
+                    bitmap,
+                    attempts: attempt,
+                    retry_count,
+                    elapsed_ms: elapsed_ms(started),
+                    retry_backoff_ms: WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                });
+            }
+            Err(WgcWindowFrameAttemptError::Timeout { detail })
+                if attempt < WGC_WINDOW_FRAME_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    code = "CAPTURE_WGC_WINDOW_FRAME_TIMEOUT_RETRY",
+                    hwnd,
+                    attempt,
+                    max_attempts = WGC_WINDOW_FRAME_MAX_ATTEMPTS,
+                    timeout_ms,
+                    retry_backoff_ms = WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                    elapsed_ms = elapsed_ms(started),
+                    detail = %detail,
+                    "WGC window frame timed out; retrying after bounded backoff"
+                );
+                thread::sleep(Duration::from_millis(WGC_WINDOW_FRAME_RETRY_BACKOFF_MS));
+            }
+            Err(WgcWindowFrameAttemptError::Timeout { detail }) => {
+                let total_elapsed_ms = elapsed_ms(started);
+                tracing::error!(
+                    code = "CAPTURE_WGC_WINDOW_FRAME_TIMEOUT_EXHAUSTED",
+                    hwnd,
+                    attempts = attempt,
+                    timeout_ms,
+                    retry_backoff_ms = WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                    elapsed_ms = total_elapsed_ms,
+                    detail = %detail,
+                    "WGC window frame did not arrive after bounded retries"
+                );
+                return Err(CaptureError::ThreadFailed {
+                    detail: format!(
+                        "timed out after {timeout_ms} ms waiting for WGC window frame after {attempt} attempts over {total_elapsed_ms} ms for hwnd {hwnd:#x}; retry_backoff_ms={WGC_WINDOW_FRAME_RETRY_BACKOFF_MS}; last_timeout={detail}; recommended_next_action=retry capture after confirming the target window is live, visible, and visually stable"
+                    ),
+                });
+            }
+            Err(WgcWindowFrameAttemptError::Other(error)) => return Err(error),
+        }
+    }
+    Err(CaptureError::ThreadFailed {
+        detail: format!(
+            "WGC window frame retry loop exhausted unexpectedly for hwnd {hwnd:#x}; max_attempts={WGC_WINDOW_FRAME_MAX_ATTEMPTS}"
+        ),
+    })
+}
+
+fn graphics_capture_window_frame_once<F>(
+    hwnd: i64,
+    timeout_ms: u64,
+    select_region: &F,
+) -> Result<CapturedBgraBitmap, WgcWindowFrameAttemptError>
+where
+    F: Fn(&CapturedFrame) -> Rect,
+{
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let handle = spawn_capture_loop(CaptureConfig {
+        target: CaptureTarget::Window { hwnd },
+        min_update_interval_ms: 16,
+        cursor_visible: false,
+        secondary_windows: false,
+        dirty_region_only: false,
+        backend_preference: CaptureBackendPreference::GraphicsCaptureApi,
+    })
+    .map_err(WgcWindowFrameAttemptError::Other)?;
+    let receiver = handle.receiver();
+    let frame = match receiver.recv_timeout(timeout) {
+        Ok(frame) => frame,
+        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+            let stop_result = handle.stop();
+            return match stop_result {
+                Ok(()) => Err(WgcWindowFrameAttemptError::Timeout {
+                    detail: format!("timed out after {timeout_ms} ms waiting for WGC window frame"),
+                }),
+                Err(stop_error) => Err(WgcWindowFrameAttemptError::Other(stop_error)),
+            };
+        }
+        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+            let stop_result = handle.stop();
+            return Err(WgcWindowFrameAttemptError::Other(match stop_result {
+                Ok(()) => CaptureError::ThreadFailed {
+                    detail: format!(
+                        "WGC window frame channel disconnected before a frame arrived for hwnd {hwnd:#x}"
+                    ),
+                },
+                Err(stop_error) => stop_error,
+            }));
+        }
+    };
+    let region = select_region(&frame);
+    let result = captured_frame_region_to_bgra_bitmap(&frame, region);
+    let stop_result = handle.stop();
+    match stop_result {
+        Ok(()) => result.map_err(WgcWindowFrameAttemptError::Other),
+        Err(error) => Err(WgcWindowFrameAttemptError::Other(error)),
+    }
+}
+
+fn graphics_capture_window_region_to_bgra_bitmap(
+    hwnd: i64,
+    region: Rect,
+    timeout_ms: u64,
+) -> Result<WgcWindowFrameCapture, CaptureError> {
+    graphics_capture_window_frame(hwnd, timeout_ms, |_frame| region)
+}
+
+fn graphics_capture_window_full_frame_to_bgra_bitmap(
+    hwnd: i64,
+    timeout_ms: u64,
+) -> Result<WgcWindowFrameCapture, CaptureError> {
+    graphics_capture_window_frame(hwnd, timeout_ms, |frame| Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(frame.width).unwrap_or(i32::MAX),
+        h: i32::try_from(frame.height).unwrap_or(i32::MAX),
+    })
+}
+
+fn minimized_client_offset_in_window_bitmap(
+    hwnd: windows::Win32::Foundation::HWND,
+    full_width: i32,
+    full_height: i32,
+) -> Result<Option<(i32, i32)>, CaptureError> {
+    let mut client_rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetClientRect(hwnd, &raw mut client_rect) }.map_err(capture_unsupported)?;
+    let client_width = client_rect.right.saturating_sub(client_rect.left);
+    let client_height = client_rect.bottom.saturating_sub(client_rect.top);
+    if client_width <= 0 || client_height <= 0 {
+        return minimized_non_client_offset_from_style(hwnd);
+    }
+
+    let non_client_x = full_width.saturating_sub(client_width).max(0);
+    let non_client_y = full_height.saturating_sub(client_height).max(0);
+    let offset_x = non_client_x / 2;
+    let offset_y = non_client_y.saturating_sub(offset_x).max(0);
+    Ok(Some((offset_x, offset_y)))
+}
+
+fn minimized_non_client_offset_from_style(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Result<Option<(i32, i32)>, CaptureError> {
+    let style_bits = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+    let ex_style_bits = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    let menu = unsafe { GetMenu(hwnd) };
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let mut client_rect = windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: 100,
+        bottom: 100,
+    };
+    unsafe {
+        AdjustWindowRectExForDpi(
+            &raw mut client_rect,
+            WINDOW_STYLE(style_bits.cast_unsigned()),
+            !menu.is_invalid(),
+            WINDOW_EX_STYLE(ex_style_bits.cast_unsigned()),
+            dpi,
+        )
+    }
+    .map_err(capture_unsupported)?;
+    Ok(Some((
+        client_rect.left.saturating_neg().max(0),
+        client_rect.top.saturating_neg().max(0),
+    )))
+}
+
 fn window_capture_extent(
     hwnd: windows::Win32::Foundation::HWND,
 ) -> Result<(i32, i32), CaptureError> {
-    if unsafe { IsIconic(hwnd) }.as_bool() {
-        return Err(CaptureError::UnsupportedSemantics {
-            detail: "minimized windows cannot be captured under the CPU/GDI visible-surface policy"
-                .to_owned(),
-        });
+    if !unsafe { IsIconic(hwnd) }.as_bool() {
+        return Ok(rect_extent(&dwm_extended_frame_bounds(hwnd)?));
     }
-    Ok(rect_extent(&dwm_extended_frame_bounds(hwnd)?))
+
+    let mut window_rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(hwnd, &raw mut window_rect) }.map_err(capture_unsupported)?;
+    let window_width = window_rect.right.saturating_sub(window_rect.left);
+    let window_height = window_rect.bottom.saturating_sub(window_rect.top);
+
+    let mut placement = WINDOWPLACEMENT {
+        length: u32::try_from(size_of::<WINDOWPLACEMENT>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &raw mut placement) }.map_err(capture_unsupported)?;
+    let normal_width = placement
+        .rcNormalPosition
+        .right
+        .saturating_sub(placement.rcNormalPosition.left);
+    let normal_height = placement
+        .rcNormalPosition
+        .bottom
+        .saturating_sub(placement.rcNormalPosition.top);
+    if normal_width > 0 && normal_height > 0 {
+        return Ok((normal_width, normal_height));
+    }
+    Ok((window_width, window_height))
 }
 
 fn dwm_extended_frame_bounds(
@@ -500,7 +787,7 @@ fn validate_region_inside_texture(
     Ok(())
 }
 
-fn copy_screen_region_bgra(region: Rect, cursor_visible: bool) -> Result<Vec<u8>, CaptureError> {
+fn copy_screen_region_bgra(region: Rect) -> Result<Vec<u8>, CaptureError> {
     let width = u32::try_from(region.w).map_err(|err| CaptureError::TargetInvalid {
         detail: err.to_string(),
     })?;
@@ -514,7 +801,6 @@ fn copy_screen_region_bgra(region: Rect, cursor_visible: bool) -> Result<Vec<u8>
         .ok_or_else(|| CaptureError::TargetInvalid {
             detail: format!("invalid screen capture region {region:?}"),
         })?;
-    validate_capture_byte_len(byte_len, region, "screen")?;
     let screen_dc = unsafe { GetDC(None) };
     if screen_dc.is_invalid() {
         return Err(CaptureError::GraphicsApiUnsupported {
@@ -528,8 +814,23 @@ fn copy_screen_region_bgra(region: Rect, cursor_visible: bool) -> Result<Vec<u8>
             detail: "CreateCompatibleDC returned null".to_owned(),
         });
     }
-    let result = (|| {
-        let scratch = GdiCaptureScratch::new(screen_dc, memory_dc, width, height, byte_len)?;
+    let result = SCREEN_CAPTURE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let needs_recreate = scratch
+            .as_ref()
+            .is_none_or(|scratch| !scratch.matches(width, height, byte_len));
+        if needs_recreate {
+            *scratch = Some(GdiCaptureScratch::new(
+                screen_dc, memory_dc, width, height, byte_len,
+            )?);
+        } else {
+            let _ = unsafe { DeleteDC(memory_dc) };
+        }
+        let scratch = scratch
+            .as_ref()
+            .ok_or_else(|| CaptureError::GraphicsApiUnsupported {
+                detail: "screen capture scratch buffer was not initialized".to_owned(),
+            })?;
         let bitblt = unsafe {
             BitBlt(
                 scratch.memory_dc,
@@ -540,54 +841,14 @@ fn copy_screen_region_bgra(region: Rect, cursor_visible: bool) -> Result<Vec<u8>
                 Some(screen_dc),
                 region.x,
                 region.y,
-                ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0),
+                SRCCOPY,
             )
         };
         bitblt.map_err(capture_unsupported)?;
-        if cursor_visible {
-            draw_cursor_on_capture(scratch.memory_dc, region)?;
-        }
         Ok(unsafe { slice::from_raw_parts(scratch.bits.cast::<u8>(), byte_len) }.to_vec())
-    })();
+    });
     let _ = unsafe { ReleaseDC(None, screen_dc) };
     result
-}
-
-fn draw_cursor_on_capture(memory_dc: HDC, region: Rect) -> Result<(), CaptureError> {
-    let mut cursor = CURSORINFO {
-        cbSize: u32::try_from(size_of::<CURSORINFO>()).unwrap_or(u32::MAX),
-        ..CURSORINFO::default()
-    };
-    unsafe { GetCursorInfo(&raw mut cursor) }.map_err(capture_unsupported)?;
-    if cursor.flags.0 & CURSOR_SHOWING.0 == 0 || cursor.hCursor.is_invalid() {
-        return Ok(());
-    }
-
-    let icon = HICON(cursor.hCursor.0);
-    let mut icon_info = windows::Win32::UI::WindowsAndMessaging::ICONINFO::default();
-    unsafe { GetIconInfo(icon, &raw mut icon_info) }.map_err(capture_unsupported)?;
-    let hotspot_x = i32::try_from(icon_info.xHotspot).unwrap_or(i32::MAX);
-    let hotspot_y = i32::try_from(icon_info.yHotspot).unwrap_or(i32::MAX);
-    let draw_x = cursor
-        .ptScreenPos
-        .x
-        .saturating_sub(hotspot_x)
-        .saturating_sub(region.x);
-    let draw_y = cursor
-        .ptScreenPos
-        .y
-        .saturating_sub(hotspot_y)
-        .saturating_sub(region.y);
-    let draw_result =
-        unsafe { DrawIconEx(memory_dc, draw_x, draw_y, icon, 0, 0, 0, None, DI_NORMAL) }
-            .map_err(capture_unsupported);
-    if !icon_info.hbmMask.is_invalid() {
-        let _ = unsafe { DeleteObject(HGDIOBJ::from(icon_info.hbmMask)) };
-    }
-    if !icon_info.hbmColor.is_invalid() {
-        let _ = unsafe { DeleteObject(HGDIOBJ::from(icon_info.hbmColor)) };
-    }
-    draw_result
 }
 
 fn validate_region_inside_window(
@@ -634,16 +895,6 @@ fn printwindow_region_bgra(
         .ok_or_else(|| CaptureError::TargetInvalid {
             detail: format!("invalid PrintWindow bitmap dimensions {window_width}x{window_height}"),
         })?;
-    validate_capture_byte_len(
-        full_byte_len,
-        Rect {
-            x: 0,
-            y: 0,
-            w: window_width,
-            h: window_height,
-        },
-        "PrintWindow",
-    )?;
     let window_dc = unsafe { GetDC(Some(hwnd)) };
     if window_dc.is_invalid() {
         return Err(CaptureError::GraphicsApiUnsupported {
@@ -773,6 +1024,9 @@ fn is_all_zero_bgra(bytes: &[u8]) -> bool {
 }
 
 struct GdiCaptureScratch {
+    width: u32,
+    height: u32,
+    byte_len: usize,
     memory_dc: HDC,
     bitmap: HBITMAP,
     old_object: HGDIOBJ,
@@ -801,7 +1055,7 @@ impl GdiCaptureScratch {
             ..BITMAPINFO::default()
         };
         let mut bits = std::ptr::null_mut();
-        let bitmap = match unsafe {
+        let bitmap = unsafe {
             CreateDIBSection(
                 Some(screen_dc),
                 &raw const bitmap_info,
@@ -810,21 +1064,8 @@ impl GdiCaptureScratch {
                 None,
                 0,
             )
-        } {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                if !unsafe { DeleteDC(memory_dc) }.as_bool() {
-                    tracing::error!(
-                        code = "CAPTURE_GDI_CLEANUP_FAILED",
-                        resource = "memory_dc",
-                        original_error = %error,
-                        cleanup_last_error = ?unsafe { windows::Win32::Foundation::GetLastError() },
-                        "CreateDIBSection failed and its already-created memory DC could not be released"
-                    );
-                }
-                return Err(capture_unsupported(error));
-            }
-        };
+        }
+        .map_err(capture_unsupported)?;
         if bits.is_null() {
             let _ = unsafe { DeleteObject(HGDIOBJ::from(bitmap)) };
             let _ = unsafe { DeleteDC(memory_dc) };
@@ -841,11 +1082,18 @@ impl GdiCaptureScratch {
             });
         }
         Ok(Self {
+            width,
+            height,
+            byte_len,
             memory_dc,
             bitmap,
             old_object,
             bits,
         })
+    }
+
+    const fn matches(&self, width: u32, height: u32, byte_len: usize) -> bool {
+        self.width == width && self.height == height && self.byte_len == byte_len
     }
 }
 
@@ -861,38 +1109,6 @@ fn validate_bitmap_region(region: Rect) -> Result<(), CaptureError> {
     if region.w <= 0 || region.h <= 0 {
         return Err(CaptureError::TargetInvalid {
             detail: format!("empty bitmap capture region {region:?}"),
-        });
-    }
-    Ok(())
-}
-
-fn validate_screen_region(region: Rect) -> Result<(), CaptureError> {
-    validate_bitmap_region(region)?;
-    validate_region_on_virtual_screen(region)?;
-    let byte_len = usize::try_from(region.w)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(region.h)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| CaptureError::TargetInvalid {
-            detail: format!("capture byte length overflow for region {region:?}"),
-        })?;
-    validate_capture_byte_len(byte_len, region, "screen")
-}
-
-fn validate_capture_byte_len(
-    byte_len: usize,
-    region: Rect,
-    source: &str,
-) -> Result<(), CaptureError> {
-    if byte_len > MAX_CAPTURE_BYTES {
-        return Err(CaptureError::UnsupportedSemantics {
-            detail: format!(
-                "{source} capture region {region:?} requires {byte_len} BGRA bytes, exceeding the bounded host-memory envelope of {MAX_CAPTURE_BYTES} bytes; request a smaller region"
-            ),
         });
     }
     Ok(())
@@ -925,4 +1141,202 @@ fn clamp_region_to_frame(frame: &CapturedFrame, region: Rect) -> Result<Rect, Ca
         w: i32::try_from(right - left).unwrap_or(i32::MAX),
         h: i32::try_from(bottom - top).unwrap_or(i32::MAX),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::{
+        client_region_to_frame_region, copy_bgra_region_from_bytes, copy_region_bgra,
+        validate_region_inside_texture,
+    };
+    use crate::{CaptureError, CapturedFrame, CapturedFrameBuffer, DxgiFormat};
+    use synapse_core::Rect;
+
+    #[test]
+    fn owned_frame_copy_rejects_short_buffer() {
+        let frame = owned_frame(DxgiFormat::Bgra8, 2, 1, 8, 4, vec![1, 2, 3, 4]);
+
+        let error = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
+        assert!(error.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn owned_frame_copy_rejects_short_stride() {
+        let frame = owned_frame(DxgiFormat::Bgra8, 2, 1, 4, 4, vec![0; 8]);
+
+        let error = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
+        assert!(error.to_string().contains("row stride 4"));
+    }
+
+    #[test]
+    fn owned_frame_copy_honors_stride_padding_and_rgba_conversion() {
+        let frame = owned_frame(
+            DxgiFormat::Rgba8,
+            2,
+            2,
+            10,
+            4,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 99, 99, //
+                9, 10, 11, 12, 13, 14, 15, 16, 88, 88,
+            ],
+        );
+
+        let output = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 1,
+                y: 0,
+                w: 1,
+                h: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, vec![7, 6, 5, 8, 15, 14, 13, 16]);
+    }
+
+    #[test]
+    fn frame_region_validation_rejects_source_box_overflow() {
+        let error = validate_region_inside_texture(
+            Rect {
+                x: 8,
+                y: 31,
+                w: 940,
+                h: 330,
+            },
+            940,
+            330,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::TargetInvalid { .. }));
+        assert!(error.to_string().contains("exceeds captured frame bounds"));
+    }
+
+    #[test]
+    fn printwindow_region_copy_extracts_bgra_crop() {
+        let full = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, //
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        ];
+
+        let crop = copy_bgra_region_from_bytes(
+            &full,
+            3,
+            Rect {
+                x: 1,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+        )
+        .expect("crop succeeds");
+
+        assert_eq!(
+            crop,
+            vec![
+                5, 6, 7, 8, 9, 10, 11, 12, //
+                17, 18, 19, 20, 21, 22, 23, 24,
+            ]
+        );
+    }
+
+    fn owned_frame(
+        format: DxgiFormat,
+        width: u32,
+        height: u32,
+        row_stride_bytes: usize,
+        bytes_per_pixel: u8,
+        bytes: Vec<u8>,
+    ) -> CapturedFrame {
+        CapturedFrame {
+            pixels: CapturedFrameBuffer {
+                bytes,
+                row_stride_bytes,
+                bytes_per_pixel,
+            },
+            width,
+            height,
+            format,
+            captured_at: Instant::now(),
+            frame_seq: 7,
+            dirty_region: None,
+        }
+    }
+
+    #[test]
+    fn client_region_uses_dwm_frame_offset_not_getwindowrect_border() {
+        let mapped = client_region_to_frame_region(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3027,
+                h: 1740,
+            },
+            3027,
+            1740,
+            2,
+            89,
+            3031,
+            1829,
+        )
+        .expect("full client area fits the DWM/WGC frame");
+
+        assert_eq!(
+            mapped,
+            Rect {
+                x: 2,
+                y: 89,
+                w: 3027,
+                h: 1740,
+            }
+        );
+    }
+
+    #[test]
+    fn client_region_over_bounds_names_client_area_limit() {
+        let error = client_region_to_frame_region(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3049,
+                h: 1740,
+            },
+            3027,
+            1740,
+            2,
+            89,
+            3031,
+            1829,
+        )
+        .expect_err("over-wide client region is rejected before frame conversion");
+
+        assert!(matches!(error, CaptureError::TargetInvalid { .. }));
+        assert!(error.to_string().contains("client area 3027x1740"));
+    }
 }

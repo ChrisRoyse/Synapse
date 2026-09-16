@@ -6,7 +6,7 @@ use std::{
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use synapse_core::{AccessibleSubtree, ElementId, ForegroundContext, Rect, error_codes};
+use synapse_core::{AccessibleSubtree, ForegroundContext, Rect, error_codes};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -14,29 +14,6 @@ pub(crate) enum DesktopWorkerOp {
     Context,
     Snapshot,
     Capture,
-    /// #2056 background ACTION route: read one element's value/state on the
-    /// session-owned desktop, without mutating it.
-    #[value(name = "element-value")]
-    ElementValue,
-    /// #2056 background ACTION route: perform the supported UIA `ValuePattern`
-    /// / Win32 `WM_SETTEXT` mutation on the session-owned desktop.
-    #[value(name = "set-element-value")]
-    SetElementValue,
-    /// #2063 background ACTION route: perform the semantic UIA click
-    /// (Invoke/Toggle/SelectionItem/ExpandCollapse/LegacyIAccessible) on the
-    /// session-owned desktop instead of from the daemon's own desktop.
-    #[value(name = "invoke-element")]
-    InvokeElement,
-    /// #2063 background ACTION route: read the PostMessage keyboard target's
-    /// text/selection state on the session-owned desktop. This is the
-    /// independent before/after Source of Truth for a hidden-desktop keystroke.
-    #[value(name = "key-state")]
-    KeyState,
-    /// #2063 background ACTION route: deliver the PostMessage keyboard sequence
-    /// on the session-owned desktop. Window messages cannot cross desktops, so
-    /// this is the only route that can actually reach the target.
-    #[value(name = "press-keys")]
-    PressKeys,
 }
 
 impl DesktopWorkerOp {
@@ -45,26 +22,7 @@ impl DesktopWorkerOp {
             Self::Context => "context",
             Self::Snapshot => "snapshot",
             Self::Capture => "capture",
-            Self::ElementValue => "element-value",
-            Self::SetElementValue => "set-element-value",
-            Self::InvokeElement => "invoke-element",
-            Self::KeyState => "key-state",
-            Self::PressKeys => "press-keys",
         }
-    }
-
-    /// Action ops carry their element id (and replacement text / key labels) in
-    /// a temp request file instead of the command line, so field contents and
-    /// keystrokes never land in the OS process table.
-    const fn requires_request_file(self) -> bool {
-        matches!(
-            self,
-            Self::ElementValue
-                | Self::SetElementValue
-                | Self::InvokeElement
-                | Self::KeyState
-                | Self::PressKeys
-        )
     }
 }
 
@@ -77,27 +35,6 @@ pub(crate) struct DesktopWorkerCli {
     pub depth: Option<u32>,
     pub json_path: Option<PathBuf>,
     pub bgra_path: Option<PathBuf>,
-    pub request_path: Option<PathBuf>,
-}
-
-/// Request body for the #2056/#2063 hidden-desktop ACTION ops.
-///
-/// `element_id` is absent for the HWND-addressed keyboard ops (#2063), which
-/// have no element at all; every op that needs one validates its presence
-/// explicitly instead of substituting a default.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HiddenDesktopActionRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub element_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Normalized key labels for `press-keys` (#2063).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keys: Option<Vec<String>>,
-    /// Key hold duration in milliseconds for `press-keys` (#2063).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hold_ms: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -132,11 +69,6 @@ struct WorkerEnvelope {
 enum WorkerPayload {
     Context {
         context: ForegroundContext,
-        /// #2063: `GA_ROOT` of the probed HWND, resolved **on this worker's
-        /// desktop**. `GetAncestor` walks the window manager's parent chain,
-        /// which only exists for windows on the calling thread's desktop, so the
-        /// daemon cannot compute this for a hidden-desktop HWND at all.
-        root_hwnd: i64,
     },
     Snapshot {
         context: ForegroundContext,
@@ -149,27 +81,6 @@ enum WorkerPayload {
         height: u32,
         capture_backend: String,
         bgra_bytes: u64,
-    },
-    ElementValue {
-        element_id: String,
-        readback: synapse_a11y::ElementValueReadback,
-    },
-    SetElementValue {
-        element_id: String,
-        readback: synapse_a11y::ElementValueSetReadback,
-    },
-    InvokeElement {
-        element_id: String,
-        action: synapse_a11y::ElementClickAction,
-    },
-    KeyState {
-        hwnd: i64,
-        state: crate::m2::HwndKeyboardTargetState,
-    },
-    PressKeys {
-        hwnd: i64,
-        keys_pressed: u32,
-        state: crate::m2::HwndKeyboardTargetState,
     },
 }
 
@@ -211,9 +122,7 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
         .map_err(|error| worker_error(error.code(), error.to_string()))?;
     match op {
         DesktopWorkerOp::Context => {
-            let context = worker_context(hwnd)?;
-            let root_hwnd = worker_top_level_root_hwnd(hwnd)?;
-            Ok(WorkerPayload::Context { context, root_hwnd })
+            worker_context(hwnd).map(|context| WorkerPayload::Context { context })
         }
         DesktopWorkerOp::Snapshot => {
             let depth = args.depth.unwrap_or(2).min(16);
@@ -247,172 +156,7 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
                 bgra_bytes: captured.bitmap.bytes.len() as u64,
             })
         }
-        DesktopWorkerOp::ElementValue => {
-            let request = worker_action_request(args)?;
-            worker_action_window_live(hwnd)?;
-            let element_id = worker_action_element_id(&request, hwnd)?;
-            let readback = synapse_a11y::element_value(&element_id)
-                .map_err(|error| worker_error(error.code(), error.to_string()))?;
-            Ok(WorkerPayload::ElementValue {
-                element_id: element_id.to_string(),
-                readback,
-            })
-        }
-        DesktopWorkerOp::SetElementValue => {
-            let request = worker_action_request(args)?;
-            worker_action_window_live(hwnd)?;
-            let element_id = worker_action_element_id(&request, hwnd)?;
-            let text = request.text.as_deref().ok_or_else(|| {
-                worker_param_error("set-element-value request is missing replacement text")
-            })?;
-            let readback = synapse_a11y::set_element_value(&element_id, text)
-                .map_err(|error| worker_error(error.code(), error.to_string()))?;
-            Ok(WorkerPayload::SetElementValue {
-                element_id: element_id.to_string(),
-                readback,
-            })
-        }
-        // #2063: the semantic UIA click runs here, on the desktop that owns the
-        // window, so the delivery is not silently dependent on whether the
-        // target happens to expose a server-side UIA provider reachable from the
-        // daemon's desktop.
-        DesktopWorkerOp::InvokeElement => {
-            let request = worker_action_request(args)?;
-            worker_action_window_live(hwnd)?;
-            let element_id = worker_action_element_id(&request, hwnd)?;
-            let action = synapse_a11y::click_element_action(&element_id)
-                .map_err(|error| worker_error(error.code(), error.to_string()))?;
-            Ok(WorkerPayload::InvokeElement {
-                element_id: element_id.to_string(),
-                action,
-            })
-        }
-        DesktopWorkerOp::KeyState => {
-            let _request = worker_action_request(args)?;
-            worker_action_window_live(hwnd)?;
-            let state = crate::m2::hwnd_keyboard_target_state(hwnd)
-                .map_err(|error| worker_mcp_error(&error))?;
-            Ok(WorkerPayload::KeyState { hwnd, state })
-        }
-        DesktopWorkerOp::PressKeys => {
-            let request = worker_action_request(args)?;
-            worker_action_window_live(hwnd)?;
-            let labels = request.keys.as_deref().ok_or_else(|| {
-                worker_param_error("press-keys request is missing normalized key labels")
-            })?;
-            let hold_ms = request
-                .hold_ms
-                .ok_or_else(|| worker_param_error("press-keys request is missing hold_ms"))?;
-            let keys = crate::m2::normalized_press_keys(labels)
-                .map_err(|error| worker_mcp_error(&error))?;
-            let keys_pressed = u32::try_from(keys.len())
-                .map_err(|_err| worker_param_error("press-keys key count exceeds u32::MAX"))?;
-            let state = crate::m2::post_key_sequence_blocking(hwnd, &keys, hold_ms)
-                .map_err(|error| worker_mcp_error(&error))?;
-            Ok(WorkerPayload::PressKeys {
-                hwnd,
-                keys_pressed,
-                state,
-            })
-        }
     }
-}
-
-/// Re-frames a daemon-shaped `ErrorData` raised inside the worker as a worker
-/// envelope, preserving its structured `code` so the daemon's per-desktop miss
-/// classification and refusal surfacing keep working verbatim.
-#[cfg(windows)]
-fn worker_mcp_error(error: &rmcp::ErrorData) -> WorkerEnvelope {
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    WorkerEnvelope {
-        ok: false,
-        payload: None,
-        error_code: Some(code),
-        error_detail: Some(error.message.to_string()),
-    }
-}
-
-/// Desktop-membership oracle for the #2056 action route. A thread only reaches
-/// windows on its own desktop, so a live `IsWindow` readback here is the proof
-/// that this worker's desktop is the one that physically owns the HWND. The
-/// daemon treats `TARGET_WINDOW_NOT_FOUND` as "not this desktop" and probes the
-/// next session-owned desktop.
-#[cfg(windows)]
-fn worker_action_window_live(hwnd: i64) -> Result<(), WorkerEnvelope> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        worker_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!(
-                "hidden desktop action target hwnd {hwnd:#x} is not a live window on this worker's desktop: {error}"
-            ),
-        )
-    })
-}
-
-#[cfg(windows)]
-fn worker_action_request(
-    args: &DesktopWorkerCli,
-) -> Result<HiddenDesktopActionRequest, WorkerEnvelope> {
-    let path = args
-        .request_path
-        .as_ref()
-        .ok_or_else(|| worker_param_error("missing_request_path"))?;
-    let bytes = fs::read(path).map_err(|error| {
-        worker_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "desktop worker action request readback failed for {}: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        worker_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "desktop worker action request decode failed for {}: {error}",
-                path.display()
-            ),
-        )
-    })
-}
-
-#[cfg(windows)]
-fn worker_action_element_id(
-    request: &HiddenDesktopActionRequest,
-    hwnd: i64,
-) -> Result<ElementId, WorkerEnvelope> {
-    let raw = request.element_id.as_deref().ok_or_else(|| {
-        worker_param_error("desktop worker element action request is missing element_id")
-    })?;
-    let element_id = ElementId::parse(raw).map_err(|error| {
-        worker_error(
-            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-            format!("desktop worker action element id {raw:?} is malformed: {error}"),
-        )
-    })?;
-    let parts = element_id.parts().map_err(|error| {
-        worker_error(
-            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-            format!("desktop worker action element id {element_id} could not be split: {error}"),
-        )
-    })?;
-    if parts.hwnd != hwnd {
-        return Err(worker_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "desktop worker action element id {element_id} carries hwnd {:#x}, but the dispatched worker hwnd is {hwnd:#x}",
-                parts.hwnd
-            ),
-        ));
-    }
-    Ok(element_id)
 }
 
 #[cfg(windows)]
@@ -427,21 +171,6 @@ fn worker_context(hwnd: i64) -> Result<ForegroundContext, WorkerEnvelope> {
         .map_err(|error| worker_error(error.code(), error.to_string()))
 }
 
-/// #2063: the top-level (`GA_ROOT`) ancestor of `hwnd`, read on this worker's
-/// desktop.
-///
-/// This is deliberately *not* computed in the daemon. `GetAncestor` resolves the
-/// window manager's parent chain, and a thread only reaches windows on its own
-/// desktop, so for a hidden-desktop HWND the daemon has no ancestry to walk —
-/// exactly the same reason `IsWindow` is false there. Resolving it here keeps the
-/// whole chain (membership probe, ancestry, snapshot, invoke) on the one desktop
-/// that physically owns the window.
-#[cfg(windows)]
-fn worker_top_level_root_hwnd(hwnd: i64) -> Result<i64, WorkerEnvelope> {
-    synapse_a11y::top_level_root_hwnd(hwnd)
-        .map_err(|error| worker_error(error.code(), error.to_string()))
-}
-
 #[cfg(windows)]
 fn worker_capture_region(
     hwnd: i64,
@@ -449,7 +178,7 @@ fn worker_capture_region(
     client_region: bool,
 ) -> Result<Rect, WorkerEnvelope> {
     let Some(region) = region else {
-        return synapse_capture::window_printwindow_capture_region(hwnd)
+        return synapse_capture::window_capture_region(hwnd)
             .map_err(|error| worker_error(error.code(), error.to_string()));
     };
     if client_region {
@@ -518,19 +247,11 @@ fn write_worker_envelope(path: &Path, envelope: &WorkerEnvelope) -> anyhow::Resu
     Ok(())
 }
 
-/// A hidden-desktop window context readback plus the target's top-level
-/// (`GA_ROOT`) ancestor as resolved **on the owning desktop** (#2063).
-#[derive(Clone, Debug)]
-pub(crate) struct HiddenDesktopWindowContext {
-    pub context: ForegroundContext,
-    pub root_hwnd: i64,
-}
-
 #[cfg(windows)]
-pub(crate) fn hidden_desktop_window_context_with_root(
+pub(crate) fn hidden_desktop_window_context(
     desktop_name: &str,
     hwnd: i64,
-) -> Result<HiddenDesktopWindowContext, rmcp::ErrorData> {
+) -> Result<ForegroundContext, rmcp::ErrorData> {
     match run_worker(
         desktop_name,
         DesktopWorkerOp::Context,
@@ -539,9 +260,7 @@ pub(crate) fn hidden_desktop_window_context_with_root(
         false,
         None,
     )? {
-        WorkerPayload::Context { context, root_hwnd } => {
-            Ok(HiddenDesktopWindowContext { context, root_hwnd })
-        }
+        WorkerPayload::Context { context } => Ok(context),
         payload => Err(crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("desktop worker returned unexpected context payload: {payload:?}"),
@@ -550,21 +269,14 @@ pub(crate) fn hidden_desktop_window_context_with_root(
 }
 
 #[cfg(not(windows))]
-pub(crate) fn hidden_desktop_window_context_with_root(
+pub(crate) fn hidden_desktop_window_context(
     _desktop_name: &str,
     _hwnd: i64,
-) -> Result<HiddenDesktopWindowContext, rmcp::ErrorData> {
+) -> Result<ForegroundContext, rmcp::ErrorData> {
     Err(crate::m1::mcp_error(
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "hidden desktop workers are only supported on Windows",
     ))
-}
-
-pub(crate) fn hidden_desktop_window_context(
-    desktop_name: &str,
-    hwnd: i64,
-) -> Result<ForegroundContext, rmcp::ErrorData> {
-    hidden_desktop_window_context_with_root(desktop_name, hwnd).map(|readback| readback.context)
 }
 
 #[cfg(windows)]
@@ -693,7 +405,7 @@ pub(crate) fn hidden_desktop_window_capture(
     client_region: bool,
 ) -> Result<HiddenDesktopCapture, rmcp::ErrorData> {
     crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new_for_op(DesktopWorkerOp::Capture)?;
+    let mut temp = WorkerTempPaths::new(true)?;
     let result = (|| {
         let payload = run_worker_with_paths(
             desktop_name,
@@ -779,252 +491,6 @@ pub(crate) fn hidden_desktop_window_capture(
     ))
 }
 
-/// #2056: reads one element's value/state through a worker attached to the
-/// session-owned desktop `desktop_name`. This is both the independent
-/// before/after Source-of-Truth readback and the desktop-membership probe for
-/// the background action route.
-#[cfg(windows)]
-pub(crate) fn hidden_desktop_element_value(
-    desktop_name: &str,
-    element_id: &ElementId,
-) -> Result<synapse_a11y::ElementValueReadback, rmcp::ErrorData> {
-    let hwnd = hidden_desktop_action_hwnd(element_id)?;
-    match run_action_worker(
-        desktop_name,
-        DesktopWorkerOp::ElementValue,
-        hwnd,
-        &HiddenDesktopActionRequest {
-            element_id: Some(element_id.to_string()),
-            ..HiddenDesktopActionRequest::default()
-        },
-    )? {
-        WorkerPayload::ElementValue { readback, .. } => Ok(readback),
-        payload => Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("desktop worker returned unexpected element value payload: {payload:?}"),
-        )),
-    }
-}
-
-/// #2056: performs the supported UIA `ValuePattern.SetValue` / Win32
-/// `WM_SETTEXT` mutation on the session-owned desktop that physically owns the
-/// target HWND. No desktop switch, no foreground activation, no raw input.
-#[cfg(windows)]
-pub(crate) fn hidden_desktop_set_element_value(
-    desktop_name: &str,
-    element_id: &ElementId,
-    text: &str,
-) -> Result<synapse_a11y::ElementValueSetReadback, rmcp::ErrorData> {
-    let hwnd = hidden_desktop_action_hwnd(element_id)?;
-    match run_action_worker(
-        desktop_name,
-        DesktopWorkerOp::SetElementValue,
-        hwnd,
-        &HiddenDesktopActionRequest {
-            element_id: Some(element_id.to_string()),
-            text: Some(text.to_owned()),
-            ..HiddenDesktopActionRequest::default()
-        },
-    )? {
-        WorkerPayload::SetElementValue { readback, .. } => Ok(readback),
-        payload => Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("desktop worker returned unexpected set element value payload: {payload:?}"),
-        )),
-    }
-}
-
-/// #2063: performs the semantic UIA click on the session-owned desktop that
-/// physically owns the target HWND. No desktop switch, no foreground
-/// activation, no raw input, and no daemon-desktop UIA call.
-#[cfg(windows)]
-pub(crate) fn hidden_desktop_invoke_element(
-    desktop_name: &str,
-    element_id: &ElementId,
-) -> Result<synapse_a11y::ElementClickAction, rmcp::ErrorData> {
-    let hwnd = hidden_desktop_action_hwnd(element_id)?;
-    match run_action_worker(
-        desktop_name,
-        DesktopWorkerOp::InvokeElement,
-        hwnd,
-        &HiddenDesktopActionRequest {
-            element_id: Some(element_id.to_string()),
-            ..HiddenDesktopActionRequest::default()
-        },
-    )? {
-        WorkerPayload::InvokeElement { action, .. } => Ok(action),
-        payload => Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("desktop worker returned unexpected invoke element payload: {payload:?}"),
-        )),
-    }
-}
-
-/// #2063: reads the PostMessage keyboard target's text/selection state on the
-/// session-owned desktop. Used as both the desktop-membership probe and the
-/// independent before/after Source of Truth for a hidden-desktop keystroke.
-#[cfg(windows)]
-pub(crate) fn hidden_desktop_key_state(
-    desktop_name: &str,
-    root_hwnd: i64,
-) -> Result<crate::m2::HwndKeyboardTargetState, rmcp::ErrorData> {
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", root_hwnd)?;
-    match run_action_worker(
-        desktop_name,
-        DesktopWorkerOp::KeyState,
-        root_hwnd,
-        &HiddenDesktopActionRequest::default(),
-    )? {
-        WorkerPayload::KeyState { state, .. } => Ok(state),
-        payload => Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("desktop worker returned unexpected key state payload: {payload:?}"),
-        )),
-    }
-}
-
-/// #2063: delivers the PostMessage keyboard sequence on the session-owned
-/// desktop. Windows documents that window messages can be sent only between
-/// processes on the same desktop, so a daemon-desktop `PostMessage` to a
-/// hidden-desktop HWND can never be proven delivered — this is the only honest
-/// route.
-#[cfg(windows)]
-pub(crate) fn hidden_desktop_press_keys(
-    desktop_name: &str,
-    root_hwnd: i64,
-    key_labels: &[String],
-    hold_ms: u32,
-) -> Result<(u32, crate::m2::HwndKeyboardTargetState), rmcp::ErrorData> {
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", root_hwnd)?;
-    match run_action_worker(
-        desktop_name,
-        DesktopWorkerOp::PressKeys,
-        root_hwnd,
-        &HiddenDesktopActionRequest {
-            keys: Some(key_labels.to_vec()),
-            hold_ms: Some(hold_ms),
-            ..HiddenDesktopActionRequest::default()
-        },
-    )? {
-        WorkerPayload::PressKeys {
-            keys_pressed,
-            state,
-            ..
-        } => Ok((keys_pressed, state)),
-        payload => Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("desktop worker returned unexpected press keys payload: {payload:?}"),
-        )),
-    }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hidden_desktop_invoke_element(
-    _desktop_name: &str,
-    _element_id: &ElementId,
-) -> Result<synapse_a11y::ElementClickAction, rmcp::ErrorData> {
-    Err(crate::m1::mcp_error(
-        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "hidden desktop workers are only supported on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hidden_desktop_key_state(
-    _desktop_name: &str,
-    _root_hwnd: i64,
-) -> Result<crate::m2::HwndKeyboardTargetState, rmcp::ErrorData> {
-    Err(crate::m1::mcp_error(
-        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "hidden desktop workers are only supported on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hidden_desktop_press_keys(
-    _desktop_name: &str,
-    _root_hwnd: i64,
-    _key_labels: &[String],
-    _hold_ms: u32,
-) -> Result<(u32, crate::m2::HwndKeyboardTargetState), rmcp::ErrorData> {
-    Err(crate::m1::mcp_error(
-        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "hidden desktop workers are only supported on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hidden_desktop_element_value(
-    _desktop_name: &str,
-    _element_id: &ElementId,
-) -> Result<synapse_a11y::ElementValueReadback, rmcp::ErrorData> {
-    Err(crate::m1::mcp_error(
-        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "hidden desktop workers are only supported on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hidden_desktop_set_element_value(
-    _desktop_name: &str,
-    _element_id: &ElementId,
-    _text: &str,
-) -> Result<synapse_a11y::ElementValueSetReadback, rmcp::ErrorData> {
-    Err(crate::m1::mcp_error(
-        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "hidden desktop workers are only supported on Windows",
-    ))
-}
-
-#[cfg(windows)]
-fn hidden_desktop_action_hwnd(element_id: &ElementId) -> Result<i64, rmcp::ErrorData> {
-    let hwnd = element_id
-        .parts()
-        .map_err(|error| {
-            crate::m1::mcp_error(
-                error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-                format!("hidden desktop action element id {element_id} is malformed: {error}"),
-            )
-        })?
-        .hwnd;
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)
-}
-
-#[cfg(windows)]
-fn run_action_worker(
-    desktop_name: &str,
-    op: DesktopWorkerOp,
-    hwnd: i64,
-    request: &HiddenDesktopActionRequest,
-) -> Result<WorkerPayload, rmcp::ErrorData> {
-    let mut temp = WorkerTempPaths::new_for_op(op)?;
-    let result = (|| {
-        let request_path = temp.request_path.as_ref().ok_or_else(|| {
-            crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "desktop worker action request temp path was not allocated",
-            )
-        })?;
-        let encoded = serde_json::to_vec(request).map_err(|error| {
-            crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("desktop worker action request encode failed: {error}"),
-            )
-        })?;
-        fs::write(request_path, &encoded).map_err(|error| {
-            crate::m1::mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "desktop worker action request write failed for {}: {error}",
-                    request_path.display()
-                ),
-            )
-        })?;
-        run_worker_with_paths(desktop_name, op, hwnd, None, false, None, &temp)
-    })();
-    finish_worker_temp_cleanup(result, &mut temp)
-}
-
 #[cfg(windows)]
 fn run_worker(
     desktop_name: &str,
@@ -1035,7 +501,7 @@ fn run_worker(
     depth: Option<u32>,
 ) -> Result<WorkerPayload, rmcp::ErrorData> {
     crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new_for_op(op)?;
+    let mut temp = WorkerTempPaths::new(matches!(op, DesktopWorkerOp::Capture))?;
     let result = run_worker_with_paths(desktop_name, op, hwnd, region, client_region, depth, &temp);
     finish_worker_temp_cleanup(result, &mut temp)
 }
@@ -1444,238 +910,6 @@ struct WorkerProcessVerdict {
     exit_code: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct OwnedWorkerVerdict {
-    pub pid: u32,
-    pub timed_out: bool,
-    pub exit_code: u32,
-}
-
-/// Process-global ownership for a long-lived worker that remains inside the
-/// same verified kill-on-close Job Object used by one-shot desktop workers.
-///
-/// `windows::HANDLE` is deliberately not stored here: the windows bindings do
-/// not make it `Send`, while kernel handles are process-wide.  The raw values
-/// stay exclusively owned by this object and are reconstructed only for
-/// checked Win32 calls or finalization.  This lets an owning runtime move
-/// between Tokio worker threads without weakening the exact-process/job
-/// teardown contract.
-#[cfg(windows)]
-#[derive(Debug)]
-pub(crate) struct OwnedWorkerProcess {
-    process_handle: Option<isize>,
-    thread_handle: Option<isize>,
-    job_handle: Option<isize>,
-    job_assigned: bool,
-    terminal_verified: bool,
-    terminal_exit_code: Option<u32>,
-    pid: u32,
-}
-
-#[cfg(windows)]
-impl OwnedWorkerProcess {
-    fn from_handles(handles: &mut WorkerProcessHandles) -> Self {
-        let process = Self {
-            process_handle: handles.process.map(|handle| handle.0 as isize),
-            thread_handle: handles.thread.map(|handle| handle.0 as isize),
-            job_handle: handles.job.map(|handle| handle.0 as isize),
-            job_assigned: handles.job_assigned,
-            terminal_verified: handles.terminal_verified,
-            terminal_exit_code: handles.terminal_exit_code,
-            pid: handles.pid,
-        };
-        handles.process = None;
-        handles.thread = None;
-        handles.job = None;
-        handles.job_assigned = false;
-        process
-    }
-
-    fn take_handles(&mut self) -> WorkerProcessHandles {
-        fn restore(raw: isize) -> windows::Win32::Foundation::HANDLE {
-            windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void)
-        }
-
-        WorkerProcessHandles {
-            process: self.process_handle.take().map(restore),
-            thread: self.thread_handle.take().map(restore),
-            job: self.job_handle.take().map(restore),
-            job_assigned: std::mem::take(&mut self.job_assigned),
-            terminal_verified: self.terminal_verified,
-            terminal_exit_code: self.terminal_exit_code,
-            child_created: true,
-            retained_owner_id: None,
-            pid: self.pid,
-        }
-    }
-
-    #[must_use]
-    pub const fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// Returns `None` only when the exact process handle is still unsignaled.
-    /// A signaled process is followed by a separate kernel exit-code read.
-    pub fn terminal_exit_code(&mut self) -> Result<Option<u32>, String> {
-        use windows::Win32::{
-            Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-        };
-
-        if self.terminal_verified {
-            return Ok(self.terminal_exit_code);
-        }
-        let raw = self.process_handle.ok_or_else(|| {
-            format!(
-                "persistent owned worker pid {} has no process handle",
-                self.pid
-            )
-        })?;
-        let process = HANDLE(raw as *mut core::ffi::c_void);
-        let wait = unsafe { WaitForSingleObject(process, 0) };
-        if wait == WAIT_TIMEOUT {
-            return Ok(None);
-        }
-        if wait != WAIT_OBJECT_0 {
-            let last_error = (wait == WAIT_FAILED)
-                .then(windows::core::Error::from_thread)
-                .map_or_else(|| "not available".to_owned(), |error| error.to_string());
-            return Err(format!(
-                "WaitForSingleObject returned {wait:?} for persistent owned worker pid {}; last_error={last_error}",
-                self.pid
-            ));
-        }
-        let mut exit_code = STILL_ACTIVE_EXIT_CODE;
-        unsafe { GetExitCodeProcess(process, &raw mut exit_code) }.map_err(|error| {
-            format!(
-                "GetExitCodeProcess failed for signaled persistent owned worker pid {}: {error}",
-                self.pid
-            )
-        })?;
-        if exit_code == STILL_ACTIVE_EXIT_CODE {
-            return Err(format!(
-                "persistent owned worker pid {} was signaled but returned STILL_ACTIVE",
-                self.pid
-            ));
-        }
-        self.terminal_verified = true;
-        self.terminal_exit_code = Some(exit_code);
-        Ok(Some(exit_code))
-    }
-
-    /// Waits for a requested graceful exit, terminating the exact job on
-    /// timeout, and consumes every kernel handle through the common checked
-    /// finalizer before returning.
-    pub fn wait_for_exit(&mut self, timeout_ms: u32) -> Result<OwnedWorkerVerdict, String> {
-        let mut handles = self.take_handles();
-        let result = wait_for_worker_process(&mut handles, timeout_ms);
-        let finalization =
-            finalize_worker_process_handles(&mut handles, "persistent_worker_result_cleanup");
-        let verdict = result?;
-        if !finalization.failures.is_empty() {
-            return Err(format!(
-                "persistent owned worker pid {} reached exit_code={} timed_out={}, but handle finalization failed: {}; retained={}",
-                verdict.pid,
-                verdict.exit_code,
-                verdict.timed_out,
-                finalization.failures.join("; "),
-                finalization.retained
-            ));
-        }
-        self.terminal_verified = true;
-        self.terminal_exit_code = Some(verdict.exit_code);
-        Ok(OwnedWorkerVerdict {
-            pid: verdict.pid,
-            timed_out: verdict.timed_out,
-            exit_code: verdict.exit_code,
-        })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for OwnedWorkerProcess {
-    fn drop(&mut self) {
-        if self.process_handle.is_none()
-            && self.thread_handle.is_none()
-            && self.job_handle.is_none()
-        {
-            return;
-        }
-        let mut handles = self.take_handles();
-        let report = finalize_worker_process_handles(&mut handles, "persistent_worker_drop");
-        if !report.failures.is_empty() {
-            report_worker_process_lifecycle_failure(
-                "MCP_PERSISTENT_WORKER_HANDLE_DROP_FAILED",
-                self.pid,
-                "persistent_worker_drop",
-                &report.failures.join("; "),
-            );
-        }
-    }
-}
-
-/// Starts this executable as a long-lived suspended worker, proves Job Object
-/// assignment, resumes it, and transfers exact kernel ownership to the caller.
-#[cfg(windows)]
-pub(crate) fn spawn_owned_current_exe_worker(
-    args: &[String],
-) -> Result<OwnedWorkerProcess, String> {
-    use windows::{
-        Win32::System::Threading::{
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            PROCESS_INFORMATION, STARTUPINFOW,
-        },
-        core::{PCWSTR, PWSTR},
-    };
-
-    retry_retained_worker_process_handles()?;
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("resolve current executable for owned worker failed: {error}"))?;
-    let command_line = std::iter::once(exe.to_string_lossy().into_owned())
-        .chain(args.iter().cloned())
-        .map(|arg| quote_windows_arg(&arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut command_line_wide = wide_null(&command_line);
-    let startup_info = STARTUPINFOW {
-        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(u32::MAX),
-        ..Default::default()
-    };
-    let job = create_worker_kill_on_close_job()?;
-    let mut process_info = PROCESS_INFORMATION::default();
-    if let Err(error) = unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(command_line_wide.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            None,
-            PCWSTR::null(),
-            &raw const startup_info,
-            &raw mut process_info,
-        )
-    } {
-        let close = close_or_retain_standalone_worker_job(job, "owned_worker_create_failed");
-        return Err(format!(
-            "CreateProcessW for owned worker failed: {error}; job_close_readback={close:?}"
-        ));
-    }
-
-    let mut handles = WorkerProcessHandles::from_process_info(process_info, job);
-    if let Err(error) = assign_worker_job_and_resume(&mut handles) {
-        let termination = terminate_worker_process_and_readback(&mut handles, 0);
-        let finalization =
-            finalize_worker_process_handles(&mut handles, "owned_worker_start_failure");
-        return Err(format!(
-            "owned worker pid {} failed verified job assignment/resume: {error}; termination={termination:?}; finalization_failures={:?}; retained={}",
-            handles.pid, finalization.failures, finalization.retained
-        ));
-    }
-    Ok(OwnedWorkerProcess::from_handles(&mut handles))
-}
-
 #[cfg(windows)]
 fn report_worker_process_lifecycle_failure(
     code: &'static str,
@@ -1725,6 +959,15 @@ fn validate_worker_exit_envelope(
         error_codes::TOOL_INTERNAL_ERROR,
         detail,
     ))
+}
+
+#[cfg(all(windows, test))]
+fn close_standalone_worker_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    kind: &'static str,
+) -> Result<(), String> {
+    unsafe { windows::Win32::Foundation::CloseHandle(handle) }
+        .map_err(|error| format!("CloseHandle({kind}) failed: {error}"))
 }
 
 #[cfg(windows)]
@@ -2417,10 +1660,6 @@ fn launch_worker_process(
         args.push("--desktop-worker-bgra".to_owned());
         args.push(bgra_path.to_string_lossy().into_owned());
     }
-    if let Some(request_path) = temp.request_path.as_ref() {
-        args.push("--desktop-worker-request".to_owned());
-        args.push(request_path.to_string_lossy().into_owned());
-    }
     let command_line = args
         .iter()
         .map(|arg| quote_windows_arg(arg))
@@ -2650,20 +1889,12 @@ fn wide_null(value: &str) -> Vec<u16> {
 struct WorkerTempPaths {
     json_path: PathBuf,
     bgra_path: Option<PathBuf>,
-    request_path: Option<PathBuf>,
     cleaned: bool,
 }
 
 #[cfg(windows)]
 impl WorkerTempPaths {
-    fn new_for_op(op: DesktopWorkerOp) -> Result<Self, rmcp::ErrorData> {
-        Self::new(
-            matches!(op, DesktopWorkerOp::Capture),
-            op.requires_request_file(),
-        )
-    }
-
-    fn new(include_bgra: bool, include_request: bool) -> Result<Self, rmcp::ErrorData> {
+    fn new(include_bgra: bool) -> Result<Self, rmcp::ErrorData> {
         let dir = std::env::temp_dir().join("synapse-desktop-worker");
         fs::create_dir_all(&dir).map_err(|error| {
             crate::m1::mcp_error(
@@ -2678,7 +1909,6 @@ impl WorkerTempPaths {
         Ok(Self {
             json_path: dir.join(format!("{id}.json")),
             bgra_path: include_bgra.then(|| dir.join(format!("{id}.bgra"))),
-            request_path: include_request.then(|| dir.join(format!("{id}.request.json"))),
             cleaned: false,
         })
     }
@@ -2687,7 +1917,6 @@ impl WorkerTempPaths {
         let mut failures = Vec::new();
         for (kind, path) in std::iter::once(("json", &self.json_path))
             .chain(self.bgra_path.as_ref().map(|path| ("bgra", path)))
-            .chain(self.request_path.as_ref().map(|path| ("request", path)))
         {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -2772,11 +2001,6 @@ fn finish_worker_temp_cleanup<T>(
 fn worker_code_static(code: &str) -> &'static str {
     match code {
         error_codes::ACTION_TARGET_INVALID => error_codes::ACTION_TARGET_INVALID,
-        error_codes::ACTION_ELEMENT_NOT_RESOLVED => error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-        error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED => {
-            error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
-        }
-        error_codes::A11Y_ELEMENT_STALE => error_codes::A11Y_ELEMENT_STALE,
         error_codes::A11Y_NOT_AVAILABLE => error_codes::A11Y_NOT_AVAILABLE,
         error_codes::A11Y_NO_FOREGROUND => error_codes::A11Y_NO_FOREGROUND,
         error_codes::A11Y_UIA_WORKER_TIMEOUT => error_codes::A11Y_UIA_WORKER_TIMEOUT,
@@ -2794,5 +2018,740 @@ fn worker_code_static(code: &str) -> &'static str {
         error_codes::TARGET_WINDOW_NOT_FOUND => error_codes::TARGET_WINDOW_NOT_FOUND,
         error_codes::TOOL_PARAMS_INVALID => error_codes::TOOL_PARAMS_INVALID,
         _ => error_codes::TOOL_INTERNAL_ERROR,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn retained_registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn spawn_real_process(executable: &Path, args: &[&str]) -> WorkerProcessHandles {
+        use windows::{
+            Win32::System::Threading::{
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+                PROCESS_INFORMATION, STARTUPINFOW,
+            },
+            core::{PCWSTR, PWSTR},
+        };
+
+        assert!(
+            executable.is_file(),
+            "real process executable is missing: {}",
+            executable.display()
+        );
+        let mut command = vec![executable.to_string_lossy().into_owned()];
+        command.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let mut command_line = wide_null(
+            &command
+                .iter()
+                .map(|arg| quote_windows_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let startup = STARTUPINFOW {
+            cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
+                .expect("STARTUPINFOW size fits u32"),
+            ..Default::default()
+        };
+        let job = create_worker_kill_on_close_job()
+            .unwrap_or_else(|error| panic!("create real process job: {error}"));
+        let mut process = PROCESS_INFORMATION::default();
+        unsafe {
+            CreateProcessW(
+                PCWSTR::null(),
+                Some(PWSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                None,
+                PCWSTR::null(),
+                &raw const startup,
+                &raw mut process,
+            )
+        }
+        .unwrap_or_else(|error| panic!("spawn real process {}: {error}", executable.display()));
+        let mut handles = WorkerProcessHandles::from_process_info(process, job);
+        if let Err(error) = assign_worker_job_and_resume(&mut handles) {
+            let termination = terminate_worker_process_and_readback(&mut handles, 0);
+            let finalization =
+                finalize_worker_process_handles(&mut handles, "test_spawn_assign_resume_failure");
+            panic!(
+                "assign/resume real process {}: {error}; termination={termination:?}; finalization={finalization:?}",
+                executable.display()
+            );
+        }
+        handles
+    }
+
+    #[test]
+    fn terminate_process_error_is_demoted_only_by_exact_terminal_readback() {
+        let mut independently_verified = vec!["prior diagnostic".to_owned()];
+        reconcile_provisional_terminate_process_failure(
+            &mut independently_verified,
+            Some("TerminateProcess failed: access denied".to_owned()),
+            Some(1),
+            4242,
+            "causal_terminal_readback",
+        );
+        assert_eq!(
+            independently_verified,
+            ["prior diagnostic"],
+            "the raced syscall is diagnostic-only after exact terminal proof"
+        );
+
+        let mut unresolved = vec!["prior diagnostic".to_owned()];
+        reconcile_provisional_terminate_process_failure(
+            &mut unresolved,
+            Some("TerminateProcess failed: access denied".to_owned()),
+            None,
+            4242,
+            "causal_terminal_readback",
+        );
+        assert_eq!(
+            unresolved,
+            ["prior diagnostic", "TerminateProcess failed: access denied"],
+            "without exact terminal proof the syscall failure remains fatal"
+        );
+    }
+
+    #[test]
+    fn failed_job_handle_close_retains_kernel_ownership_for_retry() {
+        use windows::Win32::{
+            Foundation::{
+                HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+            },
+            System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                WaitForSingleObject,
+            },
+        };
+
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ],
+        );
+        let job = handles.job().expect("real worker job handle");
+        let readback_handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                handles.pid,
+            )
+        }
+        .unwrap_or_else(|error| panic!("open exact protected-close worker: {error}"));
+        unsafe {
+            SetHandleInformation(
+                job,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE,
+            )
+        }
+        .expect("protect real job handle from close");
+
+        let protected_close_failures = handles.close_checked();
+        let job_retained_after_failed_close = handles.job.is_some();
+        let assignment_retained_after_failed_close = handles.job_assigned;
+        unsafe { SetHandleInformation(job, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0)) }
+            .expect("clear real job handle close protection");
+        let retry_failures = handles.close_checked();
+        let wait = unsafe { WaitForSingleObject(readback_handle, 10_000) };
+        let exit_code = read_worker_exit_code(
+            readback_handle,
+            handles.pid,
+            "protected_job_close_retry_readback",
+        )
+        .unwrap_or_else(|error| panic!("read protected-close worker exit: {error}"));
+        let readback_close = close_standalone_worker_handle(readback_handle, "readback_process");
+
+        assert_eq!(protected_close_failures.len(), 1);
+        assert!(protected_close_failures[0].contains("CloseHandle(job) failed"));
+        assert!(
+            job_retained_after_failed_close,
+            "failed close must retain the exact kernel handle for Drop/backstop retry"
+        );
+        assert!(
+            assignment_retained_after_failed_close,
+            "failed job close is not evidence that kill-on-close ownership ended"
+        );
+        assert!(retry_failures.is_empty(), "{retry_failures:?}");
+        assert!(handles.job.is_none());
+        assert!(!handles.job_assigned);
+        assert_eq!(wait, WAIT_OBJECT_0);
+        assert_ne!(exit_code, 259, "exact worker must not remain STILL_ACTIVE");
+        assert!(readback_close.is_ok(), "{readback_close:?}");
+    }
+
+    #[test]
+    fn worker_process_lifecycle_reads_real_natural_exit_state() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 23",
+            ],
+        );
+        let verdict = wait_for_worker_process(&mut handles, 10_000)
+            .unwrap_or_else(|error| panic!("wait for real cmd.exe child: {error}"));
+        let close_failures = handles.close_checked();
+
+        assert_eq!(
+            verdict,
+            WorkerProcessVerdict {
+                pid: verdict.pid,
+                timed_out: false,
+                exit_code: 23,
+            }
+        );
+        assert!(verdict.pid > 0);
+        assert!(
+            close_failures.is_empty(),
+            "real cmd.exe handles must close: {close_failures:?}"
+        );
+    }
+
+    #[test]
+    fn worker_process_timeout_terminates_joins_and_reads_real_child() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ],
+        );
+        let verdict = wait_for_worker_process(&mut handles, 0)
+            .unwrap_or_else(|error| panic!("terminate and read real sleeper: {error}"));
+        let close_failures = handles.close_checked();
+
+        assert!(verdict.pid > 0);
+        assert!(verdict.timed_out);
+        assert_eq!(
+            verdict.exit_code, 1,
+            "TerminateJobObject exit code must be read from the real process object"
+        );
+        assert!(
+            close_failures.is_empty(),
+            "real sleeper handles must close: {close_failures:?}"
+        );
+    }
+
+    #[test]
+    fn finalizer_reads_exact_terminal_state_after_kill_on_close_before_handle_release() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ],
+        );
+
+        let report = finalize_worker_process_handles(&mut handles, "causal_job_close_test");
+
+        assert!(
+            report.job_close_triggered,
+            "live assigned child must use the verified kill-on-close job backstop"
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!report.retained);
+        assert_ne!(report.terminal_exit_code, None);
+        assert_ne!(
+            report.terminal_exit_code,
+            Some(STILL_ACTIVE_EXIT_CODE),
+            "process handle must not be released on a STILL_ACTIVE claim"
+        );
+        assert!(
+            !handles.has_handles(),
+            "job/process/thread handles may close only after exact terminal readback"
+        );
+        assert!(handles.terminal_verified);
+    }
+
+    #[test]
+    fn terminal_process_and_thread_close_failures_retain_exact_owners_for_retry() {
+        let _serial = retained_registry_test_guard();
+        use windows::Win32::Foundation::{
+            HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation,
+        };
+
+        retry_retained_worker_process_handles()
+            .expect("prior desktop-worker retained owners must be clear");
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 17",
+            ],
+        );
+        let verdict = wait_for_worker_process(&mut handles, 10_000)
+            .unwrap_or_else(|error| panic!("wait for protected-handle worker: {error}"));
+        let process = handles.process().expect("terminal worker process handle");
+        let thread = handles.thread().expect("terminal worker thread handle");
+        for handle in [process, thread] {
+            unsafe {
+                SetHandleInformation(
+                    handle,
+                    HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+                    HANDLE_FLAG_PROTECT_FROM_CLOSE,
+                )
+            }
+            .expect("protect terminal worker handle from close");
+        }
+
+        let finalization =
+            finalize_worker_process_handles(&mut handles, "causal_process_thread_close_failure");
+        let retained = desktop_worker_retained_owner_report()
+            .active_owners
+            .into_iter()
+            .find(|owner| owner.pid == verdict.pid)
+            .expect("failed process/thread closes must retain their exact raw handles");
+        for handle in [process, thread] {
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0))
+            }
+            .expect("clear terminal worker close protection");
+        }
+        let retry = retry_retained_worker_process_handles();
+        let after = desktop_worker_retained_owner_report();
+
+        assert!(finalization.retained, "{finalization:?}");
+        assert!(retained.terminal_verified, "{retained:?}");
+        assert_eq!(retained.terminal_exit_code, Some(17), "{retained:?}");
+        assert!(retained.process_handle.is_some(), "{retained:?}");
+        assert!(retained.thread_handle.is_some(), "{retained:?}");
+        assert!(
+            finalization
+                .failures
+                .iter()
+                .any(|failure| failure.contains("CloseHandle(process) failed")),
+            "{finalization:?}"
+        );
+        assert!(
+            finalization
+                .failures
+                .iter()
+                .any(|failure| failure.contains("CloseHandle(thread) failed")),
+            "{finalization:?}"
+        );
+        assert!(retry.is_ok(), "{retry:?}");
+        assert_eq!(after.active_owner_count, 0, "{after:?}");
+    }
+
+    #[test]
+    fn drop_transfers_repeated_close_failure_to_process_global_exact_owner() {
+        let _serial = retained_registry_test_guard();
+        use windows::Win32::{
+            Foundation::{
+                HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+            },
+            System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                WaitForSingleObject,
+            },
+        };
+
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ],
+        );
+        let pid = handles.pid;
+        let job = handles.job().expect("real worker job handle");
+        let readback_handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            )
+        }
+        .unwrap_or_else(|error| panic!("open exact drop-retention worker: {error}"));
+        unsafe {
+            SetHandleInformation(
+                job,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE,
+            )
+        }
+        .expect("protect real job handle from close");
+
+        drop(handles);
+        let wait = unsafe { WaitForSingleObject(readback_handle, 10_000) };
+        let exit_code =
+            read_worker_exit_code(readback_handle, pid, "drop_retention_process_readback")
+                .unwrap_or_else(|error| panic!("read exact drop-retention worker exit: {error}"));
+        let retained_before_retry = lock_retained_worker_process_handles()
+            .iter()
+            .filter(|retained| retained.pid == pid)
+            .cloned()
+            .collect::<Vec<_>>();
+        unsafe { SetHandleInformation(job, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0)) }
+            .expect("clear retained job handle close protection");
+        let retry = retry_retained_worker_process_handles();
+        let retained_after_retry = lock_retained_worker_process_handles()
+            .iter()
+            .filter(|retained| retained.pid == pid)
+            .count();
+        let owner_report = desktop_worker_retained_owner_report();
+        let readback_close = close_standalone_worker_handle(readback_handle, "readback_process");
+
+        assert_eq!(wait, WAIT_OBJECT_0);
+        assert_ne!(exit_code, STILL_ACTIVE_EXIT_CODE);
+        assert_eq!(retained_before_retry.len(), 1, "{retained_before_retry:?}");
+        assert!(retained_before_retry[0].job_handle.is_some());
+        assert!(retained_before_retry[0].terminal_verified);
+        assert!(retry.is_ok(), "{retry:?}");
+        assert_eq!(retained_after_retry, 0);
+        assert_eq!(owner_report.active_owner_count, 0);
+        assert!(owner_report.active_owners.is_empty());
+        let owner_id = retained_before_retry[0].owner_id;
+        let owner_events = owner_report
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.owner.owner_id == owner_id)
+            .collect::<Vec<_>>();
+        assert_eq!(owner_events.len(), 2, "{owner_events:?}");
+        assert_eq!(owner_events[0].event, "retained");
+        assert_eq!(owner_events[1].event, "reaped");
+        assert!(owner_events[0].owner.job_handle.is_some());
+        assert!(!owner_events[0].owner.last_failure.is_empty());
+        assert!(!owner_events[1].detail.is_empty());
+        assert!(readback_close.is_ok(), "{readback_close:?}");
+    }
+
+    #[test]
+    fn childless_job_close_failure_is_retained_and_reaped_before_spawn() {
+        let _serial = retained_registry_test_guard();
+        use windows::Win32::Foundation::{
+            HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation,
+        };
+
+        retry_retained_worker_process_handles()
+            .expect("prior desktop-worker retained owners must be clear");
+        let job = create_worker_kill_on_close_job().expect("create childless worker job");
+        unsafe {
+            SetHandleInformation(
+                job,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE,
+            )
+        }
+        .expect("protect childless job from close");
+
+        let close = close_or_retain_standalone_worker_job(job, "causal_childless_job_test");
+        let retained = desktop_worker_retained_owner_report()
+            .active_owners
+            .into_iter()
+            .find(|owner| owner.job_handle == Some(job.0 as isize))
+            .expect("failed childless job close must preserve its exact raw handle");
+        unsafe { SetHandleInformation(job, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0)) }
+            .expect("clear childless job close protection");
+        let retry = retry_retained_worker_process_handles();
+        let after = desktop_worker_retained_owner_report();
+
+        assert!(close.is_err(), "protected close cannot claim success");
+        assert!(!retained.child_created);
+        assert_eq!(retained.pid, 0);
+        assert!(retained.process_handle.is_none());
+        assert!(retained.thread_handle.is_none());
+        assert!(retry.is_ok(), "{retry:?}");
+        assert!(
+            after
+                .active_owners
+                .iter()
+                .all(|owner| owner.owner_id != retained.owner_id),
+            "successful retry must remove the exact childless owner"
+        );
+        assert!(after.evidence.iter().any(|evidence| {
+            evidence.owner.owner_id == retained.owner_id && evidence.event == "reaped"
+        }));
+    }
+
+    #[test]
+    fn retained_owner_remains_visible_while_exact_handle_reap_is_in_progress() {
+        let _serial = retained_registry_test_guard();
+        use windows::Win32::Foundation::{
+            HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation,
+        };
+
+        retry_retained_worker_process_handles()
+            .expect("prior desktop-worker retained owners must be clear");
+        let job = create_worker_kill_on_close_job().expect("create childless worker job");
+        unsafe {
+            SetHandleInformation(
+                job,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+                HANDLE_FLAG_PROTECT_FROM_CLOSE,
+            )
+        }
+        .expect("protect childless job from close");
+        close_or_retain_standalone_worker_job(job, "causal_retry_visibility_setup")
+            .expect_err("protected close must enter the retained-owner registry");
+
+        let (retained, reap_guard) = take_retained_worker_owner_for_retry()
+            .expect("retained owner must transfer into an observable reap attempt");
+        let during = desktop_worker_retained_owner_report();
+        let mut handles = WorkerProcessHandles::from_retained(retained);
+        unsafe { SetHandleInformation(job, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0)) }
+            .expect("clear childless job close protection");
+        let finalization =
+            finalize_worker_process_handles(&mut handles, "causal_retry_visibility_cleanup");
+        drop(reap_guard);
+        let after = desktop_worker_retained_owner_report();
+
+        assert_eq!(during.reap_in_progress_count, 1, "{during:?}");
+        assert_eq!(during.active_owner_count, 1, "{during:?}");
+        assert!(
+            during.active_owners.is_empty(),
+            "the exact owner is local to the reap, not falsely absent: {during:?}"
+        );
+        assert!(!finalization.retained, "{finalization:?}");
+        assert!(finalization.failures.is_empty(), "{finalization:?}");
+        assert_eq!(after.reap_in_progress_count, 0, "{after:?}");
+        assert_eq!(after.active_owner_count, 0, "{after:?}");
+    }
+
+    #[test]
+    fn closing_real_worker_job_kills_tree_and_preserves_process_readback() {
+        use windows::Win32::{
+            Foundation::WAIT_OBJECT_0,
+            System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                WaitForSingleObject,
+            },
+        };
+
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut handles = spawn_real_process(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ],
+        );
+        assert!(handles.job_assigned);
+        let readback_handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                handles.pid,
+            )
+        }
+        .unwrap_or_else(|error| {
+            panic!(
+                "open exact worker pid {} for readback: {error}",
+                handles.pid
+            )
+        });
+
+        let mut job_close_failures = Vec::new();
+        handles.close_one("job", &mut job_close_failures);
+        let wait = unsafe { WaitForSingleObject(readback_handle, 10_000) };
+        let exit_code = read_worker_exit_code(readback_handle, handles.pid, "job_close_readback")
+            .unwrap_or_else(|error| panic!("read exact job-closed worker: {error}"));
+        let readback_close = close_standalone_worker_handle(readback_handle, "readback_process");
+        let remaining_close_failures = handles.close_checked();
+
+        assert!(job_close_failures.is_empty(), "{job_close_failures:?}");
+        assert_eq!(
+            wait, WAIT_OBJECT_0,
+            "kill-on-close job must signal exact child"
+        );
+        assert_ne!(exit_code, 259, "exact child must not remain STILL_ACTIVE");
+        assert!(readback_close.is_ok(), "{readback_close:?}");
+        assert!(
+            remaining_close_failures.is_empty(),
+            "{remaining_close_failures:?}"
+        );
+    }
+
+    #[test]
+    fn desktop_worker_rejects_noncanonical_hwnd_before_process_dispatch() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = run_worker(
+                "desktop-name-must-not-be-opened",
+                DesktopWorkerOp::Context,
+                hwnd,
+                None,
+                false,
+                None,
+            )
+            .expect_err("noncanonical HWND must fail before CreateProcessW");
+            let data = error.data.expect("structured HWND validation data");
+            assert_eq!(
+                data.get("code").and_then(serde_json::Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+            assert_eq!(
+                data.get("tool").and_then(serde_json::Value::as_str),
+                Some("hidden_desktop_worker")
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_worker_launch_guard_rejects_noncanonical_hwnd_before_create_process() {
+        let temp = WorkerTempPaths::new(false).expect("allocate launch-guard temp paths");
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = launch_worker_process(
+                "desktop-name-must-not-be-opened",
+                DesktopWorkerOp::Context,
+                hwnd,
+                None,
+                false,
+                None,
+                &temp,
+            )
+            .expect_err("final launch seam must reject noncanonical HWND");
+            let data = error.data.expect("structured launch-guard validation data");
+            assert_eq!(
+                data.get("code").and_then(serde_json::Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_worker_parse_rect_rejects_empty_capture_region_as_capture_invalid() {
+        let error = parse_rect("0,0,0,10").expect_err("empty region should fail");
+
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some(error_codes::CAPTURE_TARGET_INVALID)
+        );
+        assert!(
+            error
+                .error_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("empty desktop worker capture region"))
+        );
+    }
+
+    #[test]
+    fn desktop_worker_parse_rect_rejects_malformed_region_as_params_invalid() {
+        let error = parse_rect("0,0,10").expect_err("malformed region should fail");
+
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn desktop_worker_requires_kernel_exit_and_json_envelope_to_agree() {
+        let success = WorkerEnvelope {
+            ok: true,
+            payload: None,
+            error_code: None,
+            error_detail: None,
+        };
+        let failure = worker_error(error_codes::TOOL_INTERNAL_ERROR, "synthetic failure");
+
+        validate_worker_exit_envelope(
+            WorkerProcessVerdict {
+                pid: 101,
+                timed_out: false,
+                exit_code: 0,
+            },
+            &success,
+        )
+        .expect("zero exit and success envelope must agree");
+        validate_worker_exit_envelope(
+            WorkerProcessVerdict {
+                pid: 102,
+                timed_out: false,
+                exit_code: 7,
+            },
+            &failure,
+        )
+        .expect("nonzero exit and failure envelope must agree");
+
+        let nonzero_success = validate_worker_exit_envelope(
+            WorkerProcessVerdict {
+                pid: 103,
+                timed_out: false,
+                exit_code: 9,
+            },
+            &success,
+        )
+        .expect_err("nonzero exit must never accept a success envelope");
+        assert!(
+            nonzero_success
+                .message
+                .contains("exit_code=9 requires envelope.ok=false, but JSON envelope.ok=true")
+        );
+
+        let zero_failure = validate_worker_exit_envelope(
+            WorkerProcessVerdict {
+                pid: 104,
+                timed_out: false,
+                exit_code: 0,
+            },
+            &failure,
+        )
+        .expect_err("zero exit must never accept a failure envelope");
+        assert!(
+            zero_failure
+                .message
+                .contains("exit_code=0 requires envelope.ok=true, but JSON envelope.ok=false")
+        );
     }
 }

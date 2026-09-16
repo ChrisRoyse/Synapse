@@ -1,0 +1,75 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.minecraft.java.curated.unknown_scope"
+package_version = "0.1.0"
+profile_id = "minecraft.java"
+profile_version = "1.0.0"
+created_at = "2026-05-27T20:05:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic curated starter edge fixture for issue #482."
+
+[source]
+kind = "synthetic_fixture"
+uri = "file://crates/synapse-profiles/tests/fixtures/profile_registry/curated_starter_registry/edge_minecraft_unknown_use_scope_manifest.toml"
+revision = "m5-r22-edge"
+built_by = "codex"
+generated_by = "synapse-curated-starter-registry-v1"
+
+[[targets]]
+target_id = "minecraft.java"
+target_kind = "game"
+app_id = "minecraft.java"
+process_name = "javaw.exe"
+title_regex = "Minecraft.*[0-9]+\\.[0-9]+"
+app_version = "edge fixture"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = ["minecraft.java"]
+
+[assumptions.display]
+min_width = 1280
+min_height = 720
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software"]
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "unknown"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = false
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T20:05:00Z"
+summary = "Invalid unknown use-scope edge for Minecraft Java curated starter registry."
+
+[hashes]
+profile_toml_sha256 = "sha256:4054a4d0195574b719f7ef7bd2abcd4ce4522de2b1882d0d8f270d1be7904a98"
+package_sha256 = "sha256:4824824824824824824824824824824824824824824824824824824824824824"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/minecraft.java.toml"
+
+[metadata]
+"curated.seed_set_id" = "starter.v1"
+"curated.target_id" = "minecraft.java"
+"curated.tier" = "game.seed"
+"curated.priority" = "p1"
+"curated.status" = "edge"
+"curated.backlog_issue" = "#482"
+"curated.minimum_manual_fsv" = "profile_list,profile_registry_install"

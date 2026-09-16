@@ -1,0 +1,21 @@
+{
+  "cf_name": "CF_PROFILES",
+  "key": "profile_registry/v1/trust_root/synapse.fixture.signer/56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "registry_trust_root",
+    "row_id": "synapse.fixture.signer@sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "created_at": "2026-05-27T02:04:00Z",
+    "updated_at": "2026-05-27T02:04:00Z",
+    "source_id": "registry.synthetic.local-fixture",
+    "state": "active",
+    "signer_id": "synapse.fixture.signer",
+    "key_id": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "algorithm": "ed25519",
+    "public_key_sha256": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "trust_domain": "local-fixture",
+    "origin": "bundled_fixture_root",
+    "operator_owned": true
+  }
+}

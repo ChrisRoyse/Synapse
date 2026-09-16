@@ -9,7 +9,7 @@ use std::{
 };
 
 use synapse_core::{ElementId, element_id, win32_hwnd::hwnd_to_wire};
-use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::{
     Foundation::{GetLastError, HWND},
     System::Com::{
@@ -46,7 +46,7 @@ const WIN_EVENT_STATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const WIN_EVENT_CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct WinEventDeliveryState {
-    sender: Option<Sender<AccessibleEvent>>,
+    sender: Option<UnboundedSender<AccessibleEvent>>,
     subscription_owner_id: Option<u64>,
     last_released_owner_id: Option<u64>,
 }
@@ -67,13 +67,6 @@ static NEXT_WIN_EVENT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 /// potentially blocking cache-mutex operation after the callback returns.
 static SNAPSHOT_CACHE_INVALIDATION_PENDING: AtomicBool = AtomicBool::new(false);
 static WIN_EVENT_CALLBACKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// #1792: producer-side delivery ledger for the active subscription slot.
-/// Reset when a slot is reserved so each owner's shutdown report describes its
-/// own delivery volume. See `WinEventSubscriptionShutdownReport::events_delivered_at_disconnect`.
-static WIN_EVENT_EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
-static WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
-static WIN_EVENT_QUEUE_FULL_PENDING_LOG: AtomicU64 = AtomicU64::new(0);
-static WIN_EVENT_EVENT_SENDS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_CONTENTION: AtomicUsize = AtomicUsize::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_POISON: AtomicUsize = AtomicUsize::new(0);
 
@@ -208,15 +201,6 @@ fn drain_callback_diagnostics() {
             "WinEvent callbacks observed a poisoned delivery-state lock"
         );
     }
-    let queue_full = WIN_EVENT_QUEUE_FULL_PENDING_LOG.swap(0, Ordering::AcqRel);
-    if queue_full != 0 {
-        tracing::error!(
-            code = "A11Y_WIN_EVENT_QUEUE_SATURATED",
-            dropped_event_count = queue_full,
-            operation = "owner_loop_readback",
-            "bounded WinEvent ingress saturated; accessibility events were rejected before delivery"
-        );
-    }
 }
 
 fn wake_win_event_owner_before_stop(
@@ -309,14 +293,6 @@ impl WinEventSubscription {
         if let Some(failure) = disconnect_failure {
             failures.push(failure);
         }
-        // Read the producer-side delivery ledger at the exact disconnect
-        // boundary (#1792). No further send can be admitted past this point,
-        // so these totals are terminal for this owner.
-        let events_delivered_at_disconnect = WIN_EVENT_EVENTS_DELIVERED.load(Ordering::Acquire);
-        let events_dropped_queue_full_at_disconnect =
-            WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.load(Ordering::Acquire);
-        let event_sends_rejected_at_disconnect =
-            WIN_EVENT_EVENT_SENDS_REJECTED.load(Ordering::Acquire);
 
         let thread_owner_present = self.join.is_some();
         let mut exit_report_receiver = self.exit_report.take();
@@ -411,9 +387,6 @@ impl WinEventSubscription {
             stop_requested: true,
             stop_wake_sent,
             sender_disconnected,
-            events_delivered_at_disconnect,
-            events_dropped_queue_full_at_disconnect,
-            event_sends_rejected_at_disconnect,
             subscription_slot_released,
             thread_owner_present,
             thread_terminal: join_readback.thread_terminal,
@@ -706,7 +679,7 @@ fn lock_win_event_delivery_until(
 
 fn reserve_win_event_subscription_slot(
     owner_id: u64,
-    sender: Sender<AccessibleEvent>,
+    sender: UnboundedSender<AccessibleEvent>,
 ) -> A11yResult<()> {
     reconcile_retained_win_event_owners();
     let retained_owner_count = RETAINED_WIN_EVENT_OWNER_COUNT.load(Ordering::Acquire);
@@ -731,12 +704,6 @@ fn reserve_win_event_subscription_slot(
     }
     state.subscription_owner_id = Some(owner_id);
     state.sender = Some(sender);
-    // Per-owner delivery ledger (#1792): the slot is exclusive, so resetting
-    // here scopes both counters to exactly this subscription owner.
-    WIN_EVENT_EVENTS_DELIVERED.store(0, Ordering::Release);
-    WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.store(0, Ordering::Release);
-    WIN_EVENT_QUEUE_FULL_PENDING_LOG.store(0, Ordering::Release);
-    WIN_EVENT_EVENT_SENDS_REJECTED.store(0, Ordering::Release);
     Ok(())
 }
 
@@ -977,7 +944,9 @@ fn unwind_failed_startup(
     }
 }
 
-pub fn subscribe_win_events(sender: Sender<AccessibleEvent>) -> A11yResult<WinEventSubscription> {
+pub fn subscribe_win_events(
+    sender: UnboundedSender<AccessibleEvent>,
+) -> A11yResult<WinEventSubscription> {
     let owner_id = NEXT_WIN_EVENT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     reserve_win_event_subscription_slot(owner_id, sender)?;
 
@@ -1293,23 +1262,7 @@ unsafe extern "system" fn win_event_proc(
         name: None,
         value: None,
     };
-    // #1792: count what this producer actually pushed into the delivery
-    // channel. A consumer whose only stop signal is channel closure has to
-    // drain everything counted here that it had not yet taken before it can
-    // observe the disconnect, so this total is the evidence that separates a
-    // drain backlog from a scheduling problem.
-    match sender.try_send(event) {
-        Ok(()) => {
-            WIN_EVENT_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TrySendError::Full(_event)) => {
-            WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
-            WIN_EVENT_QUEUE_FULL_PENDING_LOG.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TrySendError::Closed(_event)) => {
-            WIN_EVENT_EVENT_SENDS_REJECTED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    let _ = sender.send(event);
 }
 
 const fn event_kind(event: u32) -> Option<AccessibleEventKind> {
@@ -1353,5 +1306,154 @@ fn read_current_apartment() -> ComApartmentKind {
         value if value == APTTYPE_NA => ComApartmentKind::Neutral,
         value if value == APTTYPE_MAINSTA => ComApartmentKind::MainSta,
         _ => ComApartmentKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn retained_owner_with_report(
+        expected_hook_count: usize,
+        unregister_attempted: usize,
+        unregister_succeeded: usize,
+    ) -> RetainedWinEventOwner {
+        RetainedWinEventOwner {
+            owner_id: 11,
+            thread_id: 17,
+            expected_hook_count: Some(expected_hook_count),
+            join: None,
+            exit_report: None,
+            terminal_report: Some(WinEventThreadExitReport {
+                unregister_attempted,
+                unregister_succeeded,
+                unregister_failed_event_ids: Vec::new(),
+                failures: Vec::new(),
+            }),
+            failures: Vec::new(),
+        }
+    }
+
+    fn clean_shutdown_report(thread_id: u32) -> WinEventSubscriptionShutdownReport {
+        WinEventSubscriptionShutdownReport {
+            reason: "synthetic_history_test",
+            thread_id,
+            hook_count: 1,
+            stop_requested: true,
+            stop_wake_sent: true,
+            sender_disconnected: true,
+            subscription_slot_released: true,
+            thread_owner_present: true,
+            thread_terminal: true,
+            thread_joined: true,
+            thread_exit_report_received: true,
+            unregister_attempted: 1,
+            unregister_succeeded: 1,
+            unregister_failed_event_ids: Vec::new(),
+            exact_owner_retained: false,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retained_owner_requires_exact_expected_unregister_count() {
+        let short = retained_owner_with_report(2, 1, 1);
+        assert!(!retained_owner_unregister_complete(&short));
+
+        let complete = retained_owner_with_report(2, 2, 2);
+        assert!(retained_owner_unregister_complete(&complete));
+    }
+
+    #[test]
+    fn retained_owner_failure_evidence_never_reconciles_as_clean() {
+        let mut owner = retained_owner_with_report(1, 1, 1);
+        owner
+            .failures
+            .push("synthetic retained-owner failure".to_owned());
+
+        assert!(!retained_owner_unregister_complete(&owner));
+    }
+
+    #[test]
+    fn wake_handshake_requires_acknowledgement_from_expected_owner() {
+        let (wake_tx, wake_rx) = mpsc::channel::<WinEventWakeRequest>();
+        let owner = thread::spawn(move || {
+            let request = match wake_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(request) => request,
+                Err(error) => panic!("synthetic WinEvent owner received no wake: {error}"),
+            };
+            if let Err(error) = request.acknowledgement.send(41) {
+                panic!("synthetic WinEvent owner could not acknowledge wake: {error}");
+            }
+        });
+
+        let readback = wake_win_event_owner_before_stop(&wake_tx, Some(41), Duration::from_secs(1));
+        assert!(owner.join().is_ok(), "synthetic WinEvent owner panicked");
+
+        assert!(readback.exact_owner_acknowledged(Some(41)), "{readback:?}");
+        assert!(!readback.exact_owner_acknowledged(Some(42)), "{readback:?}");
+    }
+
+    #[test]
+    fn shutdown_report_publication_is_append_only_per_owner() {
+        let first_owner = NEXT_WIN_EVENT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let second_owner = NEXT_WIN_EVENT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        publish_win_event_shutdown_report(WinEventSubscriptionShutdownRecord {
+            owner_id: first_owner,
+            report: clean_shutdown_report(71),
+        });
+        publish_win_event_shutdown_report(WinEventSubscriptionShutdownRecord {
+            owner_id: second_owner,
+            report: clean_shutdown_report(72),
+        });
+
+        let history = win_event_shutdown_report_history();
+        assert!(history.iter().any(|record| record.owner_id == first_owner));
+        assert!(history.iter().any(|record| record.owner_id == second_owner));
+    }
+
+    #[test]
+    fn subscription_slot_release_requires_the_exact_owner_id() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = WinEventDeliveryState {
+            sender: Some(sender),
+            subscription_owner_id: Some(91),
+            last_released_owner_id: None,
+        };
+
+        assert!(release_win_event_subscription_slot_for_owner(&mut state, 92).is_err());
+        assert_eq!(state.subscription_owner_id, Some(91));
+        assert!(state.sender.is_some());
+
+        if let Err(error) = release_win_event_subscription_slot_for_owner(&mut state, 91) {
+            panic!("exact subscription-slot owner could not release: {error}");
+        }
+        assert_eq!(state.subscription_owner_id, None);
+        assert_eq!(state.last_released_owner_id, Some(91));
+        assert!(state.sender.is_none());
+    }
+
+    #[test]
+    fn retained_owner_gate_counts_owner_only_and_sender_only_slots() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let owner_only = WinEventDeliveryState {
+            sender: None,
+            subscription_owner_id: Some(101),
+            last_released_owner_id: None,
+        };
+        let sender_only = WinEventDeliveryState {
+            sender: Some(sender),
+            subscription_owner_id: None,
+            last_released_owner_id: None,
+        };
+        let released = WinEventDeliveryState {
+            sender: None,
+            subscription_owner_id: None,
+            last_released_owner_id: Some(100),
+        };
+
+        assert!(win_event_delivery_slot_is_active(&owner_only));
+        assert!(win_event_delivery_slot_is_active(&sender_only));
+        assert!(!win_event_delivery_slot_is_active(&released));
     }
 }

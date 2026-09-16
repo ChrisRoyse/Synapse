@@ -12,9 +12,8 @@
 //! audit trail, confidence history) keyed by the same stable routine id.
 //! The miner reconciles it after every replace-all — creating candidate
 //! rows for new routines, appending confidence change-points, and flagging
-//! rows whose routine vanished. It never promotes lifecycle state, but it
-//! fail-closed quarantines confirmed routines whose locked canonical identity
-//! drifts or disappears. Disabled routines stay disabled across every re-mine.
+//! rows whose routine vanished — but NEVER changes a lifecycle the operator
+//! set, so a disabled routine stays disabled across every re-mine.
 //!
 //! The same mining entry point serves the on-demand MCP tool and the
 //! periodic in-daemon batch job ([`super::routine_miner_job`]); a
@@ -31,25 +30,18 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, Local, TimeZone};
-use num_traits::ToPrimitive as _;
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use synapse_calyx::{
-    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxRecurrenceAppendDisposition,
-};
 use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
 use synapse_core::types::{
-    EpisodeRecord, ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_FEEDBACK_EVENTS,
+    ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_FEEDBACK_EVENTS,
     ROUTINE_STATE_MAX_TRANSITIONS, ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint,
     RoutineDowClass, RoutineFeedbackEvent, RoutineFeedbackOutcome, RoutineGranularity,
-    RoutineIdentityLock, RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord,
-    RoutineStep, RoutineTransition,
+    RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
+    RoutineTransition,
 };
-use synapse_storage::{
-    Db, RecurrenceSubjectKind, cf, decode_json, encode_json, routines as routine_codec,
-};
+use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_codec};
 
 use crate::m1::mcp_error;
 
@@ -64,7 +56,6 @@ use super::hygiene::{HygieneTaintRecord, read_taint_record_from_db};
 use super::profile_authoring::{RoutineAutomationRecord, load_routine_automation_record};
 use super::{
     M3ToolStub,
-    grounding::{self, SOURCE_OPERATOR},
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -76,9 +67,6 @@ pub const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
 /// Upper bound for the `max_pattern_len` parameter.
 pub const MAX_PATTERN_LEN_LIMIT: u32 = 12;
-
-type RoutineStateRawRow = (Vec<u8>, Vec<u8>, RoutineStateRecord);
-type EpisodeEvidenceRow = (Vec<u8>, Vec<u8>, EpisodeRecord);
 /// Upper bound for the `min_support_days` parameter (the mining window is
 /// at most the 90-day episode retention horizon).
 pub const MIN_SUPPORT_DAYS_LIMIT: u32 = 92;
@@ -156,27 +144,9 @@ pub struct RoutineMineResponse {
     /// `CF_ROUTINE_STATE` rows flagged `present_in_last_mine=false` because
     /// this run no longer derived their routine (0 on dry runs).
     pub state_rows_marked_unmined: u64,
-    /// Confirmed identities moved to fail-closed quarantine because their
-    /// canonical digest changed or no durable lock existed.
-    pub state_rows_identity_quarantined: u64,
-    /// Newly inserted occurrences durably admitted after lifecycle reconcile.
-    pub recurrence_findings: Vec<RoutineRecurrenceFinding>,
-    pub recurrence_notifications_matched: u64,
-    pub recurrence_notifications_queued: u64,
-    pub recurrence_notifications_dropped: u64,
     pub dry_run: bool,
     /// The mined routines, strongest first (full persisted records).
     pub routines: Vec<RoutineRecord>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RoutineRecurrenceFinding {
-    pub routine_id: String,
-    pub subject_cx_id: String,
-    pub occurrence_id: u64,
-    pub frequency: u64,
-    pub observed_seq: u64,
 }
 
 #[must_use]
@@ -474,23 +444,26 @@ pub(crate) fn load_state_row(
     db: &Db,
     routine_id: &str,
 ) -> Result<Option<RoutineStateRecord>, ErrorData> {
-    load_state_row_with_raw(db, routine_id).map(|row| row.map(|(_key, _value, record)| record))
-}
-
-fn load_state_row_with_raw(
-    db: &Db,
-    routine_id: &str,
-) -> Result<Option<RoutineStateRawRow>, ErrorData> {
     let key =
         routine_codec::routine_state_key(routine_id).map_err(|error| invalid(error.to_string()))?;
-    let value = db
-        .get_cf(cf::CF_ROUTINE_STATE, &key)
+    let rows = db
+        .scan_cf_prefix(cf::CF_ROUTINE_STATE, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let Some(value) = value else {
+    let Some((row_key, value)) = rows.first() else {
         return Ok(None);
     };
-    let record = decode_state_row(&key, &value)?;
-    Ok(Some((key, value, record)))
+    if rows.len() > 1 || row_key != &key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_STATE_KEY_COLLISION in CF_ROUTINE_STATE: prefix lookup for \
+                 {routine_id} returned {} rows, first key {}",
+                rows.len(),
+                hex_encode(row_key)
+            ),
+        ));
+    }
+    decode_state_row(row_key, value).map(Some)
 }
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
@@ -499,13 +472,24 @@ pub(crate) fn load_routine_record(
     routine_id: &str,
 ) -> Result<Option<RoutineRecord>, ErrorData> {
     let key = routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
-    let value = db
-        .get_cf(cf::CF_ROUTINES, &key)
+    let rows = db
+        .scan_cf_prefix(cf::CF_ROUTINES, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let Some(value) = value else {
+    let Some((row_key, value)) = rows.first() else {
         return Ok(None);
     };
-    decode_routine_record_row(&key, &value).map(Some)
+    if rows.len() > 1 || row_key != &key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_KEY_COLLISION in CF_ROUTINES: prefix lookup for {routine_id} \
+                 returned {} rows, first key {}",
+                rows.len(),
+                hex_encode(row_key)
+            ),
+        ));
+    }
+    decode_routine_record_row(row_key, value).map(Some)
 }
 
 /// Decodes one `CF_ROUTINES` row (key + JSON value) into a [`RoutineRecord`].
@@ -592,7 +576,6 @@ struct StateReconcileCounters {
     created: u64,
     updated: u64,
     marked_unmined: u64,
-    identity_quarantined: u64,
 }
 
 /// Reconciles `CF_ROUTINE_STATE` with the routines a mining run just
@@ -618,54 +601,6 @@ fn reconcile_state_rows(
             opportunity_days: routine.opportunity_days,
         };
         if let Some(mut state) = existing.remove(&routine.routine_id) {
-            let observed_identity = routine_identity_sha256(routine)?;
-            if matches!(
-                state.lifecycle,
-                RoutineLifecycle::Confirmed | RoutineLifecycle::Quarantined
-            ) {
-                let lock_matches = state
-                    .identity_lock
-                    .as_ref()
-                    .is_some_and(|lock| lock.canonical_sha256 == observed_identity);
-                if state.lifecycle == RoutineLifecycle::Confirmed && !lock_matches {
-                    let reason = match state.identity_lock.as_ref() {
-                        Some(lock) => format!(
-                            "confirmed routine identity drift: canonical_sha256={} observed_sha256={observed_identity}",
-                            lock.canonical_sha256
-                        ),
-                        None => format!(
-                            "confirmed routine has no durable identity lock after schema upgrade; observed_sha256={observed_identity}"
-                        ),
-                    };
-                    state.lifecycle = RoutineLifecycle::Quarantined;
-                    push_transition(
-                        &mut state,
-                        RoutineTransition {
-                            ts_ns: mined_at,
-                            action: RoutineStateAction::IdentityQuarantine,
-                            from: Some(RoutineLifecycle::Confirmed),
-                            to: RoutineLifecycle::Quarantined,
-                            by: MINER_ACTOR.to_owned(),
-                            label_before: None,
-                            label_after: None,
-                            note: Some(reason.clone()),
-                        },
-                    );
-                    counters.identity_quarantined += 1;
-                    tracing::error!(
-                        code = "ROUTINE_IDENTITY_DRIFT",
-                        routine_id = %routine.routine_id,
-                        observed_sha256 = %observed_identity,
-                        remediation = "inspect the mined routine and its evidence; if the new identity is intended, explicitly confirm it through routine_update",
-                        reason,
-                        "confirmed routine identity failed closed into quarantine"
-                    );
-                }
-                if let Some(lock) = state.identity_lock.as_mut() {
-                    lock.last_observed_sha256 = observed_identity;
-                    lock.last_verified_ts_ns = mined_at;
-                }
-            }
             state.present_in_last_mine = true;
             state.last_mined_ts_ns = Some(mined_at);
             state.updated_ts_ns = mined_at;
@@ -677,7 +612,6 @@ fn reconcile_state_rows(
                 record_version: ROUTINE_STATE_RECORD_VERSION,
                 routine_id: routine.routine_id.clone(),
                 lifecycle: RoutineLifecycle::Candidate,
-                identity_lock: None,
                 label: None,
                 created_ts_ns: mined_at,
                 updated_ts_ns: mined_at,
@@ -715,36 +649,6 @@ fn reconcile_state_rows(
         if state.present_in_last_mine {
             state.present_in_last_mine = false;
             state.updated_ts_ns = mined_at;
-            if state.lifecycle == RoutineLifecycle::Confirmed {
-                state.lifecycle = RoutineLifecycle::Quarantined;
-                push_transition(
-                    &mut state,
-                    RoutineTransition {
-                        ts_ns: mined_at,
-                        action: RoutineStateAction::IdentityQuarantine,
-                        from: Some(RoutineLifecycle::Confirmed),
-                        to: RoutineLifecycle::Quarantined,
-                        by: MINER_ACTOR.to_owned(),
-                        label_before: None,
-                        label_after: None,
-                        note: Some(
-                            "confirmed routine disappeared from the complete mining result; canonical identity is no longer present"
-                                .to_owned(),
-                        ),
-                    },
-                );
-                counters.identity_quarantined += 1;
-                tracing::error!(
-                    code = "ROUTINE_IDENTITY_DRIFT",
-                    routine_id = %state.routine_id,
-                    canonical_sha256 = state
-                        .identity_lock
-                        .as_ref()
-                        .map_or("<missing>", |lock| lock.canonical_sha256.as_str()),
-                    remediation = "inspect the current mining result and episode evidence; explicitly confirm the intended replacement rather than reusing this missing identity",
-                    "confirmed routine disappeared and failed closed into quarantine"
-                );
-            }
             counters.marked_unmined += 1;
             writes.push(state);
         }
@@ -839,11 +743,6 @@ pub fn mine_and_store_routines(
                     state_rows_created: state_counters.created,
                     state_rows_updated: state_counters.updated,
                     state_rows_marked_unmined: state_counters.marked_unmined,
-                    state_rows_identity_quarantined: state_counters.identity_quarantined,
-                    recurrence_findings: Vec::new(),
-                    recurrence_notifications_matched: 0,
-                    recurrence_notifications_queued: 0,
-                    recurrence_notifications_dropped: 0,
                     dry_run: params.dry_run,
                     routines: Vec::new(),
                 });
@@ -883,7 +782,6 @@ pub fn mine_and_store_routines(
     let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
     let mut deleted = 0_u64;
     let mut state_counters = StateReconcileCounters::default();
-    let mut recurrence_findings = Vec::new();
     if params.dry_run {
         tracing::info!(
             code = "ROUTINE_MINE_DRY_RUN",
@@ -893,7 +791,6 @@ pub fn mine_and_store_routines(
             "routine_mine dry run computed without mutating CF_ROUTINES"
         );
     } else {
-        let recurrence_candidates = project_routine_recurrence_series(db, &mining.routines)?;
         let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
         deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         db.mutate_batch_pressure_bypass(cf::CF_ROUTINES, stale_keys, new_rows)
@@ -910,27 +807,6 @@ pub fn mine_and_store_routines(
         // this reconcile fails the error is loud, lifecycle rows are intact,
         // and the next mining run repairs the presence bookkeeping.
         state_counters = reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
-        for candidate in recurrence_candidates {
-            let Some(state) = load_state_row(db, &candidate.subject_id)? else {
-                return Err(internal(format!(
-                    "CALYX_ROUTINE_RECURRENCE_STATE_MISSING: reconciled routine={} has no CF_ROUTINE_STATE row",
-                    candidate.subject_id
-                )));
-            };
-            if state.lifecycle != RoutineLifecycle::Confirmed {
-                continue;
-            }
-            let persisted = db
-                .persist_recurrence_finding(&candidate)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            recurrence_findings.push(RoutineRecurrenceFinding {
-                routine_id: persisted.subject_id,
-                subject_cx_id: persisted.subject_cx_id,
-                occurrence_id: persisted.occurrence_id,
-                frequency: persisted.frequency,
-                observed_seq: persisted.observed_seq,
-            });
-        }
         reindex_armed_routine_schedule_due_indexes(db)?;
         tracing::info!(
             code = "ROUTINE_MINE_REPLACED",
@@ -943,7 +819,6 @@ pub fn mine_and_store_routines(
             state_rows_created = state_counters.created,
             state_rows_updated = state_counters.updated,
             state_rows_marked_unmined = state_counters.marked_unmined,
-            state_rows_identity_quarantined = state_counters.identity_quarantined,
             "routine_mine replaced the routine store"
         );
     }
@@ -971,80 +846,9 @@ pub fn mine_and_store_routines(
         state_rows_created: state_counters.created,
         state_rows_updated: state_counters.updated,
         state_rows_marked_unmined: state_counters.marked_unmined,
-        state_rows_identity_quarantined: state_counters.identity_quarantined,
-        recurrence_findings,
-        recurrence_notifications_matched: 0,
-        recurrence_notifications_queued: 0,
-        recurrence_notifications_dropped: 0,
         dry_run: params.dry_run,
         routines: mining.routines,
     })
-}
-
-fn project_routine_recurrence_series(
-    db: &Db,
-    routines: &[RoutineRecord],
-) -> Result<Vec<SynapseCalyxPersistedRecurrenceFinding>, ErrorData> {
-    let mut inserted = Vec::new();
-    for routine in routines {
-        for evidence in &routine.evidence {
-            let event_time_ns = evidence
-                .day_start_ns
-                .checked_add(u64::from(evidence.minute_of_day).saturating_mul(60_000_000_000))
-                .ok_or_else(|| {
-                    internal(format!(
-                        "CALYX_ROUTINE_RECURRENCE_TIME_OVERFLOW: routine={} day_start_ns={} minute_of_day={}",
-                        routine.routine_id, evidence.day_start_ns, evidence.minute_of_day
-                    ))
-                })?;
-            let occurrence_identity = serde_json::to_vec(evidence).map_err(|error| {
-                internal(format!(
-                    "CALYX_ROUTINE_RECURRENCE_IDENTITY_ENCODE_FAILED: routine={} day_start_ns={}: {error}",
-                    routine.routine_id, evidence.day_start_ns
-                ))
-            })?;
-            let context = serde_json::to_vec(&serde_json::json!({
-                "routine_id": routine.routine_id,
-                "day_start_ns": evidence.day_start_ns,
-                "minute_of_day": evidence.minute_of_day,
-            }))
-            .map_err(|error| {
-                internal(format!(
-                    "CALYX_ROUTINE_RECURRENCE_CONTEXT_ENCODE_FAILED: routine={} day_start_ns={}: {error}",
-                    routine.routine_id, evidence.day_start_ns
-                ))
-            })?;
-            let report = db.put_recurrence_subject_occurrence(
-                RecurrenceSubjectKind::Routine,
-                &routine.routine_id,
-                event_time_ns,
-                &occurrence_identity,
-                &context,
-            )
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "CALYX_ROUTINE_RECURRENCE_PROJECTION_FAILED: routine={} day_start_ns={} minute_of_day={}: {error}; CF_ROUTINES was not replaced",
-                        routine.routine_id, evidence.day_start_ns, evidence.minute_of_day
-                    ),
-                )
-            })?;
-            if report.occurrence.disposition == SynapseCalyxRecurrenceAppendDisposition::Inserted
-                && report.occurrence.frequency >= 2
-            {
-                inserted.push(SynapseCalyxPersistedRecurrenceFinding {
-                    subject_kind: report.subject_kind,
-                    subject_id: report.subject_id,
-                    subject_cx_id: report.subject_cx_id,
-                    occurrence_id: report.occurrence.occurrence_id,
-                    frequency: report.occurrence.frequency,
-                    observed_seq: report.occurrence.latest_seq,
-                });
-            }
-        }
-    }
-    Ok(inserted)
 }
 
 /// Default and maximum `routine_list` page sizes.
@@ -1061,7 +865,6 @@ fn synthesized_default_state(routine: &RoutineRecord) -> RoutineStateRecord {
         record_version: ROUTINE_STATE_RECORD_VERSION,
         routine_id: routine.routine_id.clone(),
         lifecycle: RoutineLifecycle::Candidate,
-        identity_lock: None,
         label: None,
         created_ts_ns: routine.ts_ns,
         updated_ts_ns: routine.ts_ns,
@@ -1233,52 +1036,6 @@ pub struct RoutineInspectResponse {
     /// Armed auto-run state written by `routine_update action=arm|disarm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed: Option<ArmedRoutineRecord>,
-    /// Oracle prediction derived from the physical native recurrence series.
-    /// Present only for an explicitly confirmed, currently mined identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_occurrence: Option<RoutineNextOccurrence>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutineNextOccurrenceStatus {
-    Predicted,
-    Insufficient,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RoutineNextOccurrence {
-    pub source_of_truth: &'static str,
-    pub status: RoutineNextOccurrenceStatus,
-    pub recurrence_cx_id: String,
-    pub latest_seq: u64,
-    pub support: u64,
-    pub active_support: u64,
-    pub rolled_support: u64,
-    pub tz_offset_secs: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predicted_at_secs: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_low_secs: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_high_secs: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cadence_secs: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cadence_mad_secs: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence_ceiling: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub periodic_confidence: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refusal_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remediation: Option<String>,
 }
 
 /// Lifecycle operations accepted by `routine_update`.
@@ -1594,14 +1351,6 @@ pub fn inspect_routine(
     let tainted = taint.is_some();
     let automation = load_routine_automation_record(db, &params.routine_id)?;
     let armed = load_armed_routine_record(db, &params.routine_id)?;
-    let next_occurrence = if state.lifecycle == RoutineLifecycle::Confirmed {
-        record
-            .as_ref()
-            .map(|record| predict_routine_next_occurrence(db, record))
-            .transpose()?
-    } else {
-        None
-    };
     Ok(RoutineInspectResponse {
         routine_id: params.routine_id.clone(),
         mined: record.is_some(),
@@ -1612,98 +1361,7 @@ pub fn inspect_routine(
         taint,
         automation,
         armed,
-        next_occurrence,
     })
-}
-
-pub(crate) fn predict_routine_next_occurrence(
-    db: &Db,
-    record: &RoutineRecord,
-) -> Result<RoutineNextOccurrence, ErrorData> {
-    let readback = db
-        .read_recurrence_subject_series(RecurrenceSubjectKind::Routine, &record.routine_id)
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "CALYX_ORACLE_STORAGE_READ_FAILURE: failed to read the physical routine recurrence series for {}: {error}; remediation: repair the recurrence projection and rerun routine_mine before prediction",
-                    record.routine_id
-                ),
-            )
-        })?;
-    let series = &readback.series.series;
-    let active_support = u64::try_from(series.occurrences.len()).unwrap_or(u64::MAX);
-    let support = series.frequency.max(active_support);
-    let rolled_support = support.saturating_sub(active_support);
-    let tz_offset_secs = Local::now().offset().local_minus_utc();
-    let confidence_ceiling = record.confidence.to_f32().filter(|value| {
-        value.is_finite() && (0.0..=1.0).contains(value)
-    }).ok_or_else(|| {
-        mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "CALYX_ORACLE_CONFIDENCE_CEILING_INVALID: routine {} persisted confidence {} cannot be represented as a finite f32 in [0,1]; remediation: repair the corrupt routine row and rerun routine_mine",
-                record.routine_id, record.confidence
-            ),
-        )
-    })?;
-    match calyx_oracle::predict_next_occurrence_from_series_with_tz_offset(
-        series,
-        confidence_ceiling,
-        tz_offset_secs,
-    ) {
-        Ok(prediction) => Ok(RoutineNextOccurrence {
-            source_of_truth: "Calyx native Recurrence CF series",
-            status: RoutineNextOccurrenceStatus::Predicted,
-            recurrence_cx_id: readback.cx_id,
-            latest_seq: readback.latest_seq,
-            support: u64::try_from(prediction.support).unwrap_or(u64::MAX),
-            active_support: u64::try_from(prediction.active_support).unwrap_or(u64::MAX),
-            rolled_support: prediction.rolled_support,
-            tz_offset_secs: prediction.tz_offset_secs,
-            predicted_at_secs: Some(prediction.t_hat.0),
-            interval_low_secs: Some(prediction.interval.low.0),
-            interval_high_secs: Some(prediction.interval.high.0),
-            cadence_secs: Some(prediction.cadence_secs),
-            cadence_mad_secs: Some(prediction.cadence_mad_secs),
-            confidence: Some(prediction.confidence),
-            confidence_ceiling: Some(prediction.confidence_ceiling),
-            periodic_confidence: Some(prediction.periodic_confidence),
-            refusal_code: None,
-            refusal: None,
-            remediation: None,
-        }),
-        Err(error) if error.code == calyx_oracle::CALYX_ORACLE_INSUFFICIENT => {
-            Ok(RoutineNextOccurrence {
-                source_of_truth: "Calyx native Recurrence CF series",
-                status: RoutineNextOccurrenceStatus::Insufficient,
-                recurrence_cx_id: readback.cx_id,
-                latest_seq: readback.latest_seq,
-                support,
-                active_support,
-                rolled_support,
-                tz_offset_secs,
-                predicted_at_secs: None,
-                interval_low_secs: None,
-                interval_high_secs: None,
-                cadence_secs: None,
-                cadence_mad_secs: None,
-                confidence: None,
-                confidence_ceiling: Some(confidence_ceiling),
-                periodic_confidence: None,
-                refusal_code: Some(error.code.to_owned()),
-                refusal: Some(error.message),
-                remediation: Some(error.remediation.to_owned()),
-            })
-        }
-        Err(error) => Err(mcp_error(
-            error.code,
-            format!(
-                "routine {} next-occurrence prediction failed: {}; remediation: {}",
-                record.routine_id, error.message, error.remediation
-            ),
-        )),
-    }
 }
 
 /// Default and maximum sample occurrences carried in a label export.
@@ -1806,34 +1464,6 @@ fn step_identity(step: &RoutineStep) -> String {
         Some(document) => format!("{}:{document}", step.app),
         None => step.app.clone(),
     }
-}
-
-#[derive(Serialize)]
-struct RoutineIdentityProjection<'a> {
-    routine_id: &'a str,
-    granularity: RoutineGranularity,
-    steps: &'a [RoutineStep],
-    dow_class: &'a RoutineDowClass,
-    mean_minute_of_day: u32,
-    tolerance_minutes: u32,
-}
-
-fn routine_identity_sha256(record: &RoutineRecord) -> Result<String, ErrorData> {
-    let projection = RoutineIdentityProjection {
-        routine_id: &record.routine_id,
-        granularity: record.granularity,
-        steps: &record.steps,
-        dow_class: &record.dow_class,
-        mean_minute_of_day: record.mean_minute_of_day,
-        tolerance_minutes: record.tolerance_minutes,
-    };
-    let bytes = serde_json::to_vec(&projection).map_err(|error| {
-        internal(format!(
-            "ROUTINE_IDENTITY_ENCODE_FAILED: routine_id={} could not encode its canonical identity projection: {error}",
-            record.routine_id
-        ))
-    })?;
-    Ok(hex_encode(&Sha256::digest(bytes)))
 }
 
 fn render_dow_class(dow: &RoutineDowClass) -> String {
@@ -2291,9 +1921,9 @@ fn transition_target(
     action: RoutineUpdateAction,
     current: RoutineLifecycle,
 ) -> Result<RoutineLifecycle, ErrorData> {
-    use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled, Quarantined};
+    use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled};
     let target = match (action, current) {
-        (RoutineUpdateAction::Confirm, Candidate | Quarantined) => Confirmed,
+        (RoutineUpdateAction::Confirm, Candidate) => Confirmed,
         (RoutineUpdateAction::Disable, Candidate | Confirmed) => Disabled,
         (RoutineUpdateAction::Enable, Disabled | Archived) => Candidate,
         (RoutineUpdateAction::Archive, Candidate | Confirmed | Disabled) => Archived,
@@ -2302,7 +1932,7 @@ fn transition_target(
         (action, current) => {
             return Err(invalid(format!(
                 "ROUTINE_TRANSITION_INVALID: action {action:?} is not legal from lifecycle \
-                 {current:?} (confirm: candidate|quarantined→confirmed; disable: candidate|confirmed→\
+                 {current:?} (confirm: candidate→confirmed; disable: candidate|confirmed→\
                  disabled; enable: disabled|archived→candidate; archive: candidate|confirmed|\
                  disabled→archived)"
             )));
@@ -2486,22 +2116,6 @@ pub fn update_routine(
 
     let now = now_ts_ns();
     state.lifecycle = lifecycle_after;
-    if params.action == RoutineUpdateAction::Confirm {
-        let record = load_routine_record(db, &params.routine_id)?.ok_or_else(|| {
-            invalid(format!(
-                "ROUTINE_IDENTITY_SOURCE_ABSENT: routine_id {} cannot be confirmed because its canonical CF_ROUTINES row is absent; run routine_mine and inspect the derived identity first",
-                params.routine_id
-            ))
-        })?;
-        let canonical_sha256 = routine_identity_sha256(&record)?;
-        state.identity_lock = Some(RoutineIdentityLock {
-            canonical_sha256: canonical_sha256.clone(),
-            confirmed_ts_ns: now,
-            confirmed_by: by_session.to_owned(),
-            last_observed_sha256: canonical_sha256,
-            last_verified_ts_ns: now,
-        });
-    }
     state.label.clone_from(&label_after);
     state.updated_ts_ns = now;
     push_transition(
@@ -2530,14 +2144,13 @@ pub fn update_routine(
 
     // Read-your-write against the physical row: the response carries what
     // storage actually holds, never just the in-memory value.
-    let (state_key, state_value, readback) = load_state_row_with_raw(db, &params.routine_id)?
-        .ok_or_else(|| {
-            internal(format!(
-                "ROUTINE_STATE_READBACK_MISSING: CF_ROUTINE_STATE row for {} vanished immediately \
+    let readback = load_state_row(db, &params.routine_id)?.ok_or_else(|| {
+        internal(format!(
+            "ROUTINE_STATE_READBACK_MISSING: CF_ROUTINE_STATE row for {} vanished immediately \
              after a flushed write",
-                params.routine_id
-            ))
-        })?;
+            params.routine_id
+        ))
+    })?;
     if readback != state {
         return Err(internal(format!(
             "ROUTINE_STATE_READBACK_MISMATCH: CF_ROUTINE_STATE row for {} does not match the \
@@ -2545,7 +2158,6 @@ pub fn update_routine(
             params.routine_id, state.lifecycle, readback.lifecycle
         )));
     }
-    anchor_routine_transition(db, &state_key, &state_value, &readback, params.action, now)?;
 
     tracing::info!(
         code = "ROUTINE_LIFECYCLE_TRANSITION",
@@ -2574,182 +2186,342 @@ pub fn update_routine(
     })
 }
 
-fn anchor_routine_transition(
-    db: &Arc<Db>,
-    state_key: &[u8],
-    state_value: &[u8],
-    state: &RoutineStateRecord,
-    action: RoutineUpdateAction,
-    transition_ts_ns: u64,
-) -> Result<(), ErrorData> {
-    let Some(anchor_value) = routine_transition_anchor_value(action) else {
-        return Ok(());
-    };
-    let observed_at_ms = grounding::observed_at_ms_from_ns(transition_ts_ns);
-    let state_record_value = serde_json::to_value(state).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "routine state anchor projection failed to serialize routine {}: {error}",
-                state.routine_id
-            ),
-        )
-    })?;
-    let state_report = grounding::write_outcome_constellation_and_anchor(
-        db,
-        cf::CF_ROUTINE_STATE,
-        state_key,
-        state_value,
-        &state_record_value,
-        grounding::enum_anchor(
-            "synapse:routine_transition",
-            anchor_value,
-            SOURCE_OPERATOR,
-            observed_at_ms,
-        ),
-        "routine state anchor",
-    )?;
-    tracing::info!(
-        code = "ROUTINE_STATE_ANCHORED",
-        routine_id = %state.routine_id,
-        action = ?action,
-        source_key_hex = %state_report.source_key_hex,
-        cx_id = %state_report.cx_id,
-        ledger_seq = state_report.ledger_seq,
-        "routine transition grounded on routine state constellation"
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let Some(routine) = load_routine_record(db, &state.routine_id)? else {
-        tracing::warn!(
-            code = "ROUTINE_EVIDENCE_ANCHOR_SKIPPED_NO_DERIVED_ROW",
-            routine_id = %state.routine_id,
-            "routine transition state was anchored, but no current CF_ROUTINES row exists for evidence episodes"
-        );
-        return Ok(());
-    };
-    let episode_rows = routine_evidence_episode_rows(db, &routine)?;
-    let evidence_kind = format!(
-        "synapse:routine_evidence_transition:{}:{}",
-        state.routine_id, transition_ts_ns
-    );
-    for (episode_key, episode_value, episode) in episode_rows {
-        db.put_episode_constellation(&episode_key, &episode_value, &episode)
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "routine evidence anchor failed to ensure episode constellation for routine {} episode {}: {error}",
-                        state.routine_id, episode.episode_id
-                    ),
-                )
-            })?;
-        let report = grounding::write_anchor_for_existing_constellation(
-            db,
-            cf::CF_EPISODES,
-            &episode_key,
-            &episode_value,
-            grounding::enum_anchor(
-                evidence_kind.clone(),
-                anchor_value,
-                SOURCE_OPERATOR,
-                observed_at_ms,
-            ),
-            "routine evidence episode anchor",
-        )?;
-        tracing::info!(
-            code = "ROUTINE_EVIDENCE_EPISODE_ANCHORED",
-            routine_id = %state.routine_id,
-            episode_id = %episode.episode_id,
-            action = ?action,
-            source_key_hex = %report.source_key_hex,
-            cx_id = %report.cx_id,
-            ledger_seq = report.ledger_seq,
-            "routine transition grounded on evidence episode constellation"
-        );
-    }
-    Ok(())
-}
-
-fn routine_transition_anchor_value(action: RoutineUpdateAction) -> Option<&'static str> {
-    match action {
-        RoutineUpdateAction::Confirm => Some("confirmed"),
-        RoutineUpdateAction::Disable => Some("disabled"),
-        RoutineUpdateAction::Rename => Some("labeled"),
-        RoutineUpdateAction::Enable
-        | RoutineUpdateAction::Archive
-        | RoutineUpdateAction::Arm
-        | RoutineUpdateAction::Disarm => None,
-    }
-}
-
-fn routine_evidence_episode_rows(
-    db: &Db,
-    routine: &RoutineRecord,
-) -> Result<Vec<EpisodeEvidenceRow>, ErrorData> {
-    let mut episode_ids = routine
-        .evidence
-        .iter()
-        .flat_map(|evidence| evidence.episode_ids.iter().cloned())
-        .collect::<Vec<_>>();
-    episode_ids.sort();
-    episode_ids.dedup();
-    if episode_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let targets = episode_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut found = BTreeMap::new();
-    let mut scanned = 0_usize;
-    let mut start = Vec::new();
-    loop {
-        if scanned >= MAX_SCAN_ROWS_PER_CALL {
-            return Err(mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "routine evidence anchor scan exhausted {MAX_SCAN_ROWS_PER_CALL} CF_EPISODES rows before finding all evidence for routine {}",
-                    routine.routine_id
-                ),
-            ));
-        }
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        for (key, value) in &rows {
-            scanned = scanned.saturating_add(1);
-            let (_day_start, _ordinal, episode) = decode_episode_row(key, value)?;
-            if targets.contains(&episode.episode_id) {
-                found.insert(
-                    episode.episode_id.clone(),
-                    (key.clone(), value.clone(), episode),
-                );
-            }
-        }
-        if found.len() == targets.len() || !more {
-            break;
-        }
-        let Some((last, _value)) = rows.last() else {
-            break;
+    #[test]
+    fn params_validation_rejects_out_of_range_values() {
+        let reject = |params: RoutineMineParams, fragment: &str| {
+            let error = build_config(&params).expect_err(fragment);
+            assert!(
+                error.message.contains(fragment),
+                "expected {fragment:?} in {:?}",
+                error.message
+            );
         };
-        start = key_after(last);
+        reject(
+            RoutineMineParams {
+                min_support_days: Some(0),
+                ..RoutineMineParams::default()
+            },
+            "min_support_days",
+        );
+        reject(
+            RoutineMineParams {
+                min_support_days: Some(MIN_SUPPORT_DAYS_LIMIT + 1),
+                ..RoutineMineParams::default()
+            },
+            "min_support_days",
+        );
+        reject(
+            RoutineMineParams {
+                max_pattern_len: Some(0),
+                ..RoutineMineParams::default()
+            },
+            "max_pattern_len",
+        );
+        reject(
+            RoutineMineParams {
+                max_pattern_len: Some(MAX_PATTERN_LEN_LIMIT + 1),
+                ..RoutineMineParams::default()
+            },
+            "max_pattern_len",
+        );
+        reject(
+            RoutineMineParams {
+                min_episode_duration_ms: Some(86_400_001),
+                ..RoutineMineParams::default()
+            },
+            "min_episode_duration_ms",
+        );
     }
-    if found.len() != targets.len() {
-        let missing = targets
-            .into_iter()
-            .filter(|episode_id| !found.contains_key(episode_id))
-            .collect::<Vec<_>>();
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "routine {} evidence references missing CF_EPISODES rows: {}",
-                routine.routine_id,
-                missing.join(", ")
-            ),
-        ));
+
+    #[test]
+    fn params_map_onto_engine_config() {
+        let params = RoutineMineParams {
+            min_support_days: Some(2),
+            min_episode_duration_ms: Some(30_000),
+            max_pattern_len: Some(4),
+            include_agent_activity: true,
+            ..RoutineMineParams::default()
+        };
+        let config = build_config(&params).expect("valid params");
+        assert_eq!(config.min_support_days, 2);
+        assert_eq!(config.min_episode_duration_ns, 30_000_000_000);
+        assert_eq!(config.max_pattern_len, 4);
+        assert!(config.include_agent_activity);
+        let defaults = build_config(&RoutineMineParams::default()).expect("defaults");
+        assert_eq!(defaults, RoutineMiningConfig::default());
     }
-    Ok(found.into_values().collect())
+
+    fn state_fixture(lifecycle: RoutineLifecycle) -> RoutineStateRecord {
+        RoutineStateRecord {
+            record_version: ROUTINE_STATE_RECORD_VERSION,
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            lifecycle,
+            label: None,
+            created_ts_ns: 1,
+            updated_ts_ns: 1,
+            last_mined_ts_ns: Some(1),
+            present_in_last_mine: true,
+            transitions: Vec::new(),
+            transitions_truncated: 0,
+            confidence_history: Vec::new(),
+            confidence_history_truncated: 0,
+            feedback_events: Vec::new(),
+            feedback_events_truncated: 0,
+            accept_count: 0,
+            decline_count: 0,
+            ignore_count: 0,
+            abandon_count: 0,
+            consecutive_declines: 0,
+            cooldown_level: 0,
+            cooldown_until_ts_ns: None,
+        }
+    }
+
+    #[test]
+    fn feedback_cooldown_escalates_geometrically_and_caps() {
+        // No streak -> no cooldown.
+        assert_eq!(feedback_cooldown_secs(0), 0);
+        // base, base*6, base*36, ... then hard cap at 14 days.
+        assert_eq!(feedback_cooldown_secs(1), FEEDBACK_COOLDOWN_BASE_SECS);
+        assert_eq!(
+            feedback_cooldown_secs(2),
+            FEEDBACK_COOLDOWN_BASE_SECS * FEEDBACK_COOLDOWN_MULTIPLIER
+        );
+        assert_eq!(
+            feedback_cooldown_secs(3),
+            FEEDBACK_COOLDOWN_BASE_SECS
+                * FEEDBACK_COOLDOWN_MULTIPLIER
+                * FEEDBACK_COOLDOWN_MULTIPLIER
+        );
+        // Monotonic non-decreasing and never above the cap, even for a huge streak.
+        let mut prev = 0;
+        for streak in 0..40 {
+            let secs = feedback_cooldown_secs(streak);
+            assert!(
+                secs >= prev,
+                "cooldown must not decrease as the streak grows"
+            );
+            assert!(
+                secs <= FEEDBACK_COOLDOWN_CAP_SECS,
+                "cooldown must respect the cap"
+            );
+            prev = secs;
+        }
+        assert_eq!(feedback_cooldown_secs(40), FEEDBACK_COOLDOWN_CAP_SECS);
+    }
+
+    #[test]
+    fn feedback_acceptance_lower_bound_is_honest_and_suppression_tracks_cooldown() {
+        let mut state = state_fixture(RoutineLifecycle::Candidate);
+        // No trials yet -> unknown, never a forced zero.
+        assert_eq!(feedback_acceptance_lower_bound(&state), None);
+        assert!(!feedback_suppressed(&state, 1_000));
+
+        // One decline: Wilson lower bound of 0/1 is 0 (honestly suppressive),
+        // and the cooldown window makes the routine suppressed inside it.
+        state.decline_count = 1;
+        state.cooldown_until_ts_ns = Some(10_000);
+        let lb = feedback_acceptance_lower_bound(&state).expect("trials exist");
+        assert!(lb.abs() < 1e-9, "0/1 accepts -> ~0 lower bound, got {lb}");
+        assert!(
+            feedback_suppressed(&state, 9_999),
+            "before deadline -> suppressed"
+        );
+        assert!(
+            !feedback_suppressed(&state, 10_000),
+            "at deadline -> not suppressed"
+        );
+
+        // Accepts recover: the lower bound rises monotonically with successes.
+        let lb_1_of_2 = {
+            let mut s = state.clone();
+            s.accept_count = 1;
+            feedback_acceptance_lower_bound(&s).unwrap()
+        };
+        let lb_5_of_6 = {
+            let mut s = state.clone();
+            s.accept_count = 5;
+            s.decline_count = 1;
+            feedback_acceptance_lower_bound(&s).unwrap()
+        };
+        assert!(
+            lb_5_of_6 > lb_1_of_2,
+            "more accepts -> higher acceptance bound"
+        );
+        assert!(lb_1_of_2 > lb, "any accept lifts the bound off zero");
+    }
+
+    #[test]
+    fn transition_targets_enforce_the_lifecycle_state_machine() {
+        use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled};
+        use RoutineUpdateAction::{Archive, Confirm, Disable, Enable, Rename};
+        let legal = [
+            (Confirm, Candidate, Confirmed),
+            (Disable, Candidate, Disabled),
+            (Disable, Confirmed, Disabled),
+            (Enable, Disabled, Candidate),
+            (Enable, Archived, Candidate),
+            (Archive, Candidate, Archived),
+            (Archive, Confirmed, Archived),
+            (Archive, Disabled, Archived),
+            (Rename, Candidate, Candidate),
+            (Rename, Archived, Archived),
+        ];
+        for (action, from, to) in legal {
+            let target = transition_target(action, from).expect("legal transition");
+            println!("transition action={action:?} from={from:?} to={target:?}");
+            assert_eq!(target, to);
+        }
+        let illegal = [
+            (Confirm, Confirmed),
+            (Confirm, Disabled),
+            (Confirm, Archived),
+            (Disable, Disabled),
+            (Disable, Archived),
+            (Enable, Candidate),
+            (Enable, Confirmed),
+            (Archive, Archived),
+        ];
+        for (action, from) in illegal {
+            let error = transition_target(action, from).expect_err("illegal transition");
+            assert!(
+                error.message.contains("ROUTINE_TRANSITION_INVALID"),
+                "{action:?} from {from:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn update_field_validation_enforces_label_and_note_rules() {
+        let base = |action| RoutineUpdateParams {
+            routine_id: "rt1-0123456789abcdef".to_owned(),
+            action,
+            label: None,
+            note: None,
+            arm_schedule: None,
+            arm_intent: None,
+            failure_threshold: None,
+        };
+        let mut rename_missing_label = base(RoutineUpdateAction::Rename);
+        let error = validate_update_fields(&rename_missing_label).expect_err("label required");
+        assert!(
+            error.message.contains("requires a label"),
+            "{}",
+            error.message
+        );
+        rename_missing_label.label = Some("  ".to_owned());
+        let error = validate_update_fields(&rename_missing_label).expect_err("blank label");
+        assert!(error.message.contains("not be blank"), "{}", error.message);
+        rename_missing_label.label = Some("a".repeat(MAX_LABEL_CHARS + 1));
+        let error = validate_update_fields(&rename_missing_label).expect_err("label too long");
+        assert!(error.message.contains("at most"), "{}", error.message);
+        rename_missing_label.label = Some("tab\tname".to_owned());
+        let error = validate_update_fields(&rename_missing_label).expect_err("control chars");
+        assert!(error.message.contains("control"), "{}", error.message);
+
+        let mut confirm_with_label = base(RoutineUpdateAction::Confirm);
+        confirm_with_label.label = Some("nope".to_owned());
+        let error = validate_update_fields(&confirm_with_label).expect_err("label rejected");
+        assert!(
+            error.message.contains("only valid for action=rename"),
+            "{}",
+            error.message
+        );
+
+        let mut long_note = base(RoutineUpdateAction::Disable);
+        long_note.note = Some("n".repeat(MAX_NOTE_CHARS + 1));
+        let error = validate_update_fields(&long_note).expect_err("note too long");
+        assert!(error.message.contains("at most"), "{}", error.message);
+
+        let mut valid_rename = base(RoutineUpdateAction::Rename);
+        valid_rename.label = Some("Morning report".to_owned());
+        valid_rename.note = Some("named after review".to_owned());
+        validate_update_fields(&valid_rename).expect("valid rename");
+    }
+
+    #[test]
+    fn transition_and_confidence_caps_are_loud() {
+        let mut state = state_fixture(RoutineLifecycle::Candidate);
+        for index in 0..(ROUTINE_STATE_MAX_TRANSITIONS as u64 + 5) {
+            push_transition(
+                &mut state,
+                RoutineTransition {
+                    ts_ns: index,
+                    action: RoutineStateAction::Rename,
+                    from: Some(RoutineLifecycle::Candidate),
+                    to: RoutineLifecycle::Candidate,
+                    by: "test".to_owned(),
+                    label_before: None,
+                    label_after: None,
+                    note: None,
+                },
+            );
+        }
+        println!(
+            "transitions len={} truncated={} oldest_ts={}",
+            state.transitions.len(),
+            state.transitions_truncated,
+            state.transitions[0].ts_ns
+        );
+        assert_eq!(state.transitions.len(), ROUTINE_STATE_MAX_TRANSITIONS);
+        assert_eq!(state.transitions_truncated, 5);
+        assert_eq!(state.transitions[0].ts_ns, 5);
+
+        let mut state = state_fixture(RoutineLifecycle::Candidate);
+        for index in 0..(ROUTINE_STATE_MAX_CONFIDENCE_POINTS as u64 + 3) {
+            #[allow(clippy::cast_precision_loss)]
+            let appended = push_confidence_point(
+                &mut state,
+                RoutineConfidencePoint {
+                    ts_ns: index,
+                    confidence: index as f64 / 1_000.0,
+                    support_days: 3,
+                    opportunity_days: 10,
+                },
+            );
+            assert!(appended, "distinct points must append");
+        }
+        assert_eq!(
+            state.confidence_history.len(),
+            ROUTINE_STATE_MAX_CONFIDENCE_POINTS
+        );
+        assert_eq!(state.confidence_history_truncated, 3);
+        // An identical observation is a heartbeat, not a change-point.
+        let last = state.confidence_history.last().expect("non-empty").clone();
+        let appended = push_confidence_point(
+            &mut state,
+            RoutineConfidencePoint {
+                ts_ns: last.ts_ns + 1,
+                confidence: last.confidence,
+                support_days: last.support_days,
+                opportunity_days: last.opportunity_days,
+            },
+        );
+        assert!(!appended, "identical observation must not append");
+        assert_eq!(
+            state.confidence_history.len(),
+            ROUTINE_STATE_MAX_CONFIDENCE_POINTS
+        );
+    }
+
+    #[test]
+    fn weekday_helper_matches_chrono() {
+        // 2026-06-08 was a Monday; local midnight of any instant that day
+        // must map to weekday 0 in the local calendar.
+        let monday_noon_utc = 1_780_920_000_000_000_000_u64; // 2026-06-08T12:00:00Z
+        let day_start = local_day_start(monday_noon_utc).expect("day start");
+        let weekday = weekday_of_day_start(day_start).expect("weekday");
+        println!("weekday_helper day_start={day_start} weekday={weekday}");
+        assert!(weekday <= 6);
+        let ts = i64::try_from(day_start).expect("fits");
+        assert_eq!(
+            u32::from(weekday),
+            Local.timestamp_nanos(ts).weekday().num_days_from_monday()
+        );
+    }
 }

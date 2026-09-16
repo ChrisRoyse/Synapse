@@ -24,13 +24,22 @@
                the Windows-side MCP clients, then verifies `health`.
 
   WHY THIS WRAPPER EXISTS (vs. running the installer directly):
+    * The RocksDB dependency (librocksdb-sys -> bindgen) needs libclang.dll on
+      PATH at BUILD time. Without it the build dies with a cryptic
+      STATUS_DLL_NOT_FOUND (0xC0000135). This script auto-discovers libclang on
+      ANY Windows machine — from a Visual Studio / Build Tools install (the
+      bundled "C++ Clang tools for Windows" component) or a standalone LLVM —
+      and puts it on PATH for the build. libclang is a BUILD-TIME-ONLY
+      dependency; the running daemon never needs it.
     * It adds the `git pull` that the installer intentionally does not do.
     * It sizes the build to the FULL machine. Cargo normally uses all logical
       CPUs, but a user-level ~/.cargo/config.toml `[build] jobs = N` cap
       silently serializes the build on any machine that has one (a jobs=1 cap
-      once turned native dependency builds into long serial waits). This script
-      sets CARGO_BUILD_JOBS — which outranks every config file — to the host's
-      logical CPU count, RAM-guarded so low-memory machines don't swap.
+      once turned the ~3-minute parallel RocksDB C++ compile into 15-20
+      minutes). This script sets CARGO_BUILD_JOBS — which outranks every
+      config file — to the host's logical CPU count, RAM-guarded so low-memory
+      machines don't swap. Cargo forwards the value to build scripts as
+      NUM_JOBS, which the `cc` crate uses to parallelize RocksDB's C++ build.
 
   PORTABILITY: nothing here is machine-specific. The repo location is the
   script's own folder, Visual Studio is located via the standard `vswhere`,
@@ -39,9 +48,18 @@
 
   PREREQUISITES (the script checks and tells you exactly what is missing):
     * git, and a Rust toolchain (rustup/cargo) — https://rustup.rs
+    * A C++ build toolchain with libclang. Easiest: install "Visual Studio
+      Build Tools" with the "Desktop development with C++" workload AND the
+      "C++ Clang tools for Windows" component. Or install LLVM
+      (winget install LLVM.LLVM) so libclang.dll exists on the machine.
 
 .PARAMETER NoPull
   Skip the git pull and just rebuild/reconnect from the current checkout.
+
+.PARAMETER NoPersistEnv
+  Do not persist LIBCLANG_PATH to the user environment (it is still set for
+  this run). By default the discovered libclang dir is saved to the USER
+  environment (no admin required) so future builds find it automatically.
 
 .PARAMETER SetupArgs
   Any remaining arguments are forwarded verbatim to scripts/synapse-setup.ps1
@@ -57,6 +75,7 @@
 [CmdletBinding()]
 param(
     [switch]$NoPull,
+    [switch]$NoPersistEnv,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$SetupArgs
 )
@@ -103,11 +122,69 @@ if ($NoPull) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. BUILD PARALLELISM — size the build to the full machine, on any machine.
+# 2. libclang discovery — required on PATH for the RocksDB build script.
+#    Looks (in order): existing valid LIBCLANG_PATH, Visual Studio / Build
+#    Tools (via vswhere), then common standalone LLVM install locations.
+# ---------------------------------------------------------------------------
+function Find-LibClangDir {
+    # a) Already configured and valid.
+    if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+        return $env:LIBCLANG_PATH
+    }
+    # b) Visual Studio / Build Tools bundled clang, located version-agnostically.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $hits = & $vswhere -latest -prerelease -products * -find 'VC\Tools\Llvm\x64\bin\libclang.dll' 2>$null
+        foreach ($hit in $hits) {
+            if ($hit -and (Test-Path $hit)) { return (Split-Path $hit -Parent) }
+        }
+    }
+    # c) Common standalone LLVM locations.
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'LLVM\bin\libclang.dll'),
+        (Join-Path ${env:ProgramFiles(x86)} 'LLVM\bin\libclang.dll'),
+        (Join-Path $env:USERPROFILE 'scoop\apps\llvm\current\bin\libclang.dll'),
+        'C:\ProgramData\chocolatey\lib\llvm\tools\LLVM\bin\libclang.dll'
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return (Split-Path $c -Parent) }
+    }
+    return $null
+}
+
+Step "Locating libclang (build-time dependency for RocksDB)"
+$llvmDir = Find-LibClangDir
+if (-not $llvmDir) {
+    Die @"
+Could not find libclang.dll on this machine. The RocksDB build needs it.
+Fix it with EITHER of these, then re-run:
+  * Visual Studio / Build Tools: in the Visual Studio Installer add the
+    'C++ Clang tools for Windows' component (under 'Desktop development with C++').
+  * Standalone LLVM:  winget install LLVM.LLVM
+"@
+}
+Info "libclang: $llvmDir"
+# Set on PATH + LIBCLANG_PATH for THIS process so the child cargo build (run by
+# synapse-setup.ps1) inherits it. A freshly spawned shell does NOT inherit a
+# registry edit made after that shell started, so in-process is what matters.
+$env:LIBCLANG_PATH = $llvmDir
+if (($env:PATH -split ';') -notcontains $llvmDir) { $env:PATH = "$llvmDir;$env:PATH" }
+# Persist to the USER environment (no admin) so future builds resolve it too.
+if (-not $NoPersistEnv) {
+    $userLib = [Environment]::GetEnvironmentVariable('LIBCLANG_PATH', 'User')
+    if ($userLib -ne $llvmDir) {
+        [Environment]::SetEnvironmentVariable('LIBCLANG_PATH', $llvmDir, 'User')
+        Info "Persisted LIBCLANG_PATH to user environment."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. BUILD PARALLELISM — size the build to the full machine, on any machine.
 #    CARGO_BUILD_JOBS (env) outranks any `[build] jobs = N` cap in a user or
 #    repo config.toml, so this guarantees full-core builds regardless of local
-#    cargo configuration. An explicit CARGO_BUILD_JOBS set by the caller for
-#    this session is honored untouched.
+#    cargo configuration. The value also reaches build scripts as NUM_JOBS,
+#    parallelizing the RocksDB C++ compile. An explicit CARGO_BUILD_JOBS set
+#    by the caller for this session is honored untouched.
 # ---------------------------------------------------------------------------
 Step "Sizing build parallelism"
 if ($env:CARGO_BUILD_JOBS) {
@@ -130,7 +207,7 @@ if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. BUILD + RECONNECT — hand off to the installer (build, install, restart the
+# 4. BUILD + RECONNECT — hand off to the installer (build, install, restart the
 #    auto-start daemon, re-wire MCP clients, verify health).
 # ---------------------------------------------------------------------------
 Step "Rebuilding and reconnecting (scripts\synapse-setup.ps1)"

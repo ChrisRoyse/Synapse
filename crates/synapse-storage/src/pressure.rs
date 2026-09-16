@@ -7,17 +7,22 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rocksdb::DB;
 use synapse_core::error_codes;
 
 use crate::{StorageError, StorageResult, cf};
 
+#[cfg(test)]
+use std::collections::VecDeque;
+
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const GB: u64 = 1_000_000_000;
-const LEVEL_1_FREE_BYTES: u64 = 15 * GB;
-const LEVEL_2_FREE_BYTES: u64 = 12 * GB;
-const LEVEL_3_FREE_BYTES: u64 = 10 * GB;
-const LEVEL_4_FREE_BYTES: u64 = 5 * GB;
-pub const PRESSURE_CF: &str = "storage_disk_pressure";
+const MB: u64 = 1_000_000;
+const LEVEL_1_FREE_BYTES: u64 = 2 * GB;
+const LEVEL_2_FREE_BYTES: u64 = GB;
+const LEVEL_3_FREE_BYTES: u64 = 500 * MB;
+const LEVEL_4_FREE_BYTES: u64 = 200 * MB;
+const PRESSURE_CF: &str = "storage_disk_pressure";
 const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 
 /// Current DB-volume pressure level.
@@ -59,7 +64,6 @@ impl DiskPressureLevel {
 #[derive(Debug)]
 pub struct PressureReport {
     pub free_bytes: u64,
-    pub total_bytes: Option<u64>,
     pub previous_level: DiskPressureLevel,
     pub current_level: DiskPressureLevel,
     pub emitted_code: Option<&'static str>,
@@ -71,7 +75,6 @@ pub struct PressureReport {
 pub struct PressureProbeReadback {
     pub observed: bool,
     pub last_free_bytes: Option<u64>,
-    pub last_total_bytes: Option<u64>,
     pub last_level: Option<DiskPressureLevel>,
     pub last_started_unix_ms: Option<u64>,
     pub last_completed_unix_ms: Option<u64>,
@@ -100,44 +103,6 @@ impl PressureTask {
     pub fn running(&self) -> bool {
         !self.handle.is_finished()
     }
-
-    /// Requests terminal shutdown and retains the exact task owner until any
-    /// already-started blocking pressure pass has completed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured storage error if the task failed before reaching
-    /// its terminal join boundary.
-    pub async fn shutdown(mut self) -> StorageResult<()> {
-        let shutdown_signal_sent = self
-            .shutdown
-            .take()
-            .is_some_and(|shutdown| shutdown.send(()).is_ok());
-        tracing::info!(
-            code = "STORAGE_MAINTENANCE_SHUTDOWN_REQUESTED",
-            task = "disk_pressure",
-            shutdown_signal_sent,
-            task_finished_before_join = self.handle.is_finished(),
-            "requested periodic storage-maintenance shutdown and retained its exact task owner"
-        );
-        let joined = (&mut self.handle).await;
-        match joined {
-            Ok(()) => {
-                tracing::info!(
-                    code = "STORAGE_MAINTENANCE_SHUTDOWN_JOINED",
-                    task = "disk_pressure",
-                    "periodic storage-maintenance task reached terminal state before vault close"
-                );
-                Ok(())
-            }
-            Err(error) => Err(StorageError::WriteFailed {
-                cf_name: "storage_maintenance".to_owned(),
-                detail: format!(
-                    "join periodic disk-pressure task before vault close: {error}; the task is terminal but shutdown is not clean"
-                ),
-            }),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -160,14 +125,25 @@ impl Default for PressureConfig {
     }
 }
 
-/// Physical compaction available to the disk-pressure monitor.
-///
-/// Implementations may rewrite or reclaim native storage files, but must not
-/// insert/delete logical rows or write MVCC tombstones (#2150). Logical
-/// retention belongs to [`crate::gc::GcRunner`], which keeps row-cap eviction
-/// and the reclamation of the versions it creates in one ordered operation.
-pub trait PressureCompaction: Send + Sync {
-    fn compact_native_for_pressure(&self) -> StorageResult<Vec<&'static str>>;
+#[cfg(test)]
+impl PressureConfig {
+    pub fn with_thresholds(
+        interval: Duration,
+        level1_free_bytes: u64,
+        level2_free_bytes: u64,
+        level3_free_bytes: u64,
+        level4_free_bytes: u64,
+    ) -> Self {
+        Self {
+            interval,
+            thresholds: PressureThresholds {
+                level1: level1_free_bytes,
+                level2: level2_free_bytes,
+                level3: level3_free_bytes,
+                level4: level4_free_bytes,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,20 +155,14 @@ struct PressureThresholds {
 }
 
 impl PressureThresholds {
-    fn level_for(self, free_bytes: u64, total_bytes: Option<u64>) -> DiskPressureLevel {
-        let percent_floor = |percent: u64| {
-            total_bytes
-                .unwrap_or_default()
-                .saturating_mul(percent)
-                .saturating_div(100)
-        };
-        if free_bytes < self.level4.max(percent_floor(5)) {
+    const fn level_for(self, free_bytes: u64) -> DiskPressureLevel {
+        if free_bytes < self.level4 {
             DiskPressureLevel::Level4
-        } else if free_bytes < self.level3.max(percent_floor(10)) {
+        } else if free_bytes < self.level3 {
             DiskPressureLevel::Level3
-        } else if free_bytes < self.level2.max(percent_floor(12)) {
+        } else if free_bytes < self.level2 {
             DiskPressureLevel::Level2
-        } else if free_bytes < self.level1.max(percent_floor(15)) {
+        } else if free_bytes < self.level1 {
             DiskPressureLevel::Level1
         } else {
             DiskPressureLevel::Normal
@@ -251,54 +221,67 @@ impl PressureState {
 }
 
 pub fn spawn(
+    db: Arc<DB>,
     state: Arc<PressureState>,
     path: PathBuf,
     config: PressureConfig,
-    compaction: Arc<dyn PressureCompaction>,
 ) -> StorageResult<PressureTask> {
-    spawn_with_probe(state, path, config, Arc::new(Fs2DiskProbe), compaction)
+    spawn_with_probe(db, state, path, config, Arc::new(Fs2DiskProbe))
 }
 
 pub fn run_once(
+    db: &DB,
     state: &PressureState,
     path: &Path,
     config: &PressureConfig,
-    compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
     let result = Fs2DiskProbe
-        .sample(path)
-        .and_then(|sample| apply_disk_sample(state, config, sample, compaction));
+        .available_space(path)
+        .and_then(|free_bytes| apply_free_bytes(db, state, config, free_bytes));
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
 
 pub fn run_once_with_free_bytes(
+    db: &DB,
     state: &PressureState,
     config: &PressureConfig,
     free_bytes: u64,
-    compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
-    let result = apply_disk_sample(
-        state,
-        config,
-        DiskSample {
-            free_bytes,
-            total_bytes: None,
-        },
-        compaction,
-    );
+    let result = apply_free_bytes(db, state, config, free_bytes);
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
 
+#[cfg(test)]
+pub fn spawn_with_free_bytes(
+    db: Arc<DB>,
+    state: Arc<PressureState>,
+    path: PathBuf,
+    config: PressureConfig,
+    values: Vec<u64>,
+) -> StorageResult<PressureTask> {
+    let fallback = values.last().copied().unwrap_or(u64::MAX);
+    spawn_with_probe(
+        db,
+        state,
+        path,
+        config,
+        Arc::new(SequenceDiskProbe {
+            values: Mutex::new(values.into_iter().collect()),
+            fallback,
+        }),
+    )
+}
+
 fn spawn_with_probe(
+    db: Arc<DB>,
     state: Arc<PressureState>,
     path: PathBuf,
     config: PressureConfig,
     probe: Arc<dyn DiskProbe>,
-    compaction: Arc<dyn PressureCompaction>,
 ) -> StorageResult<PressureTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
@@ -307,44 +290,21 @@ fn spawn_with_probe(
         })?;
     let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = handle.spawn(async move {
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + config.interval,
-            config.interval,
-        );
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut interval = tokio::time::interval(config.interval);
         loop {
             tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {
                     let started = mark_pressure_probe_started(&state);
-                    // A pressure transition can trigger a KV compaction that
-                    // runs for minutes. Admit the probe-and-apply pass onto the
-                    // dedicated blocking pool so it never parks a runtime worker
-                    // serving MCP requests (#1798).
-                    let tick_state = Arc::clone(&state);
-                    let tick_config = config.clone();
-                    let tick_probe = Arc::clone(&probe);
-                    let tick_compaction = Arc::clone(&compaction);
-                    let tick_path = path.clone();
-                    let result = crate::maintenance::run_background_admitted_maintenance(
-                        "storage_disk_pressure",
-                        move || match tick_probe.sample(&tick_path) {
-                            Ok(sample) => apply_disk_sample(
-                                &tick_state,
-                                &tick_config,
-                                sample,
-                                tick_compaction.as_ref(),
-                            ),
-                            Err(error) => Err(error),
-                        },
-                    )
-                    .await;
+                    let result = match probe.available_space(&path) {
+                        Ok(free_bytes) => apply_free_bytes(&db, &state, &config, free_bytes),
+                        Err(error) => Err(error),
+                    };
                     mark_pressure_probe_completed(&state, started, result.as_ref());
                     if let Err(error) = result {
                         tracing::warn!(error = %error, "storage disk-pressure tick failed");
                     }
                 }
+                _ = &mut shutdown_rx => break,
             }
         }
     });
@@ -354,21 +314,20 @@ fn spawn_with_probe(
     })
 }
 
-fn apply_disk_sample(
+fn apply_free_bytes(
+    db: &DB,
     state: &PressureState,
     config: &PressureConfig,
-    sample: DiskSample,
-    compaction: &dyn PressureCompaction,
+    free_bytes: u64,
 ) -> StorageResult<PressureReport> {
-    let free_bytes = sample.free_bytes;
-    let current_level = config.thresholds.level_for(free_bytes, sample.total_bytes);
+    let current_level = config.thresholds.level_for(free_bytes);
     synapse_telemetry::metrics::gauge!(STORAGE_DISK_PRESSURE_LEVEL)
         .set(f64::from(current_level as u8));
     let (previous_level, emitted_code) = state.transition_to(current_level)?;
     let transitioned = previous_level != current_level;
     let gc_advised = transitioned && current_level >= DiskPressureLevel::Level1;
     let compacted_cfs = if transitioned && current_level >= DiskPressureLevel::Level2 {
-        compaction.compact_native_for_pressure()?
+        compact_all(db)?
     } else {
         Vec::new()
     };
@@ -392,13 +351,24 @@ fn apply_disk_sample(
 
     Ok(PressureReport {
         free_bytes,
-        total_bytes: sample.total_bytes,
         previous_level,
         current_level,
         emitted_code,
         compacted_cfs,
         gc_advised,
     })
+}
+
+fn compact_all(db: &DB) -> StorageResult<Vec<&'static str>> {
+    let mut compacted = Vec::with_capacity(cf::ALL_COLUMN_FAMILIES.len());
+    for cf_name in cf::ALL_COLUMN_FAMILIES {
+        let handle = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| read_failed(format!("column family handle missing: {cf_name}")))?;
+        db.compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
+        compacted.push(cf_name);
+    }
+    Ok(compacted)
 }
 
 fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
@@ -423,12 +393,8 @@ fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
                 | cf::CF_EPISODES
                 | cf::CF_ROUTINES
                 | cf::CF_AGENT_TRANSCRIPTS
-                | cf::CF_AGENT_TRANSCRIPT_ORDER
         ),
-        DiskPressureLevel::Level4 => matches!(
-            cf_name,
-            cf::CF_REFLEX_AUDIT | cf::CF_REFLEX_AUDIT_ORDER | cf::CF_SESSIONS
-        ),
+        DiskPressureLevel::Level4 => matches!(cf_name, cf::CF_REFLEX_AUDIT | cf::CF_SESSIONS),
     }
 }
 
@@ -461,7 +427,6 @@ fn mark_pressure_probe_completed(
             Ok(report) => {
                 readback.observed = true;
                 readback.last_free_bytes = Some(report.free_bytes);
-                readback.last_total_bytes = report.total_bytes;
                 readback.last_level = Some(report.current_level);
                 readback.last_error = None;
             }
@@ -483,27 +448,32 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DiskSample {
-    free_bytes: u64,
-    total_bytes: Option<u64>,
-}
-
 trait DiskProbe: Send + Sync {
-    fn sample(&self, path: &Path) -> StorageResult<DiskSample>;
+    fn available_space(&self, path: &Path) -> StorageResult<u64>;
 }
 
 struct Fs2DiskProbe;
 
 impl DiskProbe for Fs2DiskProbe {
-    fn sample(&self, path: &Path) -> StorageResult<DiskSample> {
-        let free_bytes =
-            fs2::available_space(path).map_err(|error| read_failed(error.to_string()))?;
-        let total_bytes = fs2::total_space(path).map_err(|error| read_failed(error.to_string()))?;
-        Ok(DiskSample {
-            free_bytes,
-            total_bytes: Some(total_bytes),
-        })
+    fn available_space(&self, path: &Path) -> StorageResult<u64> {
+        fs2::available_space(path).map_err(|error| read_failed(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+struct SequenceDiskProbe {
+    values: Mutex<VecDeque<u64>>,
+    fallback: u64,
+}
+
+#[cfg(test)]
+impl DiskProbe for SequenceDiskProbe {
+    fn available_space(&self, _path: &Path) -> StorageResult<u64> {
+        let mut values = self
+            .values
+            .lock()
+            .map_err(|error| read_failed(format!("pressure sequence lock poisoned: {error}")))?;
+        Ok(values.pop_front().unwrap_or(self.fallback))
     }
 }
 

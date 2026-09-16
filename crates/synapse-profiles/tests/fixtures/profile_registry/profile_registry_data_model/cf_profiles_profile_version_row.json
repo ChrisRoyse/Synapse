@@ -1,0 +1,21 @@
+{
+  "cf_name": "CF_PROFILES",
+  "key": "profile_registry/v1/profile/synthetic.governance/1.0.0",
+  "value": {
+    "schema_version": 1,
+    "row_kind": "profile_version",
+    "row_id": "synthetic.governance@1.0.0",
+    "created_at": "2026-05-27T02:02:00Z",
+    "updated_at": "2026-05-27T02:02:00Z",
+    "source_id": "registry.synthetic.local-fixture",
+    "state": "active",
+    "profile_id": "synthetic.governance",
+    "profile_version": "1.0.0",
+    "package_id": "profile.synthetic.governance",
+    "package_version": "0.1.0",
+    "profile_toml_path": "profiles/synthetic.governance.toml",
+    "profile_toml_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "use_scope": "operator_owned_test",
+    "schema_version_supported": true
+  }
+}

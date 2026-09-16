@@ -10,9 +10,7 @@ use ort::session::Session;
 use ort::value::{PrimitiveTensorElementType, Tensor};
 use serde::{Deserialize, Serialize};
 use synapse_models::{
-    LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, WHISPER_TINY_INT8_ONNX,
-    WHISPER_TINY_INT8_ONNX_FILENAME, WHISPER_TINY_INT8_ONNX_LENGTH, WHISPER_TINY_INT8_ONNX_SHA256,
-    default_model_dir,
+    LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, default_model_dir,
 };
 
 mod window;
@@ -21,22 +19,13 @@ use window::{audio_seconds, wav_bytes_from_window};
 
 use crate::{AudioError, AudioResult, AudioWindow};
 
-pub const WHISPER_TINY_INT8_FILENAME: &str = WHISPER_TINY_INT8_ONNX_FILENAME;
-pub const WHISPER_TINY_INT8_SHA256: &str = WHISPER_TINY_INT8_ONNX_SHA256;
-/// Byte length of the pinned STT artifact.
-///
-/// Kept in step with `length` in `models/whisper-tiny-int8.pin.json`. Used only
-/// as a cheap availability probe in health (#1863); every path that actually
-/// loads the model verifies [`WHISPER_TINY_INT8_SHA256`] in full.
-pub const WHISPER_TINY_INT8_EXPECTED_LEN: u64 = WHISPER_TINY_INT8_ONNX_LENGTH;
+pub const WHISPER_TINY_INT8_FILENAME: &str = "whisper-tiny-int8.onnx";
+pub const WHISPER_TINY_INT8_SHA256: &str =
+    "147afac751f89ad8e8f82133464edc81ecff9391e98ccdcae2474384be68ec86";
 
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";
-/// CPU-only STT execution-provider selector.
-pub const STT_BACKEND_ENV: &str = "SYNAPSE_STT_BACKEND";
-// Exact prompt used by the pinned Olive graph's behavioral parity probe:
-// decoder start followed by no-timestamps.
-const EN_DECODER_PROMPT: [i32; 2] = [50_257, 50_362];
+const EN_DECODER_PROMPT: [i32; 4] = [50_258, 50_259, 50_359, 50_363];
 const AUDIO_STT_INFERENCES_TOTAL: &str = "audio_stt_inferences_total";
 const AUDIO_STT_LATENCY_MS: &str = "audio_stt_latency_ms";
 
@@ -76,51 +65,11 @@ impl TranscriptionConfidenceSource {
     }
 }
 
-/// Execution-provider policy for the pinned Whisper session.
-///
-/// The installed runtime has one legal policy: a pinned CPU provider. Keeping
-/// the policy typed makes health attest the decision without an implicit or
-/// GPU-preferring `auto` state.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SttBackendPolicy {
-    Pinned(ModelBackend),
-}
-
-/// What the process actually selected, for health and FSV readback.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SttBackendReadback {
-    pub policy: String,
-    pub loaded: bool,
-    pub selected_backend: Option<ModelBackend>,
-    pub gpu_reservation_id: Option<String>,
-    pub gpu_reservation_mib: Option<u64>,
-    pub device_memory_policy: Option<String>,
-    /// Always absent in the CPU-only runtime; retained for wire compatibility.
-    pub fallback_code: Option<String>,
-    pub fallback_detail: Option<String>,
-}
-
-struct LoadedStt {
-    model: LoadedModel,
-}
-
-struct SttBackendFailure {
-    error: AudioError,
-}
-
+#[derive(Debug)]
 pub struct WhisperTinyStt {
     descriptor: ModelDescriptor,
-    loaded: Mutex<Option<LoadedStt>>,
-}
-
-impl Debug for WhisperTinyStt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WhisperTinyStt")
-            .field("descriptor", &self.descriptor)
-            .field("loaded", &self.is_loaded())
-            .finish_non_exhaustive()
-    }
+    loader: ModelLoader,
+    loaded: Mutex<Option<LoadedModel>>,
 }
 
 impl WhisperTinyStt {
@@ -135,45 +84,9 @@ impl WhisperTinyStt {
                 input_shape: vec![1, 0],
                 class_map: Vec::new(),
             },
+            loader: ModelLoader::new(vec![ModelBackend::Cpu]),
             loaded: Mutex::new(None),
         }
-    }
-
-    /// Reports the configured policy and, once a session exists, the provider
-    /// and host-memory policy. GPU/fallback fields remain explicitly absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured model error if either source-of-truth mutex is
-    /// poisoned, rather than reporting an invented unloaded state.
-    pub fn backend_readback(&self) -> AudioResult<SttBackendReadback> {
-        let policy = match stt_backend_policy()? {
-            SttBackendPolicy::Pinned(backend) => format!("pinned:{backend:?}"),
-        };
-        let (loaded, selected_backend) = match self.loaded.lock() {
-            Ok(guard) => guard.as_ref().map_or((false, None), |state| {
-                (true, Some(state.model.selected_backend()))
-            }),
-            Err(_poisoned) => {
-                return Err(AudioError::ModelLoadFailed {
-                    path: self.descriptor.path.clone(),
-                    detail: "STT backend readback model cache lock was poisoned".to_owned(),
-                });
-            }
-        };
-        Ok(SttBackendReadback {
-            policy,
-            loaded,
-            selected_backend,
-            gpu_reservation_id: None,
-            gpu_reservation_mib: None,
-            device_memory_policy: selected_backend.map(|backend| match backend {
-                ModelBackend::Cuda => "invalid_cuda_backend".to_owned(),
-                ModelBackend::Cpu => "host_memory".to_owned(),
-            }),
-            fallback_code: None,
-            fallback_detail: None,
-        })
     }
 
     #[must_use]
@@ -280,83 +193,33 @@ impl WhisperTinyStt {
                 detail: "STT model cache lock was poisoned".to_owned(),
             })?;
         if loaded.is_none() {
-            if self.descriptor.path == default_model_path() {
-                let materialized = WHISPER_TINY_INT8_ONNX
-                    .materialize_embedded()
-                    .map_err(AudioError::from)?;
-                if materialized.path != self.descriptor.path {
-                    return Err(AudioError::ModelLoadFailed {
-                        path: materialized.path,
-                        detail: "embedded Whisper model materialized at an unexpected path"
-                            .to_owned(),
-                    });
-                }
-            } else if !self.descriptor.path.exists() {
+            if !self.descriptor.path.exists() {
                 return Err(AudioError::SttModelNotLoaded {
                     detail: format!(
-                        "STT model does not exist at {}",
+                        "side-load {} before calling audio STT",
                         self.descriptor.path.display()
                     ),
                 });
             }
-            *loaded = Some(self.build_session()?);
+            *loaded = Some(self.loader.load(self.descriptor.clone())?);
         }
 
-        let state = loaded
+        let model = loaded
             .as_ref()
             .ok_or_else(|| AudioError::SttModelNotLoaded {
                 detail: "STT model cache was empty after load".to_owned(),
             })?;
-        let SessionHandle::Ort(session) = state.model.session() else {
+        let SessionHandle::Ort(session) = model.session() else {
             return Err(AudioError::ModelLoadFailed {
                 path: self.descriptor.path.clone(),
                 detail: "STT model loaded without an ORT session".to_owned(),
             });
         };
-        let backend = state.model.selected_backend();
-        let session_id = state.model.session_id();
+        let backend = model.selected_backend();
+        let session_id = model.session_id();
         let session = Arc::clone(session);
         drop(loaded);
         Ok((backend, session_id, session))
-    }
-
-    /// Builds the one persistent ORT session under the configured provider
-    /// policy (#2109, #2260).
-    fn build_session(&self) -> AudioResult<LoadedStt> {
-        match stt_backend_policy()? {
-            SttBackendPolicy::Pinned(backend) => {
-                self.load_with_backend(backend).map_err(|failure| {
-                    tracing::error!(
-                        code = "SYNAPSE_STT_PINNED_BACKEND_UNAVAILABLE",
-                        backend = ?backend,
-                        error = %failure.error,
-                        "the pinned STT execution provider could not build a session"
-                    );
-                    failure.error
-                })
-            }
-        }
-    }
-
-    fn load_with_backend(
-        &self,
-        backend: ModelBackend,
-    ) -> Result<LoadedStt, Box<SttBackendFailure>> {
-        if backend != ModelBackend::Cpu {
-            return Err(Box::new(SttBackendFailure {
-                error: AudioError::ModelLoadFailed {
-                    path: self.descriptor.path.clone(),
-                    detail: "SYNAPSE_STT_ZERO_VRAM_POLICY: CUDA is forbidden; the installed STT runtime accepts only the CPU execution provider"
-                        .to_owned(),
-                },
-            }));
-        }
-        match ModelLoader::new(vec![backend]).load(self.descriptor.clone()) {
-            Ok(model) => Ok(LoadedStt { model }),
-            Err(error) => Err(Box::new(SttBackendFailure {
-                error: AudioError::from(error),
-            })),
-        }
     }
 
     fn run_session(&self, session: &mut Session, bytes: Vec<u8>) -> AudioResult<String> {
@@ -451,37 +314,6 @@ fn record_stt_inference(outcome: &'static str, elapsed: std::time::Duration) {
 #[must_use]
 pub fn default_model_path() -> PathBuf {
     default_model_dir().join(WHISPER_TINY_INT8_FILENAME)
-}
-
-/// Reads [`STT_BACKEND_ENV`]. Unset deterministically means CPU.
-///
-/// # Errors
-///
-/// Returns `MODEL_LOAD_FAILED` for an unrecognized or non-Unicode value rather
-/// than silently defaulting — a misconfigured provider must be visible.
-pub fn stt_backend_policy() -> AudioResult<SttBackendPolicy> {
-    let value = match std::env::var(STT_BACKEND_ENV) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => {
-            return Ok(SttBackendPolicy::Pinned(ModelBackend::Cpu));
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(AudioError::ModelLoadFailed {
-                path: default_model_path(),
-                detail: format!("{STT_BACKEND_ENV} is not valid Unicode"),
-            });
-        }
-    };
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("cpu") {
-        return Ok(SttBackendPolicy::Pinned(ModelBackend::Cpu));
-    }
-    Err(AudioError::ModelLoadFailed {
-        path: default_model_path(),
-        detail: format!(
-            "SYNAPSE_STT_BACKEND_ZERO_VRAM_POLICY: {STT_BACKEND_ENV} must be cpu or unset; got {value:?}; auto and cuda are forbidden by the installed zero-VRAM contract"
-        ),
-    })
 }
 
 fn normalize_language(language: &str) -> AudioResult<&str> {

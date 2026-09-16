@@ -3,7 +3,7 @@
 //! Toast buttons in an unpackaged desktop app can use protocol activation. The
 //! child process launched by Windows never decides approvals directly; it only
 //! forwards the one-time activation token to the already-running loopback daemon
-//! endpoint, where the durable Calyx vault row is validated and updated.
+//! endpoint, where the durable RocksDB row is validated and updated.
 
 use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, time::Duration};
 
@@ -348,5 +348,46 @@ mod windows_protocol {
 
     fn wide_null(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_activation_uri_parses_and_preserves_callback_fields() {
+        let parsed = ProtocolActivationRequest::parse(
+            "synapse-approval://decide?bind=127.0.0.1%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=snooze&snooze_ms=900000",
+        )
+        .expect("parse");
+        assert_eq!(parsed.bind, "127.0.0.1:7700");
+        assert_eq!(parsed.decision, "snooze");
+        assert_eq!(parsed.snooze_ms, Some(900_000));
+        let callback = parsed.callback_url();
+        assert!(callback.starts_with("http://127.0.0.1:7700/approval/activate?"));
+        assert!(callback.contains("decision=snooze"));
+        assert!(callback.contains("token=act1-cccc"));
+    }
+
+    #[test]
+    fn protocol_activation_uri_accepts_windows_shell_handoff_variants() {
+        for uri in [
+            "\"synapse-approval://decide?bind=127.0.0.1%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=accept\"",
+            "synapse-approval://decide/?bind=127.0.0.1%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=accept",
+        ] {
+            let parsed = ProtocolActivationRequest::parse(uri).expect(uri);
+            assert_eq!(parsed.bind, "127.0.0.1:7700");
+            assert_eq!(parsed.decision, "accept");
+        }
+    }
+
+    #[test]
+    fn protocol_activation_refuses_non_loopback_bind() {
+        let error = ProtocolActivationRequest::parse(
+            "synapse-approval://decide?bind=192.168.1.20%3A7700&approval_id=apr1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&activation_id=actv1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&token=act1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&decision=accept",
+        )
+        .unwrap_err();
+        assert!(error.contains("loopback"));
     }
 }

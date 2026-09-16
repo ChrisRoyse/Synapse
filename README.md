@@ -5,7 +5,7 @@
 <h1 align="center">Synapse</h1>
 
 <p align="center">
-  <strong>Turn opportunity into grounded action.</strong><br>
+  <strong>Turn opportunity into a numbers game.</strong><br>
   Give any AI model a real body on your Windows PC — so it can find, chase, and win
   opportunities around the clock while you keep your mouse.
 </p>
@@ -136,10 +136,8 @@ isolated session, while you keep working.
 
 Everything runs **on your machine**. No screen-scraping cloud service, no remote agent,
 no data leaving your PC. Synapse is Windows-native to the metal: Win32 `SendInput`, UI
-Automation, visible-desktop GDI `BitBlt` capture with no explicit GPU API, optional
-debug-gated WASAPI audio capture, and local process control. Windows or the display
-driver may still accelerate GDI internally; that backend identity is not a physical
-zero-VRAM attestation.
+Automation, Windows Graphics Capture / DXGI, optional debug-gated WASAPI audio capture,
+and local process control.
 
 ---
 
@@ -160,22 +158,17 @@ screenshot it has to squint at:
 - **`observe`** — the focused window, the full UI Automation element tree (every button,
   field, and menu with its on-screen box), detected entities, and HUD.
 - **`find`** — locate any element or on-screen entity by name, role, or free text.
-- **`read_text`** — OCR a region or element when its pixels are physically visible, or
-  use the exact CDP path for an owned browser target. Native visible-surface OCR reaches
-  canvases and custom UIs but retains any occluding pixels.
-- **`screenshot`** — one-shot and GIF capture of physical desktop pixels through GDI
-  `BitBlt`. A window must be visible, restored, uncloaked, and fully within the virtual
-  desktop; pixels from any occluding window remain in the image. Unsupported hidden or
-  off-screen semantics fail with a typed capture error instead of switching backends.
+- **`read_text`** — OCR any region or element. Reads pixels directly, so it works even
+  where the accessibility API can't reach (canvases and custom UIs).
+- **`screenshot`** — per-window Windows Graphics Capture (and GIF capture), so an agent
+  can photograph *its own* window even when it's behind yours.
 - **`subscribe`** — stream live events (focus changes, new windows, audio) instead of
   polling.
 - **Browser DOM mode** — Synapse-launched Chromium browsers expose real page nodes
   through CDP; `observe` and `find` merge them in.
 
-Structured UIA/CDP perception is **window-targetable**: point a session at a specific
-window with `target` (`operation=set`) and Synapse can inspect that target without
-foregrounding it. Pixel capture remains a physical visible-surface snapshot; raw-CDP
-browser screenshots are the separate exact background-tab path.
+All of it is **window-targetable**: point a session at a specific window with
+`target` (`operation=set`) and perception watches *that* window — focused or not.
 
 <br clear="all">
 
@@ -225,8 +218,8 @@ The web isn't pixels to Synapse — it's **structured DOM data**, and it can wor
 - **`browser_tabs`** — open, select, and close **background tabs** that never become the
   active tab. The page you're reading stays exactly where it is.
 - **`browser_nav`** — navigate, reload, back, and forward, all in the background.
-- **`browser_dom`** — read page content, locate and inspect nodes, pull ARIA
-  snapshots, and run strict retry-bounded assertions on the owned tab.
+- **`browser_dom`** — read page content, locate and inspect nodes, and pull ARIA
+  snapshots straight from the DevTools accessibility tree.
 - **`browser_form`** — set values and fill forms through CDP (`insertText`, dispatched
   events) instead of the cursor, so web forms fill while the browser sits behind your work.
 - **`browser_wait` · `browser_capture` · `browser_storage`** — wait on conditions,
@@ -373,7 +366,7 @@ request:
 Synapse ships **29 application profiles** that encode how to operate Notepad, Chrome, Excel,
 Word, Outlook, Teams, Slack, Explorer, Terminal, and more — and it gets *better with use*:
 
-- Every action is logged to the local **Calyx vault** audit trail.
+- Every action is logged to a local **RocksDB** audit trail.
 - **`profile`** activates and manages the right profile per app; **`audit`
   operation=profile_intelligence** turns real outcomes into quality signal per profile.
 - **`audit`** also exposes command history, lifecycle events, and a consented export bundle;
@@ -411,7 +404,7 @@ flowchart LR
         ACT["🖱️ Action + verification<br/>UIA patterns · CDP · SendInput"]
         FAB["🤖 Agent fabric<br/>spawn · mailboxes · tasks · approvals"]
         LRN["🧭 Learning<br/>routines · assist · timeline · profiles"]
-        ST["💾 Storage<br/>Calyx vault · audit · workspace"]
+        ST["💾 Storage<br/>RocksDB audit · workspace"]
     end
     B <-->|sees & controls| W["🖥️ Your Windows desktop,<br/>apps, browsers, WSL"]
     SES --- P
@@ -432,7 +425,7 @@ needed) explicit foreground.
 
 ```mermaid
 flowchart LR
-    U["Profile used"] --> O["Outcome audited<br/>(Calyx vault)"]
+    U["Profile used"] --> O["Outcome audited<br/>(RocksDB)"]
     O --> Q["Quality &amp; compatibility<br/>learned"]
     Q --> I["Profile improved"]
     I --> D["Better profile<br/>distributed"]
@@ -478,16 +471,7 @@ Install Synapse for me and wire it into my AI tools.
    real MCP client and confirm it returns { "ok": true, ... }. If an
    already-running Codex session still says `Transport closed`, restart Codex
    through the patched launcher; Windows cannot update that process environment
-   after it has started. If Codex has no Synapse MCP namespace at all but can
-   still run shell commands, run
-   `pwsh -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir <repo> -ObservedSynapseFacadeAbsent`.
-   If Codex has a Synapse namespace but tool metadata is stale after a daemon
-   tool-surface change, run
-   `pwsh -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir <repo> -ObservedSynapseSchemaStale -ActiveIssue <issue>`.
-   The doctor fails closed on broken config/token/daemon state; when a fresh
-   production Codex probe can call real Synapse `health` and the physical
-   readbacks prove the observed symptom, it writes a restart handoff under
-   `%LOCALAPPDATA%\synapse\codex-restart-handoffs`.
+   after it has started.
 
 I'm on Windows. Use the real absolute Cargo bin path, don't invent one, and tell
 me anything that needs my approval (e.g. installing the Rust toolchain).
@@ -500,7 +484,7 @@ it from <https://rustup.rs> first, or let the agent install it.
 
 Synapse has exactly **one controlling body**: the Windows-native `synapse-mcp.exe` HTTP
 daemon. It is the only process that can perform real Win32 `SendInput`, UI Automation, and
-visible-desktop GDI `BitBlt` capture — and it controls **both** Windows programs (native windows) **and** WSL
+WGC/DXGI capture — and it controls **both** Windows programs (native windows) **and** WSL
 programs (WSLg GUI apps render as real Windows windows; `shell` / `process` reach WSL CLIs
 via `wsl.exe`). Every MCP client — on Windows or in WSL — connects to that one daemon, so
 *wherever you install from, the result is identical*: one Windows daemon driving both worlds.
@@ -520,7 +504,7 @@ the WSL side):
 
 Both are idempotent and fail loud — each prerequisite is checked and a failure stops with
 the exact cause and fix (no silent fallbacks). They build the daemon from a **local** source
-path into a persistent target (re-installs are incremental, not a fresh native rebuild),
+path into a persistent target (re-installs are incremental, not a fresh RocksDB build),
 deploy the bundled profiles next to the binary, generate a loopback bearer token, register
 the auto-start daemon (interactive desktop session, single-writer DB) with `--profile-dir`,
 verify `health`, and wire detected MCP clients. Claude Code and Codex use Streamable HTTP;
@@ -653,15 +637,12 @@ trail give you a *provable* record of what happened while you slept.
 > system audio live, and while it runs, fill in the CRM form in the background window from
 > yesterday's notes. When someone says my name in the transcript, ping me."*
 
-Audio transcription is available on the default 40-tool production surface through
-`observe operation=transcribe_audio`. Deploy the supervised daemon with
-`scripts\synapse-setup.ps1 -EnableAudio` and include `READ_AUDIO` in
-`-AllowedPermissions`; setup rejects either setting without the other. The lower-level
-`audio_tail` and `audio_transcribe` tools remain debug-surface tools and require
-`SYNAPSE_DEBUG_TOOLS=1`. Whisper transcription also requires the exact verified local
-model and ONNX Runtime Extensions artifact produced by
-`scripts\build-whisper-e2e-onnx.ps1`. Background form-fill through `browser_form` / `act`
-and event subscriptions remain part of the production surface.
+Audio transcription is not on the default 40-tool production surface. The lower-level
+`audio_tail` and `audio_transcribe` tools are debug-surface tools, require
+`SYNAPSE_DEBUG_TOOLS=1` and `--enable-audio`, and Whisper transcription requires a
+verified local model side-loaded into the configured model path; Synapse does not download
+that model automatically. Background form-fill through `browser_form` / `act` and event
+subscriptions remain part of the production surface.
 
 **🖥️ A self-driving install**
 
@@ -705,7 +686,7 @@ glance:
 | `process` | `list` · `launch` · `history` |
 | `browser_tabs` | `list` · `select` · `new` · `close` |
 | `browser_nav` | `navigate` · `reload` · `back` · `forward` |
-| `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` · `assert` |
+| `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` |
 | `browser_form` | `set_value` · `fill` |
 | `browser_wait` | `for_condition` |
 | `browser_capture` | `screenshot` · `downloads` |
@@ -732,8 +713,8 @@ glance:
 | `setup` | `status` · `doctor` · `repair` |
 | `telemetry` | `status` |
 
-Every mutating operation names the physical readback source of truth — a file path, Calyx
-vault row, process id, tab id, target id, event cursor, or profile row — so "it worked" is
+Every mutating operation names the physical readback source of truth — a file path, RocksDB
+CF/key, process id, tab id, target id, event cursor, or profile row — so "it worked" is
 always backed by evidence. Full mapping and migration notes:
 [Synapse 40-Tool Surface](docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
 
@@ -745,13 +726,13 @@ always backed by evidence. Full mapping and migration notes:
 |---|---|
 | Language / runtime | **Rust** (edition 2024), `tokio` |
 | Protocol | **MCP** via `rmcp` — stdio + streamable HTTP/SSE, one shared daemon, per-session state |
-| Perception | Windows UI Automation, GDI `BitBlt` visible-surface capture (no explicit GPU API), WinRT OCR |
+| Perception | Windows UI Automation, Windows Graphics Capture / DXGI duplication, WinRT OCR |
 | Browser | **Chrome DevTools Protocol** — DOM/AX-tree perception, background tabs, page input; bundled extension bridge for normal profiles |
 | Action | Win32 `SendInput` (`enigo`), UIA control patterns, CDP input, verified readback |
-| Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, Calyx-backed mailboxes + workspace blackboard, approvals & escalation |
+| Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, RocksDB mailboxes + workspace blackboard, approvals & escalation |
 | Learning | Routine mining, intent/assist, activity timeline & episodes, profile quality from audit |
 | Audio | Debug-gated WASAPI loopback; Whisper STT requires `--enable-audio` plus a side-loaded verified model |
-| Storage | **Calyx vault**, durable audit trail |
+| Storage | **RocksDB** (LZ4 + ZSTD), durable audit trail |
 | Models | ONNX Runtime (`ort`) for optional detection |
 
 The active documented input backend is **`software`**: keyboard and mouse via `SendInput`,
@@ -811,7 +792,7 @@ and the time to keep shipping. Thank you! 🙏
 ---
 
 <p align="center">
-  <em>Your AI has a brain. Now give it a body — and turn opportunity into grounded action.</em><br>
+  <em>Your AI has a brain. Now give it a body — and turn opportunity into a numbers game.</em><br>
   <strong>⭐ Star the repo if Synapse is useful to you.</strong>
 </p>
 

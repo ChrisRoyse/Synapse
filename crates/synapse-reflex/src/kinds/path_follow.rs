@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use synapse_action::{ActionHandle, StrokePlan, plan_timed_stroke, screen_point_from_path_point};
 use synapse_core::{
@@ -17,8 +16,7 @@ pub const MAX_PATH_FOLLOW_SAMPLES: usize = 60_001;
 const MAX_PATH_FOLLOW_DURATION_MS: f64 = 60_000.0;
 const MAX_PATH_FOLLOW_PATH_POINTS: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PathFollowParams {
     pub path: PathSpec,
     pub button: Option<MouseButton>,

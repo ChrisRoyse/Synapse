@@ -3,8 +3,8 @@
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
-        validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
+        chrome_debugger_endpoint, require_target_session_id, validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -156,7 +156,7 @@ struct NormalizedBrowserHandleDialogParams {
 #[tool_router(router = browser_dialog_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Read and handle JavaScript dialogs for the calling session's owned raw-CDP browser tab. Arms target-scoped Page.javascriptDialogOpening/Page.javascriptDialogClosed listeners, returns pending dialog message/history, accepts or dismisses the pending dialog with optional prompt text, and sets the default policy (accept/dismiss/manual) for future dialogs. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Read and handle JavaScript dialogs for the calling session's owned browser tab. Arms a target-scoped Page.javascriptDialogOpening/Page.javascriptDialogClosed listener over raw CDP or the normal Chrome bridge's narrow chrome.debugger lane, returns pending dialog message/history, accepts or dismisses the pending dialog with optional prompt text, and sets the default policy (accept/dismiss/manual) for future dialogs. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_handle_dialog(
         &self,
@@ -227,6 +227,58 @@ impl SynapseService {
             "browser_handle_dialog_before_mutation",
         )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let operation = browser_dialog_operation_name(dialog.operation);
+                let default_policy = dialog
+                    .default_policy
+                    .map(browser_dialog_default_policy_name);
+                let result = crate::chrome_debugger_bridge::handle_dialog(
+                    window_hwnd,
+                    cdp_target_id,
+                    operation,
+                    default_policy,
+                    dialog.prompt_text.as_deref(),
+                    dialog.since_seq,
+                    dialog.limit,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_handle_dialog normal Chrome bridge Page.javascriptDialogOpening/Page.handleJavaScriptDialog failed for target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_handle_dialog_after_bridge_mutation",
+                )?;
+                let endpoint = result
+                    .extension_id
+                    .as_deref()
+                    .map(chrome_debugger_endpoint)
+                    .unwrap_or_else(chrome_debugger_default_endpoint);
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_DIALOG_READBACK",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    endpoint = %endpoint,
+                    cdp_target_id = %result.target_id,
+                    operation = ?dialog.operation,
+                    handled = result.handled,
+                    returned = result.returned,
+                    total_buffered = result.total_buffered,
+                    "readback=chrome.debugger.Page.javascriptDialogOpening+Page.handleJavaScriptDialog outcome=dialog_status"
+                );
+                return Ok(browser_handle_dialog_bridge_response(
+                    session_id,
+                    window_hwnd,
+                    endpoint,
+                    dialog.operation,
+                    result,
+                ));
+            }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
         let read_filter = synapse_a11y::CdpDialogReadFilter {
@@ -414,6 +466,120 @@ fn dialog_mcp_error(phase: &str, error: synapse_a11y::A11yError) -> ErrorData {
     )
 }
 
+fn browser_dialog_operation_name(operation: BrowserHandleDialogOperation) -> &'static str {
+    match operation {
+        BrowserHandleDialogOperation::Status => "status",
+        BrowserHandleDialogOperation::Accept => "accept",
+        BrowserHandleDialogOperation::Dismiss => "dismiss",
+        BrowserHandleDialogOperation::SetPolicy => "set_policy",
+    }
+}
+
+fn browser_dialog_default_policy_name(policy: BrowserDialogDefaultPolicy) -> &'static str {
+    match policy {
+        BrowserDialogDefaultPolicy::Accept => "accept",
+        BrowserDialogDefaultPolicy::Dismiss => "dismiss",
+        BrowserDialogDefaultPolicy::Manual => "manual",
+    }
+}
+
+fn browser_dialog_operation_from_wire(
+    value: &str,
+    fallback: BrowserHandleDialogOperation,
+) -> BrowserHandleDialogOperation {
+    match value {
+        "status" => BrowserHandleDialogOperation::Status,
+        "accept" => BrowserHandleDialogOperation::Accept,
+        "dismiss" => BrowserHandleDialogOperation::Dismiss,
+        "set_policy" => BrowserHandleDialogOperation::SetPolicy,
+        _ => fallback,
+    }
+}
+
+fn browser_dialog_default_policy_from_wire(value: &str) -> BrowserDialogDefaultPolicy {
+    match value {
+        "accept" => BrowserDialogDefaultPolicy::Accept,
+        "manual" => BrowserDialogDefaultPolicy::Manual,
+        _ => BrowserDialogDefaultPolicy::Dismiss,
+    }
+}
+
+fn browser_handle_dialog_bridge_response(
+    session_id: &str,
+    window_hwnd: i64,
+    endpoint: String,
+    requested_operation: BrowserHandleDialogOperation,
+    result: crate::chrome_debugger_bridge::ChromeDebuggerHandleDialogResult,
+) -> BrowserHandleDialogResponse {
+    BrowserHandleDialogResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "chrome_tabs_extension".to_owned(),
+        endpoint,
+        cdp_target_id: result.target_id,
+        operation: browser_dialog_operation_from_wire(&result.operation, requested_operation),
+        default_policy: browser_dialog_default_policy_from_wire(&result.default_policy),
+        capture_newly_armed: result.capture_newly_armed,
+        handled: result.handled,
+        handle_action: result.handle_action,
+        prompt_text: result.prompt_text,
+        pending_dialog: result.pending_dialog.map(browser_dialog_entry_from_bridge),
+        handled_dialog: result.handled_dialog.map(browser_dialog_entry_from_bridge),
+        last_dialog: result.last_dialog.map(browser_dialog_entry_from_bridge),
+        entries: result
+            .entries
+            .into_iter()
+            .map(browser_dialog_entry_from_bridge)
+            .collect(),
+        next_cursor: result.next_cursor,
+        returned: result.returned,
+        total_buffered: result.total_buffered,
+        dropped: result.dropped,
+        opened_count: result.opened_count,
+        closed_count: result.closed_count,
+        auto_handled_count: result.auto_handled_count,
+        error_count: result.error_count,
+        readback_backend: if result.readback_backend.trim().is_empty() {
+            "chrome.debugger.Page.javascriptDialogOpening+Page.handleJavaScriptDialog".to_owned()
+        } else {
+            result.readback_backend
+        },
+        backend_tier_used: if result.backend_tier_used.trim().is_empty() {
+            "chrome_tabs_extension".to_owned()
+        } else {
+            result.backend_tier_used
+        },
+        required_foreground: result.required_foreground,
+    }
+}
+
+fn browser_dialog_entry_from_bridge(
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerDialogEntry,
+) -> BrowserDialogEntry {
+    BrowserDialogEntry {
+        seq: entry.seq,
+        url: redact_url_for_public_readback(&entry.url),
+        frame_id: entry.frame_id,
+        dialog_type: entry.dialog_type,
+        message: entry.message,
+        default_prompt: entry.default_prompt,
+        has_browser_handler: entry.has_browser_handler,
+        opened_at_unix_ms: entry.opened_at_unix_ms,
+        pending: entry.pending,
+        default_policy: browser_dialog_default_policy_from_wire(&entry.default_policy),
+        auto_action: entry.auto_action,
+        auto_handled_at_unix_ms: entry.auto_handled_at_unix_ms,
+        auto_handle_error: entry.auto_handle_error,
+        manual_action: entry.manual_action,
+        manual_prompt_text: entry.manual_prompt_text,
+        manual_handled_at_unix_ms: entry.manual_handled_at_unix_ms,
+        manual_handle_error: entry.manual_handle_error,
+        closed_at_unix_ms: entry.closed_at_unix_ms,
+        close_result: entry.close_result,
+        user_input: entry.user_input,
+    }
+}
+
 fn browser_handle_dialog_response(
     session_id: &str,
     window_hwnd: i64,
@@ -543,5 +709,141 @@ impl From<synapse_a11y::CdpDialogDefaultPolicy> for BrowserDialogDefaultPolicy {
             synapse_a11y::CdpDialogDefaultPolicy::Dismiss => Self::Dismiss,
             synapse_a11y::CdpDialogDefaultPolicy::Manual => Self::Manual,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_handle_dialog_validation_edges() {
+        let normalized = validate_browser_handle_dialog_params(&BrowserHandleDialogParams {
+            operation: BrowserHandleDialogOperation::Status,
+            default_policy: Some(BrowserDialogDefaultPolicy::Manual),
+            limit: Some(MAX_DIALOG_READ_LIMIT + 100),
+            ..Default::default()
+        })
+        .expect("status params");
+        assert_eq!(normalized.limit, MAX_DIALOG_READ_LIMIT);
+        assert_eq!(
+            normalized.default_policy,
+            Some(BrowserDialogDefaultPolicy::Manual)
+        );
+
+        for error in [
+            validate_browser_handle_dialog_params(&BrowserHandleDialogParams {
+                operation: BrowserHandleDialogOperation::SetPolicy,
+                ..Default::default()
+            })
+            .expect_err("set_policy requires default_policy"),
+            validate_browser_handle_dialog_params(&BrowserHandleDialogParams {
+                operation: BrowserHandleDialogOperation::Dismiss,
+                prompt_text: Some("ignored".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("dismiss rejects prompt_text"),
+            validate_browser_handle_dialog_params(&BrowserHandleDialogParams {
+                operation: BrowserHandleDialogOperation::Accept,
+                default_policy: Some(BrowserDialogDefaultPolicy::Accept),
+                ..Default::default()
+            })
+            .expect_err("accept rejects default_policy"),
+            validate_browser_handle_dialog_params(&BrowserHandleDialogParams {
+                operation: BrowserHandleDialogOperation::Accept,
+                prompt_text: Some("bad\0text".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("prompt text rejects nul"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+    }
+
+    #[test]
+    fn browser_handle_dialog_response_maps_pending_and_handled_state() {
+        let pending = synapse_a11y::CdpDialogEntry {
+            seq: 7,
+            url: "https://example.test".to_owned(),
+            frame_id: "frame-1".to_owned(),
+            dialog_type: "prompt".to_owned(),
+            message: "Name?".to_owned(),
+            default_prompt: Some("default".to_owned()),
+            has_browser_handler: true,
+            opened_at_unix_ms: 10,
+            pending: true,
+            default_policy: synapse_a11y::CdpDialogDefaultPolicy::Manual,
+            auto_action: None,
+            auto_handled_at_unix_ms: None,
+            auto_handle_error: None,
+            manual_action: None,
+            manual_prompt_text: None,
+            manual_handled_at_unix_ms: None,
+            manual_handle_error: None,
+            closed_at_unix_ms: None,
+            close_result: None,
+            user_input: None,
+        };
+        let mut handled_entry = pending.clone();
+        handled_entry.pending = false;
+        handled_entry.manual_action = Some(synapse_a11y::CdpDialogHandleAction::Accept);
+        handled_entry.manual_prompt_text = Some("Ada".to_owned());
+        handled_entry.manual_handled_at_unix_ms = Some(20);
+        handled_entry.closed_at_unix_ms = Some(20);
+        handled_entry.close_result = Some(true);
+        handled_entry.user_input = Some("Ada".to_owned());
+
+        let response = browser_handle_dialog_response(
+            "session-1",
+            100,
+            "http://127.0.0.1:9222".to_owned(),
+            "target-1",
+            BrowserHandleDialogOperation::Accept,
+            Some(synapse_a11y::CdpDialogCaptureStatus {
+                newly_armed: false,
+                endpoint: "http://127.0.0.1:9222".to_owned(),
+                cdp_target_id: "target-1".to_owned(),
+                armed_at_unix_ms: 1,
+                capacity: 128,
+                default_policy: synapse_a11y::CdpDialogDefaultPolicy::Manual,
+                pending_dialog: None,
+                last_dialog: Some(handled_entry.clone()),
+                opened_count: 1,
+                closed_count: 1,
+                auto_handled_count: 0,
+                error_count: 0,
+            }),
+            Some(synapse_a11y::CdpDialogReadResult {
+                entries: vec![handled_entry.clone()],
+                pending_dialog: None,
+                next_cursor: 8,
+                returned: 1,
+                total_buffered: 1,
+                dropped: 0,
+                armed_at_unix_ms: 1,
+                default_policy: synapse_a11y::CdpDialogDefaultPolicy::Manual,
+            }),
+            Some(synapse_a11y::CdpDialogHandleResult {
+                cdp_target_id: "target-1".to_owned(),
+                action: synapse_a11y::CdpDialogHandleAction::Accept,
+                prompt_text: Some("Ada".to_owned()),
+                handled_at_unix_ms: 20,
+                dialog: handled_entry,
+            }),
+        );
+
+        assert!(response.handled);
+        assert_eq!(response.handle_action.as_deref(), Some("accept"));
+        assert_eq!(response.prompt_text.as_deref(), Some("Ada"));
+        assert_eq!(response.default_policy, BrowserDialogDefaultPolicy::Manual);
+        assert_eq!(response.returned, 1);
+        assert_eq!(response.next_cursor, 8);
+        assert_eq!(response.entries[0].manual_action.as_deref(), Some("accept"));
+        assert_eq!(response.entries[0].user_input.as_deref(), Some("Ada"));
     }
 }

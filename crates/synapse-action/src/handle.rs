@@ -970,3 +970,119 @@ fn is_neutral_report(report: &GamepadReport) -> bool {
         && report.lt == 0.0
         && report.rt == 0.0
 }
+
+#[cfg(test)]
+mod operator_panic_queue_tests {
+    use super::*;
+    use synapse_core::KeyCode;
+
+    #[test]
+    fn enqueued_normal_action_keeps_original_epoch_across_completed_panic_wave() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+        let epoch_at_enqueue = capture_operator_panic_action_epoch(&action)
+            .expect("initial action admission")
+            .expect("normal action must carry an enqueue epoch");
+
+        let mut token = crate::request_operator_panic_interrupt();
+        assert!(crate::acknowledge_operator_panic_preemption(&mut token));
+        let crate::OperatorPanicSafetyCompletion::Finalize(finalization) =
+            crate::complete_operator_panic_safety_generation(token)
+                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+        else {
+            panic!("isolated generation must own finalization");
+        };
+        assert!(crate::finish_operator_panic_safety_finalization(
+            finalization,
+            true
+        ));
+        assert!(!crate::operator_panic_safety_pending());
+
+        let error = ensure_operator_panic_allows_action_since(&action, Some(epoch_at_enqueue))
+            .expect_err("queued pre-panic action must remain superseded after K2 finalizes");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+    }
+
+    #[test]
+    fn normal_action_without_enqueue_epoch_fails_closed() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+
+        let error = ensure_operator_panic_allows_action_since(&action, None)
+            .expect_err("unattributed normal queue item must fail closed");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+    }
+
+    #[test]
+    fn panic_crossing_after_ledger_write_clears_stale_ownership() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let (handle, _rx) = ActionHandle::channel();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+        let epoch_at_enqueue = capture_operator_panic_action_epoch(&action)
+            .expect("initial action admission")
+            .expect("normal action must carry an enqueue epoch");
+        let mut token = crate::request_operator_panic_interrupt();
+        assert!(crate::acknowledge_operator_panic_preemption(&mut token));
+
+        let error = handle
+            .record_successful_action_with_panic_guard(
+                Some("stale-session"),
+                &action,
+                Some(epoch_at_enqueue),
+            )
+            .expect_err("post-ledger panic crossing must fail closed");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+        assert!(
+            handle
+                .session_inputs_snapshot()
+                .expect("ownership readback")
+                .sessions
+                .is_empty(),
+            "panic rollback must leave the held-input ownership ledger empty"
+        );
+
+        let crate::OperatorPanicSafetyCompletion::Finalize(finalization) =
+            crate::complete_operator_panic_safety_generation(token)
+                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+        else {
+            panic!("isolated generation must own finalization");
+        };
+        assert!(crate::finish_operator_panic_safety_finalization(
+            finalization,
+            true
+        ));
+    }
+}

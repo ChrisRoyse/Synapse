@@ -1,3 +1,0 @@
-# Generated dashboard output is reproducible from dashboard/src and must not
-# enter the repository knowledge graph. Keep the authoritative source indexed.
-/dashboard/dist/

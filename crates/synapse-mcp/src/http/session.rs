@@ -1,7 +1,4 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -50,14 +47,6 @@ enum SessionFailure {
     /// target row was persisted, so re-binding (adopting) the same browser tab
     /// is the right recovery rather than re-creating it.
     Terminated,
-    /// A tool call proved that this session never listed the current tool
-    /// surface. The server terminated it to force the protocol's mandatory
-    /// initialize -> tools/list recovery cycle.
-    ToolSurfaceAttestationMissing,
-    /// A tool call proved that this session listed a different tool surface.
-    /// The server terminated it because notification-only refresh did not
-    /// happen before the unsafe call was attempted.
-    ToolSurfaceAttestationStale,
 }
 
 impl SessionFailure {
@@ -67,8 +56,6 @@ impl SessionFailure {
             Self::Missing => "session_header_missing",
             Self::UnknownOrExpired => "session_unknown_or_expired",
             Self::Terminated => "session_terminated",
-            Self::ToolSurfaceAttestationMissing => "tool_surface_attestation_missing",
-            Self::ToolSurfaceAttestationStale => "tool_surface_attestation_stale",
         }
     }
 
@@ -91,9 +78,6 @@ impl SessionFailure {
         match self {
             Self::Missing => "initialize_session",
             Self::UnknownOrExpired | Self::Terminated => "recreate_session_then_rebind_target",
-            Self::ToolSurfaceAttestationMissing | Self::ToolSurfaceAttestationStale => {
-                "reinitialize_session_then_list_tools"
-            }
         }
     }
 
@@ -108,24 +92,6 @@ impl SessionFailure {
             Self::Terminated => {
                 "the session lifecycle terminated this session (stale-eviction / session_end / agent_kill); create a new session and re-bind the same target (its binding was persisted)"
             }
-            Self::ToolSurfaceAttestationMissing => {
-                "the session called a tool without a physical attestation for its current tools/list surface; the session was terminated so the client must initialize and validate tools/list again"
-            }
-            Self::ToolSurfaceAttestationStale => {
-                "the session called a tool after its physical tools/list attestation diverged from the live surface; the session was terminated so the client must initialize and validate tools/list again"
-            }
-        }
-    }
-
-    fn root_cause_code(self) -> Option<&'static str> {
-        match self {
-            Self::ToolSurfaceAttestationMissing => {
-                Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING)
-            }
-            Self::ToolSurfaceAttestationStale => {
-                Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE)
-            }
-            Self::Missing | Self::UnknownOrExpired | Self::Terminated => None,
         }
     }
 }
@@ -156,6 +122,16 @@ pub(crate) fn current_mcp_session_id() -> Option<String> {
     CURRENT_MCP_SESSION_ID.try_with(Clone::clone).ok().flatten()
 }
 
+#[cfg(test)]
+pub(crate) async fn with_current_mcp_session_id_for_test<F, T>(session_id: &str, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CURRENT_MCP_SESSION_ID
+        .scope(Some(session_id.to_owned()), future)
+        .await
+}
+
 pub(super) fn load_session_config() -> anyhow::Result<SessionConfig> {
     let mut config = SessionConfig::default();
     let idle_timeout_secs = session_idle_timeout_secs()?;
@@ -177,11 +153,11 @@ pub(super) async fn require_mcp_session(
         return next.run(request).await;
     }
     let session_id = session_id_from_header(&request);
-    let (request, method_from_enforce) = match enforce_session_header(request).await {
-        Ok(pair) => pair,
+    let request = match enforce_session_header(request).await {
+        Ok(request) => request,
         Err(response) => return response,
     };
-    let (request, jsonrpc_method) = match session_id.as_deref() {
+    let request = match session_id.as_deref() {
         Some(session_id) => {
             if session_is_terminated(&state.terminated_sessions, session_id) {
                 if request.method() == Method::DELETE {
@@ -200,38 +176,15 @@ pub(super) async fn require_mcp_session(
                     session_id,
                     "HTTP MCP session rejected because session lifecycle already terminated it"
                 );
-                return session_invalid_for(
-                    terminated_session_failure(&state.terminated_sessions, session_id),
-                    Some(session_id),
-                );
+                return session_invalid_for(SessionFailure::Terminated, Some(session_id));
             }
             match record_session_request(&state.session_registry, session_id, request).await {
-                Ok(pair) => pair,
+                Ok(request) => request,
                 Err(response) => return response,
             }
         }
-        None => (request, method_from_enforce),
+        None => request,
     };
-
-    // #1773 handshake attribution: emit a structured edge for the two
-    // handshake-phase JSON-RPC messages (initialize, notifications/initialized)
-    // so any future 30s client timeout can be attributed from the daemon log
-    // alone. The `received` edge is the proof the request arrived at all; the
-    // `responded` edge carries `elapsed_ms` — the exact slice of the client's
-    // handshake budget the daemon spent producing the response.
-    let handshake_phase = jsonrpc_method.as_deref().and_then(handshake_phase_label);
-    if let Some(phase) = handshake_phase {
-        tracing::info!(
-            code = "MCP_HANDSHAKE_EDGE",
-            edge = "received",
-            phase,
-            transport = "http",
-            session_id = session_id.as_deref().unwrap_or(""),
-            "handshake message received at HTTP transport"
-        );
-    }
-    let handshake_started = handshake_phase.map(|_| Instant::now());
-
     let diagnostic_session_id = session_id.clone();
     CURRENT_MCP_SESSION_ID
         .scope(session_id, async move {
@@ -242,43 +195,9 @@ pub(super) async fn require_mcp_session(
                     diagnostic_session_id.as_deref(),
                 );
             }
-            if let (Some(phase), Some(started)) = (handshake_phase, handshake_started) {
-                // For `initialize` the session id is assigned in the response
-                // header; prefer it, falling back to any request-scoped id.
-                let assigned_session_id = response
-                    .headers()
-                    .get(SESSION_ID_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-                    .or_else(|| diagnostic_session_id.clone());
-                tracing::info!(
-                    code = "MCP_HANDSHAKE_EDGE",
-                    edge = "responded",
-                    phase,
-                    transport = "http",
-                    status = response.status().as_u16(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    session_id = assigned_session_id.as_deref().unwrap_or(""),
-                    "handshake message handled by HTTP transport"
-                );
-            }
             response
         })
         .await
-}
-
-/// Map a JSON-RPC method to its handshake phase label, or `None` when the
-/// message is not part of the initialize handshake. Only these two messages
-/// participate in the client's bounded handshake window; every other method is
-/// a post-handshake tool/protocol call and is not attributed here.
-fn handshake_phase_label(method: &str) -> Option<&'static str> {
-    match method {
-        "initialize" => Some("initialize"),
-        "notifications/initialized" => Some("notifications_initialized"),
-        _ => None,
-    }
 }
 
 pub(super) async fn release_held_inputs_on_delete(
@@ -358,26 +277,7 @@ fn session_is_terminated(
 ) -> bool {
     terminated_sessions
         .lock()
-        .is_ok_and(|terminated| terminated.contains_key(session_id))
-}
-
-fn terminated_session_failure(
-    terminated_sessions: &crate::server::session_lifecycle::SharedTerminatedSessions,
-    session_id: &str,
-) -> SessionFailure {
-    let reason = terminated_sessions
-        .lock()
-        .ok()
-        .and_then(|terminated| terminated.get(session_id).cloned());
-    match reason.as_deref() {
-        Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING) => {
-            SessionFailure::ToolSurfaceAttestationMissing
-        }
-        Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE) => {
-            SessionFailure::ToolSurfaceAttestationStale
-        }
-        _ => SessionFailure::Terminated,
-    }
+        .is_ok_and(|terminated| terminated.contains(session_id))
 }
 
 fn session_idle_timeout_secs() -> anyhow::Result<u64> {
@@ -400,20 +300,16 @@ fn parse_idle_timeout(raw: &str) -> anyhow::Result<u64> {
     Ok(seconds)
 }
 
-async fn enforce_session_header(
-    request: Request<Body>,
-) -> Result<(Request<Body>, Option<String>), Response> {
+async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>, Response> {
     if has_session_header(&request) {
-        // The JSON-RPC method for a session-bearing POST is resolved later in
-        // `record_session_request`, which already consumes the body once.
-        return Ok((request, None));
+        return Ok(request);
     }
     if request.method() == Method::POST {
         allow_initialize_without_session(request).await
     } else if request.method() == Method::GET || request.method() == Method::DELETE {
         Err(session_invalid(SessionFailure::Missing))
     } else {
-        Ok((request, None))
+        Ok(request)
     }
 }
 
@@ -433,20 +329,16 @@ fn session_id_from_header(request: &Request<Body>) -> Option<String> {
 
 async fn allow_initialize_without_session(
     request: Request<Body>,
-) -> Result<(Request<Body>, Option<String>), Response> {
+) -> Result<Request<Body>, Response> {
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
     let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
-    let method = parsed
-        .as_ref()
-        .ok()
-        .and_then(|value| jsonrpc_method(value).map(ToOwned::to_owned));
-    let is_initialize = method.as_deref() == Some("initialize");
+    let is_initialize = parsed.as_ref().is_ok_and(jsonrpc_method_is_initialize);
     let request = Request::from_parts(parts, Body::from(bytes));
     if parsed.is_err() || is_initialize {
-        Ok((request, method))
+        Ok(request)
     } else {
         Err(session_invalid(SessionFailure::Missing))
     }
@@ -456,23 +348,21 @@ async fn record_session_request(
     session_registry: &crate::server::session_registry::SharedSessionRegistry,
     session_id: &str,
     request: Request<Body>,
-) -> Result<(Request<Body>, Option<String>), Response> {
+) -> Result<Request<Body>, Response> {
     if request.method() != Method::POST {
         record_session_heartbeat(session_registry, session_id, None)?;
-        return Ok((request, None));
+        return Ok(request);
     }
 
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-    let action = parsed.as_ref().and_then(jsonrpc_action_label);
-    let method = parsed
-        .as_ref()
-        .and_then(|value| jsonrpc_method(value).map(ToOwned::to_owned));
+    let action = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| jsonrpc_action_label(&value));
     record_session_heartbeat(session_registry, session_id, action)?;
-    Ok((Request::from_parts(parts, Body::from(bytes)), method))
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 fn record_session_heartbeat(
@@ -507,15 +397,16 @@ fn jsonrpc_action_label(value: &serde_json::Value) -> Option<String> {
             .and_then(|params| params.get("name"))
             .and_then(serde_json::Value::as_str)
     {
-        return Some(crate::server::session_registry::tool_call_action_label(
-            name,
-        ));
+        return Some(format!("tools/call:{name}"));
     }
     Some(method.to_owned())
 }
 
-fn jsonrpc_method(value: &serde_json::Value) -> Option<&str> {
-    value.get("method").and_then(serde_json::Value::as_str)
+fn jsonrpc_method_is_initialize(value: &serde_json::Value) -> bool {
+    value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|method| method == "initialize")
 }
 
 fn is_mcp_endpoint(path: &str) -> bool {
@@ -552,7 +443,6 @@ fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Res
         "failure_class": failure.failure_class(),
         "daemon_alive": true,
         "recovery": failure.recovery(),
-        "root_cause_code": failure.root_cause_code(),
         "session_id": session_id,
         "detail": failure.detail(),
         "source_of_truth": "http_session_middleware",
@@ -597,4 +487,150 @@ fn session_registry_failed() -> Response {
         "SESSION_REGISTRY_UNAVAILABLE",
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CURRENT_MCP_SESSION_ID, DEFAULT_SESSION_IDLE_TIMEOUT_SECS, SESSION_RECOVERY_HEADER,
+        SessionFailure, current_mcp_session_id, jsonrpc_action_label, jsonrpc_method_is_initialize,
+        parse_idle_timeout, session_invalid_for,
+    };
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn session_failure_terminated_and_expired_are_distinct_but_both_rebind() {
+        // #1360 part 3: a terminated session must be reported distinctly from an
+        // unknown/expired one (the reason tokens differ), yet both recover by
+        // re-creating a session and re-binding the persisted target.
+        assert_ne!(
+            SessionFailure::Terminated.reason(),
+            SessionFailure::UnknownOrExpired.reason()
+        );
+        assert_eq!(SessionFailure::Terminated.reason(), "session_terminated");
+        assert_eq!(
+            SessionFailure::UnknownOrExpired.reason(),
+            "session_unknown_or_expired"
+        );
+        assert_eq!(
+            SessionFailure::Terminated.recovery(),
+            "recreate_session_then_rebind_target"
+        );
+        assert_eq!(
+            SessionFailure::UnknownOrExpired.recovery(),
+            "recreate_session_then_rebind_target"
+        );
+        // Missing never had a session to rebind — it initializes instead.
+        assert_eq!(SessionFailure::Missing.reason(), "session_header_missing");
+        assert_eq!(SessionFailure::Missing.recovery(), "initialize_session");
+        // All HTTP-layer failures are session-level (daemon answered, not a crash).
+        for failure in [
+            SessionFailure::Missing,
+            SessionFailure::UnknownOrExpired,
+            SessionFailure::Terminated,
+        ] {
+            assert_eq!(failure.failure_class(), "session_level");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_invalid_response_carries_actionable_json_diagnostic() {
+        let response = session_invalid_for(SessionFailure::Terminated, Some("sess-abc-123"));
+        // Status stays 404 so rmcp transports keep treating it as session-expired.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // Recovery header lets header-only clients branch without parsing JSON.
+        assert_eq!(
+            response
+                .headers()
+                .get(SESSION_RECOVERY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("recreate_session_then_rebind_target")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json; charset=utf-8")
+        );
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("diagnostic body is JSON");
+        assert_eq!(
+            body["code"],
+            serde_json::json!(synapse_core::error_codes::HTTP_SESSION_INVALID)
+        );
+        assert_eq!(body["reason"], serde_json::json!("session_terminated"));
+        assert_eq!(body["failure_class"], serde_json::json!("session_level"));
+        assert_eq!(body["daemon_alive"], serde_json::json!(true));
+        assert_eq!(
+            body["recovery"],
+            serde_json::json!("recreate_session_then_rebind_target")
+        );
+        assert_eq!(body["session_id"], serde_json::json!("sess-abc-123"));
+        assert_eq!(
+            body["source_of_truth"],
+            serde_json::json!("http_session_middleware")
+        );
+    }
+
+    #[test]
+    fn initialize_detection_accepts_initialize_request_only() {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+        let list = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        assert!(jsonrpc_method_is_initialize(&init));
+        assert!(!jsonrpc_method_is_initialize(&list));
+    }
+
+    #[test]
+    fn jsonrpc_action_label_extracts_tool_call_name() {
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "session_list", "arguments": {}}
+        });
+        assert_eq!(
+            jsonrpc_action_label(&value).as_deref(),
+            Some("tools/call:session_list")
+        );
+        let list = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+        assert_eq!(jsonrpc_action_label(&list).as_deref(), Some("tools/list"));
+    }
+
+    #[test]
+    fn idle_timeout_parser_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_idle_timeout("1").unwrap_or_default(), 1);
+        assert!(parse_idle_timeout("0").is_err());
+        assert!(parse_idle_timeout("abc").is_err());
+    }
+
+    #[test]
+    fn default_idle_timeout_covers_unattended_orchestrator_idle_window() {
+        assert_eq!(DEFAULT_SESSION_IDLE_TIMEOUT_SECS, 24 * 60 * 60);
+    }
+
+    #[tokio::test]
+    async fn current_session_id_survives_async_request_scope() {
+        assert_eq!(current_mcp_session_id(), None);
+        CURRENT_MCP_SESSION_ID
+            .scope(Some("session-test".to_owned()), async {
+                tokio::task::yield_now().await;
+                assert_eq!(current_mcp_session_id().as_deref(), Some("session-test"));
+            })
+            .await;
+        assert_eq!(current_mcp_session_id(), None);
+    }
 }

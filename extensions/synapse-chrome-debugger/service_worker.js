@@ -1,6 +1,6 @@
-const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v26";
-const BRIDGE_DECLARED_BUILD_SHA256 = "fb7ba5c83b01ec7c7e8be32a620f882fbefbc152da810e53b66abcf60902cf24";
+const PROTOCOL_VERSION = 1;
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
+const BRIDGE_DECLARED_BUILD_SHA256 = "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -10,30 +10,11 @@ const EVALUATE_TIMEOUT_MIN_MS = 50;
 const EVALUATE_TIMEOUT_MAX_MS = 120000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
-// The screenshot pipeline is intentionally bounded before the first scroll,
-// background edit, tab activation, or Chrome capture. The 384 MiB peak budget
-// includes the extension-owned output surface, one raw tile, one encoded tile,
-// and the final Blob/ArrayBuffer/base64/JSON serialization cohort. Chrome caps
-// an extension-to-native-host message at 64 MiB; reserve 4 MiB for the command
-// envelope and evidence rather than treating the transport limit as headroom.
-const PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES = 384 * 1024 * 1024;
-// >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
-const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB = 64;
-const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB = 60;
-// <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
-const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES =
-  NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
-const NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
-const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES =
-  PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
-const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES = PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES;
-const COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES = 8;
-const COMMAND_TERMINAL_ACK_TIMEOUT_MS = 30000;
-const PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES = 256 * 1024;
 let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
+  "externalPopupRiskSuppression",
   "listTabs",
   "openTab",
   "closeTab",
@@ -48,6 +29,8 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "activateTab",
   "pageVitals",
   "pageContent",
+  "pageScreenshot",
+  "pagePdf",
   "setContent",
   "ariaSnapshot",
   "assertPoll",
@@ -55,6 +38,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "inspectElement",
   "scrollIntoView",
   "waitForText",
+  "waitForFunction",
   "waitForLoadState",
   "waitForUrl",
   "waitForRequest",
@@ -62,16 +46,27 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "waitForSelector",
   "clock",
   "pageEvents",
-  "keyDispatch",
-  "maintenancePauseReconnect",
-  "reloadSelf",
+  "evaluateScript",
+  "initScript",
+  "exposeBinding",
+  "handleDialog",
+  "fileUpload",
   "operatorPanicDisable",
   "operatorPanicCleanup",
   "operatorPanicCloseTab",
   "operatorPanicReadback",
   "operatorPanicEnable",
+  "cdpInput",
+  "viewportEmulation",
+  "deviceEmulation",
+  "geolocationEmulation",
+  "localeEmulation",
+  "mediaEmulation",
+  "networkConditions",
+  "maintenancePauseReconnect",
   "domAction",
   "coordinateClick",
+  "reloadSelf",
   "typeActiveElement",
   "setFieldValue"
 ]);
@@ -82,92 +77,20 @@ const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
-const ERROR_EXTENSION_DETACHED = "A11Y_CDP_EXTENSION_DETACHED";
-const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
-const ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT = "CAPTURE_PLAN_EXCEEDS_LIMIT";
-const ERROR_EVALUATE_JAVASCRIPT_EXCEPTION = "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
-const ERROR_MESSAGE_BODY_EXCEEDS_LIMIT = "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
-const ERROR_RESPONSE_TOO_LARGE = "A11Y_CDP_RESPONSE_TOO_LARGE";
-const ERROR_TERMINAL_PROTOCOL = "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
 const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
   "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED";
-const ERROR_RECONNECT_WAKE_ALARM_INVALID =
-  "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID";
 const ERROR_CHROME_SCRIPTING_EXECUTE_FAILED = "CHROME_SCRIPTING_EXECUTE_FAILED";
-const ERROR_CHROME_WAIT_PREDICATE_INVALID = "CHROME_WAIT_PREDICATE_INVALID";
 const ERROR_CHROME_DOM_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
 const ERROR_CHROME_DOM_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
 const ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
 const ERROR_CHROME_DOM_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
 const ERROR_CHROME_DOM_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
 const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
-const ERROR_CHROME_TAB_TARGET_ABSENT = "CHROME_TAB_TARGET_ABSENT";
 const ERROR_ACTION_TARGET_INVALID = "ACTION_TARGET_INVALID";
-const ERROR_CODE_CONTRACT_VIOLATION = "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION";
-// Every machine-readable code that may cross the authenticated command-response
-// boundary. errorPayload rejects anything outside this registry as an explicit
-// contract violation; the canonical lint gate compares the same sorted values
-// with Rust's trusted registry and synapse_core::error_codes (#2217).
-const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
-  // >>> SHARED-CHROME-ERROR-CODE-CONTRACT
-  "A11Y_CDP_ATTACH_FAILED",
-  "A11Y_CDP_AXTREE_FAILED",
-  "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED",
-  "A11Y_CDP_EXTENSION_DETACHED",
-  "A11Y_CDP_EXTENSION_TIMEOUT",
-  "A11Y_CDP_EXTENSION_UNAVAILABLE",
-  "A11Y_CDP_RESPONSE_TOO_LARGE",
-  "ACTION_TARGET_INVALID",
-  "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION",
-  "BROWSER_EVALUATE_TIMEOUT",
-  "BROWSER_NAVIGATION_FAILED",
-  "BROWSER_WAIT_TIMEOUT",
-  "CAPTURE_PLAN_EXCEEDS_LIMIT",
-  "CAPTURE_TARGET_INVALID",
-  "CHROME_ACTIVE_ELEMENT_MISSING",
-  "CHROME_ACTIVE_ELEMENT_NOT_EDITABLE",
-  "CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH",
-  "CHROME_BEFOREINPUT_CANCELLED",
-  "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
-  "CHROME_BRIDGE_EXTENSION_STALE",
-  "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT",
-  "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR",
-  "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
-  "CHROME_CLOCK_FAILED",
-  "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
-  "CHROME_DOM_ACTION_UNSUPPORTED",
-  "CHROME_DOM_ELEMENT_AMBIGUOUS",
-  "CHROME_DOM_ELEMENT_NOT_ACTIONABLE",
-  "CHROME_DOM_ELEMENT_NOT_FOUND",
-  "CHROME_DOM_SELECTOR_INVALID",
-  "CHROME_FRAME_METADATA_FAILED",
-  "CHROME_SCRIPTING_EMPTY_RESULT",
-  "CHROME_SCRIPTING_EXECUTE_FAILED",
-  "CHROME_SCRIPTING_UNAVAILABLE",
-  "CHROME_SET_FIELD_BAD_LOCATOR",
-  "CHROME_SET_FIELD_NOT_FOUND",
-  "CHROME_SET_FIELD_NOT_UNIQUE",
-  "CHROME_SET_FIELD_SELECTOR_INVALID",
-  "CHROME_SET_FIELD_VALUE_MISMATCH",
-  "CHROME_STORAGE_ACTION_FAILED",
-  "CHROME_STORAGE_KEY_INVALID",
-  "CHROME_STORAGE_OPERATION_UNSUPPORTED",
-  "CHROME_STORAGE_STATE_LOAD_FAILED",
-  "CHROME_STORAGE_STATE_READ_FAILED",
-  "CHROME_TAB_TARGET_ABSENT",
-  "CHROME_WAIT_PREDICATE_INVALID",
-  "PAGE_VITALS_READ_FAILED",
-  "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
-  "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID",
-  "SYNAPSE_CHROME_DAEMON_UNAVAILABLE",
-  "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH",
-  // <<< SHARED-CHROME-ERROR-CODE-CONTRACT <<<
-]);
-const PUBLIC_COMMAND_ERROR_CODE_SET = new Set(PUBLIC_COMMAND_ERROR_CODES);
 const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
@@ -181,14 +104,13 @@ const DISCONNECTED_KEEPALIVE_MS = 20000;
 const RECONNECT_WAKE_ALARM_NAME = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_DELAY_MINUTES = 0.5;
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES = 0.5;
-const RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS = true;
 const MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY = "synapseMaintenanceReconnectPause";
 const WEBSOCKET_CLOSE_CODE_RECONNECT_CLEANUP = 3001;
 const WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS = 0;
 const MAINTENANCE_RECONNECT_PAUSE_MIN_MS = 1000;
 const MAINTENANCE_RECONNECT_PAUSE_MAX_MS = 900000;
-const MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS = 30000;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
+const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
 const MAX_PAGE_EVENT_BUFFER = 1000;
 const MAX_NETWORK_EVENT_BUFFER = 2000;
@@ -201,6 +123,8 @@ const MAX_FILE_CHOOSER_EVENT_BUFFER = 1000;
 const MAX_FILE_UPLOAD_PATHS = 256;
 const MAX_FILE_UPLOAD_PATH_CHARS = 32768;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
+const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
+const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
 const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
 const GEOLOCATION_OVERRIDE_BY_TAB = new Map();
@@ -212,10 +136,6 @@ const BINDING_DEBUGGER_SESSIONS = new Map();
 const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
-// Exact owner descriptors for the sole intentional MAIN-world mutation. The
-// durable ledger persists the same rows; a tab id alone is not a document
-// identity because Chrome reuses frame/tab ids across navigations.
-const CLOCK_DOCUMENT_OWNERS = new Map();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
 let DURABLE_MUTATION_OWNERS_ENABLED = true;
 let DURABLE_MUTATION_DISABLE_SEQUENCE = 0;
@@ -232,299 +152,26 @@ let ACTIVE_COMMAND_MUTATION_CONTEXT = null;
 let IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = 0;
 let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
 let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
-const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV4";
-const DURABLE_OWNER_STORAGE_SCHEMA_VERSION = 7;
-const DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS = 5000;
-const LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY =
-  "synapseOperatorPanicDurableOwnerLedgerSchema5ArchiveV1";
-const LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
+const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
 const LEGACY_DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV1";
 const DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY =
   "synapseOperatorPanicBrowserSessionTokenV1";
-const DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS = 10000;
 const DURABLE_OWNER_WORKER_BOOT_ID = typeof globalThis.crypto?.randomUUID === "function"
   ? globalThis.crypto.randomUUID()
   : `worker-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-const DURABLE_OWNER_LIFECYCLE_EVENTS = [];
-let DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = null;
-const DURABLE_OWNER_LIFECYCLE_SIGNAL = new Promise((resolve) => {
-  DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = resolve;
-});
 let DURABLE_OWNER_STATE_LOADED = false;
 let DURABLE_OWNER_STATE_LOAD_ERROR = null;
-const DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS = 4096;
-let DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = null;
-let DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED = false;
-let DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = null;
-let DURABLE_OWNER_STORAGE_WRITE_TRANSITION = null;
-let DURABLE_OWNER_STORAGE_DIVERGENCE = null;
 let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
 let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
-let DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = null;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
-let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
-let RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = null;
-let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
-let RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = null;
-let REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = null;
-let RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION = null;
-let DURABLE_OWNER_SCHEMA5_MIGRATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
-
-function boundedDurableOwnerFailureDetail(error) {
-  const full = redactPublicErrorDetail(errorMessage(error));
-  return {
-    text: full.slice(0, DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS),
-    original_char_count: full.length,
-    truncated: full.length > DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS
-  };
-}
-
-function recordDurableOwnerSecondaryFailure(stage, error) {
-  const detail = boundedDurableOwnerFailureDetail(error);
-  const previous = DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC;
-  const primary = previous || {
-    schema_version: 1,
-    primary_stage: "preexisting_unclassified_failure",
-    primary_recorded_at_unix_ms: null,
-    primary_error_char_count: String(DURABLE_OWNER_STATE_LOAD_ERROR || "").length,
-    primary_error_truncated: false,
-    secondary_occurrence_count: 0,
-    last_secondary_failure: null
-  };
-  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = {
-    ...primary,
-    secondary_occurrence_count:
-      Number(primary.secondary_occurrence_count || 0) + 1,
-    last_secondary_failure: {
-      stage: String(stage),
-      observed_at_unix_ms: Date.now(),
-      cause: detail.text,
-      cause_char_count: detail.original_char_count,
-      cause_truncated: detail.truncated
-    }
-  };
-  console.error("synapse durable owner secondary failure recorded without replacing first cause", {
-    stage: String(stage),
-    secondary_occurrence_count:
-      DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC.secondary_occurrence_count,
-    cause: detail.text,
-    cause_char_count: detail.original_char_count,
-    cause_truncated: detail.truncated,
-    primary_error_preserved: Boolean(DURABLE_OWNER_STATE_LOAD_ERROR)
-  });
-  return DURABLE_OWNER_STATE_LOAD_ERROR;
-}
-
-function recordDurableOwnerStateFailure(stage, error) {
-  if (DURABLE_OWNER_STATE_LOAD_ERROR) {
-    return recordDurableOwnerSecondaryFailure(stage, error);
-  }
-  const detail = boundedDurableOwnerFailureDetail(error);
-  DURABLE_OWNER_STATE_LOAD_ERROR = detail.text;
-  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = {
-    schema_version: 1,
-    primary_stage: String(stage),
-    primary_recorded_at_unix_ms: Date.now(),
-    primary_error_char_count: detail.original_char_count,
-    primary_error_truncated: detail.truncated,
-    secondary_occurrence_count: 0,
-    last_secondary_failure: null
-  };
-  console.error("synapse durable owner state entered fail-closed state", {
-    stage: String(stage),
-    cause: detail.text,
-    cause_char_count: detail.original_char_count,
-    cause_truncated: detail.truncated
-  });
-  return DURABLE_OWNER_STATE_LOAD_ERROR;
-}
-
-function durableOwnerStorageValueJson(value) {
-  return value === undefined ? null : canonicalDurableOwnerJson(value);
-}
-
-function durableOwnerStorageJsonIdentity(json) {
-  let value;
-  try {
-    value = json === null ? undefined : JSON.parse(json);
-  } catch {
-    value = undefined;
-  }
-  return {
-    present: json !== null,
-    schema_version: Number.isSafeInteger(value?.version) ? value.version : null,
-    revision: Number.isSafeInteger(value?.revision) ? value.revision : null,
-    bytes: json === null ? 0 : new TextEncoder().encode(json).byteLength
-  };
-}
-
-function enterDurableOwnerStorageFailClosed(stage, error) {
-  DURABLE_MUTATION_OWNERS_ENABLED = false;
-  UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
-    1,
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
-  );
-  recordDurableOwnerStateFailure(stage, error);
-  return error;
-}
-
-function recordDurableOwnerStorageDivergence(stage, oldJson, newJson) {
-  if (!DURABLE_OWNER_STORAGE_DIVERGENCE) {
-    DURABLE_OWNER_STORAGE_DIVERGENCE = {
-      schema_version: 1,
-      stage: String(stage),
-      observed_at_unix_ms: Date.now(),
-      worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
-      bridge_build_id: BRIDGE_BUILD_ID,
-      baseline_initialized: DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED,
-      expected: durableOwnerStorageJsonIdentity(
-        DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON
-      ),
-      observed_old: durableOwnerStorageJsonIdentity(oldJson),
-      observed_new: durableOwnerStorageJsonIdentity(newJson),
-      verified_write_in_flight: Boolean(DURABLE_OWNER_STORAGE_WRITE_TRANSITION)
-    };
-  }
-  const error = new Error(
-    "authoritative chrome.storage.local durable owner row changed outside the exact " +
-      "verified writer transition; refusing every subsequent mutation and persistence; " +
-      `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
-  );
-  enterDurableOwnerStorageFailClosed(stage, error);
-  const transition = DURABLE_OWNER_STORAGE_WRITE_TRANSITION;
-  if (transition && !transition.eventObserved) {
-    transition.eventObserved = true;
-    transition.resolveEvent();
-  }
-  return error;
-}
-
-function handleDurableOwnerStorageChanged(changes, areaName) {
-  if (areaName !== "local") return;
-  const change = changes?.[DURABLE_OWNER_STORAGE_KEY];
-  if (!change) return;
-  const oldJson = durableOwnerStorageValueJson(change.oldValue);
-  const newJson = durableOwnerStorageValueJson(change.newValue);
-  if (oldJson === newJson) return;
-
-  const transition = DURABLE_OWNER_STORAGE_WRITE_TRANSITION;
-  if (transition &&
-      oldJson === transition.beforeJson &&
-      newJson === transition.expectedJson) {
-    transition.eventObserved = true;
-    transition.resolveEvent();
-    return;
-  }
-  recordDurableOwnerStorageDivergence(
-    DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED
-      ? "authoritative_storage_changed_outside_verified_writer"
-      : "authoritative_storage_changed_before_baseline",
-    oldJson,
-    newJson
-  );
-}
-
-function initializeDurableOwnerStorageBaseline(value) {
-  if (DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
-    throw new Error("durable owner storage baseline initialization attempted more than once");
-  }
-  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
-    throw new Error(
-      "durable owner storage changed before its initial read completed; refusing to " +
-        `select a competing baseline; storage_divergence=${JSON.stringify(
-          DURABLE_OWNER_STORAGE_DIVERGENCE
-        )}`
-    );
-  }
-  DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = durableOwnerStorageValueJson(value);
-  DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED = true;
-}
-
-function durableOwnerStorageAuthoritySnapshot() {
-  return {
-    baseline_initialized: DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED,
-    last_verified: durableOwnerStorageJsonIdentity(
-      DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON
-    ),
-    verified_write_in_flight: Boolean(DURABLE_OWNER_STORAGE_WRITE_TRANSITION),
-    divergence: DURABLE_OWNER_STORAGE_DIVERGENCE
-  };
-}
-
-function recordDurableOwnerLifecycleEvent(kind, reason = null) {
-  const event = {
-    kind,
-    reason,
-    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
-    recorded_at_unix_ms: Date.now()
-  };
-  DURABLE_OWNER_LIFECYCLE_EVENTS.push(event);
-  if (DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE) {
-    DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE(event);
-    DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = null;
-  }
-  if (kind === "runtime.onStartup" && DURABLE_OWNER_STATE_LOADED) {
-    DURABLE_MUTATION_OWNERS_ENABLED = false;
-    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
-    DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-    DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-      source: kind,
-      lifecycle_reason: null,
-      session_token_present: false,
-      decision: "late_new_browser_session_fail_closed",
-      observed_at_unix_ms: Date.now()
-    };
-    STALE_BROWSER_SESSION_OWNER_COUNT = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
-      (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-    recordDurableOwnerStateFailure(
-      "late_runtime_on_startup",
-      "runtime.onStartup arrived after durable-owner initialization; refusing mutation " +
-        "until the browser-session ledger is reloaded against the new profile session"
-    );
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
-      1,
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
-    );
-    chrome.storage.session.set({
-      [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-    }).catch((error) => {
-      recordDurableOwnerSecondaryFailure(
-        "persist_late_browser_session_token",
-        `failed to persist late browser-session token: ${errorMessage(error)}`
-      );
-    });
-  }
-  return event;
-}
-
-function handleSynapseRuntimeInstalled(details) {
-  recordDurableOwnerLifecycleEvent(
-    "runtime.onInstalled",
-    typeof details?.reason === "string" ? details.reason : null
-  );
-  startBridgeFromEvent();
-}
-
-function handleSynapseRuntimeStartup() {
-  recordDurableOwnerLifecycleEvent("runtime.onStartup");
-  startBridgeFromEvent();
-}
-
-chrome.runtime.onInstalled.addListener(handleSynapseRuntimeInstalled);
-chrome.runtime.onStartup.addListener(handleSynapseRuntimeStartup);
-if (chrome.storage?.onChanged) {
-  chrome.storage.onChanged.addListener(handleDurableOwnerStorageChanged);
-}
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
 let hostId = null;
 let bridgeToken = null;
 let connectInFlight = null;
 let webSocket = null;
-const COMMAND_TERMINAL_ACK_WAITERS = new Map();
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
@@ -532,30 +179,30 @@ let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
 let maintenanceReconnectPauseUntilMs = 0;
 let maintenanceReconnectPauseReason = "";
-let maintenanceReconnectPauseStoredAtMs = 0;
-let maintenanceReconnectResumeProbeAfterMs = 0;
-let maintenanceReconnectPausedDaemonPid = null;
-let maintenanceReconnectPausedDaemonInstanceId = "";
 let maintenanceReconnectPauseLoaded = false;
 let maintenanceReconnectPauseLoadInFlight = null;
-let maintenanceReconnectResumeProbeInFlight = null;
-let reconnectWakeAlarmState = {
-  status: "not_checked",
-  reason: "not_checked",
-  name: RECONNECT_WAKE_ALARM_NAME,
-  period_minutes: null,
-  persist_across_sessions: null,
-  scheduled_time: null,
-  checked_at_unix_ms: 0,
-  error: null
-};
 const agentNavigationClaims = new Map();
-let navigationEventSequence = 0;
-let navigationEventTail = Promise.resolve();
+const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
 const networkEventBuffers = new Map();
 const downloadEventBuffer = [];
 let downloadEventSeq = 0;
+let popupRiskSuppressionInFlight = null;
+let popupRiskSuppressionState = {
+  ok: false,
+  status: "not_checked",
+  reason: "not_checked",
+  checked_at_unix_ms: 0,
+  hazard_count: 0,
+  remaining_hazard_count: 0,
+  disabled_count: 0,
+  failure_count: 0,
+  management_available: Boolean(chrome.management?.getAll),
+  hazards: [],
+  disabled: [],
+  remaining_hazards: [],
+  failures: []
+};
 let serviceWorkerIntegrityState = {
   status: "not_checked",
   source: chrome.runtime.getURL("service_worker.js"),
@@ -565,27 +212,6 @@ let serviceWorkerIntegrityState = {
   checkedAtUnixMs: 0,
   reason: "not_checked"
 };
-// Identity of the bytes THIS worker is executing (#1828).
-//
-// `refreshServiceWorkerIntegrity()` fetches `service_worker.js` when it is
-// called, so it reports what is on disk *now* - not what Chrome loaded when it
-// started this worker. Redeploying the file therefore flipped
-// `extension_stale` to false while the old code was still the code running,
-// which is exactly backwards: a changed file is evidence of staleness, not
-// proof of freshness.
-//
-// Chrome reads the file once at worker startup, so hashing it during startup
-// is an exact fingerprint of the executing script. It is captured once and
-// never refreshed for the life of the worker; divergence from the live on-disk
-// hash is then a real, reportable staleness signal.
-let runningServiceWorkerIdentity = {
-  status: "not_checked",
-  sha256: null,
-  byteLength: null,
-  error: null,
-  capturedAtUnixMs: 0
-};
-let runningServiceWorkerCapture = null;
 
 function maintenanceReconnectPauseStorage() {
   return chrome.storage?.session || null;
@@ -600,54 +226,10 @@ function normalizeStoredMaintenanceReconnectPause(record) {
   if (!Number.isFinite(pauseUntilMs) || pauseUntilMs <= 0 || !reason) {
     return null;
   }
-  const storedAtNumber = Number(record.stored_at_unix_ms);
-  const storedAtMs = Number.isFinite(storedAtNumber) && storedAtNumber > 0
-    ? storedAtNumber
-    : 0;
-  const fallbackProbeBaseMs = storedAtMs > 0 ? storedAtMs : Date.now();
-  const resumeProbeAfterNumber = Number(record.resume_probe_after_unix_ms);
-  const resumeProbeAfterMs =
-    Number.isFinite(resumeProbeAfterNumber) && resumeProbeAfterNumber > 0
-      ? Math.min(resumeProbeAfterNumber, pauseUntilMs)
-      : Math.min(
-        pauseUntilMs,
-        fallbackProbeBaseMs + MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS
-      );
-  const pausedDaemonPidNumber = Number(record.paused_daemon_pid);
-  const pausedDaemonPid =
-    Number.isSafeInteger(pausedDaemonPidNumber) && pausedDaemonPidNumber > 0
-      ? pausedDaemonPidNumber
-      : null;
-  const pausedDaemonInstanceId = String(record.paused_daemon_instance_id || "").trim();
   return {
     pauseUntilMs,
-    reason,
-    storedAtMs,
-    resumeProbeAfterMs,
-    pausedDaemonPid,
-    pausedDaemonInstanceId
+    reason
   };
-}
-
-function resetMaintenanceReconnectPauseState() {
-  maintenanceReconnectPauseUntilMs = 0;
-  maintenanceReconnectPauseReason = "";
-  maintenanceReconnectPauseStoredAtMs = 0;
-  maintenanceReconnectResumeProbeAfterMs = 0;
-  maintenanceReconnectPausedDaemonPid = null;
-  maintenanceReconnectPausedDaemonInstanceId = "";
-}
-
-async function clearMaintenanceReconnectPause(reason) {
-  const hadPause =
-    maintenanceReconnectPauseUntilMs > 0 ||
-    Boolean(maintenanceReconnectPauseReason) ||
-    maintenanceReconnectPauseStoredAtMs > 0 ||
-    maintenanceReconnectResumeProbeAfterMs > 0;
-  if (hadPause) {
-    await requireRemoveStoredMaintenanceReconnectPause(reason);
-  }
-  resetMaintenanceReconnectPauseState();
 }
 
 async function removeStoredMaintenanceReconnectPause(reason) {
@@ -660,31 +242,12 @@ async function removeStoredMaintenanceReconnectPause(reason) {
   } catch (error) {
     console.warn(
       `Synapse maintenance reconnect pause storage cleanup failed: ` +
-      `reason=${reason} error=${errorMessage(error)}`
-    );
-  }
-}
-
-async function requireRemoveStoredMaintenanceReconnectPause(reason) {
-  const storage = maintenanceReconnectPauseStorage();
-  if (!storage?.remove) {
-    throw bridgeError(
-      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
-      "chrome.storage.session is unavailable; maintenance pause release cannot be persisted"
-    );
-  }
-  try {
-    await storage.remove(MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY);
-  } catch (error) {
-    throw bridgeError(
-      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
-      `chrome.storage.session.remove failed for maintenance pause release: ` +
         `reason=${reason} error=${errorMessage(error)}`
     );
   }
 }
 
-async function persistMaintenanceReconnectPause(pauseUntilMs, reason, options = {}) {
+async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
   const storage = maintenanceReconnectPauseStorage();
   if (!storage?.set) {
     throw bridgeError(
@@ -692,25 +255,10 @@ async function persistMaintenanceReconnectPause(pauseUntilMs, reason, options = 
       "chrome.storage.session is unavailable; maintenance pause cannot survive MV3 worker restart"
     );
   }
-  const storedAtMs = Date.now();
-  const resumeProbeAfterDurationMs = normalizeMaintenanceReconnectResumeProbeAfterMs(
-    options.resumeProbeAfterMs,
-    pauseUntilMs - storedAtMs
-  );
-  const resumeProbeAfterMs = Math.min(
-    pauseUntilMs,
-    storedAtMs + resumeProbeAfterDurationMs
-  );
-  const pausedDaemonPid = normalizeOptionalPositiveInteger(options.pausedDaemonPid);
-  const pausedDaemonInstanceId = String(options.pausedDaemonInstanceId || "").trim();
   const record = {
     pause_until_unix_ms: pauseUntilMs,
-    resume_probe_after_ms: resumeProbeAfterDurationMs,
-    resume_probe_after_unix_ms: resumeProbeAfterMs,
     reason,
-    stored_at_unix_ms: storedAtMs,
-    paused_daemon_pid: pausedDaemonPid,
-    paused_daemon_instance_id: pausedDaemonInstanceId,
+    stored_at_unix_ms: Date.now(),
     bridge_build_id: BRIDGE_BUILD_ID,
     extension_id: chrome.runtime.id
   };
@@ -722,13 +270,6 @@ async function persistMaintenanceReconnectPause(pauseUntilMs, reason, options = 
       `chrome.storage.session.set failed for maintenance pause: ${errorMessage(error)}`
     );
   }
-  return {
-    storedAtMs,
-    resumeProbeAfterDurationMs,
-    resumeProbeAfterMs,
-    pausedDaemonPid,
-    pausedDaemonInstanceId
-  };
 }
 
 async function loadMaintenanceReconnectPause(reason) {
@@ -762,21 +303,14 @@ async function loadMaintenanceReconnectPause(reason) {
     if (stored && stored.pauseUntilMs > now) {
       maintenanceReconnectPauseUntilMs = stored.pauseUntilMs;
       maintenanceReconnectPauseReason = stored.reason;
-      maintenanceReconnectPauseStoredAtMs = stored.storedAtMs;
-      maintenanceReconnectResumeProbeAfterMs = stored.resumeProbeAfterMs;
-      maintenanceReconnectPausedDaemonPid = stored.pausedDaemonPid;
-      maintenanceReconnectPausedDaemonInstanceId = stored.pausedDaemonInstanceId;
-      await requireReconnectWakeAlarm(`maintenance-pause-restore:${reason}`);
+      ensureReconnectWakeAlarm();
       console.warn(
         `Synapse daemon bridge restored persisted maintenance pause: ` +
-          `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} ` +
-          `resume_probe_after_unix_ms=${stored.resumeProbeAfterMs} ` +
-          `paused_daemon_pid=${stored.pausedDaemonPid || "<unknown>"} ` +
-          `paused_daemon_instance_id=${stored.pausedDaemonInstanceId || "<unknown>"} ` +
-          `trigger=${reason}`
+          `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} trigger=${reason}`
       );
     } else if (stored) {
-      resetMaintenanceReconnectPauseState();
+      maintenanceReconnectPauseUntilMs = 0;
+      maintenanceReconnectPauseReason = "";
       removeStoredMaintenanceReconnectPause(`expired:${reason}`);
     }
     maintenanceReconnectPauseLoaded = true;
@@ -796,55 +330,19 @@ async function startBridge() {
     );
     return;
   }
-  // Chrome's MV3 worker is ephemeral, so every event can race the asynchronous
-  // storage preload. Never publish a healthy bridge host from the default
-  // in-memory globals: wait for the one authoritative restore attempt first.
-  // The promise resolves after both success and a captured fail-closed error;
-  // the startup readback below then makes either state visible to the daemon.
-  await DURABLE_OWNER_STATE_READY;
-  await requireReconnectWakeAlarm("startup");
+  ensureReconnectWakeAlarm();
   await loadMaintenanceReconnectPause("startup");
+  await ensureExternalPopupRiskSuppression("startup");
   connectDaemon();
 }
 
-/// Host id this worker boot has already published a supplementary hello for.
-///
-/// #1880: the reconnect wake alarm fires every 30 s and called
-/// `startBridgeFromEvent`, which re-published a full `hello` unconditionally
-/// whenever a host already existed. That produced 2,679 HELLOs in 30 h across
-/// this host (~2,100/day, one per 30 s, 3.3% of every line the daemon wrote),
-/// each one a full re-registration: capability list, service-worker SHA
-/// verification, profile scan. The re-publish exists only to cover the
-/// bootstrap-before-`runtime.onStartup` ordering, which is a once-per-worker-
-/// boot condition — so it is now performed once per (worker boot, host id) and
-/// the alarm's remaining job is to confirm the connection, not to re-register.
-let supplementaryHelloPublishedForHostId = null;
-
 function startBridgeFromEvent() {
-  startBridge()
-    .then(async () => {
-      // The top-level bootstrap can register before runtime.onStartup is
-      // delivered. If a host already exists, publish the identity again so the
-      // daemon's durable health snapshot contains the lifecycle event and the
-      // separately read reconnect-alarm state from this exact browser startup.
-      // Once per worker boot: a re-registration that changes nothing is not
-      // evidence, and at 30 s cadence it hides a real disconnect in the noise.
-      if (hostId && bridgeToken && supplementaryHelloPublishedForHostId !== hostId) {
-        supplementaryHelloPublishedForHostId = hostId;
-        await postDaemonMessage({
-          type: "hello",
-          transport: "direct_http",
-          userAgent: navigator.userAgent,
-          ...bridgeIdentity()
-        });
-      }
-    })
-    .catch((error) => {
-      disableBridgePermanently(
-        `startup prerequisite failed: ${errorMessage(error)}`,
-        error?.code || ERROR_DAEMON_UNAVAILABLE
-      );
-    });
+  startBridge().catch((error) => {
+    console.error(`Synapse daemon bridge startup failed: ${errorMessage(error)}`);
+    if (!permanentlyDisabled) {
+      connectDaemon();
+    }
+  });
 }
 
 function connectDaemon() {
@@ -868,12 +366,7 @@ function connectDaemon() {
   }
   const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
   if (pauseRemainingMs > 0) {
-    void requireReconnectWakeAlarm("connectDaemon:maintenance-pause").catch((error) => {
-      disableBridgePermanently(
-        `reconnect alarm verification failed before maintenance reconnect pause: ${errorMessage(error)}`,
-        error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
-      );
-    });
+    ensureReconnectWakeAlarm();
     console.warn(
       `Synapse daemon bridge reconnect paused for maintenance: ` +
         `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason}`
@@ -894,8 +387,16 @@ function connectDaemon() {
     return;
   }
   clearReconnectTimer();
-  connectInFlight = registerDaemon()
+  connectInFlight = ensureExternalPopupRiskSuppression("connectDaemon")
+    .then(() => registerDaemon())
     .catch((error) => {
+      if (error?.code === ERROR_DEBUGGER_WARNING_UNSUPPRESSED) {
+        scheduleReconnect(
+          `direct daemon register refused unsafe profile: ${errorMessage(error)}`,
+          ERROR_DEBUGGER_WARNING_UNSUPPRESSED
+        );
+        return;
+      }
       scheduleReconnect(
         `direct daemon register failed: ${errorMessage(error)}`,
         ERROR_DAEMON_UNAVAILABLE
@@ -928,9 +429,6 @@ async function registerDaemon() {
   }
   hostId = registered.host_id;
   bridgeToken = registered.bridge_token;
-  // Both identities before the hello: the startup fingerprint of the running
-  // code, and the current on-disk bytes (#1828).
-  await captureRunningServiceWorkerIdentity();
   await refreshServiceWorkerIntegrity("registerDaemon");
   await postDaemonMessage({
     type: "hello",
@@ -965,12 +463,7 @@ function scheduleReconnect(detail, code) {
   if (pauseRemainingMs > 0) {
     clearReconnectTimer();
     stopDisconnectedKeepAlive();
-    void requireReconnectWakeAlarm("scheduleReconnect:maintenance-pause").catch((error) => {
-      disableBridgePermanently(
-        `reconnect alarm verification failed while maintenance-paused: ${errorMessage(error)}`,
-        error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
-      );
-    });
+    ensureReconnectWakeAlarm();
     console.warn(
       `Synapse daemon bridge reconnect suppressed during maintenance: code=${code} ` +
         `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
@@ -1008,22 +501,14 @@ function resetReconnectState() {
   reconnectAttempt = 0;
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
-  void requireReconnectWakeAlarm("resetReconnectState").catch((error) => {
-    disableBridgePermanently(
-      `reconnect alarm verification failed after connection: ${errorMessage(error)}`,
-      error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
-    );
-  });
+  ensureReconnectWakeAlarm();
 }
 
 function maintenanceReconnectPauseRemainingMs(now = Date.now()) {
   if (maintenanceReconnectPauseUntilMs <= now) {
-    const hadPause =
-      maintenanceReconnectPauseUntilMs > 0 ||
-      Boolean(maintenanceReconnectPauseReason) ||
-      maintenanceReconnectPauseStoredAtMs > 0 ||
-      maintenanceReconnectResumeProbeAfterMs > 0;
-    resetMaintenanceReconnectPauseState();
+    const hadPause = maintenanceReconnectPauseUntilMs > 0 || maintenanceReconnectPauseReason;
+    maintenanceReconnectPauseUntilMs = 0;
+    maintenanceReconnectPauseReason = "";
     if (hadPause) {
       removeStoredMaintenanceReconnectPause("expired");
     }
@@ -1032,96 +517,252 @@ function maintenanceReconnectPauseRemainingMs(now = Date.now()) {
   return maintenanceReconnectPauseUntilMs - now;
 }
 
-async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
-  if (permanentlyDisabled) {
-    return false;
-  }
+async function ensureExternalPopupRiskSuppression(reason) {
   const now = Date.now();
-  const probeAfterMs = maintenanceReconnectResumeProbeAfterMs || (
-    (maintenanceReconnectPauseStoredAtMs || now) + MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS
+  if (
+    popupRiskSuppressionState.status !== "not_checked" &&
+    now - popupRiskSuppressionState.checked_at_unix_ms < POPUP_RISK_SUPPRESSION_RECHECK_MS
+  ) {
+    return popupRiskSuppressionState;
+  }
+  if (popupRiskSuppressionInFlight) {
+    return popupRiskSuppressionInFlight;
+  }
+  popupRiskSuppressionInFlight = refreshExternalPopupRiskSuppression(reason)
+    .catch((error) => {
+      popupRiskSuppressionState = {
+        ok: false,
+        status: "suppression_error",
+        reason,
+        checked_at_unix_ms: Date.now(),
+        hazard_count: 0,
+        remaining_hazard_count: 0,
+        disabled_count: 0,
+        failure_count: 1,
+        management_available: Boolean(chrome.management?.getAll),
+        hazards: [],
+        disabled: [],
+        remaining_hazards: [],
+        failures: [{
+          id: "<suppression_scan>",
+          name: "suppression_scan",
+          error: errorMessage(error)
+        }]
+      };
+      return popupRiskSuppressionState;
+    })
+    .finally(() => {
+      popupRiskSuppressionInFlight = null;
+    });
+  return popupRiskSuppressionInFlight;
+}
+
+async function requireExternalPopupRisksSuppressed(commandKind, params) {
+  if (!commandRequiresExternalPopupSuppression(commandKind)) {
+    return;
+  }
+  const state = await ensureExternalPopupRiskSuppression(`command:${String(commandKind)}`);
+  if (state.ok && state.remaining_hazard_count === 0) {
+    return;
+  }
+  throw bridgeError(
+    ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
+    `normal Synapse Chrome Bridge refused ${String(commandKind)} before queueing a Chrome ` +
+      `tabs/scripting command because external debugger/nativeMessaging popup risk remains ` +
+      `unsuppressed; hwnd=${String(params?.hwnd ?? "unknown")} ` +
+      formatPopupRiskSuppressionForError(state)
   );
-  if (now < probeAfterMs) {
-    await requireReconnectWakeAlarm("maintenance-resume-probe:not-due");
-    console.warn(
-      `Synapse daemon bridge maintenance pause alarm fired before resume probe window: ` +
-        `remaining_ms=${pauseRemainingMs} probe_after_unix_ms=${probeAfterMs} ` +
-        `probe_wait_ms=${probeAfterMs - now} reason=${maintenanceReconnectPauseReason}`
-    );
-    return false;
+}
+
+function commandRequiresExternalPopupSuppression(kind) {
+  return [
+    "openTab",
+    "listTabs",
+    "closeTab",
+    "targetInfo",
+    "targetInfoPageText",
+    "frames",
+    "typeActiveElement",
+    "setFieldValue",
+    "pageVitals",
+    "pageContent",
+    "setContent",
+    "ariaSnapshot",
+    "assertPoll",
+    "locateElements",
+    "inspectElement",
+    "scrollIntoView",
+    "waitForText",
+    "waitForFunction",
+    "waitForSelector",
+    "clock",
+    "pageEvents",
+    "evaluateScript",
+    "initScript",
+    "exposeBinding",
+    "handleDialog",
+    "cdpInput",
+    "viewportEmulation",
+    "deviceEmulation",
+    "geolocationEmulation",
+    "localeEmulation",
+    "mediaEmulation",
+    "networkConditions",
+    "navigateTab",
+    "activateTab",
+    "domAction",
+    "coordinateClick"
+  ].includes(kind);
+}
+
+async function refreshExternalPopupRiskSuppression(reason) {
+  const checkedAt = Date.now();
+  const managementAvailable = Boolean(chrome.management?.getAll);
+  if (!managementAvailable) {
+    popupRiskSuppressionState = {
+      ok: false,
+      status: "management_unavailable",
+      reason,
+      checked_at_unix_ms: checkedAt,
+      hazard_count: 0,
+      remaining_hazard_count: 0,
+      disabled_count: 0,
+      failure_count: 1,
+      management_available: false,
+      hazards: [],
+      disabled: [],
+      remaining_hazards: [],
+      failures: [{
+        id: "<chrome.management>",
+        name: "chrome.management",
+        error: "management permission/API unavailable"
+      }]
+    };
+    return popupRiskSuppressionState;
   }
-  if (maintenanceReconnectResumeProbeInFlight) {
-    return maintenanceReconnectResumeProbeInFlight;
-  }
-  maintenanceReconnectResumeProbeInFlight = (async () => {
-    let probe;
-    try {
-      probe = await daemonFetchJson("/chrome-debugger/native/reconnect-probe", {
-        method: "GET",
-        forceRegisterToken: true
+
+  const before = await chrome.management.getAll();
+  const hazards = enabledExternalPopupRiskExtensions(before);
+  const disabled = [];
+  const failures = [];
+
+  for (const hazard of hazards) {
+    if (hazard.may_disable === false) {
+      failures.push({
+        ...hazard,
+        error: "chrome.management reports mayDisable=false"
       });
+      continue;
+    }
+    try {
+      await chrome.management.setEnabled(hazard.id, false);
+      disabled.push(hazard);
     } catch (error) {
-      await requireReconnectWakeAlarm("maintenance-resume-probe:daemon-unavailable");
-      console.warn(
-        `Synapse daemon bridge maintenance resume probe failed: ` +
-          `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
-          `paused_daemon_pid=${maintenanceReconnectPausedDaemonPid || "<unknown>"} ` +
-          `paused_daemon_instance_id=${maintenanceReconnectPausedDaemonInstanceId || "<unknown>"} ` +
-          `error=${errorMessage(error)}`
-      );
-      return false;
+      failures.push({
+        ...hazard,
+        error: errorMessage(error)
+      });
     }
+  }
 
-    const daemonPid = Number(probe?.daemon_pid);
-    const daemonInstanceId = String(probe?.daemon_instance_id || "").trim();
-    if (
-      probe?.ok !== true ||
-      !Number.isSafeInteger(daemonPid) ||
-      daemonPid <= 0 ||
-      !daemonInstanceId
-    ) {
-      await requireReconnectWakeAlarm("maintenance-resume-probe:invalid-response");
-      console.warn(
-        `Synapse daemon bridge maintenance resume probe returned invalid response: ` +
-          `response=${JSON.stringify(probe)} reason=${maintenanceReconnectPauseReason}`
-      );
-      return false;
+  const after = disabled.length > 0 ? await chrome.management.getAll() : before;
+  const remaining = enabledExternalPopupRiskExtensions(after);
+  const remainingIds = new Set(remaining.map((entry) => entry.id));
+  for (const entry of disabled) {
+    if (remainingIds.has(entry.id)) {
+      failures.push({
+        ...entry,
+        error: "chrome.management.setEnabled returned but extension remained enabled"
+      });
     }
+  }
 
-    const pausedInstanceId = maintenanceReconnectPausedDaemonInstanceId;
-    const pausedPid = maintenanceReconnectPausedDaemonPid;
-    const sameInstance = pausedInstanceId && daemonInstanceId === pausedInstanceId;
-    const samePidWithoutInstance = !pausedInstanceId && pausedPid && daemonPid === pausedPid;
-    if (sameInstance || samePidWithoutInstance) {
-      await requireReconnectWakeAlarm("maintenance-resume-probe:same-daemon");
-      console.warn(
-        `Synapse daemon bridge maintenance resume probe still sees pausing daemon: ` +
-          `daemon_pid=${daemonPid} daemon_instance_id=${daemonInstanceId} ` +
-          `paused_daemon_pid=${pausedPid || "<unknown>"} ` +
-          `paused_daemon_instance_id=${pausedInstanceId || "<unknown>"} ` +
-          `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason}`
-      );
-      return false;
-    }
-
-    const pausedPidForLog = pausedPid || "<unknown>";
-    const pausedInstanceForLog = pausedInstanceId || "<unknown>";
-    await clearMaintenanceReconnectPause("replacement_daemon_reconnect_probe");
-    closeWebSocket({ reason: "maintenance pause released after replacement daemon probe" });
-    hostId = null;
-    bridgeToken = null;
-    resetReconnectState();
+  const ok = remaining.length === 0 && failures.length === 0;
+  popupRiskSuppressionState = {
+    ok,
+    status: ok ? (hazards.length > 0 ? "suppressed" : "clear") : "unsuppressed",
+    reason,
+    checked_at_unix_ms: checkedAt,
+    hazard_count: hazards.length,
+    remaining_hazard_count: remaining.length,
+    disabled_count: disabled.length,
+    failure_count: failures.length,
+    management_available: true,
+    hazards,
+    disabled,
+    remaining_hazards: remaining,
+    failures
+  };
+  if (!ok) {
     console.warn(
-      `Synapse daemon bridge maintenance pause released by alarm reconnect probe: ` +
-        `replacement_daemon_pid=${daemonPid} replacement_daemon_instance_id=${daemonInstanceId} ` +
-        `paused_daemon_pid=${pausedPidForLog} ` +
-        `paused_daemon_instance_id=${pausedInstanceForLog}`
+      `Synapse external popup risk suppression incomplete: ` +
+        formatPopupRiskSuppressionForError(popupRiskSuppressionState)
     );
-    connectDaemon();
-    return true;
-  })().finally(() => {
-    maintenanceReconnectResumeProbeInFlight = null;
-  });
-  return maintenanceReconnectResumeProbeInFlight;
+  } else if (disabled.length > 0) {
+    console.warn(
+      `Synapse disabled ${disabled.length} external debugger/nativeMessaging extension(s): ` +
+        disabled.map((entry) => `${entry.id}:${entry.name}`).join(" | ")
+    );
+  }
+  return popupRiskSuppressionState;
+}
+
+function enabledExternalPopupRiskExtensions(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((info) => info?.id && info.id !== chrome.runtime.id && info.enabled === true)
+    .map((info) => {
+      const permissions = Array.isArray(info.permissions) ? info.permissions : [];
+      const hazardPermissions = permissions
+        .filter((permission) => EXTERNAL_POPUP_RISK_PERMISSIONS.includes(permission))
+        .sort();
+      return {
+        id: String(info.id),
+        name: String(info.name || ""),
+        type: String(info.type || ""),
+        install_type: String(info.installType || ""),
+        may_disable: info.mayDisable !== false,
+        permissions: permissions.map(String).sort(),
+        hazard_permissions: [...new Set(hazardPermissions)],
+        enabled: info.enabled === true,
+        disabled_reason: info.disabledReason ? String(info.disabledReason) : ""
+      };
+    })
+    .filter((info) => info.hazard_permissions.length > 0)
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function popupRiskSuppressionSnapshot() {
+  return JSON.parse(JSON.stringify(popupRiskSuppressionState));
+}
+
+function formatPopupRiskSuppressionForError(state) {
+  const remaining = Array.isArray(state?.remaining_hazards) ? state.remaining_hazards : [];
+  const failures = Array.isArray(state?.failures) ? state.failures : [];
+  const remainingText = remaining.length > 0
+    ? remaining
+        .slice(0, 8)
+        .map((entry) => `${entry.id}:${entry.name}:${entry.hazard_permissions.join(",")}`)
+        .join(" | ")
+    : "<none>";
+  const failureText = failures.length > 0
+    ? failures
+        .slice(0, 8)
+        .map((entry) => `${entry.id}:${entry.name}:${entry.error || "unknown"}`)
+        .join(" | ")
+    : "<none>";
+  return (
+    `suppression_status=${String(state?.status || "unknown")} ` +
+    `suppression_reason=${String(state?.reason || "unknown")} ` +
+    `management_available=${Boolean(state?.management_available)} ` +
+    `hazard_count=${Number(state?.hazard_count || 0)} ` +
+    `disabled_count=${Number(state?.disabled_count || 0)} ` +
+    `remaining_hazard_count=${Number(state?.remaining_hazard_count || 0)} ` +
+    `failure_count=${Number(state?.failure_count || 0)} ` +
+    `remaining_hazards=${remainingText} failures=${failureText} ` +
+    `remediation=disable the named extension IDs in Chrome or repair ` +
+    `HKCU\\Software\\Policies\\Google\\Chrome ACL so Synapse can apply ` +
+    `ExtensionSettings blocked_permissions for debugger/nativeMessaging`
+  );
 }
 
 function connectWebSocket() {
@@ -1137,12 +778,6 @@ function connectWebSocket() {
     resetReconnectState();
     console.info(`Synapse daemon bridge connected: host_id=${hostId}`);
     startWebSocketKeepAlive(socket);
-    flushCommandTerminalOutbox(socket).catch((error) => {
-      scheduleReconnect(
-        `durable command-terminal replay failed: ${errorMessage(error)}`,
-        ERROR_DAEMON_UNAVAILABLE
-      );
-    });
   };
   socket.onmessage = (event) => {
     handleWebSocketMessage(event.data).catch((error) => {
@@ -1181,22 +816,7 @@ async function handleWebSocketMessage(raw) {
   if (message?.ok === false) {
     throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
   }
-  if (message?.type === "command_terminal_ack") {
-    await acknowledgeCommandTerminal(message);
-    return;
-  }
-  if (message?.type === "command_diagnostic_ack") {
-    return;
-  }
-  if (message?.type === "command_terminal_nack") {
-    disableBridgePermanently(
-      `daemon rejected a durable command terminal: ${JSON.stringify(message)}`,
-      ERROR_TERMINAL_PROTOCOL
-    );
-    return;
-  }
   if (message?.command) {
-    message.command.__synapseOriginalHostId = hostId;
     await enqueueCommand(message.command);
   }
 }
@@ -1226,10 +846,8 @@ function enqueueImmediateOperatorPanicDisable(command) {
       try {
         await persistDurableOwnerLedger({ mergeLiveOwners: true });
       } catch (error) {
-        recordDurableOwnerStateFailure(
-          "persist_immediate_operator_panic_disable",
-          `persist immediate operator panic disable failed: ${errorMessage(error)}`
-        );
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          `persist immediate operator panic disable failed: ${errorMessage(error)}`;
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       }
       return DURABLE_MUTATION_DISABLE_SEQUENCE;
@@ -1251,18 +869,12 @@ function enqueueImmediateOperatorPanicDisable(command) {
 
 function emptyDurableOwnerLedger() {
   return {
-    version: DURABLE_OWNER_STORAGE_SCHEMA_VERSION,
+    version: 2,
     revision: 0,
     browserSessionId: "",
     enabled: true,
     disableSequence: 0,
     inFlightMutation: null,
-    commandTerminalSequence: 0,
-    commandTerminalOutbox: [],
-    lastCommandTerminalAck: null,
-    legacySchema5Migration: null,
-    captureVisibleTabLease: null,
-    lastCaptureVisibleTabSettlement: null,
     openedTabs: [],
     initScripts: [],
     bindings: [],
@@ -1286,285 +898,6 @@ function normalizeStoredTabId(value) {
   return Number.isSafeInteger(tabId) && tabId >= 0 ? tabId : null;
 }
 
-function normalizeStoredCaptureVisibleTabLease(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("durable owner ledger capture-visible-tab lease is malformed");
-  }
-  const id = String(value.id || "").trim();
-  const browserSessionId = String(value.browserSessionId || "").trim();
-  const workerBootId = String(value.workerBootId || "").trim();
-  const targetId = String(value.targetId || "").trim();
-  const status = String(value.status || "").trim();
-  const tabId = normalizeStoredTabId(value.tabId);
-  const windowId = Number(value.windowId);
-  const tileIndex = Number(value.tileIndex);
-  const tileCount = Number(value.tileCount);
-  const requestedTimeoutMs = Number(value.requestedTimeoutMs);
-  const effectiveTimeoutMs = Number(value.effectiveTimeoutMs);
-  const queuedAtUnixMs = Number(value.queuedAtUnixMs);
-  const startedAtUnixMs = value.startedAtUnixMs === null ||
-      value.startedAtUnixMs === undefined
-    ? null
-    : Number(value.startedAtUnixMs);
-  const deadlineUnixMs = Number(value.deadlineUnixMs);
-  const callerTimedOutAtUnixMs = value.callerTimedOutAtUnixMs === null ||
-      value.callerTimedOutAtUnixMs === undefined
-    ? null
-    : Number(value.callerTimedOutAtUnixMs);
-  if (
-    !id || !browserSessionId || !workerBootId ||
-    tabId === null || targetId !== targetIdForTabId(tabId) ||
-    !Number.isSafeInteger(windowId) || windowId < 0 ||
-    !Number.isSafeInteger(tileIndex) || tileIndex <= 0 ||
-    !Number.isSafeInteger(tileCount) || tileCount <= 0 || tileIndex > tileCount ||
-    !Number.isSafeInteger(requestedTimeoutMs) || requestedTimeoutMs <= 0 ||
-    !Number.isSafeInteger(effectiveTimeoutMs) || effectiveTimeoutMs <= 0 ||
-    !Number.isSafeInteger(queuedAtUnixMs) || queuedAtUnixMs <= 0 ||
-    !Number.isSafeInteger(deadlineUnixMs) || deadlineUnixMs <= queuedAtUnixMs ||
-    !["admitted", "active", "quarantined_worker_restart"].includes(status) ||
-    (status === "admitted" && startedAtUnixMs !== null) ||
-    (status !== "admitted" &&
-      (!Number.isSafeInteger(startedAtUnixMs) || startedAtUnixMs < queuedAtUnixMs)) ||
-    (callerTimedOutAtUnixMs !== null &&
-      (!Number.isSafeInteger(callerTimedOutAtUnixMs) ||
-       startedAtUnixMs === null || callerTimedOutAtUnixMs < startedAtUnixMs))
-  ) {
-    throw new Error("durable owner ledger capture-visible-tab lease fields are malformed");
-  }
-  return {
-    id,
-    browserSessionId,
-    workerBootId,
-    tabId,
-    windowId,
-    targetId,
-    tileIndex,
-    tileCount,
-    requestedTimeoutMs,
-    effectiveTimeoutMs,
-    queuedAtUnixMs,
-    startedAtUnixMs,
-    deadlineUnixMs,
-    callerTimedOutAtUnixMs,
-    status
-  };
-}
-
-function normalizeStoredCaptureVisibleTabSettlement(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("durable owner ledger capture-visible-tab settlement is malformed");
-  }
-  const leaseId = String(value.leaseId || "").trim();
-  const outcome = String(value.outcome || "").trim();
-  const workerBootId = String(value.workerBootId || "").trim();
-  const tabId = normalizeStoredTabId(value.tabId);
-  const startedAtUnixMs = Number(value.startedAtUnixMs);
-  const settledAtUnixMs = Number(value.settledAtUnixMs);
-  const elapsedMs = Number(value.elapsedMs);
-  if (
-    !leaseId || !workerBootId || tabId === null ||
-    !["fulfilled", "rejected", "browser_session_ended"].includes(outcome) ||
-    !Number.isSafeInteger(startedAtUnixMs) || startedAtUnixMs <= 0 ||
-    !Number.isSafeInteger(settledAtUnixMs) || settledAtUnixMs < startedAtUnixMs ||
-    !Number.isSafeInteger(elapsedMs) || elapsedMs < 0 ||
-    typeof value.callerTimedOut !== "boolean"
-  ) {
-    throw new Error("durable owner ledger capture-visible-tab settlement fields are malformed");
-  }
-  return {
-    leaseId,
-    outcome,
-    workerBootId,
-    tabId,
-    startedAtUnixMs,
-    settledAtUnixMs,
-    elapsedMs,
-    callerTimedOut: value.callerTimedOut,
-    errorCode: typeof value.errorCode === "string" ? value.errorCode : null,
-    errorDetail: typeof value.errorDetail === "string" ? value.errorDetail : null
-  };
-}
-
-function normalizeStoredCommandTerminal(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("durable command terminal is not an object");
-  }
-  const normalized = {
-    protocolVersion: Number(value.protocolVersion),
-    originalHostId: String(value.originalHostId || "").trim(),
-    browserSessionId: String(value.browserSessionId || "").trim(),
-    commandId: String(value.commandId || "").trim(),
-    commandKind: String(value.commandKind || "").trim(),
-    terminalSequence: Number(value.terminalSequence),
-    payloadJson: typeof value.payloadJson === "string" ? value.payloadJson : "",
-    payloadSha256: String(value.payloadSha256 || "").toLowerCase(),
-    payloadBytes: Number(value.payloadBytes),
-    createdAtUnixMs: Number(value.createdAtUnixMs),
-    workerBootId: String(value.workerBootId || "").trim()
-  };
-  const actualPayloadBytes = new TextEncoder().encode(normalized.payloadJson).byteLength;
-  if (
-    normalized.protocolVersion !== PROTOCOL_VERSION ||
-    !normalized.originalHostId || !normalized.browserSessionId ||
-    !normalized.commandId || !normalized.commandKind || !normalized.workerBootId ||
-    !Number.isSafeInteger(normalized.terminalSequence) || normalized.terminalSequence <= 0 ||
-    !Number.isSafeInteger(normalized.payloadBytes) || normalized.payloadBytes <= 0 ||
-    normalized.payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES ||
-    actualPayloadBytes !== normalized.payloadBytes ||
-    !/^[0-9a-f]{64}$/.test(normalized.payloadSha256) ||
-    !Number.isSafeInteger(normalized.createdAtUnixMs) || normalized.createdAtUnixMs <= 0
-  ) {
-    throw new Error(
-      `durable command terminal fields are malformed: command_id=${normalized.commandId || "missing"} ` +
-        `recorded_bytes=${normalized.payloadBytes} actual_bytes=${actualPayloadBytes}`
-    );
-  }
-  return normalized;
-}
-
-function normalizeStoredCommandTerminalAck(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("durable command terminal acknowledgement is not an object");
-  }
-  const ack = {
-    commandId: String(value.commandId || "").trim(),
-    terminalSequence: Number(value.terminalSequence),
-    payloadSha256: String(value.payloadSha256 || "").toLowerCase(),
-    payloadBytes: Number(value.payloadBytes),
-    daemonHostId: String(value.daemonHostId || "").trim(),
-    acknowledgedAtUnixMs: Number(value.acknowledgedAtUnixMs)
-  };
-  if (!ack.commandId || !Number.isSafeInteger(ack.terminalSequence) ||
-      ack.terminalSequence <= 0 || !/^[0-9a-f]{64}$/.test(ack.payloadSha256) ||
-      !Number.isSafeInteger(ack.payloadBytes) || ack.payloadBytes <= 0 ||
-      !ack.daemonHostId || !Number.isSafeInteger(ack.acknowledgedAtUnixMs) ||
-      ack.acknowledgedAtUnixMs <= 0) {
-    throw new Error("durable command terminal acknowledgement fields are malformed");
-  }
-  return ack;
-}
-
-function isLowerSha256Hex(value) {
-  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
-}
-
-function normalizeLegacySchema5MigrationMetadata(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("durable owner ledger schema-5 migration metadata is malformed");
-  }
-  const metadata = {
-    archiveVersion: Number(value.archiveVersion),
-    sourceSchemaVersion: Number(value.sourceSchemaVersion),
-    sourceRevision: Number(value.sourceRevision),
-    sourceSha256: String(value.sourceSha256 || "").trim(),
-    sourceBytes: Number(value.sourceBytes),
-    sourceTerminalSequence: Number(value.sourceTerminalSequence),
-    archiveKey: String(value.archiveKey || "").trim(),
-    archivedAtUnixMs: Number(value.archivedAtUnixMs),
-    migratedAtUnixMs: Number(value.migratedAtUnixMs)
-  };
-  if (metadata.archiveVersion !== 1 || metadata.sourceSchemaVersion !== 5 ||
-      !Number.isSafeInteger(metadata.sourceRevision) || metadata.sourceRevision < 0 ||
-      !isLowerSha256Hex(metadata.sourceSha256) ||
-      !Number.isSafeInteger(metadata.sourceBytes) || metadata.sourceBytes <= 0 ||
-      !Number.isSafeInteger(metadata.sourceTerminalSequence) ||
-      metadata.sourceTerminalSequence < 0 ||
-      metadata.archiveKey !== LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY ||
-      !Number.isSafeInteger(metadata.archivedAtUnixMs) ||
-      metadata.archivedAtUnixMs <= 0 ||
-      !Number.isSafeInteger(metadata.migratedAtUnixMs) ||
-      metadata.migratedAtUnixMs < metadata.archivedAtUnixMs) {
-    throw new Error("durable owner ledger schema-5 migration metadata fields are malformed");
-  }
-  return metadata;
-}
-
-function normalizeLegacySchema5LastTerminalAcknowledgement(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("schema-5 durable owner last terminal acknowledgement is malformed");
-  }
-  const row = {
-    commandId: String(value.commandId || "").trim(),
-    commandKind: String(value.commandKind || "").trim(),
-    ownerHostId: String(value.ownerHostId || "").trim(),
-    acceptedHostId: String(value.acceptedHostId || "").trim(),
-    browserSessionSha256: String(value.browserSessionSha256 || "").trim(),
-    terminalSequence: Number(value.terminalSequence),
-    wireSha256: String(value.wireSha256 || "").trim(),
-    wireBytes: Number(value.wireBytes),
-    status: String(value.status || "").trim(),
-    responseOk: value.responseOk,
-    responseErrorCode: String(value.responseErrorCode || ""),
-    acceptedAtUnixMs: Number(value.acceptedAtUnixMs),
-    recordedAtUnixMs: Number(value.recordedAtUnixMs)
-  };
-  if (!row.commandId || !row.commandKind || !row.ownerHostId ||
-      !row.acceptedHostId || !isLowerSha256Hex(row.browserSessionSha256) ||
-      !Number.isSafeInteger(row.terminalSequence) || row.terminalSequence <= 0 ||
-      !isLowerSha256Hex(row.wireSha256) ||
-      !Number.isSafeInteger(row.wireBytes) || row.wireBytes <= 0 ||
-      !["accepted", "duplicate"].includes(row.status) ||
-      typeof row.responseOk !== "boolean" ||
-      !Number.isSafeInteger(row.acceptedAtUnixMs) || row.acceptedAtUnixMs <= 0 ||
-      !Number.isSafeInteger(row.recordedAtUnixMs) || row.recordedAtUnixMs <= 0) {
-    throw new Error("schema-5 durable owner last terminal acknowledgement fields are malformed");
-  }
-  return row;
-}
-
-function normalizeLegacySchema5LastCaptureSettlement(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("schema-5 durable owner last capture settlement is malformed");
-  }
-  const row = {
-    id: String(value.id || "").trim(),
-    status: String(value.status || "").trim(),
-    tabId: normalizeStoredTabId(value.tabId),
-    windowId: Number(value.windowId),
-    tileIndex: Number(value.tileIndex),
-    tileCount: Number(value.tileCount),
-    workerBootId: String(value.workerBootId || "").trim(),
-    browserSessionSha256: String(value.browserSessionSha256 || "").trim(),
-    rawStartedAtUnixMs: Number(value.rawStartedAtUnixMs),
-    rawSettledAtUnixMs: Number(value.rawSettledAtUnixMs),
-    callerTimedOut: value.callerTimedOut,
-    resultDiscarded: value.resultDiscarded,
-    errorCode: value.errorCode === null ? null : String(value.errorCode || "").trim(),
-    errorDetail: value.errorDetail === null ? null : String(value.errorDetail || "")
-  };
-  if (!row.id || !["fulfilled", "rejected", "postcondition_failed"].includes(row.status) ||
-      row.tabId === null || !Number.isSafeInteger(row.windowId) || row.windowId < 0 ||
-      !Number.isSafeInteger(row.tileIndex) || row.tileIndex < 1 ||
-      !Number.isSafeInteger(row.tileCount) || row.tileCount < row.tileIndex ||
-      !row.workerBootId || !isLowerSha256Hex(row.browserSessionSha256) ||
-      !Number.isSafeInteger(row.rawStartedAtUnixMs) || row.rawStartedAtUnixMs <= 0 ||
-      !Number.isSafeInteger(row.rawSettledAtUnixMs) ||
-      row.rawSettledAtUnixMs < row.rawStartedAtUnixMs ||
-      typeof row.callerTimedOut !== "boolean" ||
-      typeof row.resultDiscarded !== "boolean" ||
-      (row.status === "fulfilled" && row.errorCode !== null) ||
-      (row.status !== "fulfilled" && !row.errorCode) ||
-      (row.errorDetail !== null && row.errorDetail.length > 2048)) {
-    throw new Error("schema-5 durable owner last capture settlement fields are malformed");
-  }
-  return row;
-}
-
 function normalizeDurableOwnerLedger(value) {
   if (value === undefined) {
     return emptyDurableOwnerLedger();
@@ -1573,14 +906,8 @@ function normalizeDurableOwnerLedger(value) {
     throw new Error("durable owner ledger is not an object");
   }
   const source = value;
-  if (![2, 4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
+  if (source.version !== 2) {
     throw new Error(`durable owner ledger version is unsupported: ${String(source.version)}`);
-  }
-  if (source.version === 2 && source.inFlightMutation) {
-    throw new Error(
-      "durable owner ledger v2 contains an in-flight mutation without a terminal outbox; " +
-        "execution outcome cannot be reconstructed, so migration is refused"
-    );
   }
   if (typeof source.enabled !== "boolean") {
     throw new Error("durable owner ledger enabled flag is not boolean");
@@ -1615,13 +942,6 @@ function normalizeDurableOwnerLedger(value) {
       throw new Error(`durable owner ledger ${field} is not an array`);
     }
   }
-  if (source.version === DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
-    for (const entry of source.clockTabs) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        throw new Error("durable owner ledger clockTabs contains a non-descriptor row");
-      }
-    }
-  }
   if (source.inFlightMutation !== null &&
       (!source.inFlightMutation || typeof source.inFlightMutation !== "object" ||
        Array.isArray(source.inFlightMutation))) {
@@ -1632,10 +952,6 @@ function normalizeDurableOwnerLedger(value) {
   ledger.browserSessionId = source.browserSessionId.trim();
   ledger.enabled = source.enabled;
   ledger.disableSequence = source.disableSequence;
-  ledger.captureVisibleTabLease =
-    normalizeStoredCaptureVisibleTabLease(source.captureVisibleTabLease);
-  ledger.lastCaptureVisibleTabSettlement =
-    normalizeStoredCaptureVisibleTabSettlement(source.lastCaptureVisibleTabSettlement);
   if (source.inFlightMutation) {
     const activitySequence = source.inFlightMutation.activitySequence;
     const id = String(source.inFlightMutation.id || "").trim();
@@ -1646,42 +962,6 @@ function normalizeDurableOwnerLedger(value) {
       throw new Error("durable owner ledger in-flight mutation fields are malformed");
     }
     ledger.inFlightMutation = { id, kind, activitySequence, workerBootId };
-  }
-  if ([4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
-    if (!Number.isSafeInteger(source.commandTerminalSequence) ||
-        source.commandTerminalSequence < 0) {
-      throw new Error("durable owner ledger command terminal sequence is malformed");
-    }
-    if (!Array.isArray(source.commandTerminalOutbox) ||
-        source.commandTerminalOutbox.length > COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES) {
-      throw new Error("durable owner ledger command terminal outbox is malformed or over capacity");
-    }
-    ledger.commandTerminalSequence = source.commandTerminalSequence;
-    let outboxPayloadBytes = 0;
-    const commandIds = new Set();
-    for (const entry of source.commandTerminalOutbox) {
-      const normalized = normalizeStoredCommandTerminal(entry);
-      if (commandIds.has(normalized.commandId)) {
-        throw new Error(`durable command terminal outbox repeats command id ${normalized.commandId}`);
-      }
-      commandIds.add(normalized.commandId);
-      outboxPayloadBytes += normalized.payloadBytes;
-      ledger.commandTerminalOutbox.push(normalized);
-    }
-    if (outboxPayloadBytes >
-        COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES * COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
-      throw new Error(
-        `durable command terminal outbox byte bound exceeded: actual=${outboxPayloadBytes}`
-      );
-    }
-    ledger.lastCommandTerminalAck = source.lastCommandTerminalAck === null
-      ? null
-      : normalizeStoredCommandTerminalAck(source.lastCommandTerminalAck);
-  }
-  if ([6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
-    ledger.legacySchema5Migration = normalizeLegacySchema5MigrationMetadata(
-      source.legacySchema5Migration
-    );
   }
   const initKeys = new Set();
   for (const entry of source.initScripts) {
@@ -1758,63 +1038,17 @@ function normalizeDurableOwnerLedger(value) {
         : null,
       openedAtUnixMs: Number.isSafeInteger(entry?.openedAtUnixMs)
         ? Math.max(0, entry.openedAtUnixMs)
-        : 0,
-      urlSha256: typeof entry?.urlSha256 === "string" &&
-          /^[0-9a-f]{64}$/i.test(entry.urlSha256)
-        ? entry.urlSha256.toLowerCase()
-        : null
+        : 0
     });
   }
   ledger.openedTabs = Array.from(openedTabsById.values());
-  for (const field of ["dialogTabs", "fileChooserTabs"]) {
+  for (const field of ["dialogTabs", "fileChooserTabs", "clockTabs"]) {
     const normalized = source[field].map(normalizeStoredTabId);
     if (normalized.some((tabId) => tabId === null)) {
       throw new Error(`durable owner ledger ${field} contains an invalid tab id`);
     }
     ledger[field] = Array.from(new Set(normalized));
   }
-  const clockOwnersByTab = new Map();
-  for (const raw of source.clockTabs) {
-    if (source.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
-      const tabId = normalizeStoredTabId(raw);
-      if (tabId === null) {
-        throw new Error("durable owner ledger legacy clockTabs contains an invalid tab id");
-      }
-      clockOwnersByTab.set(tabId, {
-        tabId,
-        targetId: targetIdForTabId(tabId),
-        documentId: null,
-        clockVersion: "legacy-unbound",
-        installedAtUnixMs: 0
-      });
-      continue;
-    }
-    const tabId = normalizeStoredTabId(raw?.tabId);
-    const targetId = String(raw?.targetId || "").trim();
-    const documentId = raw?.documentId === null
-      ? null
-      : String(raw?.documentId || "").trim();
-    const clockVersion = String(raw?.clockVersion || "").trim();
-    const installedAtUnixMs = Number(raw?.installedAtUnixMs);
-    const legacyUnbound = documentId === null && clockVersion === "legacy-unbound";
-    if (tabId === null || targetId !== targetIdForTabId(tabId) ||
-        (!legacyUnbound && !documentId) || !clockVersion ||
-        !Number.isSafeInteger(installedAtUnixMs) || installedAtUnixMs < 0 ||
-        (legacyUnbound && installedAtUnixMs !== 0)) {
-      throw new Error("durable owner ledger clockTabs contains a malformed descriptor row");
-    }
-    if (clockOwnersByTab.has(tabId)) {
-      throw new Error(`durable owner ledger clockTabs contains duplicate tab ${tabId}`);
-    }
-    clockOwnersByTab.set(tabId, {
-      tabId,
-      targetId,
-      documentId,
-      clockVersion,
-      installedAtUnixMs
-    });
-  }
-  ledger.clockTabs = Array.from(clockOwnersByTab.values());
   for (const field of [
     "viewportOverrides",
     "deviceOverrides",
@@ -1849,49 +1083,6 @@ function normalizeDurableOwnerLedger(value) {
   return ledger;
 }
 
-function normalizeRecoverableEmptyLedgerMissingBrowserSession(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(
-      "durable owner ledger missing browser session id is not an object; refusing repair"
-    );
-  }
-  if (typeof value.browserSessionId === "string" && value.browserSessionId.trim()) {
-    throw new Error(
-      "durable owner ledger repair was requested for a row that already has a browser session id"
-    );
-  }
-  // Reuse the strict decoder for every other field. The temporary value is
-  // validation-only and is never published or persisted.
-  const ledger = normalizeDurableOwnerLedger({
-    ...value,
-    browserSessionId: "validation-only-missing-browser-session"
-  });
-  const ownerCount = durableOwnerRowCount(ledger);
-  if (
-    ownerCount !== 0 ||
-    ledger.inFlightMutation !== null ||
-    ledger.captureVisibleTabLease !== null ||
-    ledger.disableSequence !== 0
-  ) {
-    throw new Error(
-      "durable owner ledger browser session id is missing and the row is not a pristine " +
-        `unowned ledger; owner_count=${ownerCount} ` +
-        `in_flight_mutation=${ledger.inFlightMutation ? "present" : "none"} ` +
-        `capture_visible_tab_lease=${ledger.captureVisibleTabLease ? "present" : "none"} ` +
-        `disable_sequence=${ledger.disableSequence} enabled=${ledger.enabled}; refusing repair`
-    );
-  }
-  // `enabled=false` with generation zero is not an operator panic: every real
-  // disable increments disableSequence first. The normal valid-ledger restore
-  // path below already re-enables this exact owner-free generation-zero state.
-  // The old failed-restore path could persist the fail-closed runtime flag into
-  // this malformed row before any generation existed, so preserve that same
-  // invariant for the narrow migration and keep every non-zero generation
-  // refused above.
-  ledger.browserSessionId = "";
-  return ledger;
-}
-
 function durableOwnerRowCount(ledger = DURABLE_OWNER_LEDGER) {
   return [
     "openedTabs",
@@ -1912,842 +1103,44 @@ function durableOwnerRowCount(ledger = DURABLE_OWNER_LEDGER) {
   ].reduce((count, field) => count + ledger[field].length, 0);
 }
 
-function durableOwnerLedgerTabIds(ledger = DURABLE_OWNER_LEDGER) {
-  const ids = new Set();
-  const add = (tabId) => {
-    if (Number.isSafeInteger(tabId) && tabId >= 0) ids.add(tabId);
-  };
-  for (const entry of ledger.openedTabs) add(entry.tabId);
-  for (const entry of ledger.initScripts) add(entry.tabId);
-  for (const entry of ledger.bindings) add(entry.tabId);
-  for (const tabId of ledger.debuggerTabs) add(tabId);
-  for (const entry of ledger.unresolvedDebuggerCommandTimeouts) add(entry.tabId);
-  for (const tabId of ledger.dialogTabs) add(tabId);
-  for (const tabId of ledger.fileChooserTabs) add(tabId);
-  for (const entry of ledger.clockTabs) add(entry.tabId);
-  for (const entry of ledger.executedInitScriptEffects) add(entry.tabId);
-  for (const field of [
-    "viewportOverrides",
-    "deviceOverrides",
-    "geolocationOverrides",
-    "localeOverrides",
-    "mediaOverrides",
-    "networkOverrides"
-  ]) {
-    for (const entry of ledger[field]) add(entry.tabId);
-  }
-  return Array.from(ids).sort((left, right) => left - right);
-}
-
-function assertDurableOwnerPersistenceAuthority(context, duringRestore) {
-  if (!DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
-    throw new Error(
-      `${context} refused because the authoritative storage baseline is not initialized`
-    );
-  }
-  if (DURABLE_OWNER_STORAGE_DIVERGENCE || DURABLE_OWNER_STATE_LOAD_ERROR) {
-    throw new Error(
-      `${context} refused because durable owner storage authority is unhealthy; ` +
-        `restore_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "not_available")}; ` +
-        `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
-    );
-  }
-  if (!DURABLE_OWNER_STATE_LOADED && duringRestore !== true) {
-    throw new Error(
-      `${context} refused because durable owner state did not load; ` +
-        `restore_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "not_available")}; ` +
-        "the default in-memory ledger is never a persistence source of truth"
-    );
-  }
-}
-
-async function writeAndVerifyDurableOwnerSnapshot(snapshot) {
-  const expectedJson = canonicalDurableOwnerJson(snapshot);
-  if (!DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
-    throw enterDurableOwnerStorageFailClosed(
-      "durable_owner_write_without_storage_baseline",
-      new Error("durable owner snapshot write refused before the storage baseline was read")
-    );
-  }
-  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
-    throw new Error(
-      "durable owner snapshot write refused after authoritative storage divergence; " +
-        `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
-    );
-  }
-
-  const beforeReadback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
-  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
-    throw new Error(
-      "durable owner snapshot write refused because storage diverged during the pre-write read"
-    );
-  }
-  const beforeJson = durableOwnerStorageValueJson(
-    beforeReadback?.[DURABLE_OWNER_STORAGE_KEY]
-  );
-  if (beforeJson !== DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON) {
-    const error = new Error(
-      "chrome.storage.local durable owner write precondition failed; " +
-        `expected_sha256=${await sha256HexText(
-          DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON || "missing"
-        )} ` +
-        `actual_sha256=${await sha256HexText(beforeJson || "missing")} ` +
-        `expected_bytes=${DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON === null
-          ? 0
-          : new TextEncoder().encode(DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON).byteLength} ` +
-        `actual_bytes=${beforeJson === null
-          ? 0
-          : new TextEncoder().encode(beforeJson).byteLength}`
-    );
-    recordDurableOwnerStorageDivergence(
-      "durable_owner_write_precondition_mismatch",
-      DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON,
-      beforeJson
-    );
-    throw error;
-  }
-
-  let resolveEvent;
-  const eventPromise = new Promise((resolve) => {
-    resolveEvent = resolve;
-  });
-  const transition = {
-    beforeJson,
-    expectedJson,
-    eventObserved: false,
-    resolveEvent
-  };
-  DURABLE_OWNER_STORAGE_WRITE_TRANSITION = transition;
-  let eventTimeoutId = null;
-  try {
-    await chrome.storage.local.set({ [DURABLE_OWNER_STORAGE_KEY]: snapshot });
-    const readback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
-    const stored = readback?.[DURABLE_OWNER_STORAGE_KEY];
-    const actualJson = durableOwnerStorageValueJson(stored);
-    if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
-      throw new Error(
-        "durable owner snapshot write refused because storage diverged during its " +
-          "verified write transition"
-      );
-    }
-    if (actualJson !== expectedJson) {
-      const error = new Error(
-        "chrome.storage.local durable owner write postcondition failed; " +
-          `expected_sha256=${await sha256HexText(expectedJson)} ` +
-          `actual_sha256=${await sha256HexText(actualJson || "missing")} ` +
-          `expected_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
-          `actual_bytes=${actualJson === null
-            ? 0
-            : new TextEncoder().encode(actualJson).byteLength}`
-      );
-      recordDurableOwnerStorageDivergence(
-        "durable_owner_write_postcondition_mismatch",
-        expectedJson,
-        actualJson
-      );
-      throw error;
-    }
-    const eventObserved = await Promise.race([
-      eventPromise.then(() => true),
-      new Promise((resolve) => {
-        eventTimeoutId = setTimeout(
-          () => resolve(false),
-          DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS
-        );
-      })
-    ]);
-    if (!eventObserved || !transition.eventObserved) {
-      throw enterDurableOwnerStorageFailClosed(
-        "durable_owner_storage_change_event_missing",
-        new Error(
-          "chrome.storage.onChanged did not confirm the exact durable owner write " +
-            `transition within ${DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS}ms; refusing ` +
-            "to treat the readback alone as writer authority"
-        )
-      );
-    }
-    if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
-      throw new Error(
-        "durable owner snapshot write refused because storage diverged before the " +
-          "verified transition completed"
-      );
-    }
-    DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = actualJson;
-  } finally {
-    if (eventTimeoutId !== null) clearTimeout(eventTimeoutId);
-    if (DURABLE_OWNER_STORAGE_WRITE_TRANSITION === transition) {
-      DURABLE_OWNER_STORAGE_WRITE_TRANSITION = null;
-    }
-  }
-}
-
-function canonicalDurableOwnerJson(value) {
-  const canonicalize = (entry) => {
-    if (Array.isArray(entry)) {
-      return entry.map(canonicalize);
-    }
-    if (entry && typeof entry === "object") {
-      return Object.fromEntries(
-        Object.keys(entry)
-          .sort()
-          .map((key) => [key, canonicalize(entry[key])])
-      );
-    }
-    return entry;
-  };
-  return JSON.stringify(canonicalize(value));
-}
-
-async function analyzeLegacySchema5DurableOwnerLedger(source) {
-  if (!source || typeof source !== "object" || Array.isArray(source) || source.version !== 5) {
-    throw new Error("schema-5 durable owner migration source is not an exact schema-5 object");
-  }
-  const requiredFields = [
-    "revision",
-    "browserSessionId",
-    "browserSessionSha256",
-    "enabled",
-    "disableSequence",
-    "inFlightMutation",
-    "terminalSequence",
-    "pendingTerminalResponses",
-    "lastTerminalAcknowledgement",
-    "captureVisibleTabLease",
-    "lastCaptureVisibleTabSettlement",
-    "openedTabs",
-    "initScripts",
-    "bindings",
-    "debuggerTabs",
-    "unresolvedDebuggerCommandTimeouts",
-    "dialogTabs",
-    "fileChooserTabs",
-    "clockTabs",
-    "executedInitScriptEffects",
-    "viewportOverrides",
-    "deviceOverrides",
-    "geolocationOverrides",
-    "localeOverrides",
-    "mediaOverrides",
-    "networkOverrides"
-  ];
-  const missingFields = requiredFields.filter(
-    (field) => !Object.prototype.hasOwnProperty.call(source, field)
-  );
-  if (missingFields.length > 0) {
-    throw new Error(
-      `schema-5 durable owner ledger is missing required fields: ${missingFields.join(",")}`
-    );
-  }
-  if (!Number.isSafeInteger(source.revision) || source.revision < 0 ||
-      typeof source.browserSessionId !== "string" || !source.browserSessionId.trim() ||
-      !isLowerSha256Hex(source.browserSessionSha256) ||
-      typeof source.enabled !== "boolean" ||
-      !Number.isSafeInteger(source.disableSequence) || source.disableSequence < 0 ||
-      !Number.isSafeInteger(source.terminalSequence) || source.terminalSequence < 0) {
-    throw new Error("schema-5 durable owner ledger scalar fields are malformed");
-  }
-  const actualBrowserSessionSha256 = await sha256HexText(source.browserSessionId.trim());
-  if (actualBrowserSessionSha256 !== source.browserSessionSha256) {
-    throw new Error(
-      "schema-5 durable owner browser-session digest does not match its session id; " +
-        `expected_sha256=${actualBrowserSessionSha256} ` +
-        `actual_sha256=${source.browserSessionSha256}`
-    );
-  }
-  if (!Array.isArray(source.pendingTerminalResponses)) {
-    throw new Error("schema-5 durable owner pending terminal responses is not an array");
-  }
-  if (source.inFlightMutation !== null || source.pendingTerminalResponses.length !== 0 ||
-      source.captureVisibleTabLease !== null) {
-    throw new Error(
-      "schema-5 durable owner ledger is not quiescent; migration cannot translate live " +
-        "command/capture ownership without changing execution semantics; " +
-        `in_flight_mutation=${source.inFlightMutation ? "present" : "none"} ` +
-        `pending_terminal_response_count=${source.pendingTerminalResponses.length} ` +
-        `capture_visible_tab_lease=${source.captureVisibleTabLease ? "present" : "none"}`
-    );
-  }
-  const lastTerminalAcknowledgement =
-    normalizeLegacySchema5LastTerminalAcknowledgement(source.lastTerminalAcknowledgement);
-  const lastCaptureVisibleTabSettlement =
-    normalizeLegacySchema5LastCaptureSettlement(source.lastCaptureVisibleTabSettlement);
-  if (lastTerminalAcknowledgement &&
-      (lastTerminalAcknowledgement.terminalSequence > source.terminalSequence ||
-       lastTerminalAcknowledgement.browserSessionSha256 !== source.browserSessionSha256)) {
-    throw new Error(
-      "schema-5 durable owner last terminal acknowledgement contradicts the ledger " +
-        "sequence or browser-session lineage"
-    );
-  }
-  if (lastCaptureVisibleTabSettlement &&
-      lastCaptureVisibleTabSettlement.browserSessionSha256 !== source.browserSessionSha256) {
-    throw new Error(
-      "schema-5 durable owner last capture settlement contradicts browser-session lineage"
-    );
-  }
-
-  const ledger = normalizeDurableOwnerLedger({
-    ...source,
-    version: 4,
-    commandTerminalSequence: source.terminalSequence,
-    commandTerminalOutbox: [],
-    lastCommandTerminalAck: null,
-    captureVisibleTabLease: null,
-    lastCaptureVisibleTabSettlement: null
-  });
-  const sourceJson = canonicalDurableOwnerJson(source);
-  return {
-    ledger,
-    sourceJson,
-    sourceSha256: await sha256HexText(sourceJson),
-    sourceBytes: new TextEncoder().encode(sourceJson).byteLength,
-    sourceRevision: source.revision,
-    sourceTerminalSequence: source.terminalSequence
-  };
-}
-
-async function validateLegacySchema5Archive(archive, analysis) {
-  if (!archive || typeof archive !== "object" || Array.isArray(archive) ||
-      archive.archiveVersion !== 1 || archive.sourceSchemaVersion !== 5 ||
-      !Number.isSafeInteger(archive.archivedAtUnixMs) || archive.archivedAtUnixMs <= 0 ||
-      !Number.isSafeInteger(archive.sourceRevision) || archive.sourceRevision < 0 ||
-      !Number.isSafeInteger(archive.sourceBytes) || archive.sourceBytes <= 0 ||
-      !isLowerSha256Hex(archive.sourceSha256) ||
-      !archive.source || typeof archive.source !== "object" || Array.isArray(archive.source)) {
-    throw new Error("durable owner schema-5 archive wrapper is malformed");
-  }
-  const archivedAnalysis = await analyzeLegacySchema5DurableOwnerLedger(archive.source);
-  if (archive.sourceRevision !== analysis.sourceRevision ||
-      archive.sourceRevision !== archivedAnalysis.sourceRevision ||
-      archive.sourceBytes !== analysis.sourceBytes ||
-      archive.sourceBytes !== archivedAnalysis.sourceBytes ||
-      archive.sourceSha256 !== analysis.sourceSha256 ||
-      archive.sourceSha256 !== archivedAnalysis.sourceSha256 ||
-      archivedAnalysis.sourceJson !== analysis.sourceJson) {
-    throw new Error(
-      "durable owner schema-5 archive does not exactly match the migration source; " +
-        `expected_revision=${analysis.sourceRevision} actual_revision=${archive.sourceRevision} ` +
-        `expected_sha256=${analysis.sourceSha256} actual_sha256=${archive.sourceSha256} ` +
-        `expected_bytes=${analysis.sourceBytes} actual_bytes=${archive.sourceBytes}`
-    );
-  }
-  return archive;
-}
-
-async function writeAndVerifyLegacySchema5Archive(analysis, existingArchive) {
-  let archive = existingArchive;
-  if (archive === undefined) {
-    archive = {
-      archiveVersion: 1,
-      sourceSchemaVersion: 5,
-      sourceRevision: analysis.sourceRevision,
-      sourceSha256: analysis.sourceSha256,
-      sourceBytes: analysis.sourceBytes,
-      archivedAtUnixMs: Date.now(),
-      source: JSON.parse(analysis.sourceJson)
-    };
-    await chrome.storage.local.set({
-      [LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]: archive
-    });
-  }
-  const readback = await chrome.storage.local.get(
-    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-  );
-  const stored = await validateLegacySchema5Archive(
-    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
-    analysis
-  );
-  if (canonicalDurableOwnerJson(stored) !== canonicalDurableOwnerJson(archive)) {
-    throw new Error(
-      "durable owner schema-5 archive write postcondition failed after exact readback"
-    );
-  }
-  return stored;
-}
-
-async function migrateLegacySchema5DurableOwnerLedger(
-  source,
-  existingArchive,
-  sourceStorageKey
-) {
-  const analysis = await analyzeLegacySchema5DurableOwnerLedger(source);
-  const archive = await writeAndVerifyLegacySchema5Archive(analysis, existingArchive);
-  const ledger = analysis.ledger;
-  ledger.revision = analysis.sourceRevision + 1;
-  ledger.legacySchema5Migration = {
-    archiveVersion: 1,
-    sourceSchemaVersion: 5,
-    sourceRevision: analysis.sourceRevision,
-    sourceSha256: analysis.sourceSha256,
-    sourceBytes: analysis.sourceBytes,
-    sourceTerminalSequence: analysis.sourceTerminalSequence,
-    archiveKey: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
-    archivedAtUnixMs: archive.archivedAtUnixMs,
-    migratedAtUnixMs: Math.max(Date.now(), archive.archivedAtUnixMs)
-  };
-  await writeAndVerifyDurableOwnerSnapshot(ledger);
-  const readback = await chrome.storage.local.get([
-    DURABLE_OWNER_STORAGE_KEY,
-    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-  ]);
-  const persistedLedger = normalizeDurableOwnerLedger(
-    readback?.[DURABLE_OWNER_STORAGE_KEY]
-  );
-  await validateLegacySchema5Archive(
-    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
-    analysis
-  );
-  const expectedJson = canonicalDurableOwnerJson(ledger);
-  const actualJson = canonicalDurableOwnerJson(persistedLedger);
-  if (actualJson !== expectedJson) {
-    throw new Error(
-      "schema-5 to schema-7 durable owner migration postcondition failed; " +
-        `expected_sha256=${await sha256HexText(expectedJson)} ` +
-        `actual_sha256=${await sha256HexText(actualJson)}`
-    );
-  }
-  if (sourceStorageKey === LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY) {
-    await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
-    const removalReadback = await chrome.storage.local.get([
-      DURABLE_OWNER_STORAGE_KEY,
-      LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
-      LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-    ]);
-    const legacyAbsent =
-      removalReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
-    const currentJson = canonicalDurableOwnerJson(
-      normalizeDurableOwnerLedger(removalReadback?.[DURABLE_OWNER_STORAGE_KEY])
-    );
-    await validateLegacySchema5Archive(
-      removalReadback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
-      analysis
-    );
-    if (!legacyAbsent || currentJson !== expectedJson) {
-      throw new Error(
-        "schema-5 migration cleanup postcondition failed; canonical schema-7 must " +
-          "remain exact and the legacy source key must be absent; " +
-          `legacy_absent=${legacyAbsent}`
-      );
-    }
-  } else if (sourceStorageKey !== DURABLE_OWNER_STORAGE_KEY) {
-    throw new Error(
-      `schema-5 migration source key is unsupported: ${String(sourceStorageKey)}`
-    );
-  }
-  return {
-    ledger: persistedLedger,
-    readback: {
-      migrated: true,
-      reason: "validated_quiescent_schema_5_to_schema_7",
-      source_revision: analysis.sourceRevision,
-      accepted_revision: persistedLedger.revision,
-      source_terminal_sequence: analysis.sourceTerminalSequence,
-      source_sha256: analysis.sourceSha256,
-      source_bytes: analysis.sourceBytes,
-      archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
-      archive_readback_verified: true,
-      migrated_at_unix_ms: ledger.legacySchema5Migration.migratedAtUnixMs
-    }
-  };
-}
-
-async function reconcileInterruptedLegacySchema5Migration(
-  canonicalStored,
-  legacyStored,
-  archiveStored
-) {
-  const canonicalLedger = normalizeDurableOwnerLedger(canonicalStored);
-  if (![6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(canonicalStored?.version) ||
-      legacyStored?.version !== 5 || !canonicalLedger.legacySchema5Migration) {
-    throw new Error(
-      "canonical and legacy durable owner rows do not form a schema-5 migration pair; " +
-        `canonical_version=${String(canonicalStored?.version)} ` +
-        `legacy_version=${String(legacyStored?.version)}`
-    );
-  }
-  const analysis = await analyzeLegacySchema5DurableOwnerLedger(legacyStored);
-  await validateLegacySchema5Archive(archiveStored, analysis);
-  const metadata = canonicalLedger.legacySchema5Migration;
-  await verifyLegacySchema5MigrationArchive(metadata, archiveStored);
-  const expectedLedger = analysis.ledger;
-  expectedLedger.revision = analysis.sourceRevision + 1;
-  expectedLedger.legacySchema5Migration = metadata;
-  const expectedJson = canonicalDurableOwnerJson(expectedLedger);
-  const actualJson = canonicalDurableOwnerJson(canonicalLedger);
-  if (actualJson !== expectedJson) {
-    throw new Error(
-      "canonical schema-7 row is not the exact one-revision product of the retained " +
-        "schema-5 source; refusing ambiguous authority; " +
-        `expected_sha256=${await sha256HexText(expectedJson)} ` +
-        `actual_sha256=${await sha256HexText(actualJson)}`
-    );
-  }
-  await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
-  const readback = await chrome.storage.local.get([
-    DURABLE_OWNER_STORAGE_KEY,
-    LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
-    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-  ]);
-  const legacyAbsent =
-    readback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
-  const persistedLedger = normalizeDurableOwnerLedger(
-    readback?.[DURABLE_OWNER_STORAGE_KEY]
-  );
-  await validateLegacySchema5Archive(
-    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
-    analysis
-  );
-  if (!legacyAbsent || canonicalDurableOwnerJson(persistedLedger) !== actualJson) {
-    throw new Error(
-      "interrupted schema-5 migration cleanup postcondition failed; canonical schema-7 " +
-        `must remain exact and legacy source must be absent; legacy_absent=${legacyAbsent}`
-    );
-  }
-  return {
-    ledger: persistedLedger,
-    readback: {
-      migrated: true,
-      reconciled_interrupted_migration: true,
-      reason: "exact_one_revision_schema_5_to_schema_7_migration_product",
-      source_revision: analysis.sourceRevision,
-      accepted_revision: persistedLedger.revision,
-      source_terminal_sequence: analysis.sourceTerminalSequence,
-      source_sha256: analysis.sourceSha256,
-      source_bytes: analysis.sourceBytes,
-      archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
-      archive_readback_verified: true,
-      legacy_source_absent_after: true,
-      migrated_at_unix_ms: metadata.migratedAtUnixMs
-    }
-  };
-}
-
-async function verifyLegacySchema5MigrationArchive(metadata, archive) {
-  if (!metadata) {
-    if (archive !== undefined) {
-      throw new Error(
-        "durable owner schema-5 archive exists without canonical schema-7 migration metadata; " +
-          "refusing ambiguous authority"
-      );
-    }
-    return null;
-  }
-  const analysis = await analyzeLegacySchema5DurableOwnerLedger(archive?.source);
-  await validateLegacySchema5Archive(archive, analysis);
-  if (metadata.sourceRevision !== analysis.sourceRevision ||
-      metadata.sourceSha256 !== analysis.sourceSha256 ||
-      metadata.sourceBytes !== analysis.sourceBytes ||
-      metadata.sourceTerminalSequence !== analysis.sourceTerminalSequence ||
-      metadata.archivedAtUnixMs !== archive.archivedAtUnixMs) {
-    throw new Error(
-      "canonical schema-7 migration metadata contradicts the immutable schema-5 archive"
-    );
-  }
-  return {
-    migrated: false,
-    reason: "existing_schema_5_archive_verified",
-    source_revision: analysis.sourceRevision,
-    accepted_revision: null,
-    source_terminal_sequence: analysis.sourceTerminalSequence,
-    source_sha256: analysis.sourceSha256,
-    source_bytes: analysis.sourceBytes,
-    archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
-    archive_readback_verified: true,
-    migrated_at_unix_ms: metadata.migratedAtUnixMs
-  };
-}
-
-async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
-  if (![4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(v4Stored?.version) ||
-      v2Stored?.version !== 2) {
-    throw new Error(
-      "both durable owner ledger keys exist but do not carry exact canonical/v2 versions; " +
-        `canonical_version=${String(v4Stored?.version)} ` +
-        `v2_version=${String(v2Stored?.version)}; ` +
-        "refusing ambiguous authority"
-    );
-  }
-  const actualCanonical = normalizeDurableOwnerLedger(v4Stored);
-  const expectedCanonical = normalizeDurableOwnerLedger(v2Stored);
-  const sourceRevision = expectedCanonical.revision;
-  expectedCanonical.revision += 1;
-  const actualJson = canonicalDurableOwnerJson(actualCanonical);
-  const expectedJson = canonicalDurableOwnerJson(expectedCanonical);
-  const actualSha256 = await sha256HexText(actualJson);
-  const expectedSha256 = await sha256HexText(expectedJson);
-  if (actualJson !== expectedJson) {
-    throw new Error(
-      "both canonical and legacy v2 durable owner ledgers are present and the canonical " +
-        "row is not " +
-        "the exact one-revision migration product; refusing ambiguous authority; " +
-        `v2_revision=${sourceRevision} canonical_revision=${actualCanonical.revision} ` +
-        `expected_canonical_sha256=${expectedSha256} ` +
-        `actual_canonical_sha256=${actualSha256} ` +
-        `expected_canonical_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
-        `actual_canonical_bytes=${new TextEncoder().encode(actualJson).byteLength}`
-    );
-  }
-
-  await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
-  const readback = await chrome.storage.local.get([
-    DURABLE_OWNER_STORAGE_KEY,
-    LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
-  ]);
-  const v2Absent = readback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
-  const persistedCanonicalJson = canonicalDurableOwnerJson(
-    normalizeDurableOwnerLedger(readback?.[DURABLE_OWNER_STORAGE_KEY])
-  );
-  const persistedCanonicalSha256 = await sha256HexText(persistedCanonicalJson);
-  if (!v2Absent || persistedCanonicalJson !== actualJson) {
-    throw new Error(
-      "interrupted durable owner migration cleanup postcondition failed; " +
-        `legacy_v2_absent=${v2Absent} expected_canonical_sha256=${actualSha256} ` +
-        `actual_canonical_sha256=${persistedCanonicalSha256}; canonical row must remain ` +
-        "exact and v2 must be absent"
-    );
-  }
-  return {
-    reconciled: true,
-    reason: "exact_one_revision_v2_to_canonical_migration_product",
-    source_v2_revision: sourceRevision,
-    accepted_canonical_revision: actualCanonical.revision,
-    accepted_canonical_sha256: actualSha256,
-    accepted_canonical_bytes: new TextEncoder().encode(actualJson).byteLength,
-    legacy_v2_absent_after: true,
-    reconciled_at_unix_ms: Date.now()
-  };
-}
-
-async function persistDurableOwnerLedgerRepairSnapshot({ duringRestore = false } = {}) {
-  assertDurableOwnerPersistenceAuthority(
-    "persist durable owner repair snapshot",
-    duringRestore
-  );
-  DURABLE_OWNER_LEDGER.revision += 1;
-  const snapshot = typeof globalThis.structuredClone === "function"
-    ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
-    : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
-  const write = () => writeAndVerifyDurableOwnerSnapshot(snapshot);
-  const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
-  DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
-  await persisted;
-}
-
-async function pruneAbsentTabsFromStaleBrowserSessionLedger() {
-  const checked = [];
-  const absent = [];
-  const closedMatchingOpenedTabs = [];
-  const live = [];
-  const failures = [];
-  const beforeCount = durableOwnerRowCount(DURABLE_OWNER_LEDGER);
-  for (const tabId of durableOwnerLedgerTabIds(DURABLE_OWNER_LEDGER)) {
-    checked.push(tabId);
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      const openedOwner = DURABLE_OWNER_LEDGER.openedTabs
-        .find((entry) => entry.tabId === tabId) || null;
-      const expectedUrlSha256 = openedOwner?.urlSha256 || null;
-      const actualUrlSha256 = expectedUrlSha256
-        ? await sha256HexText(tab?.url || "")
-        : null;
-      const chromeWindowMatched = !Number.isSafeInteger(openedOwner?.chromeWindowId) ||
-        openedOwner.chromeWindowId === tab?.windowId;
-      if (
-        openedOwner &&
-        expectedUrlSha256 &&
-        actualUrlSha256 === expectedUrlSha256 &&
-        chromeWindowMatched
-      ) {
-        await chrome.tabs.remove(tabId);
-        await waitForTargetAbsent(openedOwner.targetId, 10000);
-        pruneDurableOwnerLedgerForClosedTab(tabId);
-        closedMatchingOpenedTabs.push({
-          tab_id: tabId,
-          target_id: openedOwner.targetId,
-          chrome_window_id: Number.isSafeInteger(tab?.windowId) ? tab.windowId : null
-        });
-        continue;
-      }
-      live.push({
-        tab_id: tabId,
-        chrome_window_id: Number.isSafeInteger(tab?.windowId) ? tab.windowId : null,
-        opened_tab_url_fingerprint_present: Boolean(expectedUrlSha256),
-        opened_tab_url_fingerprint_matched: Boolean(
-          expectedUrlSha256 && actualUrlSha256 === expectedUrlSha256
-        ),
-        chrome_window_matched: chromeWindowMatched
-      });
-    } catch (error) {
-      if (operatorPanicTargetAbsent(error)) {
-        pruneDurableOwnerLedgerForClosedTab(tabId);
-        absent.push(tabId);
-      } else {
-        failures.push({
-          tab_id: tabId,
-          error: errorMessage(error)
-        });
-      }
-    }
-  }
-  return {
-    checked_tab_ids: checked,
-    absent_tab_ids: absent,
-    closed_matching_opened_tabs: closedMatchingOpenedTabs,
-    live_tabs: live,
-    failures,
-    before_owner_count: beforeCount,
-    after_owner_count: durableOwnerRowCount(DURABLE_OWNER_LEDGER)
-  };
-}
-
-function rebaseDurableOwnerLedgerAfterStaleOwnerDrain() {
-  if (
-    DURABLE_OWNER_STORAGE_DIVERGENCE ||
-    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
-    !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
-    durableOwnerRowCount(DURABLE_OWNER_LEDGER) !== 0 ||
-    DURABLE_OWNER_LEDGER.inFlightMutation
-  ) {
-    return false;
-  }
-  DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-  DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-  STALE_BROWSER_SESSION_OWNER_COUNT = 0;
-  DURABLE_OWNER_STATE_LOAD_ERROR = null;
-  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = null;
-  if (DURABLE_OWNER_LEDGER.disableSequence === 0) {
-    DURABLE_OWNER_LEDGER.enabled = true;
-    DURABLE_MUTATION_OWNERS_ENABLED =
-      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
-  }
-  return true;
-}
-
 function newDurableOwnerBrowserSessionId() {
   return typeof globalThis.crypto?.randomUUID === "function"
     ? globalThis.crypto.randomUUID()
     : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function waitForDurableOwnerLifecycleEvent() {
-  if (DURABLE_OWNER_LIFECYCLE_EVENTS.length > 0) {
-    return DURABLE_OWNER_LIFECYCLE_EVENTS[0];
-  }
-  let timeoutId = null;
-  try {
-    return await Promise.race([
-      DURABLE_OWNER_LIFECYCLE_SIGNAL,
-      new Promise((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error(
-            "chrome.storage.session browser token is absent and no runtime.onInstalled/" +
-            `runtime.onStartup evidence arrived within ${DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS}ms; ` +
-            "refusing to infer browser-session continuity"
-          ));
-        }, DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS);
-      })
-    ]);
-  } finally {
-    if (timeoutId !== null) clearTimeout(timeoutId);
-  }
-}
-
 async function restoreDurableOwnerLedger() {
-  let schemaMigrated = false;
   try {
-    if (!chrome.storage?.local || !chrome.storage?.session || !chrome.storage?.onChanged) {
-      throw new Error(
-        "chrome.storage.local/session/onChanged are required for durable owner continuity"
-      );
+    if (!chrome.storage?.local || !chrome.storage?.session) {
+      throw new Error("chrome.storage.local/session are required for durable owner continuity");
     }
     const [localStored, sessionStored] = await Promise.all([
-      chrome.storage.local.get([
-        DURABLE_OWNER_STORAGE_KEY,
-        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
-        LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-      ]),
+      chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY),
       chrome.storage.session.get([
         DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY,
         LEGACY_DURABLE_OWNER_STORAGE_KEY
       ])
     ]);
-    initializeDurableOwnerStorageBaseline(localStored?.[DURABLE_OWNER_STORAGE_KEY]);
-    const hasCurrentLocalLedger = Object.prototype.hasOwnProperty.call(
+    const hasLocalLedger = Object.prototype.hasOwnProperty.call(
       localStored || {},
       DURABLE_OWNER_STORAGE_KEY
     );
-    let hasV2LocalLedger = Object.prototype.hasOwnProperty.call(
-      localStored || {},
-      LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
-    );
-    const hasSchema5Archive = Object.prototype.hasOwnProperty.call(
-      localStored || {},
-      LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
-    );
-    if (hasCurrentLocalLedger && hasV2LocalLedger) {
-      if (localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]?.version === 5) {
-        const reconciled = await reconcileInterruptedLegacySchema5Migration(
-          localStored[DURABLE_OWNER_STORAGE_KEY],
-          localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY],
-          localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]
-        );
-        localStored[DURABLE_OWNER_STORAGE_KEY] = reconciled.ledger;
-        DURABLE_OWNER_SCHEMA5_MIGRATION = reconciled.readback;
-      } else {
-        RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION =
-          await reconcileInterruptedDurableOwnerMigration(
-            localStored[DURABLE_OWNER_STORAGE_KEY],
-            localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]
-          );
-      }
-      delete localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
-      hasV2LocalLedger = false;
-      console.warn(
-        "synapse durable owner ledger: reconciled an interrupted migration only after " +
-          "proving the canonical row was the exact one-revision product",
-        DURABLE_OWNER_SCHEMA5_MIGRATION ||
-          RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION
-      );
-    }
-    const hasLocalLedger = hasCurrentLocalLedger || hasV2LocalLedger;
-    if (!hasLocalLedger && hasSchema5Archive) {
-      throw new Error(
-        "durable owner schema-5 archive exists without a canonical or legacy owner row; " +
-          "refusing to initialize a competing authority"
-      );
-    }
     const storedBrowserSessionId = typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]
       === "string"
       ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
       : "";
-    const lifecycleEvent = storedBrowserSessionId
-      ? null
-      : await waitForDurableOwnerLifecycleEvent();
     if (!hasLocalLedger && sessionStored?.[LEGACY_DURABLE_OWNER_STORAGE_KEY] !== undefined) {
       throw new Error(
         "legacy session-only durable owner ledger is present; refusing to claim continuity after storage migration"
       );
     }
     if (!hasLocalLedger) {
-      // A durable ledger is the sole authority for the terminal-sequence lineage.
-      // Reusing a surviving chrome.storage.session token after that ledger has
-      // disappeared would reset commandTerminalSequence to zero under an identity
-      // whose daemon-side high-water mark may already be greater than zero. The
-      // first new terminal would then be (correctly) rejected as a replay and its
-      // durable outbox could never be acknowledged. Loss of the ledger therefore
-      // ends the logical browser session even when Chrome's volatile token survives.
-      // Rotate the identity before publishing the new ledger; never weaken the
-      // daemon's monotonic replay check.
+      if (storedBrowserSessionId) {
+        throw new Error(
+          "durable local owner ledger is missing while the current browser-session token exists"
+        );
+      }
       DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-      DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-        source: storedBrowserSessionId
-          ? "durable_ledger_absent_with_surviving_session_token"
-          : String(lifecycleEvent?.kind || "missing"),
-        lifecycle_reason: lifecycleEvent?.reason || null,
-        session_token_present: Boolean(storedBrowserSessionId),
-        decision: "new_ledger_with_rotated_browser_session_identity",
-        observed_at_unix_ms: Date.now()
-      };
       DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
       DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
@@ -2755,413 +1148,59 @@ async function restoreDurableOwnerLedger() {
         [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
           DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
       });
-      await persistDurableOwnerLedger({ duringRestore: true });
+      await persistDurableOwnerLedger();
     } else {
-      const storedLedger = hasCurrentLocalLedger
-        ? localStored[DURABLE_OWNER_STORAGE_KEY]
-        : localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
-      const storedLedgerKey = hasCurrentLocalLedger
-        ? DURABLE_OWNER_STORAGE_KEY
-        : LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY;
-      let repairedEmptyMissingSession = false;
-      try {
-        if (storedLedger?.version === 5) {
-          const migration = await migrateLegacySchema5DurableOwnerLedger(
-            storedLedger,
-            localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
-            storedLedgerKey
-          );
-          DURABLE_OWNER_LEDGER = migration.ledger;
-          DURABLE_OWNER_SCHEMA5_MIGRATION = migration.readback;
-          localStored[DURABLE_OWNER_STORAGE_KEY] = migration.ledger;
-          delete localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
-          hasV2LocalLedger = false;
-        } else {
-          DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(storedLedger);
-          schemaMigrated =
-            storedLedger?.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION;
-          DURABLE_OWNER_SCHEMA5_MIGRATION =
-            await verifyLegacySchema5MigrationArchive(
-              DURABLE_OWNER_LEDGER.legacySchema5Migration,
-              localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]
-            );
-        }
-      } catch (error) {
-        if (errorMessage(error) !== "durable owner ledger browser session id is missing") {
-          throw error;
-        }
-        DURABLE_OWNER_LEDGER =
-          normalizeRecoverableEmptyLedgerMissingBrowserSession(storedLedger);
-        const enabledBeforeRepair = DURABLE_OWNER_LEDGER.enabled;
-        if (storedBrowserSessionId) {
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = storedBrowserSessionId;
-          DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-            source: "chrome.storage.session",
-            lifecycle_reason: null,
-            session_token_present: true,
-            decision: "repair_pristine_empty_ledger_missing_browser_session_id",
-            observed_at_unix_ms: Date.now()
-          };
-        } else if (
-          lifecycleEvent?.kind === "runtime.onInstalled" &&
-          lifecycleEvent?.reason === "update"
-        ) {
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-          DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-            source: lifecycleEvent.kind,
-            lifecycle_reason: lifecycleEvent.reason,
-            session_token_present: false,
-            decision: "repair_pristine_empty_ledger_after_extension_update",
-            observed_at_unix_ms: Date.now()
-          };
-        } else if (lifecycleEvent?.kind === "runtime.onStartup") {
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-          DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-            source: lifecycleEvent.kind,
-            lifecycle_reason: null,
-            session_token_present: false,
-            decision: "repair_pristine_empty_ledger_for_new_browser_session",
-            observed_at_unix_ms: Date.now()
-          };
-        } else {
-          throw new Error(
-            "durable owner ledger browser session id is missing; the row is empty but " +
-              "neither chrome.storage.session nor runtime.onInstalled(update)/runtime.onStartup " +
-              `proves a browser-session identity; kind=${String(lifecycleEvent?.kind || "missing")} ` +
-              `reason=${String(lifecycleEvent?.reason || "missing")}; refusing repair`
-          );
-        }
-        DURABLE_OWNER_LEDGER.browserSessionId =
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-        DURABLE_OWNER_LEDGER.enabled = true;
-        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-        REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = {
-          repaired: true,
-          source_revision: DURABLE_OWNER_LEDGER.revision,
-          owner_count_before: 0,
-          in_flight_mutation_before: false,
-          enabled_before: enabledBeforeRepair,
-          enabled_after: DURABLE_OWNER_LEDGER.enabled,
-          disable_sequence_before: DURABLE_OWNER_LEDGER.disableSequence,
-          lifecycle_source: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE.source,
-          lifecycle_reason: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE.lifecycle_reason,
-          repaired_at_unix_ms: Date.now()
-        };
-        if (!storedBrowserSessionId) {
-          await chrome.storage.session.set({
-            [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-              DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-          });
-        }
-        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-        repairedEmptyMissingSession = true;
-      }
-      if (!repairedEmptyMissingSession && storedBrowserSessionId) {
-        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = storedBrowserSessionId;
-        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-          source: "chrome.storage.session",
-          lifecycle_reason: null,
-          session_token_present: true,
-          decision: "compare_persisted_session_token",
-          observed_at_unix_ms: Date.now()
-        };
-      } else if (!repairedEmptyMissingSession &&
-        lifecycleEvent?.kind === "runtime.onInstalled" &&
-        lifecycleEvent?.reason === "update"
-      ) {
-        // Chrome explicitly clears storage.session when an unpacked extension
-        // is reloaded and reports that lifecycle as onInstalled(reason=update).
-        // Chrome tab/window ids remain in the ledger's browser session. Re-seed
-        // only the volatile token; do not weaken the runtime.onStartup path.
-        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
-          DURABLE_OWNER_LEDGER.browserSessionId;
-        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-          source: lifecycleEvent.kind,
-          lifecycle_reason: lifecycleEvent.reason,
-          session_token_present: false,
-          decision: "preserve_ledger_session_after_extension_update",
-          observed_at_unix_ms: Date.now()
-        };
-      } else if (!repairedEmptyMissingSession && (
-        lifecycleEvent?.kind === "runtime.onStartup" ||
-        (lifecycleEvent?.kind === "runtime.onInstalled" &&
-          lifecycleEvent?.reason === "install")
-      )) {
-        // A first install has no pre-install worker whose Chrome API promises can
-        // still be alive. Persisted local bytes can nevertheless exist for an
-        // unpacked extension loaded into a reused profile (observed with Chrome
-        // for Testing). Treat that lifecycle as a new browser session exactly as
-        // runtime.onStartup, while an unpacked chrome.runtime.reload() remains the
-        // distinct onInstalled(reason=update) continuity path documented by Chrome.
-        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
-          source: lifecycleEvent.kind,
-          lifecycle_reason: lifecycleEvent.reason || null,
-          session_token_present: false,
-          decision: lifecycleEvent.kind === "runtime.onStartup"
-            ? "new_browser_session"
-            : "new_browser_session_after_extension_install",
-          observed_at_unix_ms: Date.now()
-        };
-      } else if (!repairedEmptyMissingSession) {
-        throw new Error(
-          "chrome.storage.session browser token is absent and lifecycle evidence cannot " +
-          `prove continuity; kind=${String(lifecycleEvent?.kind || "missing")} ` +
-          `reason=${String(lifecycleEvent?.reason || "missing")}`
-        );
-      }
-      if (!repairedEmptyMissingSession && !storedBrowserSessionId) {
+      DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(
+        localStored[DURABLE_OWNER_STORAGE_KEY]
+      );
+      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
+        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
+      if (!storedBrowserSessionId) {
         await chrome.storage.session.set({
           [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
             DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
         });
       }
-      if (!repairedEmptyMissingSession) {
-        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
-          DURABLE_OWNER_LEDGER.browserSessionId ===
-            DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-      }
-      if (
-        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-        DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement
-      ) {
-        lastCaptureVisibleTabAtMs = Math.max(
-          lastCaptureVisibleTabAtMs,
-          DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement.startedAtUnixMs
-        );
-      }
-      if (
-        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-        DURABLE_OWNER_LEDGER.captureVisibleTabLease
-      ) {
-        const strandedLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
-        const startedAtUnixMs =
-          strandedLease.startedAtUnixMs ?? strandedLease.queuedAtUnixMs;
-        const settledAtUnixMs = Math.max(Date.now(), startedAtUnixMs);
-        RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = {
-          ...strandedLease,
-          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
-          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
-          resolved_at_unix_ms: settledAtUnixMs,
-          resolution: "browser_session_ended"
-        };
-        DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = {
-          leaseId: strandedLease.id,
-          outcome: "browser_session_ended",
-          workerBootId: strandedLease.workerBootId,
-          tabId: strandedLease.tabId,
-          startedAtUnixMs,
-          settledAtUnixMs,
-          elapsedMs: settledAtUnixMs - startedAtUnixMs,
-          callerTimedOut: strandedLease.callerTimedOutAtUnixMs !== null,
-          errorCode: null,
-          errorDetail: null
-        };
-        DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
-        console.warn(
-          "synapse durable capture ledger: resolved captureVisibleTab lease from a prior " +
-            "browser session because its Chrome process and promise cannot still be live",
-          RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE
-        );
-        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-      }
-      let staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
+        DURABLE_OWNER_LEDGER.browserSessionId ===
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+      const staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
         (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners > 0) {
-        DURABLE_OWNER_STALE_SESSION_REPAIR =
-          await pruneAbsentTabsFromStaleBrowserSessionLedger();
-        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
-          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-        if (DURABLE_OWNER_STALE_SESSION_REPAIR.absent_tab_ids.length > 0) {
-          await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-        }
-      }
-      if (
-        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-        DURABLE_OWNER_LEDGER.inFlightMutation
-      ) {
-        // A mutation persisted by a *prior* browser session cannot still be in
-        // flight: its worker died with that browser session, and Chrome tab
-        // ids are not stable across browser restarts, so no observation in
-        // this session can ever resolve it. Retaining it kept the mutation
-        // gate closed forever with no repair path (issue #1811 structural
-        // gap). It is provably terminal — resolve it audibly and let the
-        // stale-owner rebase decide re-enablement (a real operator panic,
-        // disableSequence > 0, still refuses to re-enable).
-        RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = {
-          ...DURABLE_OWNER_LEDGER.inFlightMutation,
-          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
-          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
-          resolved_at_unix_ms: Date.now()
-        };
-        console.warn(
-          "synapse durable owner ledger: resolved terminally stranded in-flight " +
-            "mutation from a prior browser session",
-          RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION
-        );
-        DURABLE_OWNER_LEDGER.inFlightMutation = null;
-        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER);
-        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-      }
-      if (
-        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-        DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length > 0
-      ) {
-        // Same terminal argument as the prior-session in-flight mutation
-        // above: a debugger command that timed out in a PRIOR browser session
-        // died with that session's worker and debuggee, and Chrome tab ids are
-        // not stable across browser sessions, so no observation in this session
-        // can ever resolve it or deliver its neutralizing release. Retaining
-        // the rows kept durableOwnerRowCount() permanently above zero, which
-        // blocked the stale-owner rebase and left every physical mutation
-        // refused with no repair path - the bridge became unusable after any
-        // service-worker restart that happened to follow a debugger timeout.
-        RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = {
-          rows: DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
-            id: entry.id || null,
-            tab_id: entry.tabId ?? null,
-            method: entry.method || null,
-            worker_boot_id: entry.workerBootId || null,
-            timed_out_at_unix_ms: entry.timedOutAtUnixMs ?? null,
-            neutralization_method: entry.neutralizationMethod || null
-          })),
-          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
-          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
-          resolved_at_unix_ms: Date.now()
-        };
-        console.warn(
-          "synapse durable owner ledger: resolved terminally unresolvable debugger-command " +
-            "timeouts from a prior browser session",
-          RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS
-        );
-        DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts = [];
-        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
-          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-      }
-      if (
-        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-        staleOwners === 0 &&
-        !DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length &&
-        rebaseDurableOwnerLedgerAfterStaleOwnerDrain()
-      ) {
-        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
+      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners === 0) {
+        DURABLE_OWNER_LEDGER.browserSessionId =
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+        await persistDurableOwnerLedger();
       } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
         STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
-        recordDurableOwnerStateFailure(
-          "stale_browser_session_owners",
-          "durable owners belong to a prior browser session; stale tab ids will not be mutated; " +
-            `stale_owner_count=${staleOwners} ` +
-            `stale_repair_absent_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.absent_tab_ids?.length || 0)} ` +
-            `stale_repair_closed_matching_opened_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.closed_matching_opened_tabs?.length || 0)} ` +
-            `stale_repair_live_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.live_tabs?.length || 0)} ` +
-            `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)} ` +
-            `resolved_prior_session_in_flight_mutation=${RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION ? "resolved" : "none"}`
-        );
+        DURABLE_OWNER_LEDGER.enabled = false;
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          "durable owners belong to a prior browser session; stale tab ids will not be mutated";
       }
-    }
-    if (
-      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-      DURABLE_OWNER_LEDGER.captureVisibleTabLease &&
-      DURABLE_OWNER_LEDGER.captureVisibleTabLease.workerBootId !==
-        DURABLE_OWNER_WORKER_BOOT_ID
-    ) {
-      DURABLE_OWNER_LEDGER.captureVisibleTabLease.status =
-        "quarantined_worker_restart";
-      await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-      console.error(
-        "synapse durable capture ledger: captureVisibleTab settlement became " +
-          "unobservable across a service-worker restart; capture remains quarantined " +
-          "until Chrome establishes a new browser session",
-        DURABLE_OWNER_LEDGER.captureVisibleTabLease
-      );
-    }
-    if (
-      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-      DURABLE_OWNER_LEDGER.enabled === false &&
-      DURABLE_OWNER_LEDGER.disableSequence === 0 &&
-      durableOwnerRowCount(DURABLE_OWNER_LEDGER) === 0 &&
-      !DURABLE_OWNER_LEDGER.inFlightMutation
-    ) {
-      DURABLE_OWNER_LEDGER.enabled = true;
-      await persistDurableOwnerLedger({ duringRestore: true });
     }
     DURABLE_MUTATION_OWNERS_ENABLED = DURABLE_OWNER_LEDGER.enabled &&
       IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
     DURABLE_MUTATION_DISABLE_SEQUENCE = DURABLE_OWNER_LEDGER.disableSequence;
     if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-      for (const owner of DURABLE_OWNER_LEDGER.clockTabs) {
-        CLOCK_INSTALLED_TABS.add(owner.tabId);
-        CLOCK_DOCUMENT_OWNERS.set(owner.tabId, { ...owner });
+      for (const tabId of DURABLE_OWNER_LEDGER.clockTabs) {
+        CLOCK_INSTALLED_TABS.add(tabId);
       }
-      hydrateDurableOverrideMaps();
     }
     if (DURABLE_OWNER_LEDGER.inFlightMutation) {
-      const matchingTerminal = DURABLE_OWNER_LEDGER.commandTerminalOutbox.find(
-        (entry) => entry.commandId === DURABLE_OWNER_LEDGER.inFlightMutation.id
-      );
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = matchingTerminal ? 0 : 1;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       DURABLE_OWNER_LEDGER.enabled = false;
       if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-        await persistDurableOwnerLedger({ mergeLiveOwners: true, duringRestore: true });
-      }
-    }
-    if (schemaMigrated) {
-      await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
-      await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
-      const migrationReadback = await chrome.storage.local.get([
-        DURABLE_OWNER_STORAGE_KEY,
-        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
-      ]);
-      if (migrationReadback?.[DURABLE_OWNER_STORAGE_KEY]?.version !==
-            DURABLE_OWNER_STORAGE_SCHEMA_VERSION ||
-          migrationReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] !== undefined) {
-        throw new Error(
-          "durable owner ledger schema migration postcondition failed; canonical schema-7 " +
-            "must exist and the legacy v2 key must be absent after the verified write"
-        );
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
       }
     }
     DURABLE_OWNER_STATE_LOADED = true;
   } catch (error) {
-    recordDurableOwnerStateFailure("restore_durable_owner_state", error);
+    DURABLE_OWNER_STATE_LOAD_ERROR = errorMessage(error);
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   }
-}
-
-function hydrateDurableOverrideMaps() {
-  const hydrate = (field, map, valueName = "baseline") => {
-    for (const entry of DURABLE_OWNER_LEDGER[field]) {
-      if (!Object.prototype.hasOwnProperty.call(entry, valueName) ||
-          entry[valueName] === null || entry[valueName] === undefined) {
-        throw new Error(
-          `durable owner ledger ${field} row for tab ${entry.tabId} has no ${valueName}; ` +
-          "the pre-override source of truth cannot be reconstructed"
-        );
-      }
-      const durableValue = entry[valueName];
-      if (map.has(entry.tabId) &&
-          JSON.stringify(map.get(entry.tabId)) !== JSON.stringify(durableValue)) {
-        throw new Error(
-          `durable owner ledger ${field} conflicts with live override owner for tab ${entry.tabId}; ` +
-          `durable_${valueName}=${JSON.stringify(durableValue)} live_${valueName}=${JSON.stringify(map.get(entry.tabId))}`
-        );
-      }
-      const restored = typeof globalThis.structuredClone === "function"
-        ? globalThis.structuredClone(durableValue)
-        : JSON.parse(JSON.stringify(durableValue));
-      map.set(entry.tabId, restored);
-    }
-  };
-  hydrate("viewportOverrides", VIEWPORT_BASELINE_BY_TAB);
-  hydrate("deviceOverrides", DEVICE_BASELINE_BY_TAB);
-  hydrate("geolocationOverrides", GEOLOCATION_OVERRIDE_BY_TAB, "origin");
-  hydrate("localeOverrides", LOCALE_BASELINE_BY_TAB);
-  hydrate("mediaOverrides", MEDIA_BASELINE_BY_TAB);
-  hydrate("networkOverrides", NETWORK_BASELINE_BY_TAB);
 }
 
 function mergeLiveOwnersIntoDurableLedger() {
@@ -3208,19 +1247,10 @@ function mergeLiveOwnersIntoDurableLedger() {
       .filter(([, session]) => session?.interceptEnabled)
       .map(([tabId]) => tabId)
   ]));
-  const clockOwnersByTab = new Map(
-    DURABLE_OWNER_LEDGER.clockTabs.map((entry) => [entry.tabId, entry])
-  );
-  for (const tabId of CLOCK_INSTALLED_TABS) {
-    const owner = CLOCK_DOCUMENT_OWNERS.get(tabId);
-    if (!owner) {
-      throw new Error(
-        `clock mutation owner for tab ${tabId} has no exact document descriptor`
-      );
-    }
-    clockOwnersByTab.set(tabId, { ...owner });
-  }
-  DURABLE_OWNER_LEDGER.clockTabs = Array.from(clockOwnersByTab.values());
+  DURABLE_OWNER_LEDGER.clockTabs = Array.from(new Set([
+    ...DURABLE_OWNER_LEDGER.clockTabs,
+    ...CLOCK_INSTALLED_TABS
+  ]));
   const mergeOverrideMap = (field, map, valueName = "baseline") => {
     const byTab = new Map(DURABLE_OWNER_LEDGER[field].map((entry) => [entry.tabId, entry]));
     for (const [tabId, value] of map.entries()) {
@@ -3247,11 +1277,7 @@ function mergeLiveOwnersIntoDurableLedger() {
   }
 }
 
-async function persistDurableOwnerLedger({
-  mergeLiveOwners = false,
-  duringRestore = false
-} = {}) {
-  assertDurableOwnerPersistenceAuthority("persist durable owner ledger", duringRestore);
+async function persistDurableOwnerLedger({ mergeLiveOwners = false } = {}) {
   if (mergeLiveOwners) {
     mergeLiveOwnersIntoDurableLedger();
   }
@@ -3261,7 +1287,9 @@ async function persistDurableOwnerLedger({
   const snapshot = typeof globalThis.structuredClone === "function"
     ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
     : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
-  const write = () => writeAndVerifyDurableOwnerSnapshot(snapshot);
+  const write = () => chrome.storage.local.set({
+    [DURABLE_OWNER_STORAGE_KEY]: snapshot
+  });
   const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
   DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
   await persisted;
@@ -3286,16 +1314,6 @@ function upsertLedgerOpenedTab(tab) {
   DURABLE_OWNER_LEDGER.openedTabs = DURABLE_OWNER_LEDGER.openedTabs
     .filter((entry) => entry.tabId !== tab.tabId);
   DURABLE_OWNER_LEDGER.openedTabs.push(tab);
-}
-
-async function durableOpenedTabOwnerFromCreatedTab(tab, url) {
-  return {
-    tabId: tab.id,
-    targetId: targetIdForTabId(tab.id),
-    chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
-    openedAtUnixMs: Date.now(),
-    urlSha256: await sha256HexText(url || "about:blank")
-  };
 }
 
 function removeLedgerOpenedTab(tabId) {
@@ -3323,7 +1341,6 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
-  CLOCK_DOCUMENT_OWNERS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
   GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
@@ -3337,22 +1354,14 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
     .filter((entry) => entry.tabId !== tabId);
   DURABLE_OWNER_LEDGER.debuggerTabs = DURABLE_OWNER_LEDGER.debuggerTabs
     .filter((candidate) => candidate !== tabId);
-  // An unresolved debugger-command timeout is owned by a debugger session on a
-  // specific tab. Once that tab is gone the command can never resolve and the
-  // neutralizing release can never be delivered, so the row is terminal. It was
-  // the ONLY owner category this prune skipped, which meant a proven-closed tab
-  // still left a stale owner row behind - keeping durableOwnerRowCount() above
-  // zero, blocking the stale-owner rebase, and leaving the whole bridge
-  // fail-closed for every mutation with no repair path.
-  DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts =
-    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
-      .filter((entry) => entry.tabId !== tabId);
+  DURABLE_OWNER_LEDGER.executedInitScriptEffects =
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects.filter((entry) => entry.tabId !== tabId);
   DURABLE_OWNER_LEDGER.dialogTabs = DURABLE_OWNER_LEDGER.dialogTabs
     .filter((candidate) => candidate !== tabId);
   DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
     .filter((candidate) => candidate !== tabId);
   DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-    .filter((candidate) => candidate.tabId !== tabId);
+    .filter((candidate) => candidate !== tabId);
   for (const field of [
     "viewportOverrides",
     "deviceOverrides",
@@ -3368,29 +1377,11 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
 function enqueueClosedTabLedgerPrune(tabId) {
   const queued = COMMAND_EXECUTION_TAIL.then(async () => {
     await DURABLE_OWNER_STATE_READY;
-    if (!DURABLE_OWNER_STATE_LOADED) {
-      DURABLE_MUTATION_OWNERS_ENABLED = false;
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
-        1,
-        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
-      );
-      return;
-    }
     pruneDurableOwnerLedgerForClosedTab(tabId);
     try {
-      if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-        await persistDurableOwnerLedger({ mergeLiveOwners: true });
-      } else {
-        STALE_BROWSER_SESSION_OWNER_COUNT = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
-          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-        rebaseDurableOwnerLedgerAfterStaleOwnerDrain();
-        await persistDurableOwnerLedgerRepairSnapshot();
-      }
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (error) {
-      recordDurableOwnerStateFailure(
-        "persist_closed_tab_owner_prune",
-        `persist closed-tab owner prune failed: ${errorMessage(error)}`
-      );
+      DURABLE_OWNER_STATE_LOAD_ERROR = `persist closed-tab owner prune failed: ${errorMessage(error)}`;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
@@ -3401,18 +1392,6 @@ function enqueueClosedTabLedgerPrune(tabId) {
 function enqueueInitScriptEffectNavigationReconcile(tabId) {
   const queued = COMMAND_EXECUTION_TAIL.then(async () => {
     await DURABLE_OWNER_STATE_READY;
-    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
-      DURABLE_MUTATION_OWNERS_ENABLED = false;
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
-        1,
-        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
-      );
-      recordDurableOwnerSecondaryFailure(
-        "init_script_navigation_reconciliation_skipped",
-        "durable owner state is unavailable; reconciliation persistence was not attempted"
-      );
-      return;
-    }
     mergeLiveOwnersIntoDurableLedger();
     const registered = new Set(
       DURABLE_OWNER_LEDGER.initScripts
@@ -3426,59 +1405,8 @@ function enqueueInitScriptEffectNavigationReconcile(tabId) {
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (error) {
-      recordDurableOwnerStateFailure(
-        "persist_init_script_navigation_reconciliation",
-        `persist init-script navigation reconciliation failed: ${errorMessage(error)}`
-      );
-      DURABLE_MUTATION_OWNERS_ENABLED = false;
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
-    }
-  });
-  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
-}
-
-function enqueueClockDocumentNavigationReconcile(tabId, committedDocumentId) {
-  const queued = COMMAND_EXECUTION_TAIL.then(async () => {
-    await DURABLE_OWNER_STATE_READY;
-    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
-      DURABLE_MUTATION_OWNERS_ENABLED = false;
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
-        1,
-        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
-      );
-      recordDurableOwnerSecondaryFailure(
-        "clock_navigation_reconciliation_skipped",
-        `durable owner state is unavailable; tab=${tabId} ` +
-          `committed_document=${String(committedDocumentId || "missing")}`
-      );
-      return;
-    }
-    const owner = CLOCK_DOCUMENT_OWNERS.get(tabId) ||
-      DURABLE_OWNER_LEDGER.clockTabs.find((entry) => entry.tabId === tabId) ||
-      null;
-    if (!owner) {
-      return;
-    }
-    if (owner.documentId && owner.documentId === committedDocumentId) {
-      return;
-    }
-    // A committed main-frame document destroys every property owned in the old
-    // document. Reconcile that physical lifecycle instead of attempting to
-    // uninstall against the new, unrelated page.
-    CLOCK_INSTALLED_TABS.delete(tabId);
-    CLOCK_DOCUMENT_OWNERS.delete(tabId);
-    DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-      .filter((entry) => entry.tabId !== tabId);
-    try {
-      await persistDurableOwnerLedger({ mergeLiveOwners: true });
-    } catch (error) {
-      recordDurableOwnerStateFailure(
-        "persist_clock_navigation_reconciliation",
-        `persist clock navigation reconciliation failed: tab=${tabId} ` +
-          `old_document=${String(owner.documentId || "legacy-unbound")} ` +
-          `committed_document=${String(committedDocumentId || "missing")} ` +
-          `storage_error=${errorMessage(error)}`
-      );
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist init-script navigation reconciliation failed: ${errorMessage(error)}`;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
@@ -3503,18 +1431,15 @@ function enqueuePersistedBackgroundMutation(kind, operation) {
       if (!DURABLE_MUTATION_OWNERS_ENABLED || !DURABLE_OWNER_STATE_LOADED) {
         throw bridgeError(
           ERROR_ACTION_TARGET_INVALID,
-          `operator panic disabled background mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; ` +
-            `refusing ${String(kind)} ${operatorPanicGateErrorSummary()}`
+          `operator panic disabled background mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
         );
       }
       try {
         await beginPersistedMutationCommand(command, activitySequence);
         persistedMutationMarker = true;
       } catch (error) {
-        recordDurableOwnerStateFailure(
-          "persist_background_mutation_admission",
-          `persist background mutation admission failed: ${errorMessage(error)}`
-        );
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          `persist background mutation admission failed: ${errorMessage(error)}`;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
         throw bridgeError(ERROR_ACTION_TARGET_INVALID, DURABLE_OWNER_STATE_LOAD_ERROR);
@@ -3535,10 +1460,8 @@ function enqueuePersistedBackgroundMutation(kind, operation) {
         try {
           await finishPersistedMutationCommand();
         } catch (error) {
-          recordDurableOwnerStateFailure(
-            "persist_background_mutation_completion",
-            `persist background mutation completion failed: ${errorMessage(error)}`
-          );
+          DURABLE_OWNER_STATE_LOAD_ERROR =
+            `persist background mutation completion failed: ${errorMessage(error)}`;
           DURABLE_MUTATION_OWNERS_ENABLED = false;
           UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
         }
@@ -3561,12 +1484,6 @@ function isMutationCapableCommand(kind) {
     "operatorPanicCloseTab",
     "operatorPanicReadback",
     "operatorPanicEnable",
-    "maintenancePauseReconnect",
-    // Extension reload is a browser-owned lifecycle transition. It never
-    // activates a tab/window, emits synthetic input, or mutates a page/owner.
-    // The fresh worker still re-reads every durable admission gate before it
-    // registers, so reload cannot launder operator panic or storage divergence.
-    "reloadSelf",
     "listTabs"
   ].includes(String(kind || ""));
 }
@@ -3604,6 +1521,7 @@ async function handleTrackedCommand(command) {
   const mutationCapable = isMutationCapableCommand(kind);
   const activitySequence = ++COMMAND_ACTIVITY_SEQUENCE;
   const admittedDisableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
+  let persistedMutationMarker = false;
   COMMAND_IN_FLIGHT_COUNT += 1;
   if (mutationCapable) {
     MUTATION_HANDLER_IN_FLIGHT_COUNT += 1;
@@ -3611,11 +1529,9 @@ async function handleTrackedCommand(command) {
     if (DURABLE_MUTATION_OWNERS_ENABLED && DURABLE_OWNER_STATE_LOADED) {
       try {
         await beginPersistedMutationCommand(command, activitySequence);
+        persistedMutationMarker = true;
       } catch (error) {
-        recordDurableOwnerStateFailure(
-          "persist_mutation_admission",
-          `persist mutation admission failed: ${errorMessage(error)}`
-        );
+        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation admission failed: ${errorMessage(error)}`;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       }
@@ -3634,6 +1550,15 @@ async function handleTrackedCommand(command) {
       ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
     }
   } finally {
+    if (persistedMutationMarker) {
+      try {
+        await finishPersistedMutationCommand();
+      } catch (error) {
+        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation completion failed: ${errorMessage(error)}`;
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      }
+    }
     if (mutationCapable) {
       MUTATION_HANDLER_IN_FLIGHT_COUNT = Math.max(0, MUTATION_HANDLER_IN_FLIGHT_COUNT - 1);
       MUTATION_HANDLER_COMPLETED_COUNT += 1;
@@ -3673,12 +1598,7 @@ function stopWebSocketKeepAlive() {
 }
 
 function startDisconnectedKeepAlive() {
-  void requireReconnectWakeAlarm("startDisconnectedKeepAlive").catch((error) => {
-    disableBridgePermanently(
-      `reconnect alarm verification failed before disconnected keepalive: ${errorMessage(error)}`,
-      error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
-    );
-  });
+  ensureReconnectWakeAlarm();
   if (disconnectedKeepAliveTimer) {
     return;
   }
@@ -3709,74 +1629,26 @@ function stopDisconnectedKeepAlive() {
   }
 }
 
-async function requireReconnectWakeAlarm(reason) {
-  const checkedAtUnixMs = Date.now();
-  let created = false;
-  try {
-    if (!chrome.alarms?.create || !chrome.alarms?.get) {
-      throw new Error(
-        "chrome.alarms.create/get unavailable; manifest permission and Chrome 150+ are required"
-      );
-    }
-    let alarm = await chrome.alarms.get(RECONNECT_WAKE_ALARM_NAME);
-    if (
-      !alarm ||
-      Number(alarm.periodInMinutes) !== RECONNECT_WAKE_ALARM_PERIOD_MINUTES ||
-      alarm.persistAcrossSessions !== RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS
-    ) {
-      await chrome.alarms.create(RECONNECT_WAKE_ALARM_NAME, {
-        delayInMinutes: RECONNECT_WAKE_ALARM_DELAY_MINUTES,
-        periodInMinutes: RECONNECT_WAKE_ALARM_PERIOD_MINUTES,
-        persistAcrossSessions: RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS
-      });
-      created = true;
-      alarm = await chrome.alarms.get(RECONNECT_WAKE_ALARM_NAME);
-    }
-    const scheduledTime = Number(alarm?.scheduledTime);
-    if (
-      alarm?.name !== RECONNECT_WAKE_ALARM_NAME ||
-      Number(alarm.periodInMinutes) !== RECONNECT_WAKE_ALARM_PERIOD_MINUTES ||
-      alarm.persistAcrossSessions !== RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS ||
-      !Number.isFinite(scheduledTime) ||
-      scheduledTime <= checkedAtUnixMs
-    ) {
-      throw new Error(
-        `alarm readback mismatch name=${String(alarm?.name || "<missing>")} ` +
-          `period_minutes=${String(alarm?.periodInMinutes ?? "<missing>")} ` +
-          `persist_across_sessions=${String(alarm?.persistAcrossSessions ?? "<missing>")} ` +
-          `scheduled_time=${String(alarm?.scheduledTime ?? "<missing>")}`
-      );
-    }
-    reconnectWakeAlarmState = {
-      status: "ok",
-      reason,
-      name: alarm.name,
-      period_minutes: alarm.periodInMinutes,
-      persist_across_sessions: alarm.persistAcrossSessions,
-      scheduled_time: scheduledTime,
-      checked_at_unix_ms: checkedAtUnixMs,
-      created,
-      error: null
-    };
-    return reconnectWakeAlarmState;
-  } catch (error) {
-    reconnectWakeAlarmState = {
-      status: "error",
-      reason,
-      name: RECONNECT_WAKE_ALARM_NAME,
-      period_minutes: null,
-      persist_across_sessions: null,
-      scheduled_time: null,
-      checked_at_unix_ms: checkedAtUnixMs,
-      created,
-      error: errorMessage(error)
-    };
-    throw bridgeError(
-      ERROR_RECONNECT_WAKE_ALARM_INVALID,
-      `required persistent reconnect alarm failed readback: reason=${reason} ` +
-        `error=${errorMessage(error)} remediation=run Chrome 150+ with the alarms permission, ` +
-        "reload the constant active Synapse extension directory, and inspect the service-worker console"
+function ensureReconnectWakeAlarm() {
+  if (!chrome.alarms?.create) {
+    console.error(
+      "Synapse daemon bridge cannot register reconnect wake alarm; " +
+        "manifest must include required chrome.alarms permission"
     );
+    return;
+  }
+  try {
+    const created = chrome.alarms.create(RECONNECT_WAKE_ALARM_NAME, {
+      delayInMinutes: RECONNECT_WAKE_ALARM_DELAY_MINUTES,
+      periodInMinutes: RECONNECT_WAKE_ALARM_PERIOD_MINUTES
+    });
+    if (created && typeof created.catch === "function") {
+      created.catch((error) => {
+        console.warn(`Synapse reconnect wake alarm setup failed: ${errorMessage(error)}`);
+      });
+    }
+  } catch (error) {
+    console.warn(`Synapse reconnect wake alarm setup threw: ${errorMessage(error)}`);
   }
 }
 
@@ -3785,20 +1657,12 @@ function handleReconnectWakeAlarm(alarm) {
     return;
   }
   loadMaintenanceReconnectPause("reconnectWakeAlarm")
-    .then(async () => {
+    .then(() => {
       if (permanentlyDisabled) {
         return;
       }
-      const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
-      if (pauseRemainingMs > 0) {
-        await requireReconnectWakeAlarm("reconnectWakeAlarm:maintenance-pause");
-        attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs).catch((error) => {
-          console.warn(
-            `Synapse daemon bridge maintenance resume probe threw: ` +
-              `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
-              `error=${errorMessage(error)}`
-          );
-        });
+      if (maintenanceReconnectPauseRemainingMs() > 0) {
+        ensureReconnectWakeAlarm();
         return;
       }
       startBridgeFromEvent();
@@ -3809,6 +1673,22 @@ function handleReconnectWakeAlarm(alarm) {
         ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED
       );
     });
+}
+
+function handleManagementStateChanged(info) {
+  if (!info || info.id === chrome.runtime.id) {
+    return;
+  }
+  popupRiskSuppressionState = {
+    ...popupRiskSuppressionState,
+    ok: false,
+    status: "stale",
+    reason: "chrome.management event",
+    checked_at_unix_ms: 0
+  };
+  ensureExternalPopupRiskSuppression("chrome.management event").catch((error) => {
+    console.warn(`Synapse popup risk suppression refresh failed: ${errorMessage(error)}`);
+  });
 }
 
 function closeWebSocket(options = {}) {
@@ -3859,6 +1739,8 @@ function requestWebSocketCloseAfterResponse(reason) {
   return result;
 }
 
+chrome.runtime.onInstalled.addListener(startBridgeFromEvent);
+chrome.runtime.onStartup.addListener(startBridgeFromEvent);
 if (chrome.alarms?.onAlarm?.addListener) {
   chrome.alarms.onAlarm.addListener(handleReconnectWakeAlarm);
 }
@@ -3868,9 +1750,18 @@ if (chrome.alarms?.onAlarm?.addListener) {
 // would sit idle after such a restart and never register a bridge host (host_count=0),
 // because connectDaemon() is only reachable from those two events and the reconnect
 // alarm. Kicking off startBridge() here runs on every worker instantiation and is
-// idempotent (requireReconnectWakeAlarm + connectDaemon both guard against duplicates),
+// idempotent (ensureReconnectWakeAlarm + connectDaemon both guard against duplicates),
 // so a reloaded worker reconnects immediately instead of waiting for an event.
 startBridgeFromEvent();
+if (chrome.management?.onEnabled?.addListener) {
+  chrome.management.onEnabled.addListener(handleManagementStateChanged);
+}
+if (chrome.management?.onInstalled?.addListener) {
+  chrome.management.onInstalled.addListener(handleManagementStateChanged);
+}
+if (chrome.management?.onDisabled?.addListener) {
+  chrome.management.onDisabled.addListener(handleManagementStateChanged);
+}
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo?.status === "loading") {
     enqueueInitScriptEffectNavigationReconcile(tabId);
@@ -3887,13 +1778,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   recordTabCreatedForPageEvents(tab);
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
-  settleAgentNavigationClaim(tabId, "target_closed", {
-    correlationVerdict: "claim_target_closed_before_terminal_navigation"
-  }).catch((error) => {
-    console.error(`Synapse navigation-claim close settlement failed: ${errorMessage(error)}`);
-  });
   recordTabRemovedForPageEvents(tabId);
-  forgetCdpDomainsForTab(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
@@ -3907,6 +1792,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   NETWORK_BASELINE_BY_TAB.delete(tabId);
   enqueueClosedTabLedgerPrune(tabId);
 });
+if (chrome.debugger?.onDetach?.addListener) {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    if (Number.isInteger(source?.tabId)) {
+      INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
+      markBindingDebuggerDetached(source.tabId);
+      markDialogDebuggerDetached(source.tabId);
+      markFileChooserDebuggerDetached(source.tabId);
+      console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
+    }
+  });
+}
+if (chrome.debugger?.onEvent?.addListener) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method === "Runtime.bindingCalled" && Number.isInteger(source?.tabId)) {
+      recordBindingCalledEvent(source.tabId, params || {});
+    } else if (method === "Page.javascriptDialogOpening" && Number.isInteger(source?.tabId)) {
+      recordDialogOpeningEvent(source.tabId, params || {});
+    } else if (method === "Page.javascriptDialogClosed" && Number.isInteger(source?.tabId)) {
+      recordDialogClosedEvent(source.tabId, params || {});
+    } else if (method === "Page.fileChooserOpened" && Number.isInteger(source?.tabId)) {
+      recordFileChooserOpenedEvent(source.tabId, params || {});
+    }
+  });
+}
 chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId)
     .then((tab) => postTabNavigationEvent("tabs.onActivated", tab))
@@ -3917,9 +1826,6 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 if (chrome.webNavigation?.onBeforeNavigate?.addListener) {
   chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     recordWebNavigationPageEvent("framestartednavigating", details);
-    postWebNavigationEvent("webNavigation.onBeforeNavigate", details).catch((error) => {
-      console.error(`Synapse onBeforeNavigate event persistence failed: ${errorMessage(error)}`);
-    });
   });
 }
 if (chrome.webNavigation?.onCommitted?.addListener) {
@@ -3927,61 +1833,23 @@ if (chrome.webNavigation?.onCommitted?.addListener) {
     recordWebNavigationPageEvent("framenavigated", details, {
       navigation_type: webNavigationTransition(details)
     });
-    if (details?.frameId === 0 && Number.isSafeInteger(details?.tabId)) {
-      enqueueClockDocumentNavigationReconcile(
-        details.tabId,
-        details?.documentId == null ? null : String(details.documentId)
-      );
-    }
-    postWebNavigationEvent("webNavigation.onCommitted", details).catch((error) => {
-      console.error(`Synapse onCommitted event persistence failed: ${errorMessage(error)}`);
-    });
   });
 }
 if (chrome.webNavigation?.onDOMContentLoaded?.addListener) {
   chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
     recordWebNavigationPageEvent("domcontentloaded", details);
-    postWebNavigationEvent("webNavigation.onDOMContentLoaded", details).catch((error) => {
-      console.error(`Synapse onDOMContentLoaded event persistence failed: ${errorMessage(error)}`);
-    });
   });
 }
 if (chrome.webNavigation?.onCompleted?.addListener) {
   chrome.webNavigation.onCompleted.addListener((details) => {
     recordWebNavigationPageEvent("load", details);
     recordWebNavigationPageEvent("framestoppedloading", details);
-    postWebNavigationEvent("webNavigation.onCompleted", details).catch((error) => {
-      console.error(`Synapse onCompleted event persistence failed: ${errorMessage(error)}`);
-    });
   });
 }
 if (chrome.webNavigation?.onHistoryStateUpdated?.addListener) {
   chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
     recordWebNavigationPageEvent("framenavigated", details, {
       navigation_type: webNavigationTransition(details) || "history_api"
-    });
-    postWebNavigationEvent("webNavigation.onHistoryStateUpdated", details).catch((error) => {
-      console.error(`Synapse onHistoryStateUpdated event persistence failed: ${errorMessage(error)}`);
-    });
-  });
-}
-if (chrome.webNavigation?.onReferenceFragmentUpdated?.addListener) {
-  chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
-    recordWebNavigationPageEvent("framenavigated", details, {
-      navigation_type: webNavigationTransition(details) || "reference_fragment"
-    });
-    postWebNavigationEvent("webNavigation.onReferenceFragmentUpdated", details).catch((error) => {
-      console.error(`Synapse onReferenceFragmentUpdated event persistence failed: ${errorMessage(error)}`);
-    });
-  });
-}
-if (chrome.webNavigation?.onErrorOccurred?.addListener) {
-  chrome.webNavigation.onErrorOccurred.addListener((details) => {
-    recordWebNavigationPageEvent("navigationerror", details, {
-      navigation_type: String(details?.error || "navigation_error")
-    });
-    postWebNavigationEvent("webNavigation.onErrorOccurred", details).catch((error) => {
-      console.error(`Synapse webNavigation error-event persistence failed: ${errorMessage(error)}`);
     });
   });
 }
@@ -3994,12 +1862,6 @@ if (chrome.webRequest?.onBeforeRequest?.addListener) {
 if (chrome.webRequest?.onHeadersReceived?.addListener) {
   chrome.webRequest.onHeadersReceived.addListener(
     (details) => recordWebRequestHeadersReceived(details),
-    { urls: ["<all_urls>"] }
-  );
-}
-if (chrome.webRequest?.onBeforeRedirect?.addListener) {
-  chrome.webRequest.onBeforeRedirect.addListener(
-    (details) => recordWebRequestRedirect(details),
     { urls: ["<all_urls>"] }
   );
 }
@@ -4034,6 +1896,8 @@ if (chrome.downloads?.onErased?.addListener) {
   chrome.downloads.onErased.addListener((id) => recordDownloadEvent("erased", { id }, null));
 }
 
+startBridgeFromEvent();
+
 async function handleCommand(command) {
   if (!command || typeof command !== "object") {
     throw bridgeError(ERROR_ATTACH_FAILED, "native command was not an object");
@@ -4042,18 +1906,19 @@ async function handleCommand(command) {
   if (!id || typeof id !== "string") {
     throw bridgeError(ERROR_ATTACH_FAILED, "native command id is required");
   }
-  let terminalOk = false;
-  let terminalResult = null;
-  let terminalError = null;
-  let closeWebSocketAfterResponse = null;
   try {
     let result;
+    let reloadAfterResponse = false;
+    let closeWebSocketAfterResponse = null;
     if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
-        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; ` +
-          `refusing ${String(kind)} ${operatorPanicGateErrorSummary()}`
+        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
       );
+    }
+    if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable"]
+      .includes(String(kind || ""))) {
+      await requireExternalPopupRisksSuppressed(kind, params);
     }
     if (kind === "snapshot") {
       result = rejectAttachCommand(kind, params);
@@ -4064,7 +1929,7 @@ async function handleCommand(command) {
     } else if (kind === "nodeValue") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "openTab") {
-      result = await handleOpenTab(params, id);
+      result = await handleOpenTab(params);
     } else if (kind === "listTabs") {
       result = await handleListTabs(params);
     } else if (kind === "closeTab") {
@@ -4072,13 +1937,15 @@ async function handleCommand(command) {
     } else if (kind === "capturePageScreenshot") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "targetInfo" || kind === "targetInfoPageText") {
-      result = await handleTargetInfo(params, kind === "targetInfoPageText");
+      result = await handleTargetInfo(params);
     } else if (kind === "frames") {
       result = await handleFrames(params);
     } else if (kind === "pageContent") {
       result = await handlePageContent(params);
-    } else if (kind === "pageScreenshot" || kind === "pagePdf") {
-      result = rejectAttachCommand(kind, params);
+    } else if (kind === "pageScreenshot") {
+      result = await handlePageScreenshot(params);
+    } else if (kind === "pagePdf") {
+      result = await handlePagePdf(params);
     } else if (kind === "downloads") {
       result = await handleDownloads(params);
     } else if (kind === "cookies") {
@@ -4086,7 +1953,7 @@ async function handleCommand(command) {
     } else if (kind === "storageState") {
       result = await handleStorageState(params);
     } else if (kind === "setContent") {
-      result = await handleSetContent(params, id);
+      result = await handleSetContent(params);
     } else if (kind === "ariaSnapshot") {
       result = await handleAriaSnapshot(params);
     } else if (kind === "assertPoll") {
@@ -4100,7 +1967,7 @@ async function handleCommand(command) {
     } else if (kind === "waitForText") {
       result = await handleWaitForText(params);
     } else if (kind === "waitForFunction") {
-      result = rejectAttachCommand(kind, params);
+      result = await handleWaitForFunction(params);
     } else if (kind === "waitForLoadState") {
       result = await handleWaitForLoadState(params);
     } else if (kind === "waitForUrl") {
@@ -4115,27 +1982,39 @@ async function handleCommand(command) {
       result = await handleClock(params);
     } else if (kind === "pageEvents") {
       result = await handlePageEvents(params);
-    } else if (
-      kind === "cdpInput" ||
-      kind === "viewportEmulation" ||
-      kind === "deviceEmulation" ||
-      kind === "geolocationEmulation" ||
-      kind === "localeEmulation" ||
-      kind === "mediaEmulation" ||
-      kind === "networkConditions"
-    ) {
-      result = rejectAttachCommand(kind, params);
+    } else if (kind === "cdpInput") {
+      result = await handleCdpInput(params);
+    } else if (kind === "viewportEmulation") {
+      result = await handleViewportEmulation(params);
+    } else if (kind === "deviceEmulation") {
+      result = await handleDeviceEmulation(params);
+    } else if (kind === "geolocationEmulation") {
+      result = await handleGeolocationEmulation(params);
+    } else if (kind === "localeEmulation") {
+      result = await handleLocaleEmulation(params);
+    } else if (kind === "mediaEmulation") {
+      result = await handleMediaEmulation(params);
+    } else if (kind === "networkConditions") {
+      result = await handleNetworkConditions(params);
     } else if (kind === "maintenancePauseReconnect") {
       result = await handleMaintenancePauseReconnect(params);
       if (result?.websocket_close?.close_deferred === true) {
         closeWebSocketAfterResponse = "synapse maintenance reconnect pause";
       }
-    } else if (kind === "reloadSelf") {
-      result = handleReloadSelf(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
       result = await handleSetFieldValue(params);
+    } else if (kind === "evaluateScript") {
+      result = await handleEvaluateScript(params);
+    } else if (kind === "initScript") {
+      result = await handleInitScript(params);
+    } else if (kind === "exposeBinding") {
+      result = await handleExposeBinding(params);
+    } else if (kind === "handleDialog") {
+      result = await handleDialog(params);
+    } else if (kind === "fileUpload") {
+      result = await handleFileUpload(params);
     } else if (kind === "operatorPanicDisable") {
       result = await handleOperatorPanicDisable(
         command.__operatorPanicDisableAdmission
@@ -4148,26 +2027,19 @@ async function handleCommand(command) {
       result = operatorPanicOwnerReadback();
     } else if (kind === "operatorPanicEnable") {
       result = await handleOperatorPanicEnable(params);
-    } else if (
-      kind === "evaluateScript" ||
-      kind === "initScript" ||
-      kind === "exposeBinding" ||
-      kind === "handleDialog" ||
-      kind === "fileUpload"
-    ) {
-      result = rejectAttachCommand(kind, params);
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
-      result = await handleNavigateTab(params, id);
+      result = await handleNavigateTab(params);
     } else if (kind === "activateTab") {
       result = await handleActivateTab(params);
-    } else if (kind === "keyDispatch") {
-      result = await handleKeyDispatch(params);
     } else if (kind === "domAction") {
       result = await handleDomAction(params);
     } else if (kind === "coordinateClick") {
       result = await handleCoordinateClick(params);
+    } else if (kind === "reloadSelf") {
+      result = handleReloadSelf(params);
+      reloadAfterResponse = true;
     } else {
       throw bridgeError(
         ERROR_EXTENSION_STALE,
@@ -4175,68 +2047,26 @@ async function handleCommand(command) {
           `loaded_capabilities=${COMMAND_CAPABILITIES.join(",")}`
       );
     }
-    terminalOk = true;
-    terminalResult = result;
-  } catch (error) {
-    terminalError = errorPayload(error);
-  }
-  await postResponse(command, terminalOk, terminalResult, terminalError);
-  if (closeWebSocketAfterResponse) {
-    setTimeout(() => {
-      try {
-        closeWebSocket({
-          failOnError: false,
-          reason: closeWebSocketAfterResponse
-        });
-      } catch (error) {
-        console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
-      }
-    }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
-  }
-}
-
-/// Fingerprints the executing worker exactly once, at worker startup.
-function captureRunningServiceWorkerIdentity() {
-  if (runningServiceWorkerCapture) {
-    return runningServiceWorkerCapture;
-  }
-  const source = chrome.runtime.getURL("service_worker.js");
-  runningServiceWorkerCapture = (async () => {
-    const capturedAtUnixMs = Date.now();
-    try {
-      if (!crypto?.subtle?.digest) {
-        throw new Error("crypto.subtle.digest unavailable");
-      }
-      const response = await fetch(source, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`fetch service_worker.js failed status=${response.status}`);
-      }
-      const bytes = await response.arrayBuffer();
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      runningServiceWorkerIdentity = {
-        status: "ok",
-        sha256: arrayBufferToHex(digest),
-        byteLength: bytes.byteLength,
-        error: null,
-        capturedAtUnixMs
-      };
-    } catch (error) {
-      runningServiceWorkerIdentity = {
-        status: "error",
-        sha256: null,
-        byteLength: null,
-        error: errorMessage(error),
-        capturedAtUnixMs
-      };
+    await postResponse(id, true, result, null);
+    if (closeWebSocketAfterResponse) {
+      setTimeout(() => {
+        try {
+          closeWebSocket({
+            failOnError: false,
+            reason: closeWebSocketAfterResponse
+          });
+        } catch (error) {
+          console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
+        }
+      }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
     }
-    return runningServiceWorkerIdentity;
-  })();
-  return runningServiceWorkerCapture;
+    if (reloadAfterResponse) {
+      scheduleRuntimeReload(result.reload_delay_ms);
+    }
+  } catch (error) {
+    await postResponse(id, false, null, errorPayload(error));
+  }
 }
-
-// Startup capture: run it as the module evaluates so the fingerprint is taken
-// before any redeploy can land, not lazily at first daemon registration.
-void captureRunningServiceWorkerIdentity();
 
 async function refreshServiceWorkerIntegrity(reason) {
   const source = chrome.runtime.getURL("service_worker.js");
@@ -4280,33 +2110,7 @@ function arrayBufferToHex(buffer) {
     .join("");
 }
 
-async function sha256HexText(value) {
-  if (!crypto?.subtle?.digest) {
-    throw new Error("crypto.subtle.digest unavailable");
-  }
-  const encoded = new TextEncoder().encode(String(value || ""));
-  const digest = await crypto.subtle.digest("SHA-256", encoded);
-  return arrayBufferToHex(digest);
-}
-
 function bridgeIdentity() {
-  const captureLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
-  const captureLeaseContinuityHealthy = !captureLease || (
-    captureLease.workerBootId === DURABLE_OWNER_WORKER_BOOT_ID &&
-    captureLease.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
-    ["admitted", "active"].includes(captureLease.status)
-  );
-  const durableOwnerContinuityHealthy = DURABLE_OWNER_STATE_LOADED &&
-    !DURABLE_OWNER_STATE_LOAD_ERROR &&
-    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-    Boolean(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) &&
-    DURABLE_OWNER_LEDGER.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
-    STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
-    !DURABLE_OWNER_LEDGER.inFlightMutation &&
-    DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
-    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length === 0 &&
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
-    captureLeaseContinuityHealthy;
   return {
     extensionId: chrome.runtime.id,
     version: chrome.runtime.getManifest().version,
@@ -4321,101 +2125,47 @@ function bridgeIdentity() {
     serviceWorkerSha256Error: serviceWorkerIntegrityState.error,
     serviceWorkerSha256CheckedAtUnixMs: serviceWorkerIntegrityState.checkedAtUnixMs,
     serviceWorkerSha256Reason: serviceWorkerIntegrityState.reason,
-    // The executing bytes, captured at worker startup, plus whether disk has
-    // moved away from them since. `serviceWorkerSha256` above is the on-disk
-    // value and must never be read as proof of what is running (#1828).
-    runningServiceWorkerSha256: runningServiceWorkerIdentity.sha256,
-    runningServiceWorkerSha256Status: runningServiceWorkerIdentity.status,
-    runningServiceWorkerSha256Error: runningServiceWorkerIdentity.error,
-    runningServiceWorkerByteLength: runningServiceWorkerIdentity.byteLength,
-    runningServiceWorkerCapturedAtUnixMs: runningServiceWorkerIdentity.capturedAtUnixMs,
-    serviceWorkerBytesDivergedFromRunning: Boolean(
-      runningServiceWorkerIdentity.sha256 &&
-        serviceWorkerIntegrityState.serviceWorkerSha256 &&
-        runningServiceWorkerIdentity.sha256 !== serviceWorkerIntegrityState.serviceWorkerSha256
-    ),
     debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],
-    startupReadback: {
-      worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
-      lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
-      reconnect_alarm: { ...reconnectWakeAlarmState },
-      durable_owner_state: {
-        storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
-        storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
-        storage_state_failure_diagnostic:
-          DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
-        storage_authority: durableOwnerStorageAuthoritySnapshot(),
-        mutation_admission_enabled: DURABLE_MUTATION_OWNERS_ENABLED,
-        browser_session_id_present: Boolean(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID),
-        ledger_browser_session_id_present: Boolean(DURABLE_OWNER_LEDGER.browserSessionId),
-        browser_session_ids_match: Boolean(
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
-            DURABLE_OWNER_LEDGER.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-        ),
-        browser_session_continuity_matched:
-          DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
-        stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
-        persisted_schema_version: DURABLE_OWNER_LEDGER.version,
-        persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
-        persisted_in_flight_mutation_present: Boolean(
-          DURABLE_OWNER_LEDGER.inFlightMutation
-        ),
-        command_terminal_outbox_count:
-          DURABLE_OWNER_LEDGER.commandTerminalOutbox.length,
-        command_terminal_sequence: DURABLE_OWNER_LEDGER.commandTerminalSequence,
-        last_command_terminal_ack: DURABLE_OWNER_LEDGER.lastCommandTerminalAck,
-        unresolved_debugger_command_timeout_count:
-          DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
-        capture_visible_tab_lease: captureLease,
-        last_capture_visible_tab_settlement:
-          DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement,
-        capture_visible_tab_continuity_healthy: captureLeaseContinuityHealthy,
-        unresolved_worker_restart_mutation_count:
-          UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
-        owner_continuity_healthy: durableOwnerContinuityHealthy,
-        interrupted_migration_reconciliation:
-          RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
-        schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
-        empty_missing_session_repair:
-          REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION
-      },
-      minimum_chrome_version: chrome.runtime.getManifest().minimum_chrome_version || null,
-      captured_at_unix_ms: Date.now()
-    }
+    popupRiskSuppression: popupRiskSuppressionSnapshot()
   };
 }
 
 function runtimeDebuggerApiAvailable() {
-  return false;
+  return Boolean(
+    chrome.debugger &&
+    (chrome.debugger.attach || chrome.debugger.sendCommand || chrome.debugger.getTargets)
+  );
 }
 
-function normalProfileDebuggerForbidden(...request) {
-  const method = typeof request[1] === "string" ? request[1] : "chrome.debugger API";
+function requireDebuggerApiAvailable(kind, params) {
+  if (runtimeDebuggerApiAvailable()) {
+    return;
+  }
   throw bridgeError(
     ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-    `Synapse refused ${method} before invoking Chrome: the normal authenticated profile ` +
-      `does not declare the debugger permission and no service-worker path may attach to it. ` +
-      `Use a session-owned raw-CDP target launched in Synapse's dedicated non-default ` +
-      `automation profile.`
+    `Synapse Chrome Bridge refused ${String(kind)} because chrome.debugger is unavailable ` +
+      `in the loaded extension runtime; hwnd=${String(params?.hwnd ?? "unknown")} ` +
+      `remediation=run scripts\\install-synapse-chrome-debugger.ps1 and cdp_bridge_reload ` +
+      `so the active already-open Chrome profile loads the debugger-capable bridge build`
   );
 }
 
 function rejectAttachCommand(kind, params) {
   throw bridgeError(
     ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-    `Synapse Chrome Bridge refused debugger-backed command ${String(kind)} before queueing ` +
-      `any Chrome action; the normal authenticated profile is permanently debugger-free so ` +
-      `Chrome cannot show a layout-shifting debugger infobar. Use the same public operation ` +
-      `against a session-owned raw-CDP target launched with Synapse's dedicated non-default ` +
-      `automation profile. hwnd=${String(params?.hwnd ?? "unknown")}`
+    `Synapse Chrome Bridge refused unsupported legacy attach command ${String(kind)}; ` +
+      `target-scoped CDP input is exposed through cdpInput, while full DOM snapshots and ` +
+      `element-scoped DOM CDP work still requires the dedicated raw-CDP automation profile. ` +
+      `hwnd=${String(params?.hwnd ?? "unknown")}`
   );
 }
 
-async function handleOpenTab(params, commandId) {
+async function handleOpenTab(params) {
   const requestedUrl = normalizeOpenUrl(params.url);
   const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
+  const beforePages = await tabTargets();
   const openWindow = await selectOpenWindowForHwndHint(params);
   let tab;
   const createParams = {
@@ -4434,10 +2184,12 @@ async function handleOpenTab(params, commandId) {
   if (!tab || typeof tab.id !== "number") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.create returned no numeric tab id");
   }
-  const openedOwner = await durableOpenedTabOwnerFromCreatedTab(
-    tab,
-    createParams.url
-  );
+  const openedOwner = {
+    tabId: tab.id,
+    targetId: targetIdForTabId(tab.id),
+    chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
+    openedAtUnixMs: Date.now()
+  };
   upsertLedgerOpenedTab(openedOwner);
   try {
     // Persist the exact tab identity immediately after chrome.tabs.create. The
@@ -4445,14 +2197,10 @@ async function handleOpenTab(params, commandId) {
     // any later await leaves both the mutation-in-flight marker and, once this
     // write completes, the concrete tab owner available to panic cleanup.
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
-    await markAgentNavigation(tab.id, {
-      claimId: commandId,
+    markAgentNavigation(tab.id, {
       action: "open",
       requestedUrl: requestedUrl || "about:blank",
-      sessionId: agentSessionId,
-      beforeUrl: "",
-      beforeDocumentId: null,
-      tab
+      sessionId: agentSessionId
     });
     const target = await waitForTabTarget(tab.id, 10000);
     const state = await tabPageState(tab.id, target);
@@ -4469,6 +2217,7 @@ async function handleOpenTab(params, commandId) {
     const openedWindow = Number.isInteger(state.chrome_window_id)
       ? await chromeWindowState(state.chrome_window_id)
       : null;
+    const afterPages = await tabTargets();
     return {
       extension_id: chrome.runtime.id,
       target_id: target.id,
@@ -4485,9 +2234,8 @@ async function handleOpenTab(params, commandId) {
       url: state.url || target.url || tab.url || requestedUrl || "about:blank",
       title: state.title || target.title || tab.title || "",
       target_attached: Boolean(target.attached),
-      target_count_before: 0,
-      target_count_after: 1,
-      readback_backend: "chrome.tabs.create+chrome.tabs.get"
+      target_count_before: beforePages.length,
+      target_count_after: afterPages.length
     };
   } catch (error) {
     let rollbackFailure = null;
@@ -4515,75 +2263,23 @@ async function handleOpenTab(params, commandId) {
 }
 
 async function handleCloseTab(params) {
-  const targetIdHint = String(params.targetIdHint || "").trim();
-  const tabIdHint = tabIdFromTargetId(targetIdHint);
-  let selected;
-  try {
-    selected = await selectTabTarget(params, { requireTargetId: true });
-  } catch (error) {
-    if (error?.code !== ERROR_CHROME_TAB_TARGET_ABSENT || !Number.isInteger(tabIdHint)) {
-      throw error;
-    }
-    await persistClosedTabLedgerReconciliation(tabIdHint, targetIdHint, "already absent before close");
-    return {
-      extension_id: chrome.runtime.id,
-      target_id: targetIdHint,
-      tab_id: tabIdHint,
-      target_count_before: 0,
-      target_count_after: 0,
-      already_absent: true,
-      readback_backend: "chrome.tabs.query(absent)+chrome.storage.local(durable-owner-pruned)"
-    };
-  }
-  await tabPageState(selected.tabId, selected.target);
-  let alreadyAbsent = false;
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const beforePages = await tabTargets();
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.remove:closeTab:tab=${selected.tabId}`);
     await chrome.tabs.remove(selected.tabId);
   } catch (error) {
-    const authoritativeTab = await authoritativeTabById(
-      selected.tabId,
-      `chrome.tabs.remove(${selected.tabId}) failed: ${errorMessage(error)}`
-    );
-    if (authoritativeTab) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        `chrome.tabs.remove(${selected.tabId}) failed while authoritative chrome.tabs.query still returned the tab: ${errorMessage(error)}`
-      );
-    }
-    alreadyAbsent = true;
+    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.remove(${selected.tabId}): ${errorMessage(error)}`);
   }
-  if (!alreadyAbsent) {
-    await waitForTargetAbsent(selected.target.id, 10000);
-  }
-  await persistClosedTabLedgerReconciliation(
-    selected.tabId,
-    selected.target.id,
-    alreadyAbsent ? "became absent during close" : "closed"
-  );
+  const afterPages = await waitForTargetAbsent(selected.target.id, 10000);
+  pruneDurableOwnerLedgerForClosedTab(selected.tabId);
   return {
     extension_id: chrome.runtime.id,
     target_id: selected.target.id,
     tab_id: selected.tabId,
-    target_count_before: 1,
-    target_count_after: 0,
-    already_absent: alreadyAbsent,
-    readback_backend: alreadyAbsent
-      ? "chrome.tabs.remove(error)+chrome.tabs.query(absent)+chrome.storage.local(durable-owner-pruned)"
-      : "chrome.tabs.get+chrome.tabs.remove+chrome.tabs.get(absent)+chrome.storage.local(durable-owner-pruned)"
+    target_count_before: beforePages.length,
+    target_count_after: afterPages.length
   };
-}
-
-async function persistClosedTabLedgerReconciliation(tabId, targetId, outcome) {
-  pruneDurableOwnerLedgerForClosedTab(tabId);
-  try {
-    await persistDurableOwnerLedger({ mergeLiveOwners: true });
-  } catch (error) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `Chrome target ${targetId} is ${outcome}, but durable owner reconciliation failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  }
 }
 
 async function handleListTabs(params) {
@@ -4619,10 +2315,13 @@ async function handleListTabs(params) {
   };
 }
 
-async function handleTargetInfo(params, includePageText = false) {
+async function handleTargetInfo(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const state = await tabPageState(selected.tabId, selected.target);
-  const result = {
+  const activeElement = await tabActiveElementState(selected.tabId);
+  const pageText = await tabPageTextState(selected.tabId);
+  const pageVitals = await tabPageVitalsState(selected.tabId);
+  return {
     extension_id: chrome.runtime.id,
     target_id: state.target_id || selected.target.id,
     tab_id: selected.tabId,
@@ -4634,18 +2333,13 @@ async function handleTargetInfo(params, includePageText = false) {
     active: Boolean(state.active),
     highlighted: Boolean(state.highlighted),
     pinned: Boolean(state.pinned),
-    readback_backend: includePageText
-      ? "chrome.tabs.get+chrome.scripting.executeScript"
-      : "chrome.tabs.get",
+    readback_backend: "chrome.tabs.get+chrome.scripting.executeScript",
+    active_element: activeElement,
+    page_text: pageText,
+    page_vitals: pageVitals,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
-  if (includePageText) {
-    result.active_element = await tabActiveElementState(selected.tabId);
-    result.page_text = await tabPageTextState(selected.tabId);
-    result.page_vitals = await tabPageVitalsState(selected.tabId);
-  }
-  return result;
 }
 
 async function handleEvaluateScript(params) {
@@ -4688,18 +2382,16 @@ async function handleEvaluateScript(params) {
   } finally {
     if (attachment?.shouldDetach) {
       try {
-        await normalProfileDebuggerForbidden(attachment.debuggee);
+        await chrome.debugger.detach(attachment.debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for evaluateScript tab ${selected.tabId}: ${errorMessage(error)}`);
       }
     }
   }
   if (evaluation?.exceptionDetails) {
-    const diagnostics = debuggerExceptionDiagnostics(evaluation.exceptionDetails);
     throw bridgeError(
-      ERROR_EVALUATE_JAVASCRIPT_EXCEPTION,
-      `Runtime.evaluate JavaScript exception: ${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}`,
-      diagnostics
+      ERROR_ATTACH_FAILED,
+      `Runtime.evaluate exception: ${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}`
     );
   }
   const remote = evaluation?.result || {};
@@ -4779,7 +2471,7 @@ async function handleInitScript(params) {
       } else {
         temporaryRemoveAttachment = await attachDebuggerForCommand(selected.tabId, protocolVersion);
         debuggee = temporaryRemoveAttachment.debuggee;
-        await acquireCdpDomain(debuggee, "Page", CDP_OWNER_TRANSIENT);
+        await sendDebuggerCommand(debuggee, "Page.enable", {});
       }
       await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
         identifier
@@ -4794,7 +2486,7 @@ async function handleInitScript(params) {
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(selected.tabId);
       if (addAttachment.newlyAttached && !bindingSessionHasActiveNames(selected.tabId)) {
         try {
-          await normalProfileDebuggerForbidden(addAttachment.debuggee);
+          await chrome.debugger.detach(addAttachment.debuggee);
         } catch (detachError) {
           console.warn(`Synapse chrome.debugger detach failed after initScript add error for tab ${selected.tabId}: ${errorMessage(detachError)}`);
         }
@@ -4808,18 +2500,9 @@ async function handleInitScript(params) {
       `chrome.debugger initScript ${operation} failed for tab ${selected.tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (temporaryRemoveAttachment) {
-      try {
-        await settleTransientCdpDomains(temporaryRemoveAttachment);
-      } catch (error) {
-        console.error(
-          `Synapse initScript remove left CDP domains enabled on tab ${selected.tabId}: ${errorMessage(error)}`
-        );
-      }
-    }
     if (temporaryRemoveAttachment?.shouldDetach) {
       try {
-        await normalProfileDebuggerForbidden(temporaryRemoveAttachment.debuggee);
+        await chrome.debugger.detach(temporaryRemoveAttachment.debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for initScript tab ${selected.tabId}: ${errorMessage(error)}`);
       }
@@ -5388,7 +3071,7 @@ async function handleStorageState(params) {
   };
 }
 
-async function handleSetContent(params, commandId) {
+async function handleSetContent(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const html = String(params.html ?? "");
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
@@ -5403,14 +3086,7 @@ async function handleSetContent(params, commandId) {
     );
   }
   const before = await tabPageState(selected.tabId, selected.target);
-  const execution = await executeSetContentScript(
-    selected,
-    html,
-    waitTimeoutMs,
-    agentSessionId,
-    before,
-    commandId
-  );
+  const execution = await executeSetContentScript(selected, html, waitTimeoutMs, agentSessionId, before);
   const { injected, seed } = execution;
   const frameResults = frameExecutionResults(injected);
   const first = frameResults.find((frame) => frame.result) || null;
@@ -5460,14 +3136,7 @@ async function handleSetContent(params, commandId) {
   };
 }
 
-async function executeSetContentScript(
-  selected,
-  html,
-  waitTimeoutMs,
-  agentSessionId,
-  before,
-  commandId
-) {
+async function executeSetContentScript(selected, html, waitTimeoutMs, agentSessionId, before) {
   try {
     const injected = await runSetContentScript(selected.tabId, html, waitTimeoutMs);
     return { injected, seed: null };
@@ -5478,14 +3147,7 @@ async function executeSetContentScript(
         `chrome.scripting.executeScript setContent(${selected.tabId}) failed: ${errorMessage(error)}`
       );
     }
-    const seed = await seedTabForSetContent(
-      selected,
-      waitTimeoutMs,
-      agentSessionId,
-      before,
-      commandId,
-      error
-    );
+    const seed = await seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, before, error);
     try {
       const injected = await runSetContentScript(selected.tabId, html, waitTimeoutMs);
       return { injected, seed };
@@ -5508,23 +3170,12 @@ async function runSetContentScript(tabId, html, waitTimeoutMs) {
   }, "setContent");
 }
 
-async function seedTabForSetContent(
-  selected,
-  waitTimeoutMs,
-  agentSessionId,
-  before,
-  commandId,
-  cause
-) {
+async function seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, before, cause) {
   const seedUrl = setContentSeedUrl(selected.tabId);
-  await markAgentNavigation(selected.tabId, {
-    claimId: `${commandId}:seed`,
+  markAgentNavigation(selected.tabId, {
     action: "setContentSeed",
     requestedUrl: seedUrl,
-    sessionId: agentSessionId,
-    beforeUrl: before.url,
-    beforeDocumentId: await mainFrameDocumentIdOrNull(selected.tabId),
-    tab: before
+    sessionId: agentSessionId
   });
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.update:setContentSeed:tab=${selected.tabId}`);
@@ -6017,270 +3668,56 @@ async function handleWaitForFunction(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const expression = String(params.expression ?? "");
   if (expression.trim().length === 0) {
-    throw bridgeError(
-      ERROR_CHROME_WAIT_PREDICATE_INVALID,
-      "waitForFunction expression must be non-empty; remediation=pass a JavaScript expression or function declaration"
-    );
+    throw bridgeError(ERROR_ATTACH_FAILED, "waitForFunction expression must be non-empty");
   }
   const args = Array.isArray(params.args) ? params.args : [];
   const timeoutMs = normalizeWaitTimeout(params.timeoutMs);
   const pollingIntervalMs = normalizePollingInterval(params.pollingIntervalMs);
   const startedAt = Date.now();
   let pollCount = 0;
-  let last = {
-    condition_met: false,
-    value: null,
-    value_type: "undefined",
-    value_description: "undefined",
-    unserializable_value: null
-  };
-  let attachment = null;
-  let result = null;
-  let primaryError = null;
-  let initialDocumentId = null;
-  let currentDocumentId = null;
-  let navigationCount = 0;
-  let isolatedContextId = null;
-  try {
-    initialDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
-    if (!initialDocumentId) {
-      throw bridgeError(
-        ERROR_ATTACH_FAILED,
-        `waitForFunction could not read the exact main-frame document identity before debugger attach; ` +
-          `tab=${selected.tabId} remediation=wait for a committed page document or repair the webNavigation permission; no predicate was executed`
+  let last = null;
+  while (true) {
+    pollCount += 1;
+    const poll = await waitForFunctionProbe(selected, expression, args);
+    last = poll;
+    if (poll.condition_met) {
+      const pageState = await tabPageState(selected.tabId, selected.target);
+      return waitForFunctionResult(
+        selected,
+        pageState,
+        poll,
+        true,
+        false,
+        elapsedSince(startedAt),
+        timeoutMs,
+        pollingIntervalMs,
+        pollCount,
+        expression,
+        args
       );
     }
-    currentDocumentId = initialDocumentId;
-    try {
-      attachment = await attachDebuggerForCommand(selected.tabId);
-    } catch (error) {
-      throw bridgeError(
-        ERROR_ATTACH_FAILED,
-        `waitForFunction could not attach chrome.debugger to tab ${selected.tabId}: ${errorMessage(error)}`
+    const elapsed = elapsedSince(startedAt);
+    if (elapsed >= timeoutMs) {
+      const pageState = await tabPageState(selected.tabId, selected.target);
+      return waitForFunctionResult(
+        selected,
+        pageState,
+        last,
+        false,
+        true,
+        elapsed,
+        timeoutMs,
+        pollingIntervalMs,
+        pollCount,
+        expression,
+        args
       );
     }
-    while (true) {
-      pollCount += 1;
-      const beforePollDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
-      if (!beforePollDocumentId) {
-        throw bridgeError(
-          ERROR_ATTACH_FAILED,
-          `waitForFunction lost the exact main-frame document identity before poll ${pollCount}; ` +
-            `tab=${selected.tabId} initial_document_id=${initialDocumentId} ` +
-            `last_document_id=${String(currentDocumentId || "missing")}; no alternate target was used`
-        );
-      }
-      if (beforePollDocumentId !== currentDocumentId) {
-        navigationCount += 1;
-        currentDocumentId = beforePollDocumentId;
-        isolatedContextId = null;
-      }
-      const elapsedBeforePoll = elapsedSince(startedAt);
-      const remainingMs = Math.max(1, timeoutMs - Math.min(timeoutMs, elapsedBeforePoll));
-      let poll;
-      try {
-        if (!Number.isInteger(isolatedContextId)) {
-          isolatedContextId = await waitForFunctionIsolatedContext(
-            selected,
-            attachment.debuggee,
-            remainingMs
-          );
-        }
-        const remainingAfterContextMs = Math.max(
-          1,
-          timeoutMs - Math.min(timeoutMs, elapsedSince(startedAt))
-        );
-        poll = await waitForFunctionProbe(
-          selected,
-          attachment.debuggee,
-          isolatedContextId,
-          expression,
-          args,
-          remainingAfterContextMs
-        );
-      } catch (error) {
-        const afterErrorDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
-        if (
-          waitForFunctionRuntimeWasInterruptedByNavigation(error) &&
-          afterErrorDocumentId &&
-          afterErrorDocumentId !== currentDocumentId
-        ) {
-          navigationCount += 1;
-          currentDocumentId = afterErrorDocumentId;
-          isolatedContextId = null;
-          const elapsedAfterNavigation = elapsedSince(startedAt);
-          if (elapsedAfterNavigation >= timeoutMs) {
-            const pageState = await tabPageState(selected.tabId, selected.target);
-            last.initial_document_id = initialDocumentId;
-            last.final_document_id = currentDocumentId;
-            last.navigation_count = navigationCount;
-            result = waitForFunctionResult(
-              selected,
-              pageState,
-              last,
-              false,
-              true,
-              elapsedAfterNavigation,
-              timeoutMs,
-              pollingIntervalMs,
-              pollCount,
-              expression,
-              args
-            );
-            break;
-          }
-          await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsedAfterNavigation)));
-          continue;
-        }
-        if (error?.code === ERROR_EXTENSION_TIMEOUT) {
-          const pageState = await tabPageState(selected.tabId, selected.target);
-          if (afterErrorDocumentId && afterErrorDocumentId !== currentDocumentId) {
-            navigationCount += 1;
-            currentDocumentId = afterErrorDocumentId;
-            isolatedContextId = null;
-          }
-          last.initial_document_id = initialDocumentId;
-          last.final_document_id = currentDocumentId;
-          last.navigation_count = navigationCount;
-          result = waitForFunctionResult(
-            selected,
-            pageState,
-            last,
-            false,
-            true,
-            elapsedSince(startedAt),
-            timeoutMs,
-            pollingIntervalMs,
-            pollCount,
-            expression,
-            args
-          );
-          break;
-        }
-        throw error;
-      }
-      const afterPollDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
-      if (!afterPollDocumentId) {
-        throw bridgeError(
-          ERROR_ATTACH_FAILED,
-          `waitForFunction lost the exact main-frame document identity after poll ${pollCount}; ` +
-            `tab=${selected.tabId} initial_document_id=${initialDocumentId}; predicate result was not accepted`
-        );
-      }
-      if (afterPollDocumentId !== currentDocumentId) {
-        navigationCount += 1;
-        currentDocumentId = afterPollDocumentId;
-        isolatedContextId = null;
-        const elapsedAfterNavigation = elapsedSince(startedAt);
-        if (elapsedAfterNavigation >= timeoutMs) {
-          const pageState = await tabPageState(selected.tabId, selected.target);
-          last.initial_document_id = initialDocumentId;
-          last.final_document_id = currentDocumentId;
-          last.navigation_count = navigationCount;
-          result = waitForFunctionResult(
-            selected,
-            pageState,
-            last,
-            false,
-            true,
-            elapsedAfterNavigation,
-            timeoutMs,
-            pollingIntervalMs,
-            pollCount,
-            expression,
-            args
-          );
-          break;
-        }
-        // This result belongs to the previous document. Never accept it as
-        // evidence about the independently observed current document.
-        await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsedAfterNavigation)));
-        continue;
-      }
-      last = {
-        ...poll,
-        initial_document_id: initialDocumentId,
-        final_document_id: currentDocumentId,
-        navigation_count: navigationCount
-      };
-      if (poll.condition_met) {
-        const pageState = await tabPageState(selected.tabId, selected.target);
-        result = waitForFunctionResult(
-          selected,
-          pageState,
-          last,
-          true,
-          false,
-          elapsedSince(startedAt),
-          timeoutMs,
-          pollingIntervalMs,
-          pollCount,
-          expression,
-          args
-        );
-        break;
-      }
-      const elapsed = elapsedSince(startedAt);
-      if (elapsed >= timeoutMs) {
-        const pageState = await tabPageState(selected.tabId, selected.target);
-        result = waitForFunctionResult(
-          selected,
-          pageState,
-          last,
-          false,
-          true,
-          elapsed,
-          timeoutMs,
-          pollingIntervalMs,
-          pollCount,
-          expression,
-          args
-        );
-        break;
-      }
-      await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
-    }
-  } catch (error) {
-    primaryError = error;
+    await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
   }
-  if (attachment?.shouldDetach) {
-    try {
-      await normalProfileDebuggerForbidden(attachment.debuggee);
-      forgetCdpDomainsForTab(selected.tabId);
-    } catch (error) {
-      const priorCode = primaryError?.code ? String(primaryError.code) : "none";
-      const priorDetail = primaryError ? errorMessage(primaryError) : "none";
-      throw bridgeError(
-        ERROR_EXTENSION_DETACHED,
-        `waitForFunction could not prove transient debugger detach for tab ${selected.tabId}: ` +
-          `${errorMessage(error)}; prior_error_code=${priorCode} ` +
-          `prior_error_detail=${JSON.stringify(priorDetail)}; ` +
-          "remediation=inspect chrome.debugger target attachment state before another debugger command"
-      );
-    }
-  }
-  if (primaryError) throw primaryError;
-  if (!result) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `waitForFunction reached no terminal result for tab ${selected.tabId}; ` +
-        `poll_count=${pollCount} navigation_count=${navigationCount}`
-    );
-  }
-  return result;
 }
 
 async function handleWaitForLoadState(params) {
-  if (!chrome.webRequest?.onBeforeRequest?.addListener ||
-      !chrome.webRequest?.onBeforeRedirect?.addListener ||
-      !chrome.webRequest?.onCompleted?.addListener ||
-      !chrome.webRequest?.onErrorOccurred?.addListener) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      "load-state waits require the complete chrome.webRequest request lifecycle; " +
-        "onBeforeRequest/onBeforeRedirect/onCompleted/onErrorOccurred are not all available"
-    );
-  }
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const state = normalizeWaitForLoadStateState(params.state);
   const timeoutMs = normalizeWaitTimeout(params.timeoutMs);
@@ -6288,9 +3725,6 @@ async function handleWaitForLoadState(params) {
   const startedAt = Date.now();
   const initialState = await tabPageState(selected.tabId, selected.target);
   const { buffer } = ensurePageEventBuffer(selected.tabId, initialState);
-  const { buffer: networkBuffer } = ensureNetworkEventBuffer(selected.tabId, initialState);
-  const networkStartSeq = networkBuffer.nextSeq;
-  let maxInFlightRequests = networkBuffer.inFlightRequests;
   let pollCount = 0;
   let last = null;
   while (true) {
@@ -6298,16 +3732,8 @@ async function handleWaitForLoadState(params) {
     const pageState = await tabPageState(selected.tabId, selected.target);
     updatePageSnapshot(buffer, pageState);
     const events = loadStateEventSummary(buffer, startedAt);
-    maxInFlightRequests = Math.max(
-      maxInFlightRequests,
-      Number(networkBuffer.inFlightRequests || 0)
-    );
-    const network = loadStateNetworkSummary(
-      networkBuffer,
-      networkStartSeq,
-      maxInFlightRequests
-    );
-    last = loadStatePollSummary(pageState, network, events);
+    const probe = await loadStateProbe(selected);
+    last = loadStatePollSummary(pageState, probe, events);
     const conditionMet = loadStateConditionMet(state, last);
     const elapsed = elapsedSince(startedAt);
     if (conditionMet) {
@@ -6396,25 +3822,17 @@ async function handleWaitForUrl(params) {
 }
 
 async function handleWaitForNetwork(params, requireResponse) {
-  if (!chrome.webRequest?.onBeforeRequest?.addListener ||
-      !chrome.webRequest?.onBeforeRedirect?.addListener ||
-      !chrome.webRequest?.onCompleted?.addListener ||
-      !chrome.webRequest?.onErrorOccurred?.addListener) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      "network waits require the complete chrome.webRequest request lifecycle; " +
-        "onBeforeRequest/onBeforeRedirect/onCompleted/onErrorOccurred are not all available"
-    );
-  }
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const wait = normalizeNetworkWaitParams(params, requireResponse);
   const state = await tabPageState(selected.tabId, selected.target);
   const { buffer } = ensureNetworkEventBuffer(selected.tabId, state);
+  const recorder = await ensureInPageNetworkRecorder(selected.tabId);
   const startSeq = buffer.nextSeq;
   const startedAt = Date.now();
   let pollCount = 0;
   while (true) {
     pollCount += 1;
+    await mergeInPageNetworkEvents(selected.tabId, buffer, recorder);
     const matched = findNetworkWaitEntry(buffer, wait, requireResponse, startSeq);
     const elapsed = elapsedSince(startedAt);
     if (matched) {
@@ -6488,34 +3906,10 @@ async function handleClock(params) {
     );
   }
   const state = await tabPageState(selected.tabId, selected.target);
-  let documentReadback;
-  try {
-    documentReadback = await mainFrameDocumentReadback(selected.tabId);
-  } catch (error) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `clock could not bind tab ${selected.tabId} to one committed main-frame document: ${errorMessage(error)}`
-    );
-  }
-  const existingOwner = CLOCK_DOCUMENT_OWNERS.get(selected.tabId) ||
-    DURABLE_OWNER_LEDGER.clockTabs.find((entry) => entry.tabId === selected.tabId) ||
-    null;
-  if (existingOwner && existingOwner.documentId !== documentReadback.document_id) {
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      `clock owner generation mismatch for tab ${selected.tabId}: ` +
-        `owned_document=${String(existingOwner.documentId || "legacy-unbound")} ` +
-        `current_document=${documentReadback.document_id}; ` +
-        "the old document must be reconciled before touching the current page"
-    );
-  }
   let injected;
   try {
     injected = await executeScriptMutation({
-      target: {
-        tabId: selected.tabId,
-        documentIds: [documentReadback.document_id]
-      },
+      target: { tabId: selected.tabId },
       world: "MAIN",
       func: runClockInPage,
       args: [{
@@ -6532,20 +3926,7 @@ async function handleClock(params) {
     );
   }
   const frameResults = frameExecutionResults(injected);
-  const executionReadback = frameResults.map((frame) => ({
-    frame_id: frame.frame_id,
-    document_id: frame.document_id
-  }));
-  if (frameResults.length !== 1 || frameResults[0]?.frame_id !== 0 ||
-      frameResults[0]?.document_id !== documentReadback.document_id) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `clock document-bound execution contradicted its target: tab=${selected.tabId} ` +
-        `expected_document=${documentReadback.document_id} ` +
-        `actual_results=${JSON.stringify(executionReadback)}`
-    );
-  }
-  const first = frameResults[0];
+  const first = frameResults.find((frame) => frame.result) || null;
   const result = first?.result;
   if (!result || typeof result !== "object") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.scripting.executeScript clock returned no structured result");
@@ -6558,30 +3939,10 @@ async function handleClock(params) {
   }
   if (operation === "install") {
     CLOCK_INSTALLED_TABS.add(selected.tabId);
-    const owner = {
-      tabId: selected.tabId,
-      targetId: state.target_id || selected.target.id,
-      documentId: documentReadback.document_id,
-      clockVersion: String(result.readback?.version || ""),
-      installedAtUnixMs: Number.isSafeInteger(result.installed_at_unix_ms)
-        ? result.installed_at_unix_ms
-        : 0
-    };
-    if (!owner.clockVersion || owner.installedAtUnixMs <= 0) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        "clock install returned no exact version/installation generation; owner was not accepted"
-      );
-    }
-    CLOCK_DOCUMENT_OWNERS.set(selected.tabId, owner);
-    DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-      .filter((entry) => entry.tabId !== selected.tabId);
-    DURABLE_OWNER_LEDGER.clockTabs.push({ ...owner });
   } else if (operation === "uninstall") {
     CLOCK_INSTALLED_TABS.delete(selected.tabId);
-    CLOCK_DOCUMENT_OWNERS.delete(selected.tabId);
     DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-      .filter((entry) => entry.tabId !== selected.tabId);
+      .filter((tabId) => tabId !== selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6596,7 +3957,7 @@ async function handleClock(params) {
     url: result.url || state.url || "",
     title: result.title || state.title || "",
     ready_state: result.ready_state || state.ready_state || "",
-    readback_backend: "chrome.scripting.executeScript(MAIN exact document-bound clock transaction)",
+    readback_backend: "chrome.scripting.executeScript(MAIN synapse clock shim)",
     backend_tier_used: "chrome_tabs_extension",
     frame_id: Number.isSafeInteger(first.frame_id) ? first.frame_id : null,
     frame_document_id: first.document_id,
@@ -6609,20 +3970,9 @@ async function handleClock(params) {
 async function handlePageEvents(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const filters = normalizePageEventsFilter(params);
-  const workerEventRequested = filters.workerType !== null ||
-    filters.eventKind === null ||
-    String(filters.eventKind).startsWith("worker_");
-  if (workerEventRequested) {
-    throw bridgeError(
-      ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-      "the debugger-free normal Chrome bridge cannot observe Worker/SharedWorker/" +
-        "ServiceWorker lifecycle without mutating host constructors in MAIN world; " +
-        "select a session-owned raw-CDP target for unfiltered or worker page_events, " +
-        "or request one explicit page-only event_kind"
-    );
-  }
   const state = await tabPageState(selected.tabId, selected.target);
   const bufferResult = ensurePageEventBuffer(selected.tabId, state);
+  const workerProbe = await drainPageWorkerEvents(selected.tabId, state);
   const read = readPageEventBuffer(bufferResult.buffer, filters);
   return {
     extension_id: chrome.runtime.id,
@@ -6647,13 +3997,67 @@ async function handlePageEvents(params) {
     },
     entries: read.entries,
     pages: read.pages,
-    workers: [],
-    readback_backend: "chrome.webNavigation + chrome.tabs page lifecycle ring buffer",
+    workers: read.workers,
+    readback_backend: "chrome.webNavigation+chrome.tabs+chrome.scripting.executeScript(MAIN synapse page-events shim)",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     web_navigation_available: Boolean(chrome.webNavigation),
+    worker_probe_available: workerProbe.available,
+    worker_probe_error_code: workerProbe.error_code || null,
+    worker_probe_error_detail: workerProbe.error_detail || null,
+    worker_probe_frame_result_count: workerProbe.frame_result_count || 0,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+async function drainPageWorkerEvents(tabId, state) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return {
+      available: false,
+      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
+      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission",
+      frame_result_count: 0
+    };
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      func: runPageEventsWorkerProbe
+    });
+  } catch (error) {
+    return {
+      available: false,
+      error_code: ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      error_detail: errorMessage(error),
+      frame_result_count: 0
+    };
+  }
+  const frames = frameExecutionResults(injected);
+  for (const frame of frames) {
+    const result = frame.result;
+    if (!result || typeof result !== "object" || !Array.isArray(result.events)) {
+      continue;
+    }
+    for (const event of result.events) {
+      pushPageEvent(tabId, {
+        ...event,
+        target_id: state.target_id || targetIdForTabId(tabId),
+        frame_id: event.frame_id == null && Number.isSafeInteger(frame.frame_id)
+          ? String(frame.frame_id)
+          : event.frame_id,
+        url: event.url || result.url || state.url || "",
+        title: event.title || result.title || state.title || ""
+      });
+    }
+  }
+  return {
+    available: true,
+    error_code: null,
+    error_detail: null,
+    frame_result_count: frames.length
   };
 }
 
@@ -6661,462 +4065,9 @@ async function handleCapturePageScreenshot(params) {
   return rejectAttachCommand("capturePageScreenshot", params);
 }
 
-function checkedPageScreenshotProduct(values, label) {
-  let product = 1;
-  for (const value of values) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        `pageScreenshot capture plan ${label} contains a non-safe extent ${JSON.stringify(value)}`
-      );
-    }
-    product *= value;
-    if (!Number.isSafeInteger(product)) {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        `pageScreenshot capture plan ${label} exceeds JavaScript's exact integer range`
-      );
-    }
-  }
-  return product;
-}
-
-function checkedPageScreenshotSum(values, label) {
-  let sum = 0;
-  for (const value of values) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        `pageScreenshot capture plan ${label} contains a non-safe byte count ${JSON.stringify(value)}`
-      );
-    }
-    sum += value;
-    if (!Number.isSafeInteger(sum)) {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        `pageScreenshot capture plan ${label} exceeds JavaScript's exact integer range`
-      );
-    }
-  }
-  return sum;
-}
-
-function pageScreenshotEncodedUpperBound(rawBytes, height, format) {
-  if (format === "png") {
-    // One filter byte per scanline plus a conservative zlib stored-block
-    // overhead and PNG chunk/header allowance. A valid capture cannot need a
-    // larger lossless payload than this no-compression representation.
-    const filtered = checkedPageScreenshotSum([rawBytes, height], "png_filtered_bytes");
-    return checkedPageScreenshotSum(
-      [filtered, checkedPageScreenshotProduct([Math.ceil(filtered / 16383), 5], "png_stored_block_overhead"), 65536],
-      "png_encoded_upper_bound"
-    );
-  }
-  // JPEG encoders are implementation-owned. Bound them conservatively at two
-  // raw surfaces plus metadata rather than assuming compression is beneficial.
-  return checkedPageScreenshotSum(
-    [checkedPageScreenshotProduct([rawBytes, 2], "jpeg_raw_upper_bound"), 65536],
-    "jpeg_encoded_upper_bound"
-  );
-}
-
-function pageScreenshotDataUrlLengthUpperBound(encodedBytes, format) {
-  const headerBytes = `data:image/${format};base64,`.length;
-  return checkedPageScreenshotSum(
-    [headerBytes, checkedPageScreenshotProduct([Math.ceil(encodedBytes / 3), 4], "base64_upper_bound")],
-    "data_url_upper_bound"
-  );
-}
-
-function pageScreenshotOutputDimensions(nativeWidth, nativeHeight, request) {
-  let scale = 1;
-  if (request.maxLongEdge !== null) {
-    scale = Math.min(scale, request.maxLongEdge / Math.max(nativeWidth, nativeHeight));
-  }
-  if (request.maxPixels !== null) {
-    scale = Math.min(
-      scale,
-      Math.sqrt(request.maxPixels / checkedPageScreenshotProduct(
-        [nativeWidth, nativeHeight],
-        "native_pixels"
-      ))
-    );
-  }
-  let width = Math.max(1, Math.round(nativeWidth * Math.min(1, scale)));
-  let height = Math.max(1, Math.round(nativeHeight * Math.min(1, scale)));
-  while (
-    request.maxPixels !== null &&
-    checkedPageScreenshotProduct([width, height], "output_pixels") > request.maxPixels
-  ) {
-    if (width / nativeWidth >= height / nativeHeight && width > 1) {
-      width -= 1;
-    } else if (height > 1) {
-      height -= 1;
-    } else {
-      break;
-    }
-  }
-  while (request.maxLongEdge !== null && Math.max(width, height) > request.maxLongEdge) {
-    if (width >= height && width > 1) {
-      width -= 1;
-    } else if (height > 1) {
-      height -= 1;
-    } else {
-      break;
-    }
-  }
-  return { width, height };
-}
-
-function pageScreenshotPlanError(plan, reason) {
-  return bridgeError(
-    ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-    `pageScreenshot capture plan rejected before page mutation/capture: reason=${reason} ` +
-    `tile_count=${plan.tile_count} native=${plan.native_width}x${plan.native_height} ` +
-    `output=${plan.output_width}x${plan.output_height} ` +
-    `tile_raw_bytes=${plan.tile_raw_bytes} ` +
-    `tile_encoded_upper_bound_bytes=${plan.tile_encoded_upper_bound_bytes} ` +
-    `output_raw_bytes=${plan.output_raw_bytes} ` +
-    `output_encoded_upper_bound_bytes=${plan.output_encoded_upper_bound_bytes} ` +
-    `estimated_peak_bytes=${plan.estimated_peak_bytes} ` +
-    `hard_peak_budget_bytes=${plan.hard_peak_budget_bytes} ` +
-    `estimated_native_message_bytes=${plan.estimated_native_message_bytes} ` +
-    `native_message_budget_bytes=${plan.native_message_budget_bytes} ` +
-    `max_pixels=${String(plan.max_pixels)} max_long_edge=${String(plan.max_long_edge)}; ` +
-    `remediation=reduce the requested clip/page dimensions or provide a smaller maxPixels/maxLongEdge so the bounded extension-owned compositor and one Chrome tile fit the reported budgets`
-  );
-}
-
-function buildPageScreenshotCapturePlan(setup, request, positions, emulatedPageSurface) {
-  const clip = setup.clip_css;
-  const metrics = setup.metrics;
-  const dpr = Number(metrics.device_pixel_ratio);
-  for (const [label, value] of [
-    ["clip.w", clip.w],
-    ["clip.h", clip.h],
-    ["viewport_width", metrics.viewport_width],
-    ["viewport_height", metrics.viewport_height],
-    ["device_pixel_ratio", dpr]
-  ]) {
-    if (!Number.isFinite(Number(value)) || Number(value) <= 0) {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        `pageScreenshot capture plan cannot bind ${label}=${JSON.stringify(value)} to physical pixels`
-      );
-    }
-  }
-  const nativeWidth = Math.ceil(Number(clip.w) * dpr);
-  const nativeHeight = Math.ceil(Number(clip.h) * dpr);
-  const output = pageScreenshotOutputDimensions(nativeWidth, nativeHeight, request);
-  if (
-    !Number.isSafeInteger(nativeWidth) || !Number.isSafeInteger(nativeHeight) ||
-    nativeWidth <= 0 || nativeHeight <= 0 ||
-    nativeWidth > 0xffffffff || nativeHeight > 0xffffffff ||
-    output.width > 0xffffffff || output.height > 0xffffffff
-  ) {
-    throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      `pageScreenshot capture plan dimensions exceed the exact u32 artifact contract: native=${nativeWidth}x${nativeHeight} output=${output.width}x${output.height}`
-    );
-  }
-  const normalTileWidth = Math.ceil(Number(metrics.viewport_width) * dpr);
-  const normalTileHeight = Math.ceil(Number(metrics.viewport_height) * dpr);
-  // Page.captureScreenshot can apply the requested output scale before it
-  // materializes pixels. Its one page-surface image is therefore bounded by
-  // the output contract, not by the native emulated page dimensions.
-  const tileWidth = emulatedPageSurface ? output.width : normalTileWidth;
-  const tileHeight = emulatedPageSurface ? output.height : normalTileHeight;
-  const tileRawBytes = checkedPageScreenshotProduct(
-    [tileWidth, tileHeight, 4],
-    "tile_raw_bytes"
-  );
-  const outputRawBytes = checkedPageScreenshotProduct(
-    [output.width, output.height, 4],
-    "output_raw_bytes"
-  );
-  const tileEncodedUpperBoundBytes = pageScreenshotEncodedUpperBound(
-    tileRawBytes,
-    tileHeight,
-    request.format
-  );
-  const outputEncodedUpperBoundBytes = pageScreenshotEncodedUpperBound(
-    outputRawBytes,
-    output.height,
-    request.format
-  );
-  const tileDataUrlUpperBoundBytes = pageScreenshotDataUrlLengthUpperBound(
-    tileEncodedUpperBoundBytes,
-    request.format
-  );
-  const outputDataUrlUpperBoundBytes = pageScreenshotDataUrlLengthUpperBound(
-    outputEncodedUpperBoundBytes,
-    request.format
-  );
-  // V8 may represent these ASCII strings as one-byte or two-byte strings. Use
-  // the two-byte case, and include every final serialization cohort rather than
-  // relying on garbage collection to have run at a convenient moment.
-  const tilePhasePeakBytes = checkedPageScreenshotSum(
-    [
-      outputRawBytes,
-      tileRawBytes,
-      tileEncodedUpperBoundBytes,
-      checkedPageScreenshotProduct([tileDataUrlUpperBoundBytes, 2], "tile_data_url_heap_bytes")
-    ],
-    "tile_phase_peak_bytes"
-  );
-  const finalPhasePeakBytes = checkedPageScreenshotSum(
-    [
-      outputRawBytes,
-      checkedPageScreenshotProduct([outputEncodedUpperBoundBytes, 2], "output_blob_arraybuffer_bytes"),
-      checkedPageScreenshotProduct([outputDataUrlUpperBoundBytes, 4], "output_base64_json_heap_bytes")
-    ],
-    "final_phase_peak_bytes"
-  );
-  const estimatedPeakBytes = Math.max(tilePhasePeakBytes, finalPhasePeakBytes);
-  const estimatedNativeMessageBytes = checkedPageScreenshotSum(
-    [outputDataUrlUpperBoundBytes, PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES],
-    "estimated_native_message_bytes"
-  );
-  const plan = {
-    schema: "synapse_page_screenshot_capture_plan/v1",
-    composition_mode: "bounded_offscreen_canvas_v1",
-    hard_peak_budget_bytes: PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES,
-    native_message_budget_bytes: PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES,
-    estimated_peak_bytes: estimatedPeakBytes,
-    estimated_native_message_bytes: estimatedNativeMessageBytes,
-    native_width: nativeWidth,
-    native_height: nativeHeight,
-    output_width: output.width,
-    output_height: output.height,
-    output_scale_x: output.width / Number(clip.w),
-    output_scale_y: output.height / Number(clip.h),
-    applied_scale: Math.max(output.width, output.height) / Math.max(nativeWidth, nativeHeight),
-    tile_count: emulatedPageSurface ? 1 : positions.length,
-    tile_width: tileWidth,
-    tile_height: tileHeight,
-    tile_raw_bytes: tileRawBytes,
-    tile_encoded_upper_bound_bytes: tileEncodedUpperBoundBytes,
-    tile_data_url_upper_bound_bytes: tileDataUrlUpperBoundBytes,
-    output_raw_bytes: outputRawBytes,
-    output_encoded_upper_bound_bytes: outputEncodedUpperBoundBytes,
-    output_data_url_upper_bound_bytes: outputDataUrlUpperBoundBytes,
-    max_pixels: request.maxPixels,
-    max_long_edge: request.maxLongEdge,
-    actual_max_tile_data_url_bytes: 0,
-    actual_composite_blob_bytes: 0,
-    actual_composite_data_url_bytes: 0,
-    actual_native_message_bytes: 0,
-    surface_released: false
-  };
-  if (!Number.isSafeInteger(plan.tile_count) || plan.tile_count <= 0 || plan.tile_count > 400) {
-    throw pageScreenshotPlanError(plan, "tile_count_out_of_range");
-  }
-  if (estimatedPeakBytes > PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES) {
-    throw pageScreenshotPlanError(plan, "estimated_peak_exceeds_hard_budget");
-  }
-  if (estimatedNativeMessageBytes > PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES) {
-    throw pageScreenshotPlanError(plan, "estimated_native_message_exceeds_transport_budget");
-  }
-  return plan;
-}
-
-function createPageScreenshotCompositor(plan) {
-  if (typeof OffscreenCanvas !== "function") {
-    throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      "pageScreenshot bounded compositor requires OffscreenCanvas in the extension service worker; update Chrome to a version that supports worker OffscreenCanvas"
-    );
-  }
-  const canvas = new OffscreenCanvas(plan.output_width, plan.output_height);
-  const context = canvas.getContext("2d", { alpha: true });
-  if (!context) {
-    throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      `pageScreenshot could not allocate the bounded ${plan.output_width}x${plan.output_height} extension-owned 2D composition surface within estimated_peak_bytes=${plan.estimated_peak_bytes}`
-    );
-  }
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  context.clearRect(0, 0, plan.output_width, plan.output_height);
-  return { canvas, context, released: false };
-}
-
-function releasePageScreenshotCompositor(compositor, plan) {
-  if (!compositor || compositor.released) {
-    return;
-  }
-  compositor.canvas.width = 1;
-  compositor.canvas.height = 1;
-  compositor.released = true;
-  plan.surface_released = true;
-}
-
-async function compositePageScreenshotDataUrl(compositor, plan, dataUrl, tile, label) {
-  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `pageScreenshot ${label} returned an unsupported image payload`
-    );
-  }
-  const dataUrlBytes = dataUrl.length;
-  if (dataUrlBytes > plan.tile_data_url_upper_bound_bytes) {
-    throw pageScreenshotPlanError(
-      plan,
-      `actual_tile_data_url_exceeds_bound label=${label} actual=${dataUrlBytes}`
-    );
-  }
-  plan.actual_max_tile_data_url_bytes = Math.max(
-    plan.actual_max_tile_data_url_bytes,
-    dataUrlBytes
-  );
-  let bitmap = null;
-  try {
-    const response = await fetch(dataUrl);
-    const blob = await response.blob();
-    if (blob.size > plan.tile_encoded_upper_bound_bytes) {
-      throw pageScreenshotPlanError(
-        plan,
-        `actual_tile_blob_exceeds_bound label=${label} actual=${blob.size}`
-      );
-    }
-    if (typeof createImageBitmap !== "function") {
-      throw bridgeError(
-        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-        "pageScreenshot bounded compositor requires createImageBitmap in the extension service worker; update Chrome and retry"
-      );
-    }
-    bitmap = await createImageBitmap(blob);
-    const tileScaleX = bitmap.width / Number(tile.viewport_width_css);
-    const tileScaleY = bitmap.height / Number(tile.viewport_height_css);
-    const dprTolerance = Math.max(0.02, Math.abs(plan.tile_width / Number(tile.viewport_width_css)) * 0.01);
-    if (
-      !Number.isFinite(tileScaleX) || !Number.isFinite(tileScaleY) ||
-      Math.abs(tileScaleX - tileScaleY) > dprTolerance
-    ) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        `pageScreenshot ${label} bitmap/CSS scale mismatch bitmap=${bitmap.width}x${bitmap.height} viewport_css=${tile.viewport_width_css}x${tile.viewport_height_css} scale=${tileScaleX}x${tileScaleY}`
-      );
-    }
-    const clip = tile.clip_css;
-    const left = Math.max(clip.x, tile.scroll_x_css);
-    const top = Math.max(clip.y, tile.scroll_y_css);
-    const right = Math.min(clip.x + clip.w, tile.scroll_x_css + tile.viewport_width_css);
-    const bottom = Math.min(clip.y + clip.h, tile.scroll_y_css + tile.viewport_height_css);
-    if (right <= left || bottom <= top) {
-      return { data_url_bytes: dataUrlBytes, blob_bytes: blob.size, bitmap_width: bitmap.width, bitmap_height: bitmap.height };
-    }
-    const sourceX = (left - tile.scroll_x_css) * tileScaleX;
-    const sourceY = (top - tile.scroll_y_css) * tileScaleY;
-    const sourceW = (right - left) * tileScaleX;
-    const sourceH = (bottom - top) * tileScaleY;
-    const destX = (left - clip.x) * plan.output_scale_x;
-    const destY = (top - clip.y) * plan.output_scale_y;
-    const destW = (right - left) * plan.output_scale_x;
-    const destH = (bottom - top) * plan.output_scale_y;
-    compositor.context.drawImage(
-      bitmap,
-      sourceX,
-      sourceY,
-      sourceW,
-      sourceH,
-      destX,
-      destY,
-      destW,
-      destH
-    );
-    return { data_url_bytes: dataUrlBytes, blob_bytes: blob.size, bitmap_width: bitmap.width, bitmap_height: bitmap.height };
-  } finally {
-    if (bitmap) {
-      bitmap.close();
-    }
-  }
-}
-
-function pageScreenshotArrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const parts = [];
-  const chunkBytes = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
-    parts.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkBytes)));
-  }
-  return btoa(parts.join(""));
-}
-
-async function finalizePageScreenshotCompositor(compositor, plan, request) {
-  const expectedType = request.format === "jpeg" ? "image/jpeg" : "image/png";
-  const blob = await compositor.canvas.convertToBlob({
-    type: expectedType,
-    quality: request.format === "jpeg" ? request.quality / 100 : undefined
-  });
-  if (blob.type !== expectedType) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `pageScreenshot bounded compositor encoded ${JSON.stringify(blob.type)} instead of ${expectedType}; no format fallback is permitted`
-    );
-  }
-  if (blob.size <= 0 || blob.size > plan.output_encoded_upper_bound_bytes) {
-    throw pageScreenshotPlanError(
-      plan,
-      `composite_blob_out_of_range actual=${blob.size}`
-    );
-  }
-  const buffer = await blob.arrayBuffer();
-  const base64 = pageScreenshotArrayBufferToBase64(buffer);
-  const dataUrl = `data:${expectedType};base64,${base64}`;
-  if (dataUrl.length > plan.output_data_url_upper_bound_bytes) {
-    throw pageScreenshotPlanError(
-      plan,
-      `composite_data_url_exceeds_bound actual=${dataUrl.length}`
-    );
-  }
-  plan.actual_composite_blob_bytes = blob.size;
-  plan.actual_composite_data_url_bytes = dataUrl.length;
-  return dataUrl;
-}
-
-function finalizePageScreenshotNativeMessageReadback(result, plan) {
-  if (typeof TextEncoder !== "function") {
-    throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      "pageScreenshot cannot prove its native-message byte length because TextEncoder is unavailable in the extension service worker"
-    );
-  }
-  const encoder = new TextEncoder();
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const actual = encoder.encode(JSON.stringify(result)).byteLength +
-      PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES;
-    if (!Number.isSafeInteger(actual)) {
-      throw pageScreenshotPlanError(plan, "actual_native_message_bytes_not_exact");
-    }
-    if (actual === plan.actual_native_message_bytes) {
-      break;
-    }
-    plan.actual_native_message_bytes = actual;
-  }
-  const verified = encoder.encode(JSON.stringify(result)).byteLength +
-    PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES;
-  if (verified !== plan.actual_native_message_bytes) {
-    throw pageScreenshotPlanError(
-      plan,
-      `actual_native_message_fixed_point_failed recorded=${plan.actual_native_message_bytes} verified=${verified}`
-    );
-  }
-  if (verified > plan.native_message_budget_bytes) {
-    throw pageScreenshotPlanError(
-      plan,
-      `actual_native_message_exceeds_transport_budget actual=${verified}`
-    );
-  }
-}
-
 async function handlePageScreenshot(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const request = normalizePageScreenshotRequest(params, selected.tabId);
-  await DURABLE_OWNER_STATE_READY;
-  if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
-    throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
-  }
   const commandStartedAtMs = Date.now();
   const commandDeadlineMs =
     commandStartedAtMs + Math.min(request.waitTimeoutMs, PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS);
@@ -7133,69 +4084,31 @@ async function handlePageScreenshot(params) {
     : null;
   const previousActiveTabId = Number.isInteger(previousActive?.id) ? previousActive.id : null;
   const beforeWindow = await chromeWindowState(before.chrome_window_id);
-  if (!beforeWindow?.focused) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `pageScreenshot refused before page mutation because Chrome window ${before.chrome_window_id} is not focused; synapse-mcp must own and physically verify the OS foreground transaction`
-    );
-  }
+  const previousFocusedWindow = await focusedChromeWindow();
+  const previousFocusedWindowId = Number.isInteger(previousFocusedWindow?.id)
+    ? previousFocusedWindow.id
+    : null;
   let activeForCapture = Boolean(before.active);
+  let focusedWindowForCapture = Boolean(beforeWindow?.focused);
+  let restoredPreviousWindowFocus = focusedWindowForCapture;
+  let requiredForeground = !focusedWindowForCapture;
   let restoredPreviousActive = false;
   let setup = null;
-  let cleanupReadback = null;
-  let operationError = null;
-  let captureBackend = "chrome_tabs_extension";
+  const token = `synapse-page-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tiles = [];
   const captureAttempts = [];
-  let capturePlan = null;
-  let compositor = null;
-  let compositeImageDataUrl = null;
-  let pageMutationStarted = false;
   try {
-    if (before.discarded || before.ready_state === "unloaded") {
-      await chrome.tabs.update(selected.tabId, { active: true });
-      await waitForTabActiveState(
-        selected.tabId,
-        true,
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, "restore_discarded_tab_activation")
-      );
-      activeForCapture = true;
-      await waitForDiscardedTabDocument(
-        selected.tabId,
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, "restore_discarded_tab_document")
-      );
-    }
-    setup = await runPageScreenshotSetup(selected.tabId, request);
+    setup = await runPageScreenshotSetup(selected.tabId, {
+      ...request,
+      token
+    });
     if (!setup.ok) {
       throw bridgeError(
         String(setup.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
         `pageScreenshot setup failed: ${String(setup.error_detail || "")}`
       );
     }
-    const emulatedPageSurface =
-      VIEWPORT_BASELINE_BY_TAB.has(selected.tabId) ||
-      DEVICE_BASELINE_BY_TAB.has(selected.tabId);
-    const positions = emulatedPageSurface
-      ? [{ x: setup.clip_css.x, y: setup.clip_css.y }]
-      : pageScreenshotTilePositions(setup.clip_css, setup.metrics);
-    capturePlan = buildPageScreenshotCapturePlan(
-      setup,
-      request,
-      positions,
-      emulatedPageSurface
-    );
-    compositor = createPageScreenshotCompositor(capturePlan);
-    pageMutationStarted = true;
-    const prepared = await runPageScreenshotPrepare(selected.tabId, {
-      expectedDocumentId: setup.document_id,
-      omitBackground: request.omitBackground
-    });
-    if (!prepared.ok) {
-      throw bridgeError(
-        String(prepared.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
-        `pageScreenshot prepare failed: ${String(prepared.error_detail || "")}`
-      );
-    }
-    if (!activeForCapture) {
+    if (!before.active) {
       await chrome.tabs.update(selected.tabId, { active: true });
       await waitForTabActiveState(
         selected.tabId,
@@ -7204,15 +4117,30 @@ async function handlePageScreenshot(params) {
       );
       activeForCapture = true;
     }
-    if (emulatedPageSurface) {
+    if (!focusedWindowForCapture) {
+      await chrome.windows.update(before.chrome_window_id, { focused: true });
+      await waitForChromeWindowFocused(
+        before.chrome_window_id,
+        true,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "focus_window")
+      );
+      focusedWindowForCapture = true;
+      restoredPreviousWindowFocus = false;
+    }
+    const positions = pageScreenshotTilePositions(setup.clip_css, setup.metrics);
+    for (const [index, position] of positions.entries()) {
+      remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
+      const scrollReadback = await runPageScreenshotScroll(selected.tabId, position);
+      remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
+      await sleep(request.captureDelayMs);
+      let imageDataUrl;
       const captureStartedAtMs = Date.now();
-      let imageDataUrl = null;
       const attempt = {
-        attempt: 1,
-        scroll_x_css: setup.clip_css.x,
-        scroll_y_css: setup.clip_css.y,
-        requested_scroll_x_css: setup.clip_css.x,
-        requested_scroll_y_css: setup.clip_css.y,
+        attempt: index + 1,
+        scroll_x_css: scrollReadback.scroll_x,
+        scroll_y_css: scrollReadback.scroll_y,
+        requested_scroll_x_css: position.x,
+        requested_scroll_y_css: position.y,
         ok: false,
         elapsed_ms: 0,
         timeout_ms: 0,
@@ -7223,144 +4151,60 @@ async function handlePageScreenshot(params) {
       try {
         const captureTimeoutMs = remainingPageScreenshotBudgetMs(
           commandDeadlineMs,
-          "capture_emulated_page_surface"
+          `capture_visible_tab_tile_${index + 1}`
         );
         attempt.timeout_ms = captureTimeoutMs;
-        imageDataUrl = await captureEmulatedPageSurface(
-          selected.tabId,
-          setup.clip_css,
-          request,
-          setup.metrics.device_pixel_ratio,
-          capturePlan,
-          captureTimeoutMs
-        );
+        imageDataUrl = await captureVisibleTabWithQuota(before.chrome_window_id, {
+          format: request.format,
+          quality: request.quality
+        }, captureTimeoutMs, {
+          tabId: selected.tabId,
+          windowId: before.chrome_window_id,
+          targetId: selected.target.id,
+          tileIndex: index + 1,
+          tileCount: positions.length,
+          requestedScrollX: position.x,
+          requestedScrollY: position.y
+        });
         attempt.ok = true;
-        attempt.image_data_url_len = imageDataUrl.length;
-        await compositePageScreenshotDataUrl(
-          compositor,
-          capturePlan,
-          imageDataUrl,
-          {
-            scroll_x_css: setup.clip_css.x,
-            scroll_y_css: setup.clip_css.y,
-            viewport_width_css: setup.clip_css.w,
-            viewport_height_css: setup.clip_css.h,
-            clip_css: setup.clip_css
-          },
-          "emulated_page_surface"
-        );
-        imageDataUrl = null;
+        attempt.image_data_url_len = String(imageDataUrl || "").length;
       } catch (error) {
         attempt.error_detail = errorMessage(error);
         attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
-        throw error;
+        throw bridgeError(
+          error?.code === ERROR_EXTENSION_TIMEOUT ? ERROR_EXTENSION_TIMEOUT : ERROR_ATTACH_FAILED,
+          `pageScreenshot chrome.tabs.captureVisibleTab(window=${before.chrome_window_id}) failed: ${errorMessage(error)}`
+        );
       } finally {
         attempt.elapsed_ms = Date.now() - captureStartedAtMs;
         captureAttempts.push(attempt);
       }
-      captureBackend = "chrome_debugger_page_surface";
-    } else {
-      for (const [index, position] of positions.entries()) {
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
-        const scrollReadback = await runPageScreenshotScroll(
-          selected.tabId,
-          position,
-          setup.document_id
+      if (typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `pageScreenshot captureVisibleTab returned unsupported payload for tab ${selected.tabId}`
         );
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
-        await sleep(request.captureDelayMs);
-        let imageDataUrl = null;
-        const captureStartedAtMs = Date.now();
-        const attempt = {
-          attempt: index + 1,
-          scroll_x_css: scrollReadback.scroll_x,
-          scroll_y_css: scrollReadback.scroll_y,
-          requested_scroll_x_css: position.x,
-          requested_scroll_y_css: position.y,
-          ok: false,
-          elapsed_ms: 0,
-          timeout_ms: 0,
-          retryable: false,
-          image_data_url_len: 0,
-          error_detail: ""
-        };
-        try {
-          const captureTimeoutMs = remainingPageScreenshotBudgetMs(
-            commandDeadlineMs,
-            `capture_visible_tab_tile_${index + 1}`
-          );
-          attempt.timeout_ms = captureTimeoutMs;
-          imageDataUrl = await captureVisibleTabWithQuota(before.chrome_window_id, {
-            format: request.format,
-            quality: request.quality
-          }, captureTimeoutMs, {
-            tabId: selected.tabId,
-            windowId: before.chrome_window_id,
-            targetId: selected.target.id,
-            tileIndex: index + 1,
-            tileCount: positions.length,
-            requestedScrollX: position.x,
-            requestedScrollY: position.y
-          });
-          attempt.ok = true;
-          attempt.image_data_url_len = String(imageDataUrl || "").length;
-          await compositePageScreenshotDataUrl(
-            compositor,
-            capturePlan,
-            imageDataUrl,
-            {
-              scroll_x_css: scrollReadback.scroll_x,
-              scroll_y_css: scrollReadback.scroll_y,
-              viewport_width_css: scrollReadback.viewport_width,
-              viewport_height_css: scrollReadback.viewport_height,
-              clip_css: setup.clip_css
-            },
-            `visible_tile_${index + 1}`
-          );
-          imageDataUrl = null;
-        } catch (error) {
-          attempt.error_detail = errorMessage(error);
-          attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
-          const captureErrorCode =
-            error?.code === ERROR_EXTENSION_TIMEOUT ||
-            error?.code === ERROR_CAPTURE_VISIBLE_TAB_PENDING ||
-            error?.code === ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT ||
-            error?.code === ERROR_AXTREE_FAILED
-              ? error.code
-              : ERROR_ATTACH_FAILED;
-          throw bridgeError(
-            captureErrorCode,
-            `pageScreenshot tile ${index + 1}/${positions.length} capture/composition failed: ${errorMessage(error)}`
-          );
-        } finally {
-          attempt.elapsed_ms = Date.now() - captureStartedAtMs;
-          captureAttempts.push(attempt);
-        }
       }
+      tiles.push({
+        scroll_x_css: scrollReadback.scroll_x,
+        scroll_y_css: scrollReadback.scroll_y,
+        viewport_width_css: scrollReadback.viewport_width,
+        viewport_height_css: scrollReadback.viewport_height,
+        image_data_url: imageDataUrl,
+        image_data_url_len: imageDataUrl.length
+      });
     }
-    compositeImageDataUrl = await finalizePageScreenshotCompositor(
-      compositor,
-      capturePlan,
-      request
-    );
-    releasePageScreenshotCompositor(compositor, capturePlan);
-  } catch (error) {
-    operationError = error;
   } finally {
-    if (compositor && capturePlan) {
-      releasePageScreenshotCompositor(compositor, capturePlan);
-    }
-    const cleanupErrors = [];
-    if (pageMutationStarted && setup?.ok) {
+    if (setup?.ok) {
       try {
-        cleanupReadback = await runPageScreenshotCleanup(selected.tabId, {
-          expectedDocumentId: setup.document_id,
+        await runPageScreenshotCleanup(selected.tabId, {
+          token,
           scrollX: setup.before_scroll_x,
           scrollY: setup.before_scroll_y,
           backgroundRestore: setup.background_restore
         });
       } catch (error) {
-        cleanupErrors.push(`page_cleanup=${errorMessage(error)}`);
+        console.warn(`Synapse pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
       }
     }
     if (
@@ -7373,34 +4217,29 @@ async function handlePageScreenshot(params) {
         await waitForTabActiveState(previousActiveTabId, true, 2000);
         restoredPreviousActive = true;
       } catch (error) {
-        cleanupErrors.push(
-          `active_tab_restore target_tab_id=${previousActiveTabId} error=${errorMessage(error)}`
-        );
+        console.warn(`Synapse pageScreenshot active-tab restore failed for tab ${previousActiveTabId}: ${errorMessage(error)}`);
       }
     } else if (before.active) {
       restoredPreviousActive = true;
     }
-    if (cleanupErrors.length > 0) {
-      const primary = operationError
-        ? ` primary_error=${errorMessage(operationError)}`
-        : "";
-      operationError = bridgeError(
-        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-        `pageScreenshot refused result because cleanup could not be proven:${primary} cleanup_errors=${cleanupErrors.join(" | ")}; inspect the exact tab/document generation and restore its scroll/background/active-tab state before retrying`
-      );
+    if (
+      previousFocusedWindowId !== null &&
+      previousFocusedWindowId !== before.chrome_window_id &&
+      focusedWindowForCapture
+    ) {
+      try {
+        await chrome.windows.update(previousFocusedWindowId, { focused: true });
+        await waitForChromeWindowFocused(previousFocusedWindowId, true, 2000);
+        restoredPreviousWindowFocus = true;
+      } catch (error) {
+        console.warn(`Synapse pageScreenshot Chrome window focus restore failed for window ${previousFocusedWindowId}: ${errorMessage(error)}`);
+      }
+    } else if (beforeWindow?.focused) {
+      restoredPreviousWindowFocus = true;
     }
   }
-  if (operationError) {
-    throw operationError;
-  }
-  if (!capturePlan || !compositeImageDataUrl) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      "pageScreenshot reached response serialization without a verified capture plan and composite image"
-    );
-  }
   const after = await tabPageState(selected.tabId, selected.target);
-  const result = {
+  return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
     tab_id: selected.tabId,
@@ -7416,8 +4255,9 @@ async function handlePageScreenshot(params) {
     previous_active_tab_id: previousActiveTabId,
     restored_previous_active: restoredPreviousActive,
     before_window: beforeWindow,
-    foreground_owner: "synapse_mcp_exact_os_foreground_transaction",
-    foreground_precondition_verified: true,
+    previous_focused_window_id: previousFocusedWindowId,
+    focused_window_for_capture: focusedWindowForCapture,
+    restored_previous_window_focus: restoredPreviousWindowFocus,
     image_format: request.format,
     quality: request.quality,
     omit_background: request.omitBackground,
@@ -7430,105 +4270,18 @@ async function handlePageScreenshot(params) {
     scroll_height_css: setup.metrics.scroll_height,
     viewport_width_css: setup.metrics.viewport_width,
     viewport_height_css: setup.metrics.viewport_height,
-    composition_mode: capturePlan.composition_mode,
-    capture_plan: capturePlan,
-    composite_image_data_url: compositeImageDataUrl,
-    composite_image_data_url_len: compositeImageDataUrl.length,
-    tile_count: capturePlan.tile_count,
+    tile_count: tiles.length,
+    tiles,
     capture_attempt_count: captureAttempts.length,
     capture_attempts: captureAttempts,
-    document_id: setup.document_id,
-    cleanup_verified: Boolean(cleanupReadback?.ok),
-    cleanup_document_id: cleanupReadback?.document_id || null,
     mask_count: setup.mask_count,
     masks: setup.masks,
-    readback_backend: captureBackend === "chrome_debugger_page_surface"
-      ? "chrome.scripting.executeScript(document-pinned geometry) + bounded extension OffscreenCanvas + one Chrome debugger page-surface image"
-      : "chrome.scripting.executeScript(document-pinned geometry/scroll) + bounded extension OffscreenCanvas + one-at-a-time chrome.tabs.captureVisibleTab images",
-    backend_tier_used: captureBackend,
-    required_foreground: false,
+    readback_backend: "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: requiredForeground,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
-  finalizePageScreenshotNativeMessageReadback(result, capturePlan);
-  return result;
-}
-
-async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, plan, timeoutMs) {
-  const viewportBaseline = VIEWPORT_BASELINE_BY_TAB.get(tabId);
-  const deviceBaseline = DEVICE_BASELINE_BY_TAB.get(tabId);
-  const nativeDpr = Number(
-    viewportBaseline?.device_pixel_ratio ??
-    deviceBaseline?.viewport?.device_pixel_ratio ??
-    deviceBaseline?.device_pixel_ratio
-  );
-  const requestedDpr = Number(emulatedDpr);
-  const boundedCssScale = Math.min(plan.output_scale_x, plan.output_scale_y);
-  if (!Number.isFinite(nativeDpr) || nativeDpr <= 0 ||
-      !Number.isFinite(requestedDpr) || requestedDpr <= 0 ||
-      !Number.isFinite(boundedCssScale) || boundedCssScale <= 0) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `pageScreenshot cannot bind emulated pixels to CSS geometry: tab=${tabId} native_dpr=${String(nativeDpr)} requested_dpr=${String(requestedDpr)}; reset and reapply the viewport/device override so its baseline is physically readable`
-    );
-  }
-  const attachment = await attachDebuggerForCommand(tabId);
-  try {
-    const result = await sendDebuggerCommand(
-      attachment.debuggee,
-      "Page.captureScreenshot",
-      {
-        format: request.format,
-        quality: request.format === "jpeg" ? request.quality : undefined,
-        fromSurface: true,
-        captureBeyondViewport: true,
-        clip: {
-          x: Number(clip.x),
-          y: Number(clip.y),
-          width: Number(clip.w),
-          height: Number(clip.h),
-          scale: boundedCssScale / nativeDpr
-        }
-      },
-      timeoutMs
-    );
-    const data = String(result?.data || "");
-    if (!data) {
-      throw new Error("Page.captureScreenshot returned empty image data");
-    }
-    return `data:image/${request.format};base64,${data}`;
-  } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `pageScreenshot emulated page-surface capture failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attachment.shouldDetach) {
-      try {
-        await normalProfileDebuggerForbidden(attachment.debuggee);
-      } catch (error) {
-        console.warn(`Synapse pageScreenshot emulated surface detach failed for tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
-  }
-}
-
-async function waitForDiscardedTabDocument(tabId, waitTimeoutMs) {
-  const started = Date.now();
-  let last = null;
-  while (Date.now() - started <= waitTimeoutMs) {
-    last = await tabPageState(tabId, null);
-    if (!last.discarded && !last.frozen && last.ready_state === "complete") {
-      return last;
-    }
-    await sleep(50);
-  }
-  throw bridgeError(
-    ERROR_EXTENSION_TIMEOUT,
-    `pageScreenshot could not restore discarded/unloaded tab ${tabId} within ${waitTimeoutMs}ms; ` +
-    `last_discarded=${Boolean(last?.discarded)} last_frozen=${Boolean(last?.frozen)} ` +
-    `last_ready_state=${JSON.stringify(last?.ready_state || "")} remediation=activate or reload the exact tab and verify its main document reaches complete before retrying`
-  );
 }
 
 function normalizePageScreenshotRequest(params, selectedTabId) {
@@ -7563,26 +4316,10 @@ function normalizePageScreenshotRequest(params, selectedTabId) {
     format: normalizePageScreenshotFormat(params.format),
     quality: normalizePageScreenshotQuality(params.quality),
     omitBackground: Boolean(params.omitBackground),
-    maxPixels: normalizePageScreenshotPositiveLimit(params.maxPixels, "maxPixels"),
-    maxLongEdge: normalizePageScreenshotPositiveLimit(params.maxLongEdge, "maxLongEdge"),
     masks: normalizePageScreenshotMasks(params.masks, selectedTabId),
     waitTimeoutMs: normalizeWaitTimeout(params.waitTimeoutMs),
     captureDelayMs: normalizePageScreenshotDelay(params.captureDelayMs)
   };
-}
-
-function normalizePageScreenshotPositiveLimit(value, label) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot ${label} must be a positive safe integer; got ${JSON.stringify(value)}`
-    );
-  }
-  return parsed;
 }
 
 function normalizePageScreenshotScope(value) {
@@ -7700,51 +4437,8 @@ function normalizePageScreenshotMasks(value, selectedTabId) {
     if (color.length > 128 || /[\u0000-\u001f]/.test(color)) {
       throw bridgeError(ERROR_CHROME_DOM_ACTION_UNSUPPORTED, `pageScreenshot mask[${index}] color is invalid`);
     }
-    return { selector, elementPath, colorRgba: pageScreenshotMaskColorRgba(color, index) };
+    return { selector, elementPath, color };
   });
-}
-
-function pageScreenshotMaskColorRgba(color, index) {
-  if (typeof OffscreenCanvas !== "function") {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot mask[${index}] color cannot be resolved because OffscreenCanvas is unavailable in the extension service worker`
-    );
-  }
-  const canvas = new OffscreenCanvas(1, 1);
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot mask[${index}] color cannot be resolved because a 2D OffscreenCanvas context is unavailable`
-    );
-  }
-  // Canvas fillStyle parsing is extension-owned and deterministic. Setting the
-  // candidate from two different sentinels distinguishes a valid color from a
-  // rejected assignment without consulting mutable page CSS (#2214).
-  context.fillStyle = "#010203";
-  context.fillStyle = color;
-  const first = String(context.fillStyle);
-  context.fillStyle = "#040506";
-  context.fillStyle = color;
-  const second = String(context.fillStyle);
-  if (first !== second) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot mask[${index}] color ${JSON.stringify(color)} is not a valid extension-owned Canvas color`
-    );
-  }
-  context.clearRect(0, 0, 1, 1);
-  context.fillStyle = color;
-  context.fillRect(0, 0, 1, 1);
-  const rgba = Array.from(context.getImageData(0, 0, 1, 1).data);
-  if (rgba.length !== 4 || rgba.some((channel) => !Number.isSafeInteger(channel) || channel < 0 || channel > 255)) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot mask[${index}] color ${JSON.stringify(color)} did not resolve to exact RGBA bytes`
-    );
-  }
-  return rgba;
 }
 
 async function runPageScreenshotSetup(tabId, request) {
@@ -7758,23 +4452,10 @@ async function runPageScreenshotSetup(tabId, request) {
   try {
     injected = await chrome.scripting.executeScript({
       target: { tabId },
-      world: "MAIN",
       func: pageScreenshotSetupInPage,
       args: [request]
     });
   } catch (error) {
-    let lifecycle = null;
-    try {
-      lifecycle = await chrome.tabs.get(tabId);
-    } catch (_) {
-      lifecycle = null;
-    }
-    if (lifecycle?.discarded || lifecycle?.frozen || lifecycle?.status === "unloaded") {
-      throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        `pageScreenshot setup lost its live document for tab ${tabId}: discarded=${Boolean(lifecycle?.discarded)} frozen=${Boolean(lifecycle?.frozen)} status=${JSON.stringify(lifecycle?.status || "")}; activate or reload the exact tab and verify its main document reaches complete before retrying; injection_error=${errorMessage(error)}`
-      );
-    }
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript pageScreenshot setup(${tabId}) failed: ${errorMessage(error)}`
@@ -7784,54 +4465,14 @@ async function runPageScreenshotSetup(tabId, request) {
   if (!first || !first.result || typeof first.result !== "object") {
     throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "pageScreenshot setup returned no structured result");
   }
-  const documentId = stringOrNull(first.documentId);
-  if (!documentId) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `pageScreenshot setup for tab ${tabId} returned no document generation id; update Chrome and reload the Synapse bridge before retrying`
-    );
-  }
-  return { ...first.result, document_id: documentId };
+  return first.result;
 }
 
-async function runPageScreenshotPrepare(tabId, request) {
+async function runPageScreenshotScroll(tabId, position) {
   let injected;
   try {
     injected = await chrome.scripting.executeScript({
       target: { tabId },
-      world: "MAIN",
-      func: pageScreenshotPrepareInPage,
-      args: [request]
-    });
-  } catch (error) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `chrome.scripting.executeScript pageScreenshot prepare(${tabId}) failed: ${errorMessage(error)}`
-    );
-  }
-  const first = Array.isArray(injected) ? injected[0] : null;
-  const actualDocumentId = stringOrNull(first?.documentId);
-  if (!first || !first.result || typeof first.result !== "object") {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "pageScreenshot prepare returned no structured result"
-    );
-  }
-  if (!actualDocumentId || actualDocumentId !== request.expectedDocumentId) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `pageScreenshot document changed before preparation: expected_document_id=${JSON.stringify(request.expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; no page mutation or artifact may be accepted from mixed document generations`
-    );
-  }
-  return { ...first.result, document_id: actualDocumentId };
-}
-
-async function runPageScreenshotScroll(tabId, position, expectedDocumentId) {
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
       func: pageScreenshotScrollInPage,
       args: [position]
     });
@@ -7851,47 +4492,19 @@ async function runPageScreenshotScroll(tabId, position, expectedDocumentId) {
       `pageScreenshot scroll failed: ${String(first.result.error_detail || "")}`
     );
   }
-  const actualDocumentId = stringOrNull(first.documentId);
-  if (!actualDocumentId || actualDocumentId !== expectedDocumentId) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `pageScreenshot document changed before scroll/capture: expected_document_id=${JSON.stringify(expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; no artifact may be accepted from mixed document generations`
-    );
-  }
-  return { ...first.result, document_id: actualDocumentId };
+  return first.result;
 }
 
 async function runPageScreenshotCleanup(tabId, request) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "pageScreenshot cleanup cannot run because chrome.scripting.executeScript is unavailable"
-    );
+    return null;
   }
   const injected = await chrome.scripting.executeScript({
     target: { tabId },
-    world: "MAIN",
     func: pageScreenshotCleanupInPage,
     args: [request]
   });
-  const first = Array.isArray(injected) ? injected[0] : null;
-  const actualDocumentId = stringOrNull(first?.documentId);
-  if (!first || !first.result || typeof first.result !== "object") {
-    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "pageScreenshot cleanup returned no structured result");
-  }
-  if (!actualDocumentId || actualDocumentId !== request.expectedDocumentId) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `pageScreenshot document changed before cleanup: expected_document_id=${JSON.stringify(request.expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; page mutation restoration cannot be proven`
-    );
-  }
-  if (!first.result.ok) {
-    throw bridgeError(
-      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
-      `pageScreenshot cleanup failed: ${String(first.result.error_detail || "")}`
-    );
-  }
-  return { ...first.result, document_id: actualDocumentId };
+  return Array.isArray(injected) ? injected[0]?.result : null;
 }
 
 async function waitForTabActiveState(tabId, expected, waitTimeoutMs) {
@@ -7917,18 +4530,6 @@ function pageScreenshotTilePositions(clip, metrics) {
   const top = Number(clip.y);
   const right = left + Number(clip.w);
   const bottom = top + Number(clip.h);
-  const xIterationBound = Math.max(1, Math.ceil(Number(clip.w) / viewportW));
-  const yIterationBound = Math.max(1, Math.ceil(Number(clip.h) / viewportH));
-  const iterationBound = checkedPageScreenshotProduct(
-    [xIterationBound, yIterationBound],
-    "tile_iteration_bound"
-  );
-  if (iterationBound > 400) {
-    throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      `pageScreenshot capture plan rejected before allocating tile positions: tile_iteration_bound=${iterationBound} limit=400 clip_css=${clip.w}x${clip.h} viewport_css=${viewportW}x${viewportH}; remediation=reduce the requested clip/page dimensions or capture a smaller bounded region`
-    );
-  }
   const maxScrollX = Math.max(0, Number(metrics.scroll_width || viewportW) - viewportW);
   const maxScrollY = Math.max(0, Number(metrics.scroll_height || viewportH) - viewportH);
   const xs = [];
@@ -7955,8 +4556,8 @@ function pageScreenshotTilePositions(clip, metrics) {
   }
   if (positions.length > 400) {
     throw bridgeError(
-      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
-      `pageScreenshot capture plan rejected before capture: exact_tile_count=${positions.length} limit=400; remediation=reduce the requested clip/page dimensions or capture a smaller bounded region`
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot would require ${positions.length} tiles; limit is 400`
     );
   }
   return positions;
@@ -8060,6 +4661,11 @@ function pageScreenshotSetupInPage(request) {
       if (!element) {
         return fail("CHROME_DOM_ELEMENT_NOT_FOUND", `element path ${JSON.stringify(request.elementPath)} was not found`);
       }
+      try {
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      } catch (_) {
+        element.scrollIntoView();
+      }
       const rect = element.getBoundingClientRect();
       element_rect = rectToPlain(rect);
       clip = { x: element_rect.x, y: element_rect.y, w: element_rect.w, h: element_rect.h };
@@ -8067,20 +4673,7 @@ function pageScreenshotSetupInPage(request) {
     if (!clip || !finite(clip.x) || !finite(clip.y) || !finite(clip.w) || !finite(clip.h) || clip.w <= 0 || clip.h <= 0) {
       return fail("CAPTURE_TARGET_INVALID", `pageScreenshot resolved an empty/invalid clip ${JSON.stringify(clip)}`);
     }
-    const resolvedMetrics = metrics();
-    const clipRight = Number(clip.x) + Number(clip.w);
-    const clipBottom = Number(clip.y) + Number(clip.h);
-    if (
-      !finite(clipRight) || !finite(clipBottom) ||
-      Number(clip.x) < 0 || Number(clip.y) < 0 ||
-      clipRight > resolvedMetrics.scroll_width + 0.5 ||
-      clipBottom > resolvedMetrics.scroll_height + 0.5
-    ) {
-      return fail(
-        "CAPTURE_TARGET_INVALID",
-        `pageScreenshot clip lies outside the physical document surface: clip=${JSON.stringify(clip)} document_css=${resolvedMetrics.scroll_width}x${resolvedMetrics.scroll_height}; request a non-empty region wholly inside the document`
-      );
-    }
+    const token = String(request.token || "");
     const masks = [];
     for (const [index, mask] of Array.from(request.masks || []).entries()) {
       const target = mask.elementPath ? elementByPath(mask.elementPath) : document.querySelector(String(mask.selector || ""));
@@ -8092,13 +4685,21 @@ function pageScreenshotSetupInPage(request) {
         return fail("CAPTURE_TARGET_INVALID", `mask[${index}] target has an empty box`);
       }
       const plain = rectToPlain(rect);
-      const colorRgba = Array.from(mask.colorRgba || []);
-      if (colorRgba.length !== 4 || colorRgba.some((channel) => !Number.isSafeInteger(channel) || channel < 0 || channel > 255)) {
-        return fail("CAPTURE_TARGET_INVALID", `mask[${index}] did not carry exact extension-owned RGBA bytes`);
-      }
-      // Return geometry only. The page never receives a mask overlay: mutable
-      // author CSS/animations/script cannot participate in redaction (#2214).
-      masks.push({ index, color_rgba: colorRgba, rect: plain });
+      const overlay = document.createElement("div");
+      overlay.setAttribute("data-synapse-page-screenshot-mask", token);
+      overlay.style.position = "absolute";
+      overlay.style.left = `${plain.x}px`;
+      overlay.style.top = `${plain.y}px`;
+      overlay.style.width = `${plain.w}px`;
+      overlay.style.height = `${plain.h}px`;
+      overlay.style.background = String(mask.color || "#ff00ff");
+      overlay.style.zIndex = "2147483647";
+      overlay.style.pointerEvents = "none";
+      overlay.style.margin = "0";
+      overlay.style.padding = "0";
+      overlay.style.border = "0";
+      document.documentElement.appendChild(overlay);
+      masks.push({ index, selector: mask.selector || null, element_path: mask.elementPath || null, color: String(mask.color || "#ff00ff"), rect: plain });
     }
     let backgroundRestore = null;
     if (request.omitBackground) {
@@ -8110,6 +4711,14 @@ function pageScreenshotSetupInPage(request) {
         html_background_color: doc ? doc.style.backgroundColor : null,
         body_background_color: body ? body.style.backgroundColor : null
       };
+      if (doc) {
+        doc.style.background = "transparent";
+        doc.style.backgroundColor = "transparent";
+      }
+      if (body) {
+        body.style.background = "transparent";
+        body.style.backgroundColor = "transparent";
+      }
     }
     return {
       ok: true,
@@ -8120,7 +4729,7 @@ function pageScreenshotSetupInPage(request) {
         h: Number(clip.h)
       },
       element_rect,
-      metrics: resolvedMetrics,
+      metrics: metrics(),
       before_scroll_x: beforeScrollX,
       before_scroll_y: beforeScrollY,
       mask_count: masks.length,
@@ -8129,33 +4738,6 @@ function pageScreenshotSetupInPage(request) {
     };
   } catch (error) {
     return fail("CHROME_SCRIPTING_EXECUTE_FAILED", String(error && error.message || error));
-  }
-}
-
-function pageScreenshotPrepareInPage(request) {
-  try {
-    if (request.omitBackground) {
-      if (document.documentElement) {
-        document.documentElement.style.background = "transparent";
-        document.documentElement.style.backgroundColor = "transparent";
-      }
-      if (document.body) {
-        document.body.style.background = "transparent";
-        document.body.style.backgroundColor = "transparent";
-      }
-    }
-    return {
-      ok: true,
-      background_mutated: Boolean(request.omitBackground),
-      scroll_x: Number(window.scrollX || 0),
-      scroll_y: Number(window.scrollY || 0)
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
-      error_detail: String(error && error.message || error)
-    };
   }
 }
 
@@ -8180,32 +4762,34 @@ function pageScreenshotScrollInPage(position) {
 }
 
 function pageScreenshotCleanupInPage(request) {
-  try {
-    const restore = request.backgroundRestore;
-    if (restore) {
-      if (document.documentElement) {
-        document.documentElement.style.background = restore.html_background || "";
-        document.documentElement.style.backgroundColor = restore.html_background_color || "";
-      }
-      if (document.body) {
-        document.body.style.background = restore.body_background || "";
-        document.body.style.backgroundColor = restore.body_background_color || "";
+  const token = String(request.token || "");
+  let removed = 0;
+  if (token) {
+    for (const node of Array.from(document.querySelectorAll("[data-synapse-page-screenshot-mask]"))) {
+      if (node.getAttribute("data-synapse-page-screenshot-mask") === token) {
+        node.remove();
+        removed += 1;
       }
     }
-    window.scrollTo(Number(request.scrollX || 0), Number(request.scrollY || 0));
-    return {
-      ok: true,
-      removed: 0,
-      scroll_x: Number(window.scrollX || 0),
-      scroll_y: Number(window.scrollY || 0)
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
-      error_detail: String(error && error.message || error)
-    };
   }
+  const restore = request.backgroundRestore;
+  if (restore) {
+    if (document.documentElement) {
+      document.documentElement.style.background = restore.html_background || "";
+      document.documentElement.style.backgroundColor = restore.html_background_color || "";
+    }
+    if (document.body) {
+      document.body.style.background = restore.body_background || "";
+      document.body.style.backgroundColor = restore.body_background_color || "";
+    }
+  }
+  window.scrollTo(Number(request.scrollX || 0), Number(request.scrollY || 0));
+  return {
+    ok: true,
+    removed,
+    scroll_x: Number(window.scrollX || 0),
+    scroll_y: Number(window.scrollY || 0)
+  };
 }
 
 function recordDownloadEvent(eventKind, item, delta) {
@@ -8678,7 +5262,7 @@ async function dispatchPagePdf(tabId, request) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     const result = await sendDebuggerCommand(debuggee, "Page.printToPDF", {
       landscape: request.landscape,
@@ -8708,7 +5292,7 @@ async function dispatchPagePdf(tabId, request) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for pagePdf tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -8806,10 +5390,12 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
         `domAction popup intent create returned no numeric tab id kind=${intent.kind} opener_tab_id=${selected.tabId}`
       );
     }
-    const openedOwner = await durableOpenedTabOwnerFromCreatedTab(
-      tab,
-      createParams.url
-    );
+    const openedOwner = {
+      tabId: tab.id,
+      targetId: targetIdForTabId(tab.id),
+      chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
+      openedAtUnixMs: Date.now()
+    };
     upsertLedgerOpenedTab(openedOwner);
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
@@ -8867,7 +5453,7 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
   return created;
 }
 
-async function handleNavigateTab(params, commandId) {
+async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
   const requestedUrl = action === "navigate" ? requiredUrl(params.url) : null;
@@ -8875,16 +5461,6 @@ async function handleNavigateTab(params, commandId) {
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
-  const beforeDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
-  if (!beforeDocumentId) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `navigateTab refused ${action} before browser mutation because the exact main-frame ` +
-        `documentId is unavailable for tab ${selected.tabId}; remediation=wait for a committed ` +
-        `document or repair the webNavigation permission so navigation attribution cannot be guessed`
-    );
-  }
-  let navigationClaim = null;
   let readbackExpectation = null;
   // #1344: a navigate to a URL that triggers a Chrome download leaves the tab on
   // its current URL, so the url-change readback would (wrongly) time out. Snapshot
@@ -8893,126 +5469,59 @@ async function handleNavigateTab(params, commandId) {
   let downloadSeqBefore = null;
   try {
     if (action === "navigate") {
-      navigationClaim = await markAgentNavigation(selected.tabId, {
-        claimId: commandId,
+      markAgentNavigation(selected.tabId, {
         action,
         requestedUrl,
-        sessionId: agentSessionId,
-        beforeUrl: before.url,
-        beforeDocumentId,
-        tab: before
+        sessionId: agentSessionId
       });
       downloadSeqBefore = downloadEventSeq;
-      const sameUrlNavigate = requestedUrl === before.url;
-      if (sameUrlNavigate && beforeDocumentId === null) {
-        // Fail closed and immediately: without a main-frame documentId there is
-        // no observable that can distinguish "the same-URL navigation committed"
-        // from "nothing happened", and waiting the full budget to report a
-        // navigation that in fact succeeded is exactly the #1825 defect.
-        throw bridgeError(
-          ERROR_AXTREE_FAILED,
-          `navigateTab cannot verify a same-URL navigation for tab ${selected.tabId}: ` +
-            `requested url equals the tab's current url and chrome.webNavigation.getFrame ` +
-            `returned no main-frame documentId, so no committed-document readback is available. ` +
-            `Remediation: use action=reload (which does not require a url delta), or grant the ` +
-            `webNavigation permission so the document commit can be proven.`
-        );
-      }
       assertPhysicalMutationAdmission(`chrome.tabs.update:navigate:tab=${selected.tabId}`);
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
-      readbackExpectation = {
-        needsDocumentId: true,
-        before_document_id: beforeDocumentId,
-        description: `the command-correlated committed document for claim ${JSON.stringify(commandId)} ` +
-          `in tab ${selected.tabId}; requested_url=${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
-          `before_document_id=${JSON.stringify(beforeDocumentId)}`,
-        matches: (state) => Boolean(
-          navigationClaim?.committedDocumentId &&
-          state.main_frame_document_id === navigationClaim.committedDocumentId
-        )
-      };
+      if (requestedUrl !== before.url) {
+        readbackExpectation = {
+          description: `tab url to become ${JSON.stringify(requestedUrl)} or differ from ${JSON.stringify(before.url)}`,
+          matches: (state) => state.url === requestedUrl || state.url !== before.url
+        };
+      }
     } else if (action === "reload") {
-      navigationClaim = await markAgentNavigation(selected.tabId, {
-        claimId: commandId,
+      markAgentNavigation(selected.tabId, {
         action,
         requestedUrl: before.url,
-        sessionId: agentSessionId,
-        beforeUrl: before.url,
-        beforeDocumentId,
-        tab: before
+        sessionId: agentSessionId
       });
-      readbackExpectation = {
-        needsDocumentId: true,
-        before_document_id: beforeDocumentId,
-        description: `the command-correlated reload document for claim ${JSON.stringify(commandId)}`,
-        matches: (state) => Boolean(
-          navigationClaim?.committedDocumentId &&
-          state.main_frame_document_id === navigationClaim.committedDocumentId
-        )
-      };
       assertPhysicalMutationAdmission(`chrome.tabs.reload:navigate:tab=${selected.tabId}`);
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
     } else if (action === "back") {
-      navigationClaim = await markAgentNavigation(selected.tabId, {
-        claimId: commandId,
+      markAgentNavigation(selected.tabId, {
         action,
         requestedUrl: null,
-        sessionId: agentSessionId,
-        beforeUrl: before.url,
-        beforeDocumentId,
-        tab: before
+        sessionId: agentSessionId
       });
       assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
       await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
-        needsDocumentId: true,
-        before_document_id: beforeDocumentId,
-        description: `the command-correlated back history document for claim ${JSON.stringify(commandId)}`,
-        matches: (state) => Boolean(
-          navigationClaim?.committedDocumentId &&
-          state.main_frame_document_id === navigationClaim.committedDocumentId
-        )
+        description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
+        matches: (state) => state.url !== before.url
       };
     } else if (action === "forward") {
-      navigationClaim = await markAgentNavigation(selected.tabId, {
-        claimId: commandId,
+      markAgentNavigation(selected.tabId, {
         action,
         requestedUrl: null,
-        sessionId: agentSessionId,
-        beforeUrl: before.url,
-        beforeDocumentId,
-        tab: before
+        sessionId: agentSessionId
       });
       assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
       await chrome.tabs.goForward(selected.tabId);
       readbackExpectation = {
-        needsDocumentId: true,
-        before_document_id: beforeDocumentId,
-        description: `the command-correlated forward history document for claim ${JSON.stringify(commandId)}`,
-        matches: (state) => Boolean(
-          navigationClaim?.committedDocumentId &&
-          state.main_frame_document_id === navigationClaim.committedDocumentId
-        )
+        description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
+        matches: (state) => state.url !== before.url
       };
     }
   } catch (error) {
-    let claimSettlementError = null;
-    try {
-      await settleAgentNavigationClaim(selected.tabId, "command_failed", {
-        expectedClaimId: navigationClaim?.claimId || commandId,
-        correlationVerdict: "agent_command_failed_before_navigation_terminal"
-      });
-    } catch (settlementError) {
-      claimSettlementError = errorMessage(settlementError);
-    }
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.${tabsNavigationMethod(action)}(${selected.tabId}) failed: ${errorMessage(error)}; ` +
-        `before url=${JSON.stringify(diagnosticUrl(before.url))} ` +
-        `title=${JSON.stringify(diagnosticTitle(before.title))} ` +
-        `status=${JSON.stringify(before.ready_state)} ` +
-        `navigation_claim_id=${JSON.stringify(navigationClaim?.claimId || commandId)} ` +
-        `claim_settlement_error=${JSON.stringify(claimSettlementError)}`
+        `before url=${JSON.stringify(before.url)} title=${JSON.stringify(before.title)} ` +
+        `status=${JSON.stringify(before.ready_state)}`
     );
   }
   // #1344: for a navigate, race the tab-url readback against a Chrome download
@@ -9031,11 +5540,6 @@ async function handleNavigateTab(params, commandId) {
     if (outcome.kind === "download") {
       const dl = outcome.download;
       const after = outcome.state || before;
-      await settleAgentNavigationClaim(selected.tabId, "download", {
-        expectedClaimId: navigationClaim?.claimId || commandId,
-        correlationVerdict: "agent_navigation_resolved_as_download",
-        tab: after
-      });
       return {
         extension_id: chrome.runtime.id,
         target_id: after.target_id || selected.target.id,
@@ -9060,10 +5564,6 @@ async function handleNavigateTab(params, commandId) {
         download_filename: dl.filename,
         download_state: dl.state,
         download_match_reason: dl.match_reason,
-        navigation_claim_id: navigationClaim?.claimId || commandId,
-        navigation_correlation_status: navigationClaim?.status || "download",
-        initial_document_id: beforeDocumentId,
-        final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
         target_candidate_count: selected.targetCandidateCount,
         target_selection_reason: selected.selectionReason
       };
@@ -9086,10 +5586,6 @@ async function handleNavigateTab(params, commandId) {
       readback_backend: "chrome.tabs.get",
       navigation_error_text: null,
       is_download: false,
-      navigation_claim_id: navigationClaim?.claimId || commandId,
-      navigation_correlation_status: navigationClaim?.status || "pending_terminal_event",
-      initial_document_id: beforeDocumentId,
-      final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
       target_candidate_count: selected.targetCandidateCount,
       target_selection_reason: selected.selectionReason
     };
@@ -9112,10 +5608,6 @@ async function handleNavigateTab(params, commandId) {
     readback_backend: "chrome.tabs.get",
     navigation_error_text: null,
     is_download: null,
-    navigation_claim_id: navigationClaim?.claimId || commandId,
-    navigation_correlation_status: navigationClaim?.status || "pending_terminal_event",
-    initial_document_id: beforeDocumentId,
-    final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -9144,9 +5636,6 @@ async function waitForNavigateOrDownload(
     }
     try {
       last = await tabPageState(tabId, fallbackTarget);
-      if (expectation?.needsDocumentId) {
-        last.main_frame_document_id = await mainFrameDocumentIdOrNull(tabId);
-      }
       lastError = null;
       const loaded = last.ready_state === "complete";
       if (loaded && (!expectation || expectation.matches(last))) {
@@ -9165,11 +5654,8 @@ async function waitForNavigateOrDownload(
   }
   const detail = last
     ? `waiting for ${expectation?.description || "complete tab state"} or a Chrome download; ` +
-      `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
-      `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
-      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)} ` +
-      `before_document_id=${JSON.stringify(expectation?.before_document_id ?? null)} ` +
-      `last_document_id=${JSON.stringify(last.main_frame_document_id ?? null)}`
+      `last url=${JSON.stringify(last.url)} title=${JSON.stringify(last.title)} ` +
+      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
       : "no tab state readback";
@@ -9234,7 +5720,7 @@ async function handleActivateTab(params) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.update(${selected.tabId}, {active:true}) failed: ${errorMessage(error)}; ` +
-        `before active=${before.active} url=${JSON.stringify(diagnosticUrl(before.url))}`
+        `before active=${before.active} url=${JSON.stringify(before.url)}`
     );
   }
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, {
@@ -9258,240 +5744,12 @@ async function handleActivateTab(params) {
   };
 }
 
-// #1824: keyboard parity for background CDP tabs on the debugger-free bridge.
-//
-// Mouse and DOM actions already reach a background tab through
-// chrome.scripting; keyboard actions did not, so `act verb=key` failed with
-// A11Y_CDP_UNREACHABLE and an agent could open a modal it had no way to
-// dismiss. "Press Escape to cancel" is the most common recovery primitive in
-// browser automation, and losing it means reaching states you cannot leave.
-//
-// The events dispatched here are synthetic (isTrusted === false): they run page
-// keydown/keypress/keyup handlers - which is exactly what a modal Escape
-// handler is - but by web-platform rule they never drive the browser's own
-// default behaviours (no form submit, no caret insertion, no browser
-// shortcuts). The daemon projects that exact delivery into the canonical
-// `synapse.input_provenance.v1` record. Do not return a second, unversioned
-// trust/default-action summary here: parallel summaries can drift and
-// contradict that record.
-async function handleKeyDispatch(params) {
-  const selected = await selectTabTarget(params, { requireTargetId: true });
-  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
-  const suppressPageText = Boolean(params.suppressPageText);
-  const keys = Array.isArray(params.keys) ? params.keys.map((key) => String(key)) : [];
-  if (keys.length === 0) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      "keyDispatch requires a non-empty keys array, for example [\"Escape\"] or [\"ctrl\",\"a\"]"
-    );
-  }
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
-    );
-  }
-  const before = await tabPageState(selected.tabId, selected.target);
-  const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId },
-      func: dispatchKeySequenceInPage,
-      args: [{ keys }]
-    });
-  } catch (error) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `chrome.scripting.executeScript keyDispatch(${selected.tabId}, ${JSON.stringify(keys)}) failed: ${errorMessage(error)}`
-    );
-  }
-  const frames = frameExecutionResults(injected);
-  const top = frames.find((frame) => frame.result) || null;
-  if (!top || typeof top.result !== "object" || top.result === null) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `keyDispatch returned no structured in-page result for tab ${selected.tabId}`
-    );
-  }
-  if (!top.result.ok) {
-    throw bridgeError(
-      String(top.result.error_code || ERROR_CHROME_DOM_ACTION_UNSUPPORTED),
-      `keyDispatch failed in tab ${selected.tabId}: ${String(top.result.error_detail || "no detail")}`
-    );
-  }
-  const after = await tabPageState(selected.tabId, selected.target);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
-  return {
-    extension_id: chrome.runtime.id,
-    target_id: after.target_id || selected.target.id,
-    tab_id: selected.tabId,
-    chrome_window_id: after.chrome_window_id,
-    frame_id: top.frame_id,
-    frame_document_id: top.document_id,
-    keys,
-    readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
-    required_foreground: false,
-    wait_timeout_ms: waitTimeoutMs,
-    before_page: before,
-    after_page: after,
-    before_page_text: beforePageText,
-    after_page_text: afterPageText,
-    target_candidate_count: selected.targetCandidateCount,
-    target_selection_reason: selected.selectionReason,
-    ...top.result
-  };
-}
-
-function dispatchKeySequenceInPage(request) {
-  const ERROR_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
-  const raw = Array.isArray(request?.keys) ? request.keys.map((key) => String(key).trim()).filter(Boolean) : [];
-  if (raw.length === 0) {
-    return { ok: false, error_code: ERROR_ACTION_UNSUPPORTED, error_detail: "keys was empty" };
-  }
-  const MODIFIERS = { ctrl: "ctrlKey", control: "ctrlKey", shift: "shiftKey", alt: "altKey", meta: "metaKey", cmd: "metaKey", win: "metaKey" };
-  // Physical `code` + legacy keyCode for the keys page handlers actually test.
-  const NAMED = {
-    escape: { key: "Escape", code: "Escape", keyCode: 27 },
-    esc: { key: "Escape", code: "Escape", keyCode: 27 },
-    enter: { key: "Enter", code: "Enter", keyCode: 13 },
-    return: { key: "Enter", code: "Enter", keyCode: 13 },
-    tab: { key: "Tab", code: "Tab", keyCode: 9 },
-    backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
-    delete: { key: "Delete", code: "Delete", keyCode: 46 },
-    del: { key: "Delete", code: "Delete", keyCode: 46 },
-    space: { key: " ", code: "Space", keyCode: 32 },
-    arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
-    up: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
-    arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
-    down: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
-    arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
-    left: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
-    arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
-    right: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
-    home: { key: "Home", code: "Home", keyCode: 36 },
-    end: { key: "End", code: "End", keyCode: 35 },
-    pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
-    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 }
-  };
-
-  const modifierState = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
-  let terminal = null;
-  for (const token of raw) {
-    const lower = token.toLowerCase();
-    if (MODIFIERS[lower]) {
-      modifierState[MODIFIERS[lower]] = true;
-      continue;
-    }
-    if (terminal !== null) {
-      return {
-        ok: false,
-        error_code: ERROR_ACTION_UNSUPPORTED,
-        error_detail: `keyDispatch accepts one non-modifier key per call; got ${JSON.stringify(raw)}`
-      };
-    }
-    if (NAMED[lower]) {
-      terminal = { ...NAMED[lower] };
-    } else if (/^f([1-9]|1[0-2])$/.test(lower)) {
-      const index = Number(lower.slice(1));
-      terminal = { key: `F${index}`, code: `F${index}`, keyCode: 111 + index };
-    } else if (Array.from(token).length === 1) {
-      const upper = token.toUpperCase();
-      terminal = {
-        key: token,
-        code: /^[a-z]$/i.test(token) ? `Key${upper}` : /^[0-9]$/.test(token) ? `Digit${token}` : "",
-        keyCode: upper.charCodeAt(0),
-        printable: true
-      };
-    } else {
-      return {
-        ok: false,
-        error_code: ERROR_ACTION_UNSUPPORTED,
-        error_detail: `keyDispatch does not know key ${JSON.stringify(token)}; supported: single characters, F1-F12, and ${Object.keys(NAMED).join("/")}`
-      };
-    }
-  }
-  if (terminal === null) {
-    return {
-      ok: false,
-      error_code: ERROR_ACTION_UNSUPPORTED,
-      error_detail: `keyDispatch requires a non-modifier key; got only modifiers ${JSON.stringify(raw)}`
-    };
-  }
-
-  function describe(element) {
-    if (!element || !(element instanceof Element)) {
-      return null;
-    }
-    return {
-      tag_name: String(element.tagName || "").toLowerCase(),
-      id: String(element.id || ""),
-      role: String(element.getAttribute("role") || ""),
-      type_attr: String(element.getAttribute("type") || "")
-    };
-  }
-
-  let deepActive = document.activeElement;
-  while (deepActive && deepActive.shadowRoot && deepActive.shadowRoot.activeElement) {
-    deepActive = deepActive.shadowRoot.activeElement;
-  }
-  const dispatchTarget = deepActive instanceof Element ? deepActive : (document.body || document.documentElement);
-  if (!dispatchTarget) {
-    return { ok: false, error_code: ERROR_ACTION_UNSUPPORTED, error_detail: "page has no dispatchable node" };
-  }
-  const activeBefore = describe(deepActive);
-  const init = {
-    key: terminal.key,
-    code: terminal.code,
-    keyCode: terminal.keyCode,
-    which: terminal.keyCode,
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    ...modifierState
-  };
-  const dispatched = [];
-  const downDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keydown", init));
-  dispatched.push("keydown");
-  let pressDefaultAllowed = null;
-  if (terminal.printable && !modifierState.ctrlKey && !modifierState.metaKey && !modifierState.altKey) {
-    pressDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keypress", init));
-    dispatched.push("keypress");
-  }
-  const upDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keyup", { ...init, cancelable: true }));
-  dispatched.push("keyup");
-
-  let deepActiveAfter = document.activeElement;
-  while (deepActiveAfter && deepActiveAfter.shadowRoot && deepActiveAfter.shadowRoot.activeElement) {
-    deepActiveAfter = deepActiveAfter.shadowRoot.activeElement;
-  }
-  return {
-    ok: true,
-    resolved_key: { key: terminal.key, code: terminal.code, key_code: terminal.keyCode, modifiers: modifierState },
-    dispatch_target: describe(dispatchTarget),
-    events_dispatched: dispatched,
-    // `false` means a page handler called preventDefault() - i.e. the page
-    // actively consumed the key, which is positive evidence it was received.
-    keydown_default_allowed: downDefaultAllowed,
-    keypress_default_allowed: pressDefaultAllowed,
-    keyup_default_allowed: upDefaultAllowed,
-    active_element_before: activeBefore,
-    active_element_after: describe(deepActiveAfter),
-    in_page_url: String(location.href || ""),
-    in_page_title: String(document.title || ""),
-    in_page_ready_state: String(document.readyState || "")
-  };
-}
-
 async function handleDomAction(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeDomAction(params.action);
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const autoWait = Boolean(params.autoWait);
   const autoWaitTimeoutMs = normalizeDomActionAutoWaitTimeout(params.autoWaitTimeoutMs, autoWait);
-  // #1821 Playwright `force` parity, honoured only on this debugger-free
-  // synthetic-dispatch lane (coordinate-resolved UA/CDP input cannot bypass occlusion).
-  const force = Boolean(params.force);
   const suppressPageText = Boolean(params.suppressPageText);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -9524,29 +5782,14 @@ async function handleDomAction(params) {
     button: normalizeMouseButton(params.button, "domAction"),
     modifiers: normalizeClickModifiers(params.modifiers, "domAction"),
     position: normalizeClickPosition(params, "domAction"),
-    scrollDeltaX: action === "scroll" ? normalizeDomScrollDelta(params.scrollDeltaX, "scrollDeltaX") : 0,
-    scrollDeltaY: action === "scroll" ? normalizeDomScrollDelta(params.scrollDeltaY, "scrollDeltaY") : 0,
     autoWait,
     autoWaitTimeoutMs,
-    force,
     maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
     suppressPageText
   };
   const resolveTarget = { tabId: selected.tabId };
   if (Number.isSafeInteger(bridgeElement.frameId)) {
     resolveTarget.frameIds = [bridgeElement.frameId];
-  } else if (
-    action === "scroll" &&
-    !request.selector &&
-    !request.elementId &&
-    !request.role &&
-    !request.name &&
-    !request.value
-  ) {
-    // A page-scoped scroll targets the top document's one authoritative
-    // scrollingElement. Querying all frames would manufacture ambiguity from
-    // unrelated iframe roots.
-    resolveTarget.frameIds = [0];
   } else {
     resolveTarget.allFrames = true;
   }
@@ -9618,13 +5861,10 @@ async function handleDomAction(params) {
     );
   }
   if (!actionResult.ok) {
-    const actionReadback = actionResult.action_readback
-      ? `; action_readback=${JSON.stringify(actionResult.action_readback)}`
-      : "";
     throw bridgeError(
       String(actionResult.error_code || ERROR_AXTREE_FAILED),
       `domAction ${action} failed in resolved frame ${first.frame_id}: ${String(actionResult.error_detail || "")}; ` +
-        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}${actionReadback}`
+        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
     );
   }
 
@@ -9805,9 +6045,9 @@ async function handleCdpInput(params) {
     };
   }
 
-  // tap/click/dblclick deliver Chrome-generated `isTrusted=true` Input.* events through
+  // tap/click/dblclick deliver real trusted Input.* events through
   // chrome.debugger, which the renderer only processes for the ACTIVE tab
-  // (an inactive tab silently drops mousePressed/mouseReleased; the protocol mouse
+  // (an inactive tab silently drops mousePressed/mouseReleased; the real mouse
   // drag lane shares this constraint and activates the same way). Activate the
   // owned tab in its already-focused Chrome window first; hover does not need
   // it. This is in-Chrome tab activation, not OS foreground theft
@@ -10544,7 +6784,7 @@ async function dispatchCdpTextInput(tabId, action, text) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     if (action === "set_text" && text.length === 0) {
       await sendDebuggerCommand(debuggee, "Input.dispatchKeyEvent", {
@@ -10582,7 +6822,7 @@ async function dispatchCdpTextInput(tabId, action, text) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for text input tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11502,7 +7742,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
       userAgent: descriptor.user_agent
@@ -11535,7 +7775,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for deviceEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11548,7 +7788,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
@@ -11585,7 +7825,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for deviceEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11599,7 +7839,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
   let attached = false;
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
@@ -11640,7 +7880,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11654,7 +7894,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
   let attached = false;
   let permissionMethod = "Browser.setPermission(prompt)";
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.clearGeolocationOverride", {});
     try {
@@ -11678,7 +7918,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11692,7 +7932,7 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
   let attached = false;
   const methods = [];
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     if (requested.locale) {
       await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {
@@ -11718,7 +7958,7 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for localeEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11731,7 +7971,7 @@ async function dispatchLocaleEmulationReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
@@ -11749,7 +7989,7 @@ async function dispatchLocaleEmulationReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11762,7 +8002,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     const features = [];
     if (requested.color_scheme) {
@@ -11787,7 +8027,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for mediaEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11800,7 +8040,7 @@ async function dispatchMediaEmulationReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
       media: "",
@@ -11818,7 +8058,7 @@ async function dispatchMediaEmulationReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11831,7 +8071,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     const params = {
@@ -11856,7 +8096,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for networkConditions set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11869,7 +8109,7 @@ async function dispatchNetworkConditionsReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", {
@@ -11890,7 +8130,7 @@ async function dispatchNetworkConditionsReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for networkConditions reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11925,7 +8165,7 @@ async function dispatchViewportBaselineRestore(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
       width: requested.width,
@@ -11947,7 +8187,7 @@ async function dispatchViewportBaselineRestore(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for viewportEmulation baseline restore tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11960,7 +8200,7 @@ async function dispatchViewportEmulation(tabId, operation, params) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     if (operation === "set") {
       await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", params);
@@ -11983,7 +8223,7 @@ async function dispatchViewportEmulation(tabId, operation, params) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for viewportEmulation tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14338,12 +10578,12 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
   };
   let dispatch;
   if (action === "drag") {
-    // Chrome-generated mouse drag: chrome.debugger Input.* only dispatches to the
+    // Real trusted mouse drag: chrome.debugger Input.* only dispatches to the
     // ACTIVE tab, so activate the owned tab in its already-focused Chrome
     // window first (in-Chrome activation, required_foreground=false), then
-    // dispatch Input.dispatchMouseEvent press/move/release. NO
+    // dispatch the real Input.dispatchMouseEvent press/move/release. NO
     // synthetic fallback (#1355): a guarded pointer-DnD target must see
-    // isTrusted=true (physical_device_origin=false), or the verb fails loud — never a synthetic no-op that
+    // isTrusted=true, or the verb fails loud — never a synthetic no-op that
     // looks like success.
     dragActivation = await activateTabForCdpTouch(selected.tabId, before, "drag");
     const realDrag = await dispatchCdpInputMouseDrag(
@@ -14355,7 +10595,7 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
     );
     dispatch = { ...realDrag, backend: "chrome.debugger.Input" };
   } else if (action === "html5_real_drag") {
-    // Chrome-generated HTML5 drop via CDP Input.dispatchDragEvent (#1356). Chrome
+    // Real, TRUSTED HTML5 drop via CDP Input.dispatchDragEvent (#1356). Chrome
     // only delivers Input.* to the active tab, so activate first (in-Chrome,
     // required_foreground=false), then dispatch dragEnter/dragOver/drop on the
     // target point with a DragData built from data_mime_type/data_text. Unlike
@@ -14544,7 +10784,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
   let attached = false;
   let touchEmulationEnabled = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     if (action === "hover") {
       await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
@@ -14561,13 +10801,12 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
       };
     }
     if (action === "click" || action === "dblclick") {
-      // Chrome-generated mouse click via chrome.debugger: isTrusted=true while
-      // physical_device_origin remains false, so
+      // Real, trusted mouse click via chrome.debugger: isTrusted=true so
       // activation-guarded handlers fire (synthetic dispatchEvent does not).
       const button = String(options.button || "left");
       const modifiers = cdpModifierBitmask(options.modifiers);
       const dispatched = [];
-      // Move first so :hover/pointer state matches Chrome's input sequence.
+      // Move first so :hover/pointer state matches a real click.
       await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: point.x, y: point.y, button: "none", modifiers, pointerType: "mouse"
       });
@@ -14634,7 +10873,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
         }
       }
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14649,7 +10888,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   const dispatched = [];
   const delayMs = steps > 0 && durationMs > 0 ? Math.max(0, Math.floor(durationMs / steps)) : 0;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -14709,7 +10948,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for drag tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14717,7 +10956,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   }
 }
 
-// #1356: Chrome-generated HTML5 drop. Dispatches CDP Input.dispatchDragEvent
+// #1356: real, TRUSTED HTML5 drop. Dispatches CDP Input.dispatchDragEvent
 // dragEnter/dragOver/drop at the resolved target point with a DragData built
 // from the caller's data_mime_type/data_text. These events are isTrusted=true
 // and carry a real DataTransfer, so native drop zones that gate on trust (which
@@ -14736,7 +10975,7 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
     const dispatched = [];
     for (const type of ["dragEnter", "dragOver", "drop"]) {
@@ -14763,7 +11002,7 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
   } finally {
     if (attached) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for html5_real_drag tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14862,10 +11101,10 @@ async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
 }
 
 async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
-  assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:${String(method)}`);
+  assertPhysicalMutationAdmission(`chrome.debugger.sendCommand:${String(method)}`);
   try {
     return await promiseWithTimeout(
-      normalProfileDebuggerForbidden(debuggee, method, params),
+      chrome.debugger.sendCommand(debuggee, method, params),
       timeoutMs,
       `${method} timed out after ${timeoutMs}ms`
     );
@@ -14939,10 +11178,8 @@ async function recordUnresolvedDebuggerCommandTimeout(
   const tabId = normalizeStoredTabId(debuggee?.tabId);
   const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
   if (tabId === null || !context?.activitySequence) {
-    recordDurableOwnerStateFailure(
-      "unresolved_debugger_timeout_identity",
-      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`
-    );
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`;
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     return;
@@ -14961,10 +11198,8 @@ async function recordUnresolvedDebuggerCommandTimeout(
   try {
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
   } catch (error) {
-    recordDurableOwnerStateFailure(
-      "persist_unresolved_debugger_timeout",
-      `persist unresolved debugger timeout failed: ${errorMessage(error)}`
-    );
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `persist unresolved debugger timeout failed: ${errorMessage(error)}`;
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     return;
@@ -14974,7 +11209,7 @@ async function recordUnresolvedDebuggerCommandTimeout(
   row.neutralizationMethod = neutralization.method;
   try {
     await promiseWithTimeout(
-      normalProfileDebuggerForbidden(
+      chrome.debugger.sendCommand(
         { tabId },
         neutralization.method,
         neutralization.params
@@ -14992,180 +11227,12 @@ async function recordUnresolvedDebuggerCommandTimeout(
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (persistError) {
-      recordDurableOwnerStateFailure(
-        "persist_failed_input_neutralization_owner",
-        `persist failed input neutralization owner failed: ${errorMessage(persistError)}`
-      );
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist failed input neutralization owner failed: ${errorMessage(persistError)}`;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
   }
-}
-
-// Four persistent features (init scripts, bindings, dialogs, file choosers) share a
-// single chrome.debugger attachment per tab. The attachment was already refcounted
-// across them through persistentDebuggerSessionIsAttached(), but domain enablement
-// was tracked as per-feature booleans with no disable path anywhere in the extension.
-// A domain enabled for feature A therefore stayed enabled after A released whenever
-// feature B still held the attachment. An enabled Runtime domain is directly
-// observable from page JavaScript, so a released binding left every later page on
-// that tab flagged as automated. Domains are refcounted here by owner so each one is
-// disabled the moment its last owner releases, independently of the attachment.
-const CDP_DOMAIN_OWNERS = new Map();
-
-const CDP_OWNER_INIT_SCRIPT = "initScript";
-const CDP_OWNER_BINDING = "binding";
-const CDP_OWNER_DIALOG = "dialog";
-const CDP_OWNER_FILE_CHOOSER = "fileChooser";
-// One-shot commands that borrow a tab's attachment. attachDebuggerForCommand()
-// reuses a persistent session when one exists, so a one-shot enable can land on a
-// session that outlives the command; this owner is released the moment the command
-// finishes whenever the attachment was borrowed rather than created.
-const CDP_OWNER_TRANSIENT = "transientCommand";
-
-function cdpDomainOwnerSet(tabId, domain, create = false) {
-  let byDomain = CDP_DOMAIN_OWNERS.get(tabId);
-  if (!byDomain) {
-    if (!create) {
-      return null;
-    }
-    byDomain = new Map();
-    CDP_DOMAIN_OWNERS.set(tabId, byDomain);
-  }
-  let owners = byDomain.get(domain);
-  if (!owners) {
-    if (!create) {
-      return null;
-    }
-    owners = new Set();
-    byDomain.set(domain, owners);
-  }
-  return owners;
-}
-
-function cdpDomainIsEnabled(tabId, domain) {
-  return Boolean(cdpDomainOwnerSet(tabId, domain)?.size);
-}
-
-function cdpTabHasAnyDomainOwner(tabId) {
-  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
-  if (!byDomain) {
-    return false;
-  }
-  for (const owners of byDomain.values()) {
-    if (owners.size) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function cdpDomainLedgerSnapshot(tabId) {
-  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
-  const snapshot = {};
-  if (!byDomain) {
-    return snapshot;
-  }
-  for (const [domain, owners] of byDomain.entries()) {
-    if (owners.size) {
-      snapshot[domain] = Array.from(owners).sort();
-    }
-  }
-  return snapshot;
-}
-
-async function acquireCdpDomain(debuggee, domain, ownerId) {
-  const tabId = debuggee?.tabId;
-  if (!Number.isInteger(tabId)) {
-    throw new Error(`acquireCdpDomain requires an integer tabId, received ${String(tabId)}`);
-  }
-  const owners = cdpDomainOwnerSet(tabId, domain, true);
-  if (owners.has(ownerId)) {
-    return false;
-  }
-  const alreadyEnabled = owners.size > 0;
-  if (!alreadyEnabled) {
-    // Enable before recording ownership so a failed enable never leaves the ledger
-    // claiming a domain that is not actually on.
-    await sendDebuggerCommand(debuggee, `${domain}.enable`, {});
-  }
-  owners.add(ownerId);
-  return !alreadyEnabled;
-}
-
-async function releaseCdpDomain(debuggee, domain, ownerId) {
-  const tabId = debuggee?.tabId;
-  if (!Number.isInteger(tabId)) {
-    throw new Error(`releaseCdpDomain requires an integer tabId, received ${String(tabId)}`);
-  }
-  const owners = cdpDomainOwnerSet(tabId, domain);
-  if (!owners?.delete(ownerId)) {
-    return false;
-  }
-  if (owners.size > 0) {
-    return false;
-  }
-  try {
-    await sendDebuggerCommand(debuggee, `${domain}.disable`, {});
-  } catch (error) {
-    // The domain is still enabled and therefore still observable from page JS.
-    // Restore ownership so the ledger keeps describing reality, then surface it.
-    owners.add(ownerId);
-    const detail = `Synapse failed to disable CDP domain ${domain} for tab ${tabId} released by ` +
-      `${ownerId}; domain remains enabled and observable to page scripts. ` +
-      `owners=${JSON.stringify(cdpDomainLedgerSnapshot(tabId))}: ${errorMessage(error)}`;
-    console.error(detail);
-    throw new Error(detail);
-  }
-  return true;
-}
-
-async function releaseCdpDomainsForOwner(debuggee, ownerId) {
-  const tabId = debuggee?.tabId;
-  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
-  if (!byDomain) {
-    return [];
-  }
-  const disabled = [];
-  const failures = [];
-  for (const domain of Array.from(byDomain.keys())) {
-    try {
-      if (await releaseCdpDomain(debuggee, domain, ownerId)) {
-        disabled.push(domain);
-      }
-    } catch (error) {
-      failures.push(errorMessage(error));
-    }
-  }
-  if (failures.length) {
-    throw new Error(
-      `Synapse CDP domain release failed for owner ${ownerId} on tab ${tabId}: ${failures.join("; ")}`
-    );
-  }
-  return disabled;
-}
-
-// A detach resets every domain on the target, so the ledger is dropped without
-// issuing disable commands against a session that no longer exists.
-function forgetCdpDomainsForTab(tabId) {
-  return CDP_DOMAIN_OWNERS.delete(tabId);
-}
-
-// Settles the domains a one-shot command enabled on a borrowed attachment. When the
-// command owns the attachment the following detach clears every domain, so the
-// ledger is simply dropped; when the attachment was borrowed from a persistent
-// session the transient domains must be disabled explicitly or they outlive the
-// command on a session that keeps running.
-async function settleTransientCdpDomains(attachment) {
-  const tabId = attachment?.debuggee?.tabId;
-  if (!Number.isInteger(tabId)) {
-    return;
-  }
-  if (attachment.shouldDetach) {
-    forgetCdpDomainsForTab(tabId);
-    return;
-  }
-  await releaseCdpDomainsForOwner(attachment.debuggee, CDP_OWNER_TRANSIENT);
 }
 
 async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
@@ -15179,8 +11246,8 @@ async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
       return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
     }
   }
-  assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:tab=${tabId}`);
-  await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+  assertPhysicalMutationAdmission(`chrome.debugger.attach:tab=${tabId}`);
+  await chrome.debugger.attach(debuggee, protocolVersion);
   return { debuggee, shouldDetach: true, persistent: false, protocolVersion };
 }
 
@@ -15192,8 +11259,8 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
   }
   const reusePersistentDebugger = persistentDebuggerSessionIsAttached(tabId);
   if (!reusePersistentDebugger) {
-    assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:initScript:tab=${tabId}`);
-    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+    assertPhysicalMutationAdmission(`chrome.debugger.attach:initScript:tab=${tabId}`);
+    await chrome.debugger.attach(debuggee, protocolVersion);
   }
   session = {
     protocolVersion,
@@ -15208,11 +11275,11 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
 }
 
 async function ensureInitScriptPageDomainEnabled(debuggee, session) {
-  if (!session) {
+  if (!session || session.pageEnabled) {
     return;
   }
-  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_INIT_SCRIPT);
-  session.pageEnabled = cdpDomainIsEnabled(debuggee.tabId, "Page");
+  await sendDebuggerCommand(debuggee, "Page.enable", {});
+  session.pageEnabled = true;
 }
 
 async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier) {
@@ -15228,14 +11295,10 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
   }
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   if (bindingSessionHasActiveNames(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
-    // Another feature still holds the attachment, so the session survives. Drop only
-    // this owner's domains rather than leaving Page enabled for a session that is gone.
-    await releaseCdpDomainsForOwner(debuggee, CDP_OWNER_INIT_SCRIPT);
     return false;
   }
   try {
-    await normalProfileDebuggerForbidden(debuggee);
-    forgetCdpDomainsForTab(tabId);
+    await chrome.debugger.detach(debuggee);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
     markFileChooserDebuggerDetached(tabId, false);
@@ -15306,8 +11369,8 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:binding:tab=${tabId}`);
-      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:binding:tab=${tabId}`);
+      await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -15315,8 +11378,10 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  await acquireCdpDomain(debuggee, "Runtime", CDP_OWNER_BINDING);
-  session.runtimeEnabled = cdpDomainIsEnabled(tabId, "Runtime");
+  if (!session.runtimeEnabled) {
+    await sendDebuggerCommand(debuggee, "Runtime.enable", {});
+    session.runtimeEnabled = true;
+  }
   return { debuggee, session, newlyArmed, protocolVersion };
 }
 
@@ -15336,15 +11401,10 @@ async function addBindingToSession(debuggee, session, name, executionContextName
 
 async function detachBindingDebuggerSession(tabId, debuggee, session) {
   if (hasActiveInitScriptDebuggerSession(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
-    // Another feature still holds the attachment, so the session survives. Runtime is
-    // disabled here rather than lingering until the unrelated owner finally detaches.
-    await releaseCdpDomainsForOwner(debuggee, CDP_OWNER_BINDING);
-    session.runtimeEnabled = cdpDomainIsEnabled(tabId, "Runtime");
     return false;
   }
   try {
-    await normalProfileDebuggerForbidden(debuggee);
-    forgetCdpDomainsForTab(tabId);
+    await chrome.debugger.detach(debuggee);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
     markFileChooserDebuggerDetached(tabId, false);
@@ -15485,8 +11545,8 @@ async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:dialog:tab=${tabId}`);
-      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:dialog:tab=${tabId}`);
+      await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -15494,8 +11554,10 @@ async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_DIALOG);
-  session.pageEnabled = cdpDomainIsEnabled(tabId, "Page");
+  if (!session.pageEnabled) {
+    await sendDebuggerCommand(debuggee, "Page.enable", {});
+    session.pageEnabled = true;
+  }
   return { debuggee, session, newlyArmed, protocolVersion };
 }
 
@@ -15829,27 +11891,12 @@ function operatorPanicActiveOwners() {
     locale_override_count: DURABLE_OWNER_LEDGER.localeOverrides.length,
     media_override_count: DURABLE_OWNER_LEDGER.mediaOverrides.length,
     network_override_count: DURABLE_OWNER_LEDGER.networkOverrides.length,
-    command_terminal_pending_count:
-      DURABLE_OWNER_LEDGER.commandTerminalOutbox.length,
-    capture_visible_tab_pending_count:
-      ["admitted", "active"].includes(
-        DURABLE_OWNER_LEDGER.captureVisibleTabLease?.status
-      ) ? 1 : 0,
-    capture_visible_tab_quarantined_count:
-      DURABLE_OWNER_LEDGER.captureVisibleTabLease?.status ===
-        "quarantined_worker_restart" ? 1 : 0,
     mutation_handler_in_flight_count: MUTATION_HANDLER_IN_FLIGHT_COUNT
   };
 }
 
 function operatorPanicOwnerReadback() {
   const activeAfter = operatorPanicActiveOwners();
-  const captureLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
-  const captureLeaseContinuityHealthy = !captureLease || (
-    captureLease.workerBootId === DURABLE_OWNER_WORKER_BOOT_ID &&
-    captureLease.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
-    ["admitted", "active"].includes(captureLease.status)
-  );
   return {
     enabled: DURABLE_MUTATION_OWNERS_ENABLED,
     disable_sequence: DURABLE_MUTATION_DISABLE_SEQUENCE,
@@ -15863,39 +11910,11 @@ function operatorPanicOwnerReadback() {
     ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
     browser_session_continuity_matched:
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
-    browser_session_evidence: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE,
-    lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
     stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
-    stale_browser_session_repair: DURABLE_OWNER_STALE_SESSION_REPAIR,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
-    storage_state_failure_diagnostic:
-      DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
-    storage_authority: durableOwnerStorageAuthoritySnapshot(),
-    interrupted_migration_reconciliation:
-      RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
-    schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
-    persisted_schema_version: DURABLE_OWNER_LEDGER.version,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
-    command_terminal_outbox: DURABLE_OWNER_LEDGER.commandTerminalOutbox.map((entry) => ({
-      protocol_version: entry.protocolVersion,
-      original_host_id: entry.originalHostId,
-      browser_session_id: entry.browserSessionId,
-      command_id: entry.commandId,
-      command_kind: entry.commandKind,
-      terminal_sequence: entry.terminalSequence,
-      payload_sha256: entry.payloadSha256,
-      payload_bytes: entry.payloadBytes,
-      created_at_unix_ms: entry.createdAtUnixMs,
-      worker_boot_id: entry.workerBootId
-    })),
-    last_command_terminal_ack: DURABLE_OWNER_LEDGER.lastCommandTerminalAck,
-    capture_visible_tab_lease: captureLease,
-    last_capture_visible_tab_settlement:
-      DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement,
-    resolved_prior_session_in_flight_mutation:
-      RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION,
     unresolved_debugger_command_timeouts:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
         id: entry.id,
@@ -15906,19 +11925,12 @@ function operatorPanicOwnerReadback() {
         timed_out_at_unix_ms: entry.timedOutAtUnixMs,
         neutralization_method: entry.neutralizationMethod
       })),
-    resolved_prior_session_debugger_command_timeouts:
-      RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS,
-    resolved_prior_session_capture_visible_tab_lease:
-      RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE,
     unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
     owner_continuity_healthy: DURABLE_OWNER_STATE_LOADED &&
       !DURABLE_OWNER_STATE_LOAD_ERROR &&
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
       STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
-      !DURABLE_OWNER_LEDGER.inFlightMutation &&
-      DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
-      captureLeaseContinuityHealthy,
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0,
     active_after: activeAfter,
     fully_drained: !DURABLE_MUTATION_OWNERS_ENABLED &&
       DURABLE_OWNER_STATE_LOADED &&
@@ -15930,40 +11942,11 @@ function operatorPanicOwnerReadback() {
   };
 }
 
-function operatorPanicGateErrorSummary() {
-  const readback = operatorPanicOwnerReadback();
-  const activeAfter = readback.active_after || {};
-  const nonZeroOwners = Object.entries(activeAfter)
-    .filter(([, value]) => Number(value || 0) !== 0)
-    .map(([key, value]) => `${key}=${Number(value || 0)}`)
-    .join(",");
-  return (
-    `storage_state_loaded=${Boolean(readback.storage_state_loaded)} ` +
-    `storage_state_load_error=${JSON.stringify(readback.storage_state_load_error || "")} ` +
-    `browser_session_continuity_matched=${Boolean(readback.browser_session_continuity_matched)} ` +
-    `browser_session_evidence_source=${String(readback.browser_session_evidence?.source || "missing")} ` +
-    `browser_session_evidence_decision=${String(readback.browser_session_evidence?.decision || "missing")} ` +
-    `owner_continuity_healthy=${Boolean(readback.owner_continuity_healthy)} ` +
-    `persisted_state_revision=${Number(readback.persisted_state_revision || 0)} ` +
-    `persisted_in_flight_mutation=${readback.persisted_in_flight_mutation ? "present" : "none"} ` +
-    `unresolved_worker_restart_mutation_count=${Number(readback.unresolved_worker_restart_mutation_count || 0)} ` +
-    `stale_browser_session_owner_count=${Number(readback.stale_browser_session_owner_count || 0)} ` +
-    `stale_repair_absent_tab_count=${Number(readback.stale_browser_session_repair?.absent_tab_ids?.length || 0)} ` +
-    `stale_repair_closed_matching_opened_tab_count=${Number(readback.stale_browser_session_repair?.closed_matching_opened_tabs?.length || 0)} ` +
-    `stale_repair_live_tab_count=${Number(readback.stale_browser_session_repair?.live_tabs?.length || 0)} ` +
-    `stale_repair_failure_count=${Number(readback.stale_browser_session_repair?.failures?.length || 0)} ` +
-    `resolved_prior_session_in_flight_mutation=${readback.resolved_prior_session_in_flight_mutation ? "resolved" : "none"} ` +
-    `non_zero_owner_counts=${nonZeroOwners || "none"}`
-  );
-}
-
 async function handleOperatorPanicDisable(admission) {
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   if (!admission || typeof admission.then !== "function") {
-    recordDurableOwnerStateFailure(
-      "operator_panic_disable_admission_missing",
-      "operator panic disable reached dispatch without receipt-time persisted admission"
-    );
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      "operator panic disable reached dispatch without receipt-time persisted admission";
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   } else {
     await admission;
@@ -15995,7 +11978,7 @@ async function operatorPanicTargetAbsentAfterReadback(error, tabId) {
 }
 
 async function debuggerAttachmentReadback(tabId) {
-  const targets = await normalProfileDebuggerForbidden();
+  const targets = await chrome.debugger.getTargets();
   const target = targets.find((candidate) => candidate?.tabId === tabId) || null;
   return {
     tab_id: tabId,
@@ -16015,21 +11998,9 @@ async function operatorPanicWithDebugger(tabId, operation) {
     attachment = await attachDebuggerForCommand(tabId);
     return await operation(attachment.debuggee);
   } finally {
-    if (attachment) {
-      try {
-        // releaseCdpDomain already logs the offending domain and owner set; a failure
-        // here means a domain stayed enabled, so it must never pass silently. It is
-        // not rethrown because the panic readback is the verdict for this path.
-        await settleTransientCdpDomains(attachment);
-      } catch (error) {
-        console.error(
-          `Synapse operator panic left CDP domains enabled on tab ${tabId}: ${errorMessage(error)}`
-        );
-      }
-    }
     if (attachment?.shouldDetach) {
       try {
-        await normalProfileDebuggerForbidden(attachment.debuggee);
+        await chrome.debugger.detach(attachment.debuggee);
       } catch (_) {
         // The command readback is the verdict; detach is host hygiene only.
       }
@@ -16065,26 +12036,6 @@ async function mainFrameDocumentReadback(tabId) {
     url: String(frame?.url || tab?.url || ""),
     status: String(tab?.status || "")
   };
-}
-
-// #1825: the settle signal for a navigation is a COMMITTED DOCUMENT, not a URL
-// delta. A re-navigation to the tab's current URL (the standard way to reset a
-// page to a known state) produces a new document with an unchanged URL, so a
-// url-difference predicate is unsatisfiable and burns the entire wait budget
-// before reporting failure for a navigation that actually happened. Returns
-// null (never throws) when the documentId cannot be read, so the caller can
-// decide fail-closed instead of hanging.
-async function mainFrameDocumentIdOrNull(tabId) {
-  if (!chrome.webNavigation || typeof chrome.webNavigation.getFrame !== "function") {
-    return null;
-  }
-  try {
-    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 });
-    const documentId = String(frame?.documentId || "").trim();
-    return documentId || null;
-  } catch (_error) {
-    return null;
-  }
 }
 
 async function reloadTabForInitScriptEffectCleanup(tabId) {
@@ -16232,7 +12183,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const { tabId, identifier } of Array.from(DURABLE_OWNER_LEDGER.initScripts)) {
     try {
       await operatorPanicWithDebugger(tabId, async (debuggee) => {
-        await acquireCdpDomain(debuggee, "Page", CDP_OWNER_TRANSIENT);
+        await sendDebuggerCommand(debuggee, "Page.enable", {});
         await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
           identifier
         });
@@ -16298,7 +12249,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const { tabId, name } of Array.from(DURABLE_OWNER_LEDGER.bindings)) {
     try {
       await operatorPanicWithDebugger(tabId, async (debuggee) => {
-        await acquireCdpDomain(debuggee, "Runtime", CDP_OWNER_TRANSIENT);
+        await sendDebuggerCommand(debuggee, "Runtime.enable", {});
         await sendDebuggerCommand(debuggee, "Runtime.removeBinding", { name });
       });
       BINDING_DEBUGGER_SESSIONS.get(tabId)?.activeNames?.delete(name);
@@ -16358,44 +12309,27 @@ async function handleOperatorPanicCleanup(params) {
 
   const clocksFound = DURABLE_OWNER_LEDGER.clockTabs.length;
   let clocksUninstalled = 0;
-  for (const owner of Array.from(DURABLE_OWNER_LEDGER.clockTabs)) {
-    const tabId = owner.tabId;
+  for (const tabId of Array.from(DURABLE_OWNER_LEDGER.clockTabs)) {
     try {
-      if (!owner.documentId) {
-        throw new Error(
-          `clock owner for tab ${tabId} is legacy-unbound; navigate or close that tab ` +
-            "to destroy the old document without touching an unrelated current document"
-        );
-      }
       const injected = await executeScriptMutation({
-        target: { tabId, documentIds: [owner.documentId] },
+        target: { tabId },
         world: "MAIN",
         func: runClockInPage,
         args: [{ operation: "uninstall", timeMs: null, deltaMs: null, loopLimit: 10000 }]
       }, "operatorPanicCleanup:clockUninstall");
-      const frames = frameExecutionResults(injected);
-      if (frames.length !== 1 || frames[0]?.frame_id !== 0 ||
-          frames[0]?.document_id !== owner.documentId) {
-        throw new Error(
-          `clock uninstall document readback mismatch: expected=${owner.documentId} ` +
-            `actual=${JSON.stringify(frames.map((frame) => frame.document_id))}`
-        );
-      }
-      const result = frames[0]?.result;
+      const result = frameExecutionResults(injected).find((frame) => frame.result)?.result;
       if (!result?.ok || result?.readback?.installed !== false) {
         throw new Error(`clock uninstall returned ${JSON.stringify(result || null)}`);
       }
       CLOCK_INSTALLED_TABS.delete(tabId);
-      CLOCK_DOCUMENT_OWNERS.delete(tabId);
       DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-        .filter((candidate) => candidate.tabId !== tabId);
+        .filter((candidate) => candidate !== tabId);
       clocksUninstalled += 1;
     } catch (error) {
       if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
         CLOCK_INSTALLED_TABS.delete(tabId);
-        CLOCK_DOCUMENT_OWNERS.delete(tabId);
         DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-          .filter((candidate) => candidate.tabId !== tabId);
+          .filter((candidate) => candidate !== tabId);
         clocksUninstalled += 1;
       } else {
         failures.push(`clock tab=${tabId}: ${errorMessage(error)}`);
@@ -16411,7 +12345,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const tabId of Array.from(DURABLE_OWNER_LEDGER.debuggerTabs)) {
     try {
       try {
-        await normalProfileDebuggerForbidden({ tabId });
+        await chrome.debugger.detach({ tabId });
       } catch (error) {
         const detail = errorMessage(error).toLowerCase();
         if (!detail.includes("not attached") &&
@@ -16422,7 +12356,7 @@ async function handleOperatorPanicCleanup(params) {
       const attachment = await debuggerAttachmentReadback(tabId);
       if (attachment.attached) {
         throw new Error(
-          `normalProfileDebuggerForbidden still reports attached=true for tab ${tabId}`
+          `chrome.debugger.getTargets still reports attached=true for tab ${tabId}`
         );
       }
       removeLedgerDebuggerTab(tabId);
@@ -16439,10 +12373,7 @@ async function handleOperatorPanicCleanup(params) {
   try {
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
   } catch (error) {
-    recordDurableOwnerStateFailure(
-      "persist_operator_panic_cleanup",
-      `persist operator panic cleanup failed: ${errorMessage(error)}`
-    );
+    DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic cleanup failed: ${errorMessage(error)}`;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     failures.push(DURABLE_OWNER_STATE_LOAD_ERROR);
   }
@@ -16469,15 +12400,11 @@ async function handleOperatorPanicCleanup(params) {
     ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
     browser_session_continuity_matched:
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
-    browser_session_evidence: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE,
-    lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
     stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
-    resolved_prior_session_in_flight_mutation:
-      RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION,
     unresolved_debugger_command_timeouts:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
         id: entry.id,
@@ -16557,10 +12484,7 @@ async function handleOperatorPanicEnable(params) {
     } catch (error) {
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       enabled = false;
-      recordDurableOwnerStateFailure(
-        "persist_operator_panic_enable",
-        `persist operator panic enable failed: ${errorMessage(error)}`
-      );
+      DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic enable failed: ${errorMessage(error)}`;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       try {
         await persistDurableOwnerLedger({ mergeLiveOwners: true });
@@ -16607,7 +12531,7 @@ async function setFilesForLocator(selected, params, files, operation) {
     }
     if (attach.shouldDetach) {
       try {
-        await normalProfileDebuggerForbidden(debuggee);
+        await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for fileUpload tab ${selected.tabId}: ${errorMessage(error)}`);
       }
@@ -16771,8 +12695,8 @@ async function ensureFileChooserDebuggerSession(tabId, intercept, protocolVersio
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:fileChooser:tab=${tabId}`);
-      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:fileChooser:tab=${tabId}`);
+      await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -16780,8 +12704,10 @@ async function ensureFileChooserDebuggerSession(tabId, intercept, protocolVersio
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_FILE_CHOOSER);
-  session.pageEnabled = cdpDomainIsEnabled(tabId, "Page");
+  if (!session.pageEnabled) {
+    await sendDebuggerCommand(debuggee, "Page.enable", {});
+    session.pageEnabled = true;
+  }
   if (intercept && !session.interceptEnabled) {
     await sendDebuggerCommand(debuggee, "Page.setInterceptFileChooserDialog", { enabled: true });
     session.interceptEnabled = true;
@@ -17108,36 +13034,49 @@ function promiseWithTimeout(promise, timeoutMs, message) {
   });
 }
 
+function handleReloadSelf(params = {}) {
+  const expectedExtensionId = String(params.expectedExtensionId || EXPECTED_EXTENSION_ID).trim();
+  if (expectedExtensionId !== chrome.runtime.id) {
+    throw bridgeError(
+      ERROR_EXTENSION_ID_MISMATCH,
+      `reloadSelf refused extension_id mismatch: actual=${chrome.runtime.id} expected=${expectedExtensionId}`
+    );
+  }
+  const expectedBuildId = String(params.expectedBuildId || BRIDGE_BUILD_ID).trim();
+  if (expectedBuildId && expectedBuildId !== BRIDGE_BUILD_ID) {
+    throw bridgeError(
+      ERROR_EXTENSION_STALE,
+      `reloadSelf refused stale loaded build: loaded_build_id=${BRIDGE_BUILD_ID} expected_build_id=${expectedBuildId}`
+    );
+  }
+  const delayMs = normalizeReloadDelay(params.reloadDelayMs);
+  return {
+    ok: true,
+    ...bridgeIdentity(),
+    host_id: hostId,
+    reload_requested_at_unix_ms: Date.now(),
+    reload_delay_ms: delayMs
+  };
+}
+
 async function handleMaintenancePauseReconnect(params = {}) {
   const pauseMs = normalizeMaintenanceReconnectPauseMs(params.pauseMs);
   const reason = normalizeMaintenanceReconnectPauseReason(params.reason);
   const now = Date.now();
   const pauseUntilMs = now + pauseMs;
-  const persisted = await persistMaintenanceReconnectPause(pauseUntilMs, reason, {
-    resumeProbeAfterMs: params.resumeProbeAfterMs,
-    pausedDaemonPid: params.pausedDaemonPid,
-    pausedDaemonInstanceId: params.pausedDaemonInstanceId
-  });
+  await persistMaintenanceReconnectPause(pauseUntilMs, reason);
   maintenanceReconnectPauseLoaded = true;
   maintenanceReconnectPauseUntilMs = pauseUntilMs;
   maintenanceReconnectPauseReason = reason;
-  maintenanceReconnectPauseStoredAtMs = persisted.storedAtMs;
-  maintenanceReconnectResumeProbeAfterMs = persisted.resumeProbeAfterMs;
-  maintenanceReconnectPausedDaemonPid = persisted.pausedDaemonPid;
-  maintenanceReconnectPausedDaemonInstanceId = persisted.pausedDaemonInstanceId;
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
   const websocketClose = requestWebSocketCloseAfterResponse(
     "synapse maintenance reconnect pause"
   );
-  await requireReconnectWakeAlarm("maintenancePauseReconnect");
+  ensureReconnectWakeAlarm();
   console.warn(
     `Synapse daemon bridge reconnect paused for maintenance: ` +
       `pause_ms=${pauseMs} pause_until_unix_ms=${maintenanceReconnectPauseUntilMs} ` +
-      `resume_probe_after_ms=${persisted.resumeProbeAfterDurationMs} ` +
-      `resume_probe_after_unix_ms=${maintenanceReconnectResumeProbeAfterMs} ` +
-      `paused_daemon_pid=${maintenanceReconnectPausedDaemonPid || "<unknown>"} ` +
-      `paused_daemon_instance_id=${maintenanceReconnectPausedDaemonInstanceId || "<unknown>"} ` +
       `reason=${reason} persisted=true websocket_close=${JSON.stringify(websocketClose)}`
   );
   return {
@@ -17145,10 +13084,6 @@ async function handleMaintenancePauseReconnect(params = {}) {
     host_id: hostId,
     pause_ms: pauseMs,
     pause_until_unix_ms: maintenanceReconnectPauseUntilMs,
-    resume_probe_after_ms: persisted.resumeProbeAfterDurationMs,
-    resume_probe_after_unix_ms: maintenanceReconnectResumeProbeAfterMs,
-    paused_daemon_pid: maintenanceReconnectPausedDaemonPid,
-    paused_daemon_instance_id: maintenanceReconnectPausedDaemonInstanceId,
     reason,
     reconnect_suppressed: true,
     persisted: true,
@@ -17158,93 +13093,53 @@ async function handleMaintenancePauseReconnect(params = {}) {
   };
 }
 
-function normalizeReloadDelayMs(value) {
-  const parsed = Number(value ?? 500);
-  if (!Number.isSafeInteger(parsed) || parsed < 250 || parsed > 5000) {
-    throw bridgeError(
-      ERROR_EXTENSION_STALE,
-      `reloadSelf reloadDelayMs must be an integer in 250..=5000, got ${String(value)}`
-    );
-  }
-  return parsed;
-}
-
-function handleReloadSelf(params = {}) {
-  const expectedExtensionId = String(params.expectedExtensionId || "").trim();
-  const expectedLoadedBuildId = String(params.expectedLoadedBuildId || "").trim();
-  const expectedDeployedBuildId = String(params.expectedDeployedBuildId || "").trim();
-  const reloadDelayMs = normalizeReloadDelayMs(params.reloadDelayMs);
-  if (expectedExtensionId !== chrome.runtime.id || chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
-    throw bridgeError(
-      ERROR_EXTENSION_ID_MISMATCH,
-      `reloadSelf extension identity mismatch: actual=${chrome.runtime.id} ` +
-        `expected_request=${expectedExtensionId || "<missing>"} expected_bridge=${EXPECTED_EXTENSION_ID}`
-    );
-  }
-  if (!expectedLoadedBuildId || expectedLoadedBuildId !== BRIDGE_BUILD_ID) {
-    throw bridgeError(
-      ERROR_EXTENSION_STALE,
-      `reloadSelf loaded build mismatch: actual=${BRIDGE_BUILD_ID} ` +
-        `expected_loaded=${expectedLoadedBuildId || "<missing>"}`
-    );
-  }
-  if (!expectedDeployedBuildId) {
-    throw bridgeError(
-      ERROR_EXTENSION_STALE,
-      `reloadSelf expectedDeployedBuildId is required: loaded=${BRIDGE_BUILD_ID}`
-    );
-  }
-  const scheduledAtUnixMs = Date.now();
+function scheduleRuntimeReload(delayMs) {
+  const boundedDelayMs = normalizeReloadDelay(delayMs);
+  postDaemonMessage({
+    type: "event",
+    event: "extensionReloadScheduled",
+    ...bridgeIdentity(),
+    reload_delay_ms: boundedDelayMs,
+    scheduled_at_unix_ms: Date.now()
+  }).catch((error) => {
+    console.warn(`Synapse reload schedule event dropped: ${errorMessage(error)}`);
+  });
   setTimeout(() => {
     try {
       chrome.runtime.reload();
     } catch (error) {
-      console.error(
-        `SYNAPSE_CHROME_BACKGROUND_RUNTIME_RELOAD_THROWN ` +
-          `loaded_build=${BRIDGE_BUILD_ID} deployed_build=${expectedDeployedBuildId} ` +
-          `error=${errorMessage(error)}`
-      );
+      console.error(`Synapse runtime.reload failed: ${errorMessage(error)}`);
     }
-  }, reloadDelayMs);
-  return {
-    ok: true,
-    controlSurface: "chrome.runtime.reload",
-    requiredForeground: false,
-    extensionId: chrome.runtime.id,
-    loadedBuildId: BRIDGE_BUILD_ID,
-    deployedBuildId: expectedDeployedBuildId,
-    scheduledAtUnixMs,
-    reloadDelayMs,
-    foregroundApiCalls: 0,
-    tabMutations: 0,
-    syntheticInputEvents: 0
-  };
+  }, boundedDelayMs);
 }
 
 async function selectTabTarget(params, options = {}) {
+  const tabs = await tabTargets();
+  if (tabs.length === 0) {
+    throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
+  }
   const targetIdHint = String(params.targetIdHint || "").trim();
   const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
   const tabIdHint = tabIdFromTargetId(targetIdHint);
   if (Number.isInteger(tabIdHint)) {
-    const selectedById = await tabTargetById(tabIdHint, targetIdHint);
-    let effectiveExpectedWindowId = expectedWindowId;
-    if (!Number.isInteger(effectiveExpectedWindowId)) {
-      const expectedWindow = await expectedChromeWindowForHwndHint(params);
-      if (Number.isInteger(expectedWindow?.windowId)) {
-        effectiveExpectedWindowId = expectedWindow.windowId;
+    const selectedById = tabs.find((target) => target.tabId === tabIdHint);
+    if (selectedById) {
+      if (
+        Number.isInteger(expectedWindowId) &&
+        Number.isInteger(selectedById.chromeWindowId) &&
+        selectedById.chromeWindowId !== expectedWindowId
+      ) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `targetIdHint ${targetIdHint} is in Chrome window ${selectedById.chromeWindowId}, expected ${expectedWindowId}`
+        );
       }
+      return selectedPage(selectedById, tabs.length, "chrome_tab_id_hint");
     }
-    if (
-      Number.isInteger(effectiveExpectedWindowId) &&
-      Number.isInteger(selectedById.chromeWindowId) &&
-      selectedById.chromeWindowId !== effectiveExpectedWindowId
-    ) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        `targetIdHint ${targetIdHint} is in Chrome window ${selectedById.chromeWindowId}, expected ${effectiveExpectedWindowId}`
-      );
-    }
-    return selectedPage(selectedById, 1, "chrome_tab_id_hint_direct");
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `targetIdHint ${targetIdHint} did not match any chrome.tabs tab id`
+    );
   }
   if (options.requireTargetId) {
     throw bridgeError(
@@ -17253,10 +13148,6 @@ async function selectTabTarget(params, options = {}) {
         ? `targetIdHint ${targetIdHint} is not a tabs bridge target id; expected ${TAB_TARGET_PREFIX}<tabId>`
         : `targetIdHint is required for mutating tab navigation; expected ${TAB_TARGET_PREFIX}<tabId>`
     );
-  }
-  const tabs = await tabTargets();
-  if (tabs.length === 0) {
-    throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
   }
   let effectiveExpectedWindowId = expectedWindowId;
   const expectedWindow = await expectedChromeWindowForHwndHint(params);
@@ -17623,8 +13514,8 @@ function chromeWindowCandidateSummaryItem(windowInfo, expectedBounds) {
     ? windowBoundsDeltaScore(windowInfo.bounds, expectedBounds)
     : Number.POSITIVE_INFINITY;
   const scoreText = Number.isFinite(score) ? String(score) : "na";
-  const titleLen = String(windowInfo.activeTabTitle || "").trim().length;
-  return `id=${windowInfo.id}/focused=${windowInfo.focused}/state=${windowInfo.state || "unknown"}/score=${scoreText}/title_redacted_len=${titleLen}`;
+  const title = String(windowInfo.activeTabTitle || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  return `id=${windowInfo.id}/focused=${windowInfo.focused}/state=${windowInfo.state || "unknown"}/score=${scoreText}/title=${JSON.stringify(title)}`;
 }
 
 function chromeWindowBounds(windowInfo) {
@@ -17677,6 +13568,32 @@ async function chromeWindowState(windowId) {
   }
 }
 
+async function focusedChromeWindow() {
+  let windows;
+  try {
+    windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  } catch (error) {
+    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.windows.getAll(normal): ${errorMessage(error)}`);
+  }
+  return windows.find((windowInfo) => Boolean(windowInfo.focused)) || null;
+}
+
+async function waitForChromeWindowFocused(windowId, expected, waitTimeoutMs) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    last = await chromeWindowState(windowId);
+    if (Boolean(last?.focused) === expected) {
+      return last;
+    }
+    await sleep(50);
+  }
+  throw bridgeError(
+    ERROR_EXTENSION_TIMEOUT,
+    `Chrome window ${windowId} focused=${expected} readback did not settle within ${waitTimeoutMs}ms; last_focused=${Boolean(last?.focused)}`
+  );
+}
+
 async function tabTargets() {
   let tabs;
   try {
@@ -17687,64 +13604,6 @@ async function tabTargets() {
   return tabs
     .filter((tab) => typeof tab.id === "number")
     .map((tab) => tabTargetFromTab(tab));
-}
-
-async function tabTargetById(tabId, targetIdHint) {
-  let tab;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch (error) {
-    const authoritativeTab = await authoritativeTabById(
-      tabId,
-      `chrome.tabs.get(${tabId}) failed for targetIdHint ${targetIdHint}: ${errorMessage(error)}`
-    );
-    if (!authoritativeTab) {
-      throw bridgeError(
-        ERROR_CHROME_TAB_TARGET_ABSENT,
-        `targetIdHint ${targetIdHint} is absent from authoritative chrome.tabs.query after chrome.tabs.get(${tabId}) failed: ${errorMessage(error)}`
-      );
-    }
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `chrome.tabs.get(${tabId}) failed for targetIdHint ${targetIdHint}, but authoritative chrome.tabs.query still returned the tab: ${errorMessage(error)}`
-    );
-  }
-  if (!tab || typeof tab.id !== "number") {
-    const authoritativeTab = await authoritativeTabById(
-      tabId,
-      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}`
-    );
-    if (!authoritativeTab) {
-      throw bridgeError(
-        ERROR_CHROME_TAB_TARGET_ABSENT,
-        `targetIdHint ${targetIdHint} is absent from authoritative chrome.tabs.query after chrome.tabs.get(${tabId}) returned no tab`
-      );
-    }
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}, but authoritative chrome.tabs.query still returned it`
-    );
-  }
-  return tabTargetFromTab(tab);
-}
-
-async function authoritativeTabById(tabId, context) {
-  let tabs;
-  try {
-    tabs = await chrome.tabs.query({});
-  } catch (error) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `${context}; authoritative chrome.tabs.query failed: ${errorMessage(error)}`
-    );
-  }
-  if (!Array.isArray(tabs)) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `${context}; authoritative chrome.tabs.query returned a non-array result`
-    );
-  }
-  return tabs.find((candidate) => candidate?.id === tabId) || null;
 }
 
 function selectedPage(target, targetCandidateCount, selectionReason) {
@@ -17828,90 +13687,37 @@ function urlMatchesHint(url, hint) {
   return url === hint || url.startsWith(hint) || hint.startsWith(url);
 }
 
-function diagnosticUrl(value) {
-  const raw = String(value || "");
-  if (!raw) {
-    return "";
-  }
-  try {
-    const parsed = new URL(raw);
-    const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
-    if (["data", "javascript", "mailto", "file", "blob", "filesystem"].includes(scheme)) {
-      return `${scheme}:redacted`;
-    }
-    if (scheme === "about") {
-      return parsed.href.toLowerCase() === "about:blank" ? "about:blank" : "about:redacted";
-    }
-    parsed.username = "";
-    parsed.password = "";
-    if (parsed.pathname && parsed.pathname !== "/") {
-      parsed.pathname = "/redacted";
-    }
-    if (parsed.search) {
-      parsed.search = "?redacted";
-    }
-    if (parsed.hash) {
-      parsed.hash = "#redacted";
-    }
-    return parsed.toString();
-  } catch (_) {
-    return "redacted";
-  }
-}
-
-function diagnosticTitle(value) {
-  return String(value || "").trim() ? "redacted" : "";
-}
-
 async function waitForTabTarget(tabId, waitTimeoutMs) {
   const started = Date.now();
-  let lastError = "";
+  let lastCount = 0;
   while (Date.now() - started <= waitTimeoutMs) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab && typeof tab.id === "number") {
-        return tabTargetFromTab(tab);
-      }
-      lastError = "chrome.tabs.get returned no numeric tab id";
-    } catch (error) {
-      lastError = errorMessage(error);
+    const pages = await tabTargets();
+    lastCount = pages.length;
+    const target = pages.find((candidate) => candidate.tabId === tabId);
+    if (target?.id) {
+      return target;
     }
     await sleep(100);
   }
   throw bridgeError(
     ERROR_EXTENSION_TIMEOUT,
-    `chrome.tabs.get(${tabId}) did not expose the new tab target within ${waitTimeoutMs} ms; last_error=${JSON.stringify(lastError)}`
+    `chrome.tabs.query did not expose a tab target for new tab ${tabId} within ${waitTimeoutMs} ms; lastTabTargetCount=${lastCount}`
   );
 }
 
 async function waitForTargetAbsent(targetId, waitTimeoutMs) {
-  const tabId = tabIdFromTargetId(String(targetId || ""));
-  if (!Number.isInteger(tabId)) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `waitForTargetAbsent requires ${TAB_TARGET_PREFIX}<tabId>, got ${JSON.stringify(targetId)}`
-    );
-  }
   const started = Date.now();
-  let lastState = null;
-  let lastError = "";
+  let pages = [];
   while (Date.now() - started <= waitTimeoutMs) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      lastState = tabPageStateFromTab(tab);
-      lastError = "";
-    } catch (error) {
-      lastError = errorMessage(error);
-      return [];
+    pages = await tabTargets();
+    if (!pages.some((candidate) => candidate.id === targetId)) {
+      return pages;
     }
     await sleep(100);
   }
   throw bridgeError(
     ERROR_EXTENSION_TIMEOUT,
-    `chrome.tabs.get(${tabId}) still returns closed target ${JSON.stringify(targetId)} after ${waitTimeoutMs} ms; ` +
-      `last_url=${JSON.stringify(diagnosticUrl(lastState?.url || ""))} ` +
-      `last_title=${JSON.stringify(diagnosticTitle(lastState?.title || ""))} ` +
-      `last_error=${JSON.stringify(lastError)}`
+    `chrome.tabs.query still contains closed target ${JSON.stringify(targetId)} after ${waitTimeoutMs} ms; lastTabTargetCount=${pages.length}`
   );
 }
 
@@ -17922,9 +13728,6 @@ async function waitForTabPageState(tabId, fallbackTarget, waitTimeoutMs, expecta
   while (Date.now() - started <= waitTimeoutMs) {
     try {
       last = await tabPageState(tabId, fallbackTarget);
-      if (expectation?.needsDocumentId) {
-        last.main_frame_document_id = await mainFrameDocumentIdOrNull(tabId);
-      }
       lastError = null;
       const loaded = last.ready_state === "complete";
       if (loaded && (!expectation || expectation.matches(last))) {
@@ -17937,11 +13740,8 @@ async function waitForTabPageState(tabId, fallbackTarget, waitTimeoutMs, expecta
   }
   const detail = last
     ? `waiting for ${expectation?.description || "complete tab state"}; ` +
-      `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
-      `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
-      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)} ` +
-      `before_document_id=${JSON.stringify(expectation?.before_document_id ?? null)} ` +
-      `last_document_id=${JSON.stringify(last.main_frame_document_id ?? null)}`
+      `last url=${JSON.stringify(last.url)} title=${JSON.stringify(last.title)} ` +
+      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
     : "no tab state readback";
@@ -17964,8 +13764,6 @@ async function tabPageState(tabId, fallbackTarget = null) {
     url: String(tab.pendingUrl || tab.url || target?.url || fallbackTarget?.url || ""),
     title: String(tab.title || target?.title || fallbackTarget?.title || ""),
     ready_state: String(tab.status || ""),
-    discarded: Boolean(tab.discarded),
-    frozen: Boolean(tab.frozen),
     active: Boolean(tab.active),
     highlighted: Boolean(tab.highlighted),
     pinned: Boolean(tab.pinned),
@@ -18021,50 +13819,6 @@ async function tabActiveElementState(tabId) {
   }
 }
 
-// #1827: secret-safe page text, digested in-page. Returns the same structural
-// shape as the plain readback (never the text), plus a real SHA-256 of the page
-// text so `before`/`after` comparison proves whether the action changed the page.
-async function tabPageTextDigestState(tabId) {
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    return {
-      ...suppressedPageTextState(),
-      available: false,
-      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
-      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission"
-    };
-  }
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: readPageTextDigestInPage,
-      args: [MAX_PAGE_TEXT_CHARS]
-    });
-    const frames = frameExecutionResults(results);
-    const top = frames.find((frame) => frame.frame_id === 0 && frame.result) || frames.find((frame) => frame.result) || null;
-    if (!top || typeof top.result !== "object" || top.result === null) {
-      return {
-        ...suppressedPageTextState(),
-        available: false,
-        error_code: "CHROME_SCRIPTING_EMPTY_RESULT",
-        error_detail: "chrome.scripting.executeScript returned no secret-safe page-text digest"
-      };
-    }
-    return {
-      available: true,
-      readback_source: "secret_safe_in_page_sha256_digest",
-      frame_count: frames.length,
-      ...top.result
-    };
-  } catch (error) {
-    return {
-      ...suppressedPageTextState(),
-      available: false,
-      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
-      error_detail: errorMessage(error)
-    };
-  }
-}
-
 function suppressedPageTextState(maxChars = MAX_PAGE_TEXT_CHARS) {
   return {
     available: true,
@@ -18080,7 +13834,7 @@ function suppressedPageTextState(maxChars = MAX_PAGE_TEXT_CHARS) {
 
 async function tabPageTextState(tabId, suppressPageText = false) {
   if (suppressPageText) {
-    return tabPageTextDigestState(tabId);
+    return suppressedPageTextState();
   }
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     return {
@@ -18207,25 +13961,17 @@ function frameExecutionResults(results) {
 function summarizeFrameExecutionResult(frame) {
   const result = frame?.result && typeof frame.result === "object" ? frame.result : {};
   const text = typeof result.text === "string" ? result.text : null;
-  const rawUrl = result.url == null
-    ? (result.in_page_before_url == null ? null : String(result.in_page_before_url))
-    : String(result.url);
-  const rawTitle = result.title == null
-    ? (result.in_page_title == null ? null : String(result.in_page_title))
-    : String(result.title);
   return {
     index: Number.isSafeInteger(frame?.index) ? frame.index : null,
     frame_id: Number.isSafeInteger(frame?.frame_id) ? frame.frame_id : null,
     document_id: frame?.document_id || null,
     ok: result.ok == null ? null : Boolean(result.ok),
     error_code: result.error_code == null ? null : String(result.error_code),
-    error_detail: result.error_detail == null
-      ? null
-      : trimForReadback(redactPublicErrorDetail(result.error_detail), 240),
+    error_detail: result.error_detail == null ? null : trimForReadback(result.error_detail, 240),
     matched_count: Number.isSafeInteger(result.matched_count) ? result.matched_count : null,
     resolved_by: result.resolved_by == null ? null : String(result.resolved_by),
-    url: rawUrl == null ? null : diagnosticUrl(rawUrl),
-    title: rawTitle == null ? null : diagnosticTitle(rawTitle),
+    url: result.url == null ? (result.in_page_before_url == null ? null : String(result.in_page_before_url)) : String(result.url),
+    title: result.title == null ? (result.in_page_title == null ? null : String(result.in_page_title)) : String(result.title),
     ready_state: result.ready_state == null ? (result.in_page_ready_state == null ? null : String(result.in_page_ready_state)) : String(result.ready_state),
     has_active_element: result.has_active_element == null ? null : Boolean(result.has_active_element),
     is_editable: result.is_editable == null ? null : Boolean(result.is_editable),
@@ -18669,207 +14415,39 @@ function waitForTextResult(
   };
 }
 
-function waitForFunctionRuntimeExpression(expression, args) {
-  let argsJson;
-  try {
-    argsJson = JSON.stringify(args);
-  } catch (error) {
+async function waitForFunctionProbe(selected, expression, args) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
-      ERROR_CHROME_WAIT_PREDICATE_INVALID,
-      `waitForFunction args could not be serialized before debugger dispatch: ${errorMessage(error)}; ` +
-        `expression_len=${expression.length} arg_count=${args.length}; ` +
-        "remediation=pass only JSON-serializable predicate arguments"
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
     );
   }
-  // Runtime.evaluate compiles this source in a dedicated CDP isolated world.
-  // No page-world eval/new Function or chrome.scripting MAIN-world injection
-  // is involved, so the host page's script-src policy cannot disable the tool.
-  return `(() => {
-    const __synapseArgs = ${argsJson};
-    const __synapseCandidate = (${expression});
-    const __synapseValue = typeof __synapseCandidate === "function"
-      ? __synapseCandidate(...__synapseArgs)
-      : __synapseCandidate;
-    return Promise.resolve(__synapseValue).then((__synapseResolved) => {
-      const __synapseType = typeof __synapseResolved;
-      let __synapseSerialized = null;
-      let __synapseDescription = null;
-      let __synapseUnserializable = null;
-      if (__synapseResolved === undefined) {
-        __synapseDescription = "undefined";
-      } else if (__synapseType === "bigint") {
-        __synapseSerialized = String(__synapseResolved);
-        __synapseDescription = String(__synapseResolved) + "n";
-        __synapseUnserializable = __synapseDescription;
-      } else if (__synapseType === "number" && !Number.isFinite(__synapseResolved)) {
-        __synapseDescription = String(__synapseResolved);
-        __synapseUnserializable = __synapseDescription;
-      } else if (__synapseType === "function" || __synapseType === "symbol") {
-        __synapseDescription = String(__synapseResolved);
-      } else {
-        try {
-          __synapseSerialized = JSON.parse(JSON.stringify(__synapseResolved));
-        } catch (__synapseSerializationError) {
-          __synapseDescription = String(__synapseResolved);
-        }
-      }
-      return {
-        condition_met: Boolean(__synapseResolved),
-        value: __synapseSerialized,
-        value_type: __synapseType,
-        value_description: __synapseDescription,
-        unserializable_value: __synapseUnserializable
-      };
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId: selected.tabId },
+      world: "MAIN",
+      func: runWaitForFunctionProbeInPage,
+      args: [{ expression, args }]
     });
-  })()
-  //# sourceURL=synapse://browser-wait/function-predicate`;
-}
-
-function waitForFunctionRuntimeWasInterruptedByNavigation(error) {
-  const message = errorMessage(error);
-  return [
-    "Execution context was destroyed",
-    "Cannot find context with specified id",
-    "Cannot find default execution context",
-    "Inspected target navigated"
-  ].some((fragment) => message.includes(fragment));
-}
-
-function waitForFunctionDebuggerCommandTimedOut(error) {
-  const message = errorMessage(error);
-  return message.includes("timed out after") || message.includes("Script execution timed out");
-}
-
-async function waitForFunctionIsolatedContext(selected, debuggee, remainingMs) {
-  let frameTree;
-  try {
-    frameTree = await sendDebuggerCommand(debuggee, "Page.getFrameTree", {}, remainingMs);
   } catch (error) {
-    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) throw error;
-    if (waitForFunctionDebuggerCommandTimedOut(error)) {
-      throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        `waitForFunction could not resolve the main frame before the ${remainingMs} ms remaining deadline; ` +
-          `tab=${selected.tabId}; no predicate was executed`
-      );
-    }
     throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Page.getFrameTree waitForFunction failed for tab ${selected.tabId}: ${errorMessage(error)}`
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript waitForFunction(${selected.tabId}) failed: ${errorMessage(error)}`
     );
   }
-  const frameId = frameTree?.frameTree?.frame?.id;
-  if (typeof frameId !== "string" || frameId.length === 0) {
+  const frames = frameExecutionResults(injected);
+  const first = frames.find((frame) => frame.result && typeof frame.result === "object");
+  if (!first) {
+    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "chrome.scripting.executeScript waitForFunction returned no structured result");
+  }
+  if (first.result.ok === false) {
     throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Page.getFrameTree returned no exact main-frame id for waitForFunction; ` +
-        `tab=${selected.tabId} remediation=inspect the Chrome DevTools Protocol response`
+      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+      `waitForFunction failed: ${String(first.result.error_detail || "")}`
     );
   }
-  let isolated;
-  try {
-    isolated = await sendDebuggerCommand(
-      debuggee,
-      "Page.createIsolatedWorld",
-      {
-        frameId,
-        worldName: "synapse_browser_wait",
-        grantUniveralAccess: false
-      },
-      remainingMs
-    );
-  } catch (error) {
-    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) throw error;
-    if (waitForFunctionDebuggerCommandTimedOut(error)) {
-      throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        `waitForFunction could not create its isolated execution world before the ${remainingMs} ms remaining deadline; ` +
-          `tab=${selected.tabId} frame_id=${frameId}; no predicate was executed`
-      );
-    }
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Page.createIsolatedWorld waitForFunction failed for tab ${selected.tabId} ` +
-        `frame_id=${frameId}: ${errorMessage(error)}`
-    );
-  }
-  if (!Number.isInteger(isolated?.executionContextId)) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Page.createIsolatedWorld returned no executionContextId for waitForFunction; ` +
-        `tab=${selected.tabId} frame_id=${frameId} response=${JSON.stringify(isolated || null)}`
-    );
-  }
-  return isolated.executionContextId;
-}
-
-async function waitForFunctionProbe(
-  selected,
-  debuggee,
-  isolatedContextId,
-  expression,
-  args,
-  remainingMs
-) {
-  const runtimeExpression = waitForFunctionRuntimeExpression(expression, args);
-  const runtimeTimeoutMs = Math.max(1, Math.floor(remainingMs));
-  let evaluation;
-  try {
-    evaluation = await sendDebuggerCommand(
-      debuggee,
-      "Runtime.evaluate",
-      {
-        expression: runtimeExpression,
-        contextId: isolatedContextId,
-        awaitPromise: true,
-        returnByValue: true,
-        userGesture: false,
-        timeout: runtimeTimeoutMs,
-        disableBreaks: true,
-        allowUnsafeEvalBlockedByCSP: false
-      },
-      runtimeTimeoutMs + 1000
-    );
-  } catch (error) {
-    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) {
-      throw error;
-    }
-    const message = errorMessage(error);
-    if (waitForFunctionDebuggerCommandTimedOut(error)) {
-      throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        `waitForFunction predicate remained unresolved at the ${runtimeTimeoutMs} ms remaining deadline; ` +
-          `tab=${selected.tabId} expression_len=${expression.length} arg_count=${args.length}; ` +
-          "the debugger execution timeout bounded the exact predicate and no alternate lane was attempted"
-      );
-    }
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Runtime.evaluate waitForFunction failed for tab ${selected.tabId}: ${message}`
-    );
-  }
-  if (evaluation?.exceptionDetails) {
-    throw bridgeError(
-      ERROR_CHROME_WAIT_PREDICATE_INVALID,
-      `waitForFunction predicate failed through chrome.debugger.Runtime.evaluate: ` +
-        `${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}; ` +
-        `tab=${selected.tabId} expression_len=${expression.length} arg_count=${args.length}; ` +
-        "remediation=repair the predicate syntax/runtime error; the target page CSP and debugger transport were not the failure"
-    );
-  }
-  const remote = evaluation?.result || {};
-  const value = remote.value;
-  if (remote.type !== "object" || value === null || typeof value !== "object" ||
-      typeof value.condition_met !== "boolean" || typeof value.value_type !== "string") {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger Runtime.evaluate waitForFunction returned an invalid protocol payload; ` +
-        `tab=${selected.tabId} remote_type=${JSON.stringify(remote.type || null)} ` +
-        `remote_subtype=${JSON.stringify(remote.subtype || null)} ` +
-        "remediation=inspect the authenticated bridge/Chrome protocol versions; do not treat this as a false predicate"
-    );
-  }
-  return value;
+  return first.result;
 }
 
 function waitForFunctionResult(
@@ -18906,33 +14484,47 @@ function waitForFunctionResult(
     value_type: String(current.value_type || "undefined"),
     value_description: current.value_description ?? null,
     unserializable_value: current.unserializable_value ?? null,
-    initial_document_id: current.initial_document_id ?? null,
-    final_document_id: current.final_document_id ?? null,
-    navigation_count: Number.isSafeInteger(current.navigation_count)
-      ? current.navigation_count
-      : 0,
-    readback_backend: "chrome.debugger.Runtime.evaluate(isolated-world waitForFunction predicate polling; page CSP independent)",
-    backend_tier_used: "chrome_debugger_protocol",
+    readback_backend: "chrome.scripting.executeScript(MAIN waitForFunction predicate polling)",
+    backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
 }
 
-function loadStateNetworkSummary(buffer, startSeq, maxInFlightRequests) {
-  const now = Date.now();
-  const lastActivityAtUnixMs = Math.max(
-    Number(buffer?.armedAtUnixMs || now),
-    Number(buffer?.lastActivityAtUnixMs || 0)
-  );
-  const networkEventCount = Math.max(0, Number(buffer?.nextSeq || 0) - startSeq);
-  return {
-    network_event_count: networkEventCount,
-    max_in_flight_requests: Math.max(0, Number(maxInFlightRequests || 0)),
-    in_flight_requests: Math.max(0, Number(buffer?.inFlightRequests || 0)),
-    network_idle_quiet_ms: Math.max(0, now - lastActivityAtUnixMs),
-    lifecycle_network_idle_seen: false
-  };
+async function loadStateProbe(selected) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId: selected.tabId },
+      world: "MAIN",
+      func: runLoadStateProbeInPage,
+      args: [{ quietMs: 500 }]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript waitForLoadState(${selected.tabId}) failed: ${errorMessage(error)}`
+    );
+  }
+  const frames = frameExecutionResults(injected);
+  const first = frames.find((frame) => frame.result && typeof frame.result === "object");
+  if (!first) {
+    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "chrome.scripting.executeScript waitForLoadState returned no structured result");
+  }
+  if (first.result.ok === false) {
+    throw bridgeError(
+      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+      `waitForLoadState failed: ${String(first.result.error_detail || "")}`
+    );
+  }
+  return first.result;
 }
 
 function loadStateEventSummary(buffer, startedAt) {
@@ -19015,7 +14607,7 @@ function waitForLoadStateResult(
     in_flight_requests: current.in_flight_requests || 0,
     network_idle_quiet_ms: current.network_idle_quiet_ms || 0,
     lifecycle_network_idle_seen: Boolean(current.lifecycle_network_idle_seen),
-    readback_backend: "chrome.tabs + chrome.webNavigation + chrome.webRequest request lifecycle",
+    readback_backend: "chrome.webNavigation + chrome.scripting.executeScript(MAIN load-state/fetch/XHR/resource-timing polling)",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -19140,7 +14732,7 @@ function waitForNetworkResult(
     total_buffered: buffer.entries.length,
     dropped: buffer.dropped,
     matched_entry: matchedEntry ? networkEntryToWire(matchedEntry) : null,
-    readback_backend: "chrome.webRequest request lifecycle ring buffer",
+    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -19153,10 +14745,7 @@ function findNetworkWaitEntry(buffer, wait, requireResponse, startSeq) {
     return null;
   }
   return buffer.entries.find((entry) => {
-    const relevantSeq = requireResponse
-      ? Number(entry.response_seq || 0)
-      : Number(entry.started_seq || 0);
-    if (relevantSeq <= startSeq) {
+    if (Number(entry.seq || 0) <= startSeq) {
       return false;
     }
     if (requireResponse && !(entry.response_received && entry.status !== null && entry.status !== undefined)) {
@@ -19715,6 +15304,87 @@ function runLoadStateProbeInPage(request) {
   };
 }
 
+async function runWaitForFunctionProbeInPage(request) {
+  const expression = String(request?.expression ?? "");
+  const args = Array.isArray(request?.args) ? request.args : [];
+  const serializeValue = (value) => {
+    const valueType = typeof value;
+    if (value === undefined) {
+      return {
+        value: null,
+        value_type: "undefined",
+        value_description: "undefined",
+        unserializable_value: null
+      };
+    }
+    if (valueType === "bigint") {
+      return {
+        value: String(value),
+        value_type: valueType,
+        value_description: `${String(value)}n`,
+        unserializable_value: `${String(value)}n`
+      };
+    }
+    if (valueType === "number" && !Number.isFinite(value)) {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: String(value)
+      };
+    }
+    if (valueType === "function" || valueType === "symbol") {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: null
+      };
+    }
+    try {
+      return {
+        value: JSON.parse(JSON.stringify(value)),
+        value_type: valueType,
+        value_description: null,
+        unserializable_value: null
+      };
+    } catch (_error) {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: null
+      };
+    }
+  };
+  try {
+    const candidate = (0, eval)(`(${expression})`);
+    const value = typeof candidate === "function" ? candidate(...args) : candidate;
+    const resolved = await Promise.resolve(value);
+    const serialized = serializeValue(resolved);
+    return {
+      ok: true,
+      condition_met: Boolean(resolved),
+      value: serialized.value,
+      value_type: serialized.value_type,
+      value_description: serialized.value_description,
+      unserializable_value: serialized.unserializable_value,
+      url: String(location.href || ""),
+      title: document && typeof document.title === "string" ? document.title : "",
+      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: error && error.stack ? String(error.stack) : String(error && error.message ? error.message : error),
+      url: String(location.href || ""),
+      title: document && typeof document.title === "string" ? document.title : "",
+      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
+    };
+  }
+}
+
 async function tabPageVitalsState(tabId) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     return {
@@ -19808,59 +15478,6 @@ function readPageTextInPage(maxChars) {
     title: String(document.title || ""),
     ready_state: String(document.readyState || "")
   };
-}
-
-// #1827: secret-safe page-text readback. The suppressed variant used to return
-// a CONSTANT object, so its host-side sha256 was identical for every page and
-// every action — an information-free hash that a caller could easily read as
-// "the text did not change". Digest the real text in the page instead: the text
-// never crosses the page boundary, but the digest is a genuine change signal.
-async function readPageTextDigestInPage(maxChars) {
-  const limit = Number.isSafeInteger(maxChars) && maxChars >= 0 ? Math.min(maxChars, 65536) : 4096;
-  const source =
-    document.body && typeof document.body.innerText === "string"
-      ? document.body.innerText
-      : document.documentElement && typeof document.documentElement.innerText === "string"
-        ? document.documentElement.innerText
-        : document.body && typeof document.body.textContent === "string"
-          ? document.body.textContent
-          : document.documentElement && typeof document.documentElement.textContent === "string"
-            ? document.documentElement.textContent
-            : "";
-  const text = String(source || "");
-  const base = {
-    text: null,
-    text_len: Array.from(text).length,
-    text_truncated: false,
-    max_chars: limit,
-    redacted: true,
-    redaction_policy: "target_act_secret_safe_v1",
-    ready_state: String(document.readyState || "")
-  };
-  if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== "function") {
-    // Fail loud rather than substituting a weaker digest: a caller comparing
-    // digests must never be handed a hash from a different algorithm.
-    return {
-      ...base,
-      text_sha256: null,
-      text_sha256_error:
-        "crypto.subtle.digest is unavailable in this page (SubtleCrypto requires a secure context); no page-text digest could be computed"
-    };
-  }
-  try {
-    const bytes = new TextEncoder().encode(text);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-    const hex = Array.from(new Uint8Array(digest))
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-    return { ...base, text_sha256: `sha256:${hex}`, text_sha256_error: null };
-  } catch (error) {
-    return {
-      ...base,
-      text_sha256: null,
-      text_sha256_error: `crypto.subtle.digest failed: ${String(error && error.message ? error.message : error)}`
-    };
-  }
 }
 
 function readPageContentInPage(maxBytes) {
@@ -21151,24 +16768,6 @@ async function runBridgeElementCommandInPage(request) {
   }
 
   function twoAnimationFrames() {
-    // #1826 root cause: this inter-sample yield used to be
-    // `setTimeout(finish, 100)` raced against two animation frames. BOTH are
-    // suppressed in a background tab:
-    //   * a hidden tab does not paint, so requestAnimationFrame never fires;
-    //   * Chrome clamps timers in hidden tabs to >= 1s and, once a tab has been
-    //     hidden for ~5 minutes, applies INTENSIVE THROTTLING that aligns
-    //     timer wake-ups to a once-per-MINUTE budget.
-    // So the "100 ms" stability sample cost up to a minute per call on a
-    // long-idle background tab - which is how a plain static text subtree blew
-    // a 120 s client budget while identical calls on tabs opened moments
-    // earlier returned instantly.
-    //
-    // MessageChannel port messages are a task source that the timer-throttling
-    // budget does not govern (the same property React's scheduler relies on),
-    // so they still turn around promptly in a hidden tab. Prefer a real
-    // animation frame when the document is actually visible - that is the
-    // physically correct sample point - and fall back to the port yield
-    // otherwise. `setTimeout` is kept only as a last-resort ceiling.
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -21178,20 +16777,10 @@ async function runBridgeElementCommandInPage(request) {
         done = true;
         resolve();
       };
-      const visible =
-        typeof document !== "undefined" && document.visibilityState === "visible";
-      if (visible && typeof requestAnimationFrame === "function") {
-        requestAnimationFrame(() => requestAnimationFrame(finish));
-        setTimeout(finish, 100);
-        return;
-      }
-      if (typeof MessageChannel === "function") {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = finish;
-        channel.port2.postMessage(0);
-        return;
-      }
       setTimeout(finish, 100);
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(finish));
+      }
     });
   }
 
@@ -22175,8 +17764,7 @@ async function setContentInPage(request) {
 }
 
 function runClockInPage(request) {
-  const VERSION = "synapse-clock-2026-08-20-v3";
-  const MAX_CLOCK_MS = 8640000000000000;
+  const VERSION = "synapse-clock-2026-06-21-v1";
   const operation = String(request?.operation || "status");
   const timeMs = request?.timeMs;
   const deltaMs = request?.deltaMs;
@@ -22187,45 +17775,7 @@ function runClockInPage(request) {
   }
 
   try {
-    const marker = Object.getOwnPropertyDescriptor(globalThis, "__synapseClock");
-    const markerClock = marker && Object.prototype.hasOwnProperty.call(marker, "value")
-      ? marker.value
-      : null;
-    if (marker && (!markerClock || markerClock.version !== VERSION ||
-        typeof markerClock.call !== "function")) {
-      throw new Error(
-        "Synapse clock collision: globalThis.__synapseClock is already owned by " +
-          "an unknown or incompatible instrument"
-      );
-    }
-    if (!marker && (operation === "status" || operation === "uninstall")) {
-      return {
-        ok: true,
-        init_script_identifier: "chrome.scripting.executeScript:MAIN:synapse-clock",
-        init_script_newly_added: false,
-        installed_at_unix_ms: 0,
-        readback: {
-          installed: false,
-          version: VERSION,
-          now_ms: null,
-          pending_timer_count: 0,
-          fired_timer_count: 0,
-          last_timer_id: 0,
-          next_timer_ms: null,
-          error_count: 0,
-          last_error: null,
-          ownership_verified: true,
-          descriptor_count: 0
-        },
-        url: String(location.href || ""),
-        title: String(document.title || ""),
-        ready_state: String(document.readyState || "")
-      };
-    }
-    if (!marker && operation !== "install") {
-      throw new Error("Synapse browser clock is not installed");
-    }
-    const clock = markerClock || createSynapseClock();
+    const clock = ensureSynapseClock();
     let readback;
     if (operation === "install") {
       readback = clock.call("install", { nowMs: timeMs, loopLimit });
@@ -22260,7 +17810,11 @@ function runClockInPage(request) {
     };
   }
 
-  function createSynapseClock() {
+  function ensureSynapseClock() {
+    if (globalThis.__synapseClock && globalThis.__synapseClock.version === VERSION) {
+      return globalThis.__synapseClock;
+    }
+
     const NativeDate = globalThis.Date;
     const nativeGlobalDescriptors = new Map();
     for (const name of ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"]) {
@@ -22272,111 +17826,6 @@ function runClockInPage(request) {
     const nativePerformanceNow = globalThis.performance && globalThis.performance.now
       ? globalThis.performance.now.bind(globalThis.performance)
       : () => 0;
-    const installedDescriptors = new Map();
-    const descriptorTargets = new Map();
-    for (const name of nativeGlobalDescriptors.keys()) {
-      descriptorTargets.set(name, globalThis);
-    }
-    if (globalThis.performance) {
-      descriptorTargets.set("performance.now", globalThis.performance);
-    }
-    descriptorTargets.set("__synapseClock", globalThis);
-
-    function descriptorAt(target, name) {
-      return Object.getOwnPropertyDescriptor(target, name);
-    }
-
-    function descriptorsEqual(left, right) {
-      if (left === undefined || right === undefined) {
-        return left === right;
-      }
-      return left.configurable === right.configurable &&
-        left.enumerable === right.enumerable &&
-        left.writable === right.writable &&
-        left.value === right.value &&
-        left.get === right.get &&
-        left.set === right.set;
-    }
-
-    function propertyName(key) {
-      return key === "performance.now" ? "now" : key;
-    }
-
-    function originalDescriptor(key) {
-      if (key === "performance.now") {
-        return nativePerformanceNowDescriptor;
-      }
-      if (key === "__synapseClock") {
-        return undefined;
-      }
-      return nativeGlobalDescriptors.get(key);
-    }
-
-    function assertCanReplace(key, original) {
-      const target = descriptorTargets.get(key);
-      const name = propertyName(key);
-      if (!target) {
-        throw new Error(`Synapse clock target ${key} is unavailable`);
-      }
-      if (original === undefined) {
-        if (!Object.isExtensible(target)) {
-          throw new Error(`Synapse clock cannot create ${key} on a non-extensible target`);
-        }
-        return;
-      }
-      if (original.configurable === false &&
-          (!Object.prototype.hasOwnProperty.call(original, "value") ||
-           original.writable !== true)) {
-        throw new Error(`Synapse clock refuses non-configurable collision at ${key}`);
-      }
-      if (!descriptorsEqual(descriptorAt(target, name), original)) {
-        throw new Error(`Synapse clock preflight observed descriptor drift at ${key}`);
-      }
-    }
-
-    function replacementDescriptor(original, value) {
-      if (original === undefined) {
-        return {
-          configurable: true,
-          enumerable: false,
-          writable: true,
-          value
-        };
-      }
-      return {
-        configurable: original.configurable,
-        enumerable: original.enumerable,
-        writable: Object.prototype.hasOwnProperty.call(original, "value")
-          ? original.writable
-          : true,
-        value
-      };
-    }
-
-    function restoreDescriptor(key, descriptor) {
-      const target = descriptorTargets.get(key);
-      const name = propertyName(key);
-      if (descriptor === undefined) {
-        if (!delete target[name] || descriptorAt(target, name) !== undefined) {
-          throw new Error(`Synapse clock could not remove owned descriptor ${key}`);
-        }
-      } else {
-        Object.defineProperty(target, name, descriptor);
-        if (!descriptorsEqual(descriptorAt(target, name), descriptor)) {
-          throw new Error(`Synapse clock could not restore exact descriptor ${key}`);
-        }
-      }
-    }
-
-    function verifyInstalledOwnership() {
-      for (const [key, descriptor] of installedDescriptors.entries()) {
-        const target = descriptorTargets.get(key);
-        if (!descriptorsEqual(descriptorAt(target, propertyName(key)), descriptor)) {
-          throw new Error(`Synapse clock ownership drift detected at ${key}`);
-        }
-      }
-      return installedDescriptors.size;
-    }
     const state = {
       installed: false,
       nowMs: NativeDate.now(),
@@ -22395,26 +17844,15 @@ function runClockInPage(request) {
       return Number.isFinite(n) ? Math.max(0, n) : fallback;
     }
 
-    function requireClockMs(value, field) {
-      const n = Number(value);
-      if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CLOCK_MS) {
-        throw new Error(
-          `Synapse browser clock ${field} must be a safe integer from 0 through ${MAX_CLOCK_MS}`
-        );
-      }
-      return n;
-    }
-
     function timerDelay(value) {
       const n = Number(value);
       if (!Number.isFinite(n)) {
         return 0;
       }
-      return Math.max(0, Math.floor(n));
+      return Math.max(0, n);
     }
 
     function status() {
-      const descriptorCount = state.installed ? verifyInstalledOwnership() : 0;
       let next = null;
       for (const timer of state.timers.values()) {
         if (next === null || timer.due < next) {
@@ -22430,9 +17868,7 @@ function runClockInPage(request) {
         last_timer_id: state.nextTimerId - 1,
         next_timer_ms: next === null ? null : Math.floor(next),
         error_count: state.errorCount,
-        last_error: state.lastError,
-        ownership_verified: true,
-        descriptor_count: descriptorCount
+        last_error: state.lastError
       };
     }
 
@@ -22473,21 +17909,13 @@ function runClockInPage(request) {
           throw new Error("Synapse browser clock loop limit exceeded while draining timers");
         }
         state.nowMs = next.due;
+        state.timers.delete(next.id);
         state.firedTimerCount += 1;
         runHandler(next);
-        const stillOwned = state.timers.get(next.id) === next;
-        if (next.kind === "interval" && stillOwned && !next.cancelled) {
+        if (next.kind === "interval" && !next.cancelled) {
           const step = Math.max(1, next.delay);
-          const nextDue = state.nowMs + step;
-          if (!Number.isSafeInteger(nextDue) || nextDue > MAX_CLOCK_MS) {
-            throw new Error(
-              `Synapse browser clock interval ${next.id} cannot be rescheduled beyond ${MAX_CLOCK_MS}`
-            );
-          }
-          next.due = nextDue;
+          next.due = state.nowMs + step;
           state.timers.set(next.id, next);
-        } else if (stillOwned) {
-          state.timers.delete(next.id);
         }
       }
       state.nowMs = target;
@@ -22496,17 +17924,13 @@ function runClockInPage(request) {
     function schedule(kind, handler, delay, args) {
       const id = state.nextTimerId++;
       const normalizedDelay = timerDelay(delay);
-      const due = state.nowMs + normalizedDelay;
-      if (!Number.isSafeInteger(due) || due > MAX_CLOCK_MS) {
-        throw new Error(`Synapse browser clock timer due time must not exceed ${MAX_CLOCK_MS}`);
-      }
       state.timers.set(id, {
         id,
         kind,
         handler,
         args,
         delay: normalizedDelay,
-        due,
+        due: state.nowMs + normalizedDelay,
         cancelled: false
       });
       return id;
@@ -22538,67 +17962,28 @@ function runClockInPage(request) {
 
     function install(args) {
       if (args && Object.prototype.hasOwnProperty.call(args, "nowMs") && args.nowMs !== null) {
-        state.nowMs = requireClockMs(args.nowMs, "install nowMs");
+        state.nowMs = toFiniteMs(args.nowMs, state.nowMs);
       }
       if (args && Object.prototype.hasOwnProperty.call(args, "loopLimit")) {
         state.loopLimit = Math.max(1, Math.floor(Number(args.loopLimit) || state.loopLimit));
       }
       api.lastInstallNewlyAdded = !state.installed;
       if (!state.installed) {
-        const replacements = new Map([
-          ["Date", SynapseDate],
-          ["setTimeout", (handler, delay, ...rest) => schedule("timeout", handler, delay, rest)],
-          ["clearTimeout", clear],
-          ["setInterval", (handler, delay, ...rest) => schedule("interval", handler, delay, rest)],
-          ["clearInterval", clear],
-          ["requestAnimationFrame", (handler) =>
-            schedule("raf", (ts) => handler(ts), 16, [
-              Math.max(0, state.nowMs - state.performanceOriginMs)
-            ])],
-          ["cancelAnimationFrame", clear],
-          ["performance.now", () => Math.max(0, state.nowMs - state.performanceOriginMs)],
-          ["__synapseClock", api]
-        ]);
-        const desired = new Map();
-        for (const [key, value] of replacements.entries()) {
-          const original = originalDescriptor(key);
-          assertCanReplace(key, original);
-          desired.set(key, key === "__synapseClock"
-            ? {
-                configurable: true,
-                enumerable: false,
-                writable: false,
-                value
-              }
-            : replacementDescriptor(original, value));
-        }
-        try {
-          for (const [key, descriptor] of desired.entries()) {
-            const target = descriptorTargets.get(key);
-            const name = propertyName(key);
-            Object.defineProperty(target, name, descriptor);
-            if (!descriptorsEqual(descriptorAt(target, name), descriptor)) {
-              throw new Error(`Synapse clock install postcondition failed at ${key}`);
-            }
-            installedDescriptors.set(key, descriptor);
-          }
-        } catch (error) {
-          let rollbackError = null;
-          for (const key of Array.from(desired.keys()).reverse()) {
-            try {
-              restoreDescriptor(key, originalDescriptor(key));
-            } catch (candidate) {
-              rollbackError = rollbackError || candidate;
-            }
-          }
-          installedDescriptors.clear();
-          if (rollbackError) {
-            throw new Error(
-              `Synapse clock install failed at ${errorDetail(error)}; ` +
-                `exact rollback also failed: ${errorDetail(rollbackError)}`
-            );
-          }
-          throw error;
+        globalThis.Date = SynapseDate;
+        globalThis.setTimeout = (handler, delay, ...rest) => schedule("timeout", handler, delay, rest);
+        globalThis.clearTimeout = clear;
+        globalThis.setInterval = (handler, delay, ...rest) => schedule("interval", handler, delay, rest);
+        globalThis.clearInterval = clear;
+        globalThis.requestAnimationFrame = (handler) =>
+          schedule("raf", (ts) => handler(ts), 16, [Math.max(0, state.nowMs - state.performanceOriginMs)]);
+        globalThis.cancelAnimationFrame = clear;
+        if (globalThis.performance) {
+          try {
+            Object.defineProperty(globalThis.performance, "now", {
+              configurable: true,
+              value: () => Math.max(0, state.nowMs - state.performanceOriginMs)
+            });
+          } catch (_) {}
         }
         state.installed = true;
         state.installedAtUnixMs = NativeDate.now();
@@ -22611,62 +17996,48 @@ function runClockInPage(request) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      state.nowMs = requireClockMs(args && args.timeMs, "setFixedTime timeMs");
+      state.nowMs = toFiniteMs(args && args.timeMs, state.nowMs);
       return status();
     }
 
     function uninstall() {
-      if (!state.installed) {
-        return status();
-      }
-      verifyInstalledOwnership();
-      try {
-        for (const key of Array.from(installedDescriptors.keys()).reverse()) {
-          restoreDescriptor(key, originalDescriptor(key));
-        }
-      } catch (error) {
-        let rollbackError = null;
-        for (const key of installedDescriptors.keys()) {
-          try {
-            const target = descriptorTargets.get(key);
-            const descriptor = installedDescriptors.get(key);
-            Object.defineProperty(target, propertyName(key), descriptor);
-            if (!descriptorsEqual(
-              descriptorAt(target, propertyName(key)),
-              descriptor
-            )) {
-              throw new Error(`rollback postcondition failed at ${key}`);
-            }
-          } catch (candidate) {
-            rollbackError = rollbackError || candidate;
-          }
-        }
-        if (rollbackError) {
-          throw new Error(
-            `Synapse clock uninstall failed at ${errorDetail(error)}; ` +
-              `exact rollback also failed: ${errorDetail(rollbackError)}`
-          );
-        }
-        throw error;
-      }
-      installedDescriptors.clear();
       state.timers.clear();
+      for (const [name, descriptor] of nativeGlobalDescriptors.entries()) {
+        try {
+          if (descriptor) {
+            Object.defineProperty(globalThis, name, descriptor);
+          } else {
+            delete globalThis[name];
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }
+      if (globalThis.performance) {
+        try {
+          if (nativePerformanceNowDescriptor) {
+            Object.defineProperty(globalThis.performance, "now", nativePerformanceNowDescriptor);
+          } else {
+            delete globalThis.performance.now;
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }
       state.installed = false;
-      return status();
+      const readback = status();
+      try {
+        delete globalThis.__synapseClock;
+      } catch (_) {}
+      return readback;
     }
 
     function fastForward(args) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      const delta = requireClockMs(args && args.deltaMs, "fastForward deltaMs");
-      const target = state.nowMs + delta;
-      if (!Number.isSafeInteger(target) || target > MAX_CLOCK_MS) {
-        throw new Error(
-          `Synapse browser clock fastForward target must not exceed ${MAX_CLOCK_MS}`
-        );
-      }
-      drainUntil(target);
+      const delta = toFiniteMs(args && args.deltaMs, 0);
+      drainUntil(state.nowMs + delta);
       return status();
     }
 
@@ -22674,7 +18045,7 @@ function runClockInPage(request) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      const target = requireClockMs(args && args.timeMs, "pauseAt timeMs");
+      const target = toFiniteMs(args && args.timeMs, state.nowMs);
       if (target < state.nowMs) {
         throw new Error("Synapse browser clock pauseAt cannot move backwards");
       }
@@ -22714,6 +18085,7 @@ function runClockInPage(request) {
       }
     };
 
+    globalThis.__synapseClock = api;
     return api;
   }
 }
@@ -23825,24 +19197,13 @@ function normalizeDomAction(action) {
   if (normalized === "selecttext" || normalized === "select-text") {
     return "select_text";
   }
-  if (["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "scroll"].includes(normalized)) {
+  if (["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, dblclick, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck, scroll; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, dblclick, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck; got ${JSON.stringify(action)}`
   );
-}
-
-function normalizeDomScrollDelta(value, fieldName) {
-  const delta = Number(value);
-  if (!Number.isSafeInteger(delta) || Math.abs(delta) > 1000000) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `domAction scroll ${fieldName} must be a safe integer from -1000000 through 1000000; got ${JSON.stringify(value)}`
-    );
-  }
-  return delta;
 }
 
 function stringOrNull(value) {
@@ -24229,16 +19590,9 @@ async function performDomActionInPage(request) {
   };
   const eventType = stringOrEmpty(request?.eventType);
   const eventInit = plainObjectOrEmpty(request?.eventInit);
-  const scrollDeltaX = Number(request?.scrollDeltaX);
-  const scrollDeltaY = Number(request?.scrollDeltaY);
   const resolveOnly = Boolean(request?.resolveOnly);
   const resolveActionability = Boolean(request?.resolveActionability);
   const autoWait = Boolean(request?.autoWait);
-  // #1821: Playwright `force` parity. `force` records the actionability
-  // snapshot but never gates on it, so an element under a transparent
-  // full-viewport overlay (elementFromPoint returns the overlay, a human clicks
-  // straight through) is still reachable through synthetic in-page dispatch.
-  const force = Boolean(request?.force);
   const autoWaitTimeoutMs = Number.isSafeInteger(request?.autoWaitTimeoutMs)
     ? Math.max(50, Math.min(request.autoWaitTimeoutMs, 30000))
     : 2000;
@@ -24247,29 +19601,16 @@ async function performDomActionInPage(request) {
     : 4096;
   const suppressPageText = Boolean(request?.suppressPageText);
 
-  if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "scroll", "hover", "tap", "drag", "html5_drag", "html5_real_drag"].includes(action)) {
+  if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "hover", "tap", "drag", "html5_drag", "html5_real_drag"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
   }
   if (action === "dispatch_event" && !eventType) {
     return fail(ERROR_ACTION_UNSUPPORTED, "dispatch_event requires a non-empty eventType");
   }
-  if (
-    action === "scroll" &&
-    (!Number.isSafeInteger(scrollDeltaX) ||
-      !Number.isSafeInteger(scrollDeltaY) ||
-      Math.abs(scrollDeltaX) > 1000000 ||
-      Math.abs(scrollDeltaY) > 1000000 ||
-      (scrollDeltaX === 0 && scrollDeltaY === 0))
-  ) {
-    return fail(
-      ERROR_ACTION_UNSUPPORTED,
-      `scroll requires non-zero safe-integer scrollDeltaX/scrollDeltaY within +/-1000000; got x=${JSON.stringify(request?.scrollDeltaX)} y=${JSON.stringify(request?.scrollDeltaY)}`
-    );
-  }
 
   const beforeUrl = String(location.href || "");
   const beforePageText = suppressPageText
-    ? await suppressedPageTextDigestLocal(maxPageTextChars)
+    ? suppressedPageTextLocal(maxPageTextChars)
     : readPageText(maxPageTextChars);
   const resolved = resolveDomActionElement(action, locator);
   if (!resolved.ok) {
@@ -24278,10 +19619,8 @@ async function performDomActionInPage(request) {
   const element = resolved.element;
   const beforeElement = elementSummary(element);
 
-  const bypassActionability = ["dispatch_event", "focus", "blur", "select_text", "scroll"].includes(action);
-  // #1821: `force` defers every actionability judgement to the snapshot recorded
-  // just before dispatch, exactly like `autoWait` defers it to the poll loop.
-  const deferActionability = (autoWait || force) && !bypassActionability;
+  const bypassActionability = ["dispatch_event", "focus", "blur", "select_text"].includes(action);
+  const deferActionability = autoWait && !bypassActionability;
   if (!bypassActionability && !deferActionability && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
@@ -24299,54 +19638,23 @@ async function performDomActionInPage(request) {
   if (resolveOnly) {
     let autoWaitReadback = null;
     if (resolveActionability && !bypassActionability) {
-      // #1821: `autoWait` controls WAITING, not gating. Probing once when the
-      // caller asked not to wait keeps the safety check (coordinate-resolved UA/CDP input
-      // dispatched at an occluded point would activate the overlay instead of
-      // the target) while returning the refusal immediately, with the typed
-      // not-actionable code rather than a wait-timeout the caller never asked
-      // for. `force` records the snapshot and never gates.
-      const gateTimeoutMs = autoWait ? autoWaitTimeoutMs : 0;
-      autoWaitReadback = await waitForDomActionability(element, action, gateTimeoutMs);
-      if (!autoWaitReadback.ok && !force) {
+      autoWaitReadback = await waitForDomActionability(element, action, autoWaitTimeoutMs);
+      if (!autoWaitReadback.ok) {
         return fail(
-          autoWait ? ERROR_BROWSER_WAIT_TIMEOUT : ERROR_ELEMENT_NOT_ACTIONABLE,
-          autoWait
-            ? `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`
-            : `domAction ${action} refused: ${autoWaitReadback.requirement} not met on a single probe (auto_wait=false, so no wait was performed); unmet predicates: ${autoWaitReadback.predicate_detail}. Retry with auto_wait=true to poll, or force=true to dispatch the event on the resolved node anyway (synthetic, untrusted input)`,
+          ERROR_BROWSER_WAIT_TIMEOUT,
+          `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`,
           {
             matched_count: resolved.matchedCount,
             resolved_by: resolved.resolvedBy,
             before_element: beforeElement,
-            auto_wait: autoWait,
+            auto_wait: true,
             auto_wait_readback: autoWaitReadback,
-            forced_actionability_bypass: false,
             source_of_truth: "Element.scrollIntoView({block:nearest,inline:nearest}) + getBoundingClientRect + elementFromPoint"
           }
         );
       }
     }
     let actionPoint = null;
-    if (action === "scroll") {
-      return {
-        ok: true,
-        action,
-        matched_count: resolved.matchedCount,
-        resolved_by: resolved.resolvedBy,
-        before_element: beforeElement,
-        after_element: elementSummary(element),
-        action_point: null,
-        resolve_only: true,
-        auto_wait: false,
-        auto_wait_readback: null,
-        forced_actionability_bypass: false,
-        in_page_before_url: beforeUrl,
-        in_page_after_url: String(location.href || ""),
-        in_page_title: String(document.title || ""),
-        in_page_ready_state: String(document.readyState || ""),
-        in_page_before_text: beforePageText,
-        in_page_after_text: beforePageText
-      };
-    }
     try {
       const point = elementClickPoint(element, null);
       actionPoint = { x: point.client_x, y: point.client_y };
@@ -24370,7 +19678,6 @@ async function performDomActionInPage(request) {
       resolve_only: true,
       auto_wait: autoWait,
       auto_wait_readback: autoWaitReadback,
-      forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
       in_page_before_url: beforeUrl,
       in_page_after_url: String(location.href || ""),
       in_page_title: String(document.title || ""),
@@ -24383,9 +19690,9 @@ async function performDomActionInPage(request) {
   const eventsDispatched = [];
   let actionReadback = {};
   let autoWaitReadback = null;
-  if ((autoWait || force) && !bypassActionability) {
-    autoWaitReadback = await waitForDomActionability(element, action, autoWait ? autoWaitTimeoutMs : 0);
-    if (!autoWaitReadback.ok && !force) {
+  if (autoWait && !bypassActionability) {
+    autoWaitReadback = await waitForDomActionability(element, action, autoWaitTimeoutMs);
+    if (!autoWaitReadback.ok) {
       return fail(
         ERROR_BROWSER_WAIT_TIMEOUT,
         `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`,
@@ -24395,29 +19702,12 @@ async function performDomActionInPage(request) {
           before_element: beforeElement,
           auto_wait: true,
           auto_wait_readback: autoWaitReadback,
-          forced_actionability_bypass: false,
           source_of_truth: "Element.scrollIntoView({block:nearest,inline:nearest}) + getBoundingClientRect + elementFromPoint"
         }
       );
     }
-    // #1821: with `force`, an unmet predicate is recorded and overridden, never
-    // fatal. `attached` stays fatal: there is no node to dispatch on.
-    if (force && !autoWaitReadback.attached && !autoWaitReadback.last_actionability?.attached) {
-      return fail(
-        ERROR_ELEMENT_NOT_ACTIONABLE,
-        `domAction ${action} force=true cannot dispatch on a detached node; the resolved element is no longer connected to the document`,
-        {
-          matched_count: resolved.matchedCount,
-          resolved_by: resolved.resolvedBy,
-          before_element: beforeElement,
-          auto_wait: autoWait,
-          auto_wait_readback: autoWaitReadback,
-          forced_actionability_bypass: false
-        }
-      );
-    }
   }
-  if (!force && !bypassActionability && !isElementEnabled(element)) {
+  if (!bypassActionability && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -24426,7 +19716,7 @@ async function performDomActionInPage(request) {
       auto_wait_readback: autoWaitReadback
     });
   }
-  if (!force && !bypassActionability && !isElementVisible(element) && action !== "submit") {
+  if (!bypassActionability && !isElementVisible(element) && action !== "submit") {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is not visible/actionable", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -24456,8 +19746,6 @@ async function performDomActionInPage(request) {
       actionReadback = performCheckState(element, true, eventsDispatched);
     } else if (action === "uncheck") {
       actionReadback = performCheckState(element, false, eventsDispatched);
-    } else if (action === "scroll") {
-      actionReadback = await performScroll(element, scrollDeltaX, scrollDeltaY);
     } else if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag" || action === "html5_real_drag") {
       throw actionError(ERROR_ACTION_UNSUPPORTED, `DOM action ${action} is resolver-only; dispatch through cdpInput`);
     }
@@ -24468,14 +19756,13 @@ async function performDomActionInPage(request) {
       before_element: beforeElement,
       auto_wait: autoWait,
       auto_wait_readback: autoWaitReadback,
-      events_dispatched: eventsDispatched,
-      action_readback: error?.readback || null
+      events_dispatched: eventsDispatched
     });
   }
 
   const afterElement = element.isConnected ? elementSummary(element) : null;
   const afterPageText = suppressPageText
-    ? await suppressedPageTextDigestLocal(maxPageTextChars)
+    ? suppressedPageTextLocal(maxPageTextChars)
     : readPageText(maxPageTextChars);
   return {
     ok: true,
@@ -24486,11 +19773,6 @@ async function performDomActionInPage(request) {
     after_element: afterElement,
     auto_wait: autoWait,
     auto_wait_readback: autoWaitReadback,
-    // #1821: an explicit, auditable record that an unmet actionability
-    // predicate was overridden, and that the delivered events were synthetic
-    // in-page dispatch rather than OS/CDP input.
-    forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
-    forced_dom_dispatch: Boolean(force),
     events_dispatched: eventsDispatched,
     action_readback: actionReadback,
     in_page_before_url: beforeUrl,
@@ -24867,24 +20149,6 @@ async function performDomActionInPage(request) {
   }
 
   function twoAnimationFramesLocal() {
-    // #1826 root cause: this inter-sample yield used to be
-    // `setTimeout(finish, 100)` raced against two animation frames. BOTH are
-    // suppressed in a background tab:
-    //   * a hidden tab does not paint, so requestAnimationFrame never fires;
-    //   * Chrome clamps timers in hidden tabs to >= 1s and, once a tab has been
-    //     hidden for ~5 minutes, applies INTENSIVE THROTTLING that aligns
-    //     timer wake-ups to a once-per-MINUTE budget.
-    // So the "100 ms" stability sample cost up to a minute per call on a
-    // long-idle background tab - which is how a plain static text subtree blew
-    // a 120 s client budget while identical calls on tabs opened moments
-    // earlier returned instantly.
-    //
-    // MessageChannel port messages are a task source that the timer-throttling
-    // budget does not govern (the same property React's scheduler relies on),
-    // so they still turn around promptly in a hidden tab. Prefer a real
-    // animation frame when the document is actually visible - that is the
-    // physically correct sample point - and fall back to the port yield
-    // otherwise. `setTimeout` is kept only as a last-resort ceiling.
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -24894,55 +20158,20 @@ async function performDomActionInPage(request) {
         done = true;
         resolve();
       };
-      const visible =
-        typeof document !== "undefined" && document.visibilityState === "visible";
-      if (visible && typeof requestAnimationFrame === "function") {
-        requestAnimationFrame(() => requestAnimationFrame(finish));
-        setTimeout(finish, 100);
-        return;
-      }
-      if (typeof MessageChannel === "function") {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = finish;
-        channel.port2.postMessage(0);
-        return;
-      }
       setTimeout(finish, 100);
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => requestAnimationFrame(finish));
+      }
     });
   }
 
-  // #1826, same root cause as the stability-sample yield: a bare `setTimeout`
-  // poll interval is clamped to >= 1 s in a hidden tab and aligned to a
-  // once-per-minute budget once the tab has been hidden ~5 minutes, so a 50 ms
-  // poll could overshoot an entire auto-wait budget by a minute. Short waits in
-  // a hidden document are therefore driven by MessageChannel turns (a task
-  // source the throttling budget does not govern) until the real elapsed time
-  // is satisfied; a visible document keeps the ordinary timer.
   function delay(ms) {
-    const target = Math.max(0, Number(ms) || 0);
-    const hidden = typeof document !== "undefined" && document.visibilityState !== "visible";
-    if (!hidden || target > 250 || typeof MessageChannel !== "function") {
-      return new Promise((resolve) => setTimeout(resolve, target));
-    }
-    return new Promise((resolve) => {
-      const started = Date.now();
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => {
-        if (Date.now() - started >= target) {
-          channel.port1.onmessage = null;
-          resolve();
-          return;
-        }
-        channel.port2.postMessage(0);
-      };
-      channel.port2.postMessage(0);
-    });
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function resolveDomActionElement(actionName, loc) {
     let candidates = [];
     let resolvedBy = "semantic";
-    let pathDiagnostic = null;
     if (loc.selector) {
       resolvedBy = "selector";
       try {
@@ -24952,17 +20181,13 @@ async function performDomActionInPage(request) {
       }
     } else if (loc.elementPath) {
       resolvedBy = "element_path";
-      pathDiagnostic = elementByPathDiagnosticLocal(loc.elementPath);
-      candidates = pathDiagnostic.element ? [pathDiagnostic.element] : [];
+      const byPath = elementByPathLocal(loc.elementPath);
+      candidates = byPath ? [byPath] : [];
     } else if (loc.elementId) {
       resolvedBy = "element_id";
       const id = loc.elementId.startsWith("#") ? loc.elementId.slice(1) : loc.elementId;
       const byId = id ? document.getElementById(id) : null;
       candidates = byId ? [byId] : [];
-    } else if (actionName === "scroll" && !loc.role && !loc.name && !loc.value) {
-      resolvedBy = "document_scrolling_element";
-      const scrollingElement = document.scrollingElement;
-      candidates = scrollingElement instanceof Element ? [scrollingElement] : [];
     } else {
       candidates = semanticCandidates(actionName);
     }
@@ -24984,18 +20209,9 @@ async function performDomActionInPage(request) {
     });
 
     if (filtered.length === 0) {
-      const pathDetail = pathDiagnostic && !pathDiagnostic.element
-        ? `; element path traversal stopped at segment index ${pathDiagnostic.failed_at_segment_index} ` +
-          `(${JSON.stringify(pathDiagnostic.failed_segment)}) of ${JSON.stringify(pathDiagnostic.requested_path)}: ` +
-          `${pathDiagnostic.reason}; deepest resolved node was ${JSON.stringify(pathDiagnostic.resolved_node_description)} ` +
-          `at prefix ${JSON.stringify(pathDiagnostic.resolved_prefix)}`
-        : "";
-      return fail(ERROR_ELEMENT_NOT_FOUND, `no DOM element matched ${locatorDebug(loc)}${pathDetail}`, {
+      return fail(ERROR_ELEMENT_NOT_FOUND, `no DOM element matched ${locatorDebug(loc)}`, {
         matched_count: 0,
-        resolved_by: resolvedBy,
-        element_path_diagnostic: pathDiagnostic
-          ? { ...pathDiagnostic, element: undefined }
-          : null
+        resolved_by: resolvedBy
       });
     }
     if (filtered.length > 1) {
@@ -25014,98 +20230,36 @@ async function performDomActionInPage(request) {
   }
 
   function elementByPathLocal(path) {
-    return elementByPathDiagnosticLocal(path).element;
-  }
-
-  // #1822: a bare "element not found" for a path the read plane resolved sends
-  // the caller hunting for a staleness bug that may not exist. Report exactly
-  // which segment failed and what was actually there, so "the DOM moved under
-  // me" is distinguishable from "this path form is unsupported" without
-  // trial-and-error at up to 30 s per attempt.
-  function elementByPathDiagnosticLocal(path) {
-    const diagnostic = {
-      element: null,
-      requested_path: path == null ? null : String(path),
-      failed_at_segment_index: null,
-      failed_segment: null,
-      resolved_prefix: null,
-      resolved_node_description: null,
-      reason: null
-    };
     if (!path) {
-      diagnostic.reason = "empty_path";
-      return diagnostic;
+      return null;
     }
     // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
     const parts = String(path).split(".");
     if (Number(parts[0]) !== 0) {
-      diagnostic.failed_at_segment_index = 0;
-      diagnostic.failed_segment = parts[0];
-      diagnostic.reason = "root_segment_must_be_0_documentElement";
-      return diagnostic;
+      return null;
     }
     let current = document.documentElement;
     let enterShadow = false;
-    for (let index = 1; index < parts.length; index += 1) {
-      const raw = parts[index];
+    for (const raw of parts.slice(1)) {
       if (raw === "s") {
         enterShadow = true;
         continue;
       }
-      const childIndex = Number(raw);
-      if (!current || !Number.isSafeInteger(childIndex) || childIndex < 0) {
-        diagnostic.failed_at_segment_index = index;
-        diagnostic.failed_segment = raw;
-        diagnostic.resolved_prefix = parts.slice(0, index).join(".");
-        diagnostic.resolved_node_description = describeNodeForPathLocal(current);
-        diagnostic.reason = current ? "segment_is_not_a_child_index" : "traversal_reached_a_null_node";
-        return diagnostic;
+      const index = Number(raw);
+      if (!current || !Number.isSafeInteger(index) || index < 0) {
+        return null;
       }
       let scope = current;
       if (enterShadow) {
         if (!current.shadowRoot) {
-          diagnostic.failed_at_segment_index = index;
-          diagnostic.failed_segment = raw;
-          diagnostic.resolved_prefix = parts.slice(0, index).join(".");
-          diagnostic.resolved_node_description = describeNodeForPathLocal(current);
-          diagnostic.reason = "shadow_hop_requested_but_node_has_no_open_shadow_root";
-          return diagnostic;
+          return null;
         }
         scope = current.shadowRoot;
         enterShadow = false;
       }
-      const next = scope.children[childIndex] || null;
-      if (!next) {
-        diagnostic.failed_at_segment_index = index;
-        diagnostic.failed_segment = raw;
-        diagnostic.resolved_prefix = parts.slice(0, index).join(".");
-        diagnostic.resolved_node_description = describeNodeForPathLocal(current);
-        diagnostic.reason = `child_index_out_of_range (scope has ${scope.children.length} element children); the DOM most likely changed after this element id was resolved`;
-        return diagnostic;
-      }
-      current = next;
+      current = scope.children[index] || null;
     }
-    if (!(current instanceof Element)) {
-      diagnostic.reason = "path_resolved_to_a_non_element_node";
-      diagnostic.resolved_node_description = describeNodeForPathLocal(current);
-      return diagnostic;
-    }
-    diagnostic.element = current;
-    return diagnostic;
-  }
-
-  function describeNodeForPathLocal(node) {
-    if (!node) {
-      return null;
-    }
-    if (!(node instanceof Element)) {
-      return String(node.nodeName || "unknown-node");
-    }
-    const id = node.id ? `#${node.id}` : "";
-    const cls = node.classList && node.classList.length
-      ? `.${Array.from(node.classList).slice(0, 3).join(".")}`
-      : "";
-    return `${String(node.tagName || "").toLowerCase()}${id}${cls}`;
+    return current instanceof Element ? current : null;
   }
 
   function deepQueryAllLocal(selector) {
@@ -25170,13 +20324,13 @@ async function performDomActionInPage(request) {
     let readback;
     try {
       if (!needsSyntheticEvents && typeof element.click === "function") {
-        // A user-agent click normally emits the pointer/mouse press-release sequence
+        // A real left click always emits the pointer/mouse press-release sequence
         // before activation. Many components (e.g. react-select's control, which
         // opens on `mousedown`, not `click`) never respond to a bare
-        // element.click() that fires only a `click` event. Emit the synthetic
+        // element.click() that fires only a `click` event. Emit the real
         // pointerdown/mousedown/pointerup/mouseup sequence first, then use the
-        // native click() for HTML activation behavior (its click event remains
-        // isTrusted=false). This is a strict superset of the prior behavior. (#1311)
+        // native click() for trusted activation defaults (checkbox/link/form
+        // submit). This is a strict superset of the prior behavior. (#1311)
         const point = elementClickPoint(element, null);
         dispatchPointerLikeEvent(element, "pointerdown", point, button, modifiers, 1, true);
         events.push("pointerdown");
@@ -25534,84 +20688,6 @@ async function performDomActionInPage(request) {
       input_fired: true,
       change_fired: true
     };
-  }
-
-  async function performScroll(element, deltaX, deltaY) {
-    if (typeof element.scrollBy !== "function") {
-      throw actionError(
-        ERROR_ACTION_UNSUPPORTED,
-        `resolved ${tag(element)} element has no scrollBy() method`
-      );
-    }
-    const snapshot = () => ({
-      scroll_left: Number(element.scrollLeft || 0),
-      scroll_top: Number(element.scrollTop || 0),
-      scroll_width: Number(element.scrollWidth || 0),
-      scroll_height: Number(element.scrollHeight || 0),
-      client_width: Number(element.clientWidth || 0),
-      client_height: Number(element.clientHeight || 0),
-      max_scroll_left: Math.max(0, Number(element.scrollWidth || 0) - Number(element.clientWidth || 0)),
-      max_scroll_top: Math.max(0, Number(element.scrollHeight || 0) - Number(element.clientHeight || 0))
-    });
-    const before = snapshot();
-    const expectedLeft = before.scroll_left + deltaX;
-    const expectedTop = before.scroll_top + deltaY;
-    const preflight = {
-      requested_delta_x: deltaX,
-      requested_delta_y: deltaY,
-      expected_scroll_left: expectedLeft,
-      expected_scroll_top: expectedTop,
-      before
-    };
-    if (
-      expectedLeft < 0 ||
-      expectedLeft > before.max_scroll_left ||
-      expectedTop < 0 ||
-      expectedTop > before.max_scroll_top
-    ) {
-      throw actionError(
-        ERROR_POSTCONDITION_FAILED,
-        `scroll delta exceeds the target's remaining range: requested=(${deltaX},${deltaY}) before=(${before.scroll_left},${before.scroll_top}) max=(${before.max_scroll_left},${before.max_scroll_top})`,
-        { ...preflight, after: before, dispatched: false, verified: false }
-      );
-    }
-
-    element.scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
-    await twoAnimationFramesLocal();
-    const after = snapshot();
-    const actualDeltaX = after.scroll_left - before.scroll_left;
-    const actualDeltaY = after.scroll_top - before.scroll_top;
-    const toleranceCssPx = 0.5;
-    const xMagnitudeVerified = Math.abs(actualDeltaX - deltaX) <= toleranceCssPx;
-    const yMagnitudeVerified = Math.abs(actualDeltaY - deltaY) <= toleranceCssPx;
-    const xDirectionVerified = deltaX === 0 || Math.sign(actualDeltaX) === Math.sign(deltaX);
-    const yDirectionVerified = deltaY === 0 || Math.sign(actualDeltaY) === Math.sign(deltaY);
-    const readback = {
-      ...preflight,
-      after,
-      actual_delta_x: actualDeltaX,
-      actual_delta_y: actualDeltaY,
-      x_direction_verified: xDirectionVerified,
-      y_direction_verified: yDirectionVerified,
-      x_magnitude_verified: xMagnitudeVerified,
-      y_magnitude_verified: yMagnitudeVerified,
-      tolerance_css_px: toleranceCssPx,
-      dispatched: true,
-      verified:
-        xDirectionVerified &&
-        yDirectionVerified &&
-        xMagnitudeVerified &&
-        yMagnitudeVerified,
-      source_of_truth: "same-target Element.scrollLeft/scrollTop read before and after Element.scrollBy"
-    };
-    if (!readback.verified) {
-      throw actionError(
-        ERROR_POSTCONDITION_FAILED,
-        `scroll postcondition failed: requested=(${deltaX},${deltaY}) actual=(${actualDeltaX},${actualDeltaY}) before=(${before.scroll_left},${before.scroll_top}) after=(${after.scroll_left},${after.scroll_top})`,
-        readback
-      );
-    }
-    return readback;
   }
 
   function performFocus(element, events) {
@@ -26314,54 +21390,6 @@ async function performDomActionInPage(request) {
     };
   }
 
-  // #1827: secret-safe page text with a REAL digest. The constant-shaped
-  // suppressed payload hashed identically on every page, so before/after
-  // comparison carried no information. Digest the text in the page: the text
-  // never leaves, the digest proves whether the action changed the page.
-  async function suppressedPageTextDigestLocal(maxChars) {
-    // Digest the WHOLE page text, not the max_chars-truncated prefix: a change
-    // beyond the readback cap is still a change, and this value's only job is
-    // to answer "did the page change".
-    const full = String(
-      (document.body && typeof document.body.innerText === "string" && document.body.innerText) ||
-        (document.documentElement && typeof document.documentElement.innerText === "string" && document.documentElement.innerText) ||
-        (document.body && typeof document.body.textContent === "string" && document.body.textContent) ||
-        (document.documentElement && typeof document.documentElement.textContent === "string" && document.documentElement.textContent) ||
-        ""
-    );
-    const readback = { text: full, text_len: Array.from(full).length };
-    const base = {
-      text: null,
-      text_len: readback.text_len,
-      text_truncated: false,
-      max_chars: maxChars,
-      redacted: true,
-      redaction_policy: "target_act_secret_safe_v1"
-    };
-    if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== "function") {
-      return {
-        ...base,
-        text_sha256: null,
-        text_sha256_error:
-          "crypto.subtle.digest is unavailable in this page (SubtleCrypto requires a secure context); no page-text digest could be computed"
-      };
-    }
-    try {
-      const bytes = new TextEncoder().encode(readback.text);
-      const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-      const hex = Array.from(new Uint8Array(digest))
-        .map((byte) => byte.toString(16).padStart(2, "0"))
-        .join("");
-      return { ...base, text_sha256: `sha256:${hex}`, text_sha256_error: null };
-    } catch (error) {
-      return {
-        ...base,
-        text_sha256: null,
-        text_sha256_error: `crypto.subtle.digest failed: ${errorMessageLocal(error)}`
-      };
-    }
-  }
-
   function locatorDebug(loc) {
     return JSON.stringify({
       selector: loc.selector || null,
@@ -26414,10 +21442,9 @@ async function performDomActionInPage(request) {
     return String(value).replace(/["\\]/g, "\\$&");
   }
 
-  function actionError(code, detail, readback = null) {
+  function actionError(code, detail) {
     const error = new Error(detail);
     error.code = code;
-    error.readback = readback;
     return error;
   }
 
@@ -26929,315 +21956,37 @@ function normalizeOptionalSessionId(value) {
   return sessionId || null;
 }
 
-function canonicalNavigationUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return null;
-  }
-  try {
-    return new URL(raw).href;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function nextNavigationEventId() {
-  navigationEventSequence += 1;
-  return `${DURABLE_OWNER_WORKER_BOOT_ID}:navigation:${navigationEventSequence}`;
-}
-
-function navigationTabSnapshot(tabId, tab) {
-  return {
-    id: tabId,
-    windowId: Number.isInteger(tab?.windowId)
-      ? tab.windowId
-      : Number.isInteger(tab?.chrome_window_id)
-        ? tab.chrome_window_id
-        : null,
-    url: String(tab?.pendingUrl || tab?.url || ""),
-    title: String(tab?.title || ""),
-    status: String(tab?.status || tab?.ready_state || ""),
-    active: Boolean(tab?.active),
-    highlighted: Boolean(tab?.highlighted),
-    pinned: Boolean(tab?.pinned)
-  };
-}
-
-async function readNavigationTabSnapshot(tabId, fallback = null) {
-  try {
-    return navigationTabSnapshot(tabId, await chrome.tabs.get(tabId));
-  } catch (_error) {
-    return navigationTabSnapshot(tabId, fallback);
-  }
-}
-
-async function postNavigationObservation({
-  event = "tabNavigation",
-  source,
-  tab,
-  details = null,
-  initiator = "page_or_operator",
-  claim = null,
-  correlationVerdict = "unmatched_no_agent_claim",
-  claimStatus = null
-}) {
-  const tabId = Number.isInteger(details?.tabId) ? details.tabId : tab?.id;
-  if (!Number.isInteger(tabId) || tabId < 0) {
+function markAgentNavigation(tabId, claim) {
+  if (!Number.isInteger(tabId) || !claim?.sessionId) {
     return;
   }
-  const qualifiers = Array.isArray(details?.transitionQualifiers)
-    ? details.transitionQualifiers.map(String).sort()
-    : [];
-  await postDaemonMessage({
-    type: "event",
-    event,
-    event_id: nextNavigationEventId(),
-    source: String(source || ""),
-    target_id: targetIdForTabId(tabId),
-    tab_id: tabId,
-    chrome_window_id: Number.isInteger(tab?.windowId) ? tab.windowId : null,
-    url: String(details?.url || tab?.pendingUrl || tab?.url || claim?.requestedUrl || claim?.beforeUrl || ""),
-    title: String(tab?.title || ""),
-    status: String(tab?.status || ""),
-    active: Boolean(tab?.active),
-    highlighted: Boolean(tab?.highlighted),
-    pinned: Boolean(tab?.pinned),
-    initiator,
-    claim_id: claim?.claimId || null,
-    claim_status: claimStatus || claim?.status || null,
-    agent_session_id: claim?.sessionId || null,
-    action: claim?.action || null,
-    requested_url: claim?.requestedUrl || null,
-    before_url: claim?.beforeUrl || null,
-    before_document_id: claim?.beforeDocumentId || null,
-    correlation_verdict: correlationVerdict,
-    frame_id: Number.isSafeInteger(details?.frameId) ? details.frameId : null,
-    parent_frame_id: Number.isSafeInteger(details?.parentFrameId) ? details.parentFrameId : null,
-    document_id: details?.documentId == null ? null : String(details.documentId),
-    parent_document_id: details?.parentDocumentId == null ? null : String(details.parentDocumentId),
-    document_lifecycle: details?.documentLifecycle == null ? null : String(details.documentLifecycle),
-    frame_type: details?.frameType == null ? null : String(details.frameType),
-    transition_type: details?.transitionType == null ? null : String(details.transitionType),
-    transition_qualifiers: qualifiers,
-    navigation_error: details?.error == null ? null : String(details.error),
-    navigation_timestamp_ms: Number.isFinite(details?.timeStamp)
-      ? Math.max(0, Math.floor(details.timeStamp))
-      : null,
-    observed_at_unix_ms: Date.now()
-  });
-}
-
-async function settleAgentNavigationClaim(tabId, status, options = {}) {
-  const claim = agentNavigationClaims.get(tabId);
-  if (!claim) {
-    return null;
-  }
-  if (options.expectedClaimId && claim.claimId !== options.expectedClaimId) {
-    return null;
-  }
-  claim.status = status;
-  claim.terminalAtUnixMs = Date.now();
-  const tab = await readNavigationTabSnapshot(tabId, options.tab || claim.tab);
-  try {
-    await postNavigationObservation({
-      event: "navigationClaim",
-      source: "synapse.navigationClaim",
-      tab,
-      initiator: "agent",
-      claim,
-      correlationVerdict: options.correlationVerdict || `claim_${status}`,
-      claimStatus: status
-    });
-  } catch (error) {
-    claim.status = "terminal_delivery_failed";
-    claim.terminalDeliveryError = errorMessage(error);
-    throw error;
-  }
-  if (claim.expiryTimer) {
-    clearTimeout(claim.expiryTimer);
-  }
-  agentNavigationClaims.delete(tabId);
-  return claim;
-}
-
-async function markAgentNavigation(tabId, claim) {
-  const claimId = String(claim?.claimId || "").trim();
-  const sessionId = String(claim?.sessionId || "").trim();
-  if (!Number.isInteger(tabId) || tabId < 0 || !claimId || !sessionId) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `navigation claim requires exact tab_id, command claim_id, and agent session_id; ` +
-        `tab_id=${String(tabId)} claim_id=${JSON.stringify(claimId)} ` +
-        `session_id_present=${Boolean(sessionId)}; no browser mutation was admitted`
-    );
-  }
-  const existing = agentNavigationClaims.get(tabId);
-  if (existing) {
-    await settleAgentNavigationClaim(tabId, "superseded", {
-      expectedClaimId: existing.claimId,
-      correlationVerdict: `claim_superseded_by_${claimId}`
-    });
-  }
-  const at = Date.now();
-  const record = {
-    claimId,
+  agentNavigationClaims.set(tabId, {
     action: String(claim.action || ""),
     requestedUrl: claim.requestedUrl === null ? null : String(claim.requestedUrl || ""),
-    requestedCanonicalUrl: canonicalNavigationUrl(claim.requestedUrl),
-    beforeUrl: String(claim.beforeUrl || ""),
-    beforeCanonicalUrl: canonicalNavigationUrl(claim.beforeUrl),
-    beforeDocumentId: claim.beforeDocumentId == null ? null : String(claim.beforeDocumentId),
-    sessionId,
-    at,
-    deadlineAtUnixMs: at + AGENT_NAVIGATION_CLAIM_TTL_MS,
-    status: "created",
-    sawExactRequestedBeforeNavigate: false,
-    committedDocumentId: null,
-    committedUrl: null,
-    tab: navigationTabSnapshot(tabId, claim.tab),
-    expiryTimer: null
-  };
-  agentNavigationClaims.set(tabId, record);
-  record.expiryTimer = setTimeout(() => {
-    settleAgentNavigationClaim(tabId, "expired", {
-      expectedClaimId: claimId,
-      correlationVerdict: "claim_ttl_expired_without_terminal_navigation"
-    }).catch((error) => {
-      console.error(`Synapse navigation-claim expiry persistence failed: ${errorMessage(error)}`);
-    });
-  }, AGENT_NAVIGATION_CLAIM_TTL_MS + 25);
-  await postNavigationObservation({
-    event: "navigationClaim",
-    source: "synapse.navigationClaim",
-    tab: record.tab,
-    initiator: "agent",
-    claim: record,
-    correlationVerdict: "claim_created_before_browser_mutation",
-    claimStatus: "created"
+    sessionId: claim.sessionId,
+    at: Date.now()
   });
-  return record;
 }
 
-async function correlateAgentNavigation(tabId, source, url, details = null) {
+function matchingAgentNavigationClaim(tabId, url, status) {
   const claim = agentNavigationClaims.get(tabId);
   if (!claim) {
-    return {
-      claim: null,
-      initiator: "page_or_operator",
-      correlationVerdict: "unmatched_no_agent_claim",
-      terminalStatus: null
-    };
+    return null;
   }
-  if (Date.now() > claim.deadlineAtUnixMs) {
-    await settleAgentNavigationClaim(tabId, "expired", {
-      expectedClaimId: claim.claimId,
-      correlationVerdict: "claim_ttl_expired_before_observed_event"
-    });
-    return {
-      claim: null,
-      initiator: "page_or_operator",
-      correlationVerdict: "unmatched_expired_agent_claim",
-      terminalStatus: null
-    };
+  const ageMs = Date.now() - claim.at;
+  if (ageMs > AGENT_NAVIGATION_CLAIM_TTL_MS) {
+    agentNavigationClaims.delete(tabId);
+    return null;
   }
-  const frameId = Number.isSafeInteger(details?.frameId) ? details.frameId : 0;
-  if (frameId !== 0) {
-    return {
-      claim,
-      initiator: "page_or_operator",
-      correlationVerdict: "unmatched_subframe_outside_top_level_claim",
-      terminalStatus: null
-    };
+  const requestedUrl = claim.requestedUrl || "";
+  const matchesUrl = !requestedUrl || !url || url === requestedUrl || url.startsWith(requestedUrl) || requestedUrl.startsWith(url);
+  if (!matchesUrl) {
+    return null;
   }
-  const canonicalUrl = canonicalNavigationUrl(url);
-  const documentId = details?.documentId == null ? null : String(details.documentId);
-  const transitionType = String(details?.transitionType || "");
-  const qualifiers = Array.isArray(details?.transitionQualifiers)
-    ? details.transitionQualifiers.map(String)
-    : [];
-  const newDocument = Boolean(documentId && documentId !== claim.beforeDocumentId);
-  const exactRequested = Boolean(
-    canonicalUrl && claim.requestedCanonicalUrl && canonicalUrl === claim.requestedCanonicalUrl
-  );
-  let correlated = false;
-  let verdict = "unmatched_active_agent_claim";
-  let initiator = "page_or_operator";
-  let terminalStatus = null;
-
-  if (source === "webNavigation.onBeforeNavigate") {
-    if (["navigate", "open", "setContentSeed"].includes(claim.action) && exactRequested) {
-      claim.sawExactRequestedBeforeNavigate = true;
-      claim.status = "started";
-      correlated = true;
-      verdict = "agent_exact_requested_url_before_navigation";
-    } else {
-      verdict = "claim_pending_unproven_before_navigation";
-    }
-  } else if (source === "webNavigation.onCommitted") {
-    if (["navigate", "open", "setContentSeed"].includes(claim.action)) {
-      const explicitRedirect = claim.sawExactRequestedBeforeNavigate &&
-        qualifiers.some((value) => value === "server_redirect" || value === "client_redirect");
-      correlated = newDocument && (exactRequested || explicitRedirect);
-      verdict = correlated
-        ? exactRequested
-          ? "agent_exact_requested_url_committed_document"
-          : "agent_explicit_redirect_chain_committed_document"
-        : "unmatched_commit_not_in_agent_url_or_redirect_chain";
-    } else if (claim.action === "reload") {
-      correlated = newDocument && transitionType === "reload" &&
-        canonicalUrl === claim.beforeCanonicalUrl;
-      verdict = correlated
-        ? "agent_reload_transition_committed_document"
-        : "unmatched_commit_not_proven_reload_transition";
-    } else if (claim.action === "back" || claim.action === "forward") {
-      correlated = newDocument && qualifiers.includes("forward_back") &&
-        canonicalUrl !== claim.beforeCanonicalUrl;
-      verdict = correlated
-        ? `agent_${claim.action}_history_transition_committed_document`
-        : "unmatched_commit_not_proven_history_transition";
-    }
-    if (correlated) {
-      claim.status = "committed";
-      claim.committedDocumentId = documentId;
-      claim.committedUrl = String(url || "");
-    }
-  } else if (
-    source === "webNavigation.onHistoryStateUpdated" ||
-    source === "webNavigation.onReferenceFragmentUpdated"
-  ) {
-    if (claim.committedDocumentId && documentId === claim.committedDocumentId) {
-      verdict = "within_agent_destination_document_but_not_agent_navigation_trigger";
-    } else {
-      verdict = "unmatched_in_document_transition";
-    }
-  } else if (
-    claim.committedDocumentId && documentId === claim.committedDocumentId
-  ) {
-    correlated = true;
-    verdict = "agent_committed_document_lifecycle";
-    if (source === "webNavigation.onCompleted") {
-      terminalStatus = "completed";
-    } else if (source === "webNavigation.onErrorOccurred") {
-      terminalStatus = "failed";
-    }
-  } else if (source === "tabs.onUpdated") {
-    const currentDocumentId = await mainFrameDocumentIdOrNull(tabId);
-    if (claim.committedDocumentId && currentDocumentId === claim.committedDocumentId) {
-      correlated = true;
-      verdict = "agent_committed_document_tab_update";
-    } else if (claim.sawExactRequestedBeforeNavigate && exactRequested) {
-      correlated = true;
-      verdict = "agent_exact_requested_url_tab_update_pending_commit";
-    } else {
-      verdict = "unmatched_tab_update_active_claim";
-    }
-  } else {
-    verdict = "unmatched_non_navigation_tab_event";
+  if (status === "complete") {
+    agentNavigationClaims.delete(tabId);
   }
-  if (correlated) {
-    initiator = "agent";
-  }
-  return { claim, initiator, correlationVerdict: verdict, terminalStatus };
+  return claim;
 }
 
 async function performHtml5DragDropInPage(request) {
@@ -27393,28 +22142,21 @@ function ensureNetworkEventBuffer(tabId, state = {}) {
     requests: new Map(),
     nextSeq: 0,
     dropped: 0,
-    armedAtUnixMs: now,
-    lastActivityAtUnixMs: now,
-    inFlightRequests: 0,
-    maxInFlightRequests: 0
+    armedAtUnixMs: now
   };
   networkEventBuffers.set(tabId, buffer);
   return { buffer, newlyArmed: true };
 }
 
-function networkBufferForTabId(tabId, { create = false } = {}) {
+function networkBufferForTabId(tabId) {
   if (!Number.isInteger(tabId) || tabId < 0) {
     return null;
   }
-  const existing = networkEventBuffers.get(tabId) || null;
-  if (existing || !create) {
-    return existing;
-  }
-  return ensureNetworkEventBuffer(tabId).buffer;
+  return networkEventBuffers.get(tabId) || null;
 }
 
 function recordWebRequestStarted(details) {
-  const buffer = networkBufferForTabId(details?.tabId, { create: true });
+  const buffer = networkBufferForTabId(details?.tabId);
   if (!buffer) {
     return;
   }
@@ -27423,21 +22165,11 @@ function recordWebRequestStarted(details) {
   entry.method = String(details.method || entry.method || "").toUpperCase() || null;
   entry.resource_type = webRequestResourceTypeToCdp(details.type);
   entry.web_request_type = String(details.type || "");
-  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
-  if (!entry.request_started) {
-    entry.request_started = true;
-    buffer.inFlightRequests += 1;
-    buffer.maxInFlightRequests = Math.max(
-      buffer.maxInFlightRequests,
-      buffer.inFlightRequests
-    );
-  }
   touchNetworkEntry(buffer, entry);
-  entry.started_seq = entry.seq;
 }
 
 function recordWebRequestHeadersReceived(details) {
-  const buffer = networkBufferForTabId(details?.tabId, { create: true });
+  const buffer = networkBufferForTabId(details?.tabId);
   if (!buffer) {
     return;
   }
@@ -27452,38 +22184,11 @@ function recordWebRequestHeadersReceived(details) {
   entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
   entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
   entry.response_headers = headersArrayToObject(details.responseHeaders);
-  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
-  entry.response_seq = entry.seq;
-}
-
-function recordWebRequestRedirect(details) {
-  const buffer = networkBufferForTabId(details?.tabId, { create: true });
-  if (!buffer) {
-    return;
-  }
-  const entry = ensureNetworkEntry(buffer, details);
-  entry.response_received = true;
-  entry.response_url = String(details.url || entry.response_url || entry.url || "");
-  entry.status = Number.isFinite(Number(details.statusCode)) ? Number(details.statusCode) : entry.status;
-  entry.status_text = statusTextFromWebRequest(details.statusLine, entry.status);
-  entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
-  entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
-  entry.response_headers = headersArrayToObject(details.responseHeaders);
-  entry.redirect_url = details.redirectUrl == null ? null : String(details.redirectUrl);
-  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
-  touchNetworkEntry(buffer, entry);
-  entry.response_seq = entry.seq;
-  // Chrome documents one terminal exception: a redirect to data: has no later
-  // onCompleted/onErrorOccurred. Close that request here so network-idle cannot
-  // leak a permanent in-flight count.
-  if (/^data:/i.test(entry.redirect_url || "")) {
-    terminalizeNetworkEntry(buffer, entry, { failed: false });
-  }
 }
 
 function recordWebRequestCompleted(details) {
-  const buffer = networkBufferForTabId(details?.tabId, { create: true });
+  const buffer = networkBufferForTabId(details?.tabId);
   if (!buffer) {
     return;
   }
@@ -27500,14 +22205,11 @@ function recordWebRequestCompleted(details) {
   entry.loading_finished = true;
   entry.loading_failed = false;
   entry.failure_error_text = null;
-  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
-  entry.response_seq = entry.seq;
-  terminalizeNetworkEntry(buffer, entry, { failed: false });
 }
 
 function recordWebRequestFailed(details) {
-  const buffer = networkBufferForTabId(details?.tabId, { create: true });
+  const buffer = networkBufferForTabId(details?.tabId);
   if (!buffer) {
     return;
   }
@@ -27519,24 +22221,7 @@ function recordWebRequestFailed(details) {
   entry.loading_finished = false;
   entry.loading_failed = true;
   entry.failure_error_text = details.error || "webRequest.onErrorOccurred";
-  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
-  terminalizeNetworkEntry(buffer, entry, { failed: true });
-}
-
-function terminalizeNetworkEntry(buffer, entry, { failed }) {
-  if (entry.terminal) {
-    return;
-  }
-  entry.terminal = true;
-  entry.loading_finished = !failed;
-  entry.loading_failed = Boolean(failed);
-  if (entry.request_started) {
-    buffer.inFlightRequests = Math.max(0, buffer.inFlightRequests - 1);
-  }
-  if (!buffer.entries.includes(entry) && buffer.requests.get(entry.request_id) === entry) {
-    buffer.requests.delete(entry.request_id);
-  }
 }
 
 function ensureNetworkEntry(buffer, details) {
@@ -27565,13 +22250,7 @@ function ensureNetworkEntry(buffer, details) {
     encoded_data_length: null,
     loading_finished: false,
     loading_failed: false,
-    failure_error_text: null,
-    request_started: false,
-    started_seq: 0,
-    response_seq: 0,
-    terminal: false,
-    document_id: details?.documentId == null ? null : String(details.documentId),
-    redirect_url: null
+    failure_error_text: null
   };
   buffer.requests.set(requestId, entry);
   pushNetworkEntry(buffer, entry);
@@ -27583,7 +22262,7 @@ function pushNetworkEntry(buffer, entry) {
   while (buffer.entries.length > buffer.capacity) {
     const dropped = buffer.entries.shift();
     buffer.dropped += 1;
-    if (dropped?.terminal && buffer.requests.get(dropped.request_id) === dropped) {
+    if (dropped && buffer.requests.get(dropped.request_id) === dropped) {
       buffer.requests.delete(dropped.request_id);
     }
   }
@@ -27593,7 +22272,6 @@ function touchNetworkEntry(buffer, entry) {
   buffer.nextSeq += 1;
   entry.seq = buffer.nextSeq;
   entry.observed_at_unix_ms = Date.now();
-  buffer.lastActivityAtUnixMs = entry.observed_at_unix_ms;
 }
 
 function webRequestResourceTypeToCdp(type) {
@@ -27673,6 +22351,99 @@ function statusTextFromWebRequest(statusLine, status) {
     return match[1] || "";
   }
   return line;
+}
+
+async function ensureInPageNetworkRecorder(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
+      throw bridgeError(
+        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+        "network waits require chrome.webRequest or chrome.scripting.executeScript"
+      );
+    }
+    return { available: false, reason: "chrome.scripting unavailable" };
+  }
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: installSynapseNetworkRecorderInPage
+    });
+    const first = Array.isArray(injected) ? injected[0]?.result : null;
+    return {
+      available: Boolean(first?.ok),
+      reason: first?.reason || "installed",
+      installed_at_seq: Number(first?.next_seq || 0)
+    };
+  } catch (error) {
+    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
+      throw bridgeError(
+        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+        `network wait recorder injection failed and chrome.webRequest is unavailable: ${errorMessage(error)}`
+      );
+    }
+    return { available: false, reason: errorMessage(error) };
+  }
+}
+
+async function mergeInPageNetworkEvents(tabId, buffer, recorder) {
+  if (!recorder?.available || !chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return;
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: readSynapseNetworkRecorderInPage
+    });
+  } catch (error) {
+    recorder.available = false;
+    recorder.reason = errorMessage(error);
+    return;
+  }
+  const entries = Array.isArray(injected) ? injected.flatMap((item) => item?.result?.entries || []) : [];
+  for (const raw of entries) {
+    mergeInPageNetworkEntry(buffer, raw);
+  }
+}
+
+function mergeInPageNetworkEntry(buffer, raw) {
+  if (!raw || typeof raw !== "object") {
+    return;
+  }
+  const requestId = `page:${String(raw.request_id || "")}`;
+  if (requestId === "page:") {
+    return;
+  }
+  let entry = buffer.requests.get(requestId);
+  if (!entry) {
+    entry = ensureNetworkEntry(buffer, {
+      requestId,
+      url: raw.url,
+      method: raw.method,
+      type: String(raw.resource_type || "").toLowerCase() === "xhr" ? "xmlhttprequest" : "fetch"
+    });
+  }
+  const rawSeq = Number(raw.seq || 0);
+  if (Number(entry.page_recorder_seq || 0) >= rawSeq) {
+    return;
+  }
+  entry.page_recorder_seq = rawSeq;
+  entry.url = raw.url ? String(raw.url) : entry.url;
+  entry.method = raw.method ? String(raw.method).toUpperCase() : entry.method;
+  entry.resource_type = raw.resource_type ? String(raw.resource_type) : entry.resource_type;
+  entry.response_received = Boolean(raw.response_received);
+  entry.response_url = raw.response_url ? String(raw.response_url) : entry.response_url;
+  entry.status = Number.isFinite(Number(raw.status)) ? Number(raw.status) : entry.status;
+  entry.status_text = raw.status_text === undefined || raw.status_text === null ? entry.status_text : String(raw.status_text);
+  entry.loading_finished = Boolean(raw.loading_finished);
+  entry.loading_failed = Boolean(raw.loading_failed);
+  entry.failure_error_text = raw.failure_error_text ? String(raw.failure_error_text) : null;
+  entry.response_headers = null;
+  entry.request_headers = null;
+  entry.response_timing = null;
+  touchNetworkEntry(buffer, entry);
 }
 
 function installSynapseNetworkRecorderInPage() {
@@ -28174,17 +22945,7 @@ function webNavigationTransition(details) {
   return [transitionType, ...qualifiers].filter(Boolean).join("+");
 }
 
-function enqueueNavigationEventObservation(work) {
-  const queued = navigationEventTail.then(work, work);
-  navigationEventTail = queued.catch(() => undefined);
-  return queued;
-}
-
-function postTabNavigationEvent(source, tab) {
-  return enqueueNavigationEventObservation(() => postTabNavigationEventOrdered(source, tab));
-}
-
-async function postTabNavigationEventOrdered(source, tab) {
+async function postTabNavigationEvent(source, tab) {
   if (!tab || typeof tab.id !== "number") {
     return;
   }
@@ -28194,49 +22955,33 @@ async function postTabNavigationEventOrdered(source, tab) {
   }
   const title = String(tab.title || "");
   const status = String(tab.status || "");
-  const correlation = await correlateAgentNavigation(tab.id, source, url, null);
-  await postNavigationObservation({
-    source,
-    tab: { ...tab, title, status },
-    initiator: correlation.initiator,
-    claim: correlation.claim,
-    correlationVerdict: correlation.correlationVerdict
-  });
-}
-
-function postWebNavigationEvent(source, details) {
-  return enqueueNavigationEventObservation(() => postWebNavigationEventOrdered(source, details));
-}
-
-async function postWebNavigationEventOrdered(source, details) {
-  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) {
+  const agentClaim = matchingAgentNavigationClaim(tab.id, url, status);
+  if (agentClaim) {
     return;
   }
-  const tab = await readNavigationTabSnapshot(details.tabId, {
-    url: details.url,
-    status: source === "webNavigation.onCompleted" ? "complete" : "loading"
-  });
-  const correlation = await correlateAgentNavigation(
-    details.tabId,
-    source,
-    String(details.url || tab.url || ""),
-    details
-  );
-  await postNavigationObservation({
-    source,
-    tab,
-    details,
-    initiator: correlation.initiator,
-    claim: correlation.claim,
-    correlationVerdict: correlation.correlationVerdict
-  });
-  if (correlation.terminalStatus && correlation.claim) {
-    await settleAgentNavigationClaim(details.tabId, correlation.terminalStatus, {
-      expectedClaimId: correlation.claim.claimId,
-      correlationVerdict: `claim_${correlation.terminalStatus}_after_${source}`,
-      tab
-    });
+  const key = `${tab.id}\n${url}\n${title}\n${status}`;
+  if (recentNavigationKeys.includes(key)) {
+    return;
   }
+  recentNavigationKeys.push(key);
+  while (recentNavigationKeys.length > MAX_RECENT_NAVIGATION_KEYS) {
+    recentNavigationKeys.shift();
+  }
+  await postDaemonMessage({
+    type: "event",
+    event: "tabNavigation",
+    source,
+    target_id: targetIdForTabId(tab.id),
+    tab_id: tab.id,
+    chrome_window_id: Number.isInteger(tab.windowId) ? tab.windowId : null,
+    url,
+    title,
+    status,
+    active: Boolean(tab.active),
+    highlighted: Boolean(tab.highlighted),
+    pinned: Boolean(tab.pinned),
+    observed_at_unix_ms: Date.now()
+  });
 }
 
 function requiredUrl(url) {
@@ -28717,6 +23462,17 @@ function buildStorageStateFromFrameResults(frames, cookies) {
   };
 }
 
+function normalizeReloadDelay(value) {
+  if (value === undefined || value === null) {
+    return 100;
+  }
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0 || number > 5000) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "reloadDelayMs must be an integer from 0 through 5000");
+  }
+  return number;
+}
+
 function normalizeMaintenanceReconnectPauseMs(value) {
   const number = Number(value);
   if (
@@ -28729,43 +23485,6 @@ function normalizeMaintenanceReconnectPauseMs(value) {
       `pauseMs must be an integer from ${MAINTENANCE_RECONNECT_PAUSE_MIN_MS} ` +
         `through ${MAINTENANCE_RECONNECT_PAUSE_MAX_MS}`
     );
-  }
-  return number;
-}
-
-function normalizeMaintenanceReconnectResumeProbeAfterMs(value, maxRemainingMs) {
-  if (value === undefined || value === null) {
-    return Math.min(
-      MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS,
-      Math.max(MAINTENANCE_RECONNECT_PAUSE_MIN_MS, Number(maxRemainingMs) || 0)
-    );
-  }
-  const number = Number(value);
-  const upperBound = Math.max(
-    MAINTENANCE_RECONNECT_PAUSE_MIN_MS,
-    Number(maxRemainingMs) || MAINTENANCE_RECONNECT_PAUSE_MIN_MS
-  );
-  if (
-    !Number.isInteger(number) ||
-    number < MAINTENANCE_RECONNECT_PAUSE_MIN_MS ||
-    number > upperBound
-  ) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `resumeProbeAfterMs must be an integer from ${MAINTENANCE_RECONNECT_PAUSE_MIN_MS} ` +
-        `through ${upperBound}`
-    );
-  }
-  return number;
-}
-
-function normalizeOptionalPositiveInteger(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number <= 0) {
-    throw bridgeError(ERROR_ATTACH_FAILED, "paused daemon pid must be a positive integer when supplied");
   }
   return number;
 }
@@ -28970,339 +23689,64 @@ function formatDebuggerExceptionDetails(details) {
   return `${String(exceptionText)}${url}${line}${column}`;
 }
 
-function debuggerExceptionDiagnostics(details) {
-  const description = String(
-    details?.exception?.description || details?.exception?.value || details?.text ||
-      "unknown exception"
-  );
-  const firstLine = description.split(/\r?\n/, 1)[0];
-  const className = typeof details?.exception?.className === "string"
-    ? details.exception.className.trim()
-    : "";
-  const separator = firstLine.indexOf(":");
-  const inferredType = separator > 0 ? firstLine.slice(0, separator).trim() : "";
-  const inferredMessage = separator > 0
-    ? firstLine.slice(separator + 1).trim()
-    : firstLine.trim();
-  return {
-    exception_type: (className || inferredType || "JavaScriptException").slice(0, 256),
-    exception_message: inferredMessage.slice(0, 4096),
-    line_number: Number.isInteger(details?.lineNumber) ? details.lineNumber + 1 : null,
-    column_number: Number.isInteger(details?.columnNumber) ? details.columnNumber + 1 : null
-  };
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function captureVisibleTabPendingError(lease) {
-  const ageMs = Math.max(0, Date.now() - (lease.startedAtUnixMs ?? lease.queuedAtUnixMs));
-  const remediation = lease.status === "quarantined_worker_restart"
-    ? "fully restart Chrome so a new browser-session identity proves the prior Chrome API operation cannot still be live"
-    : "wait for this exact lease to settle; do not retry or start a parallel capture";
-  return bridgeError(
-    ERROR_CAPTURE_VISIBLE_TAB_PENDING,
-    "chrome.tabs.captureVisibleTab admission refused because an earlier uncancellable Chrome " +
-      `promise still owns the capture slot; lease_id=${lease.id} status=${lease.status} ` +
-      `age_ms=${ageMs} browser_session_id=${lease.browserSessionId} ` +
-      `worker_boot_id=${lease.workerBootId} tab_id=${lease.tabId} window_id=${lease.windowId} ` +
-      `target_id=${lease.targetId} tile=${lease.tileIndex}/${lease.tileCount} ` +
-      `started_at_unix_ms=${String(lease.startedAtUnixMs ?? "not_started")} ` +
-      `deadline_unix_ms=${lease.deadlineUnixMs} ` +
-      `caller_timed_out_at_unix_ms=${String(lease.callerTimedOutAtUnixMs ?? "none")} ` +
-      `queue_recovered=false remediation=${remediation}`
-  );
-}
-
-async function markCaptureVisibleTabCallerTimedOut(leaseId) {
-  const lease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
-  if (!lease || lease.id !== leaseId) {
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      "captureVisibleTab deadline fired after durable lease identity changed; " +
-        `expected_lease_id=${leaseId} actual_lease_id=${String(lease?.id || "none")}; ` +
-        "the caller outcome is unprovable; inspect operatorPanicReadback before retrying"
-    );
-  }
-  if (lease.callerTimedOutAtUnixMs === null) {
-    lease.callerTimedOutAtUnixMs = Date.now();
-  }
-  try {
-    await persistDurableOwnerLedger();
-  } catch (error) {
-    recordDurableOwnerStateFailure(
-      "persist_capture_visible_tab_caller_deadline",
-      `persist captureVisibleTab caller deadline failed: ${errorMessage(error)}`
-    );
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      "captureVisibleTab caller deadline could not be persisted; " +
-        `lease_id=${leaseId} error=${errorMessage(error)}; ` +
-        "capture remains quarantined in memory and the caller outcome is unprovable"
-    );
-  }
-  return lease.callerTimedOutAtUnixMs;
-}
-
-async function settleCaptureVisibleTabLease(leaseId, outcome, error = null) {
-  const lease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
-  if (!lease || lease.id !== leaseId) {
-    recordDurableOwnerStateFailure(
-      "capture_visible_tab_settlement_identity_lost",
-      `captureVisibleTab raw settlement lost durable lease identity expected=${leaseId} ` +
-        `actual=${String(lease?.id || "none")}`
-    );
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      `${DURABLE_OWNER_STATE_LOAD_ERROR}; refusing to publish a caller result`
-    );
-  }
-  const priorSettlement = DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement;
-  const startedAtUnixMs = lease.startedAtUnixMs ?? lease.queuedAtUnixMs;
-  const settledAtUnixMs = Math.max(Date.now(), startedAtUnixMs);
-  const settlement = {
-    leaseId: lease.id,
-    outcome,
-    workerBootId: lease.workerBootId,
-    tabId: lease.tabId,
-    startedAtUnixMs,
-    settledAtUnixMs,
-    elapsedMs: settledAtUnixMs - startedAtUnixMs,
-    callerTimedOut: lease.callerTimedOutAtUnixMs !== null,
-    errorCode: error?.code ? String(error.code) : null,
-    errorDetail: error ? redactPublicErrorDetail(errorMessage(error)).slice(0, 1024) : null
-  };
-  DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
-  DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = settlement;
-  try {
-    await persistDurableOwnerLedger();
-  } catch (persistError) {
-    DURABLE_OWNER_LEDGER.captureVisibleTabLease = lease;
-    DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = priorSettlement;
-    recordDurableOwnerStateFailure(
-      "persist_capture_visible_tab_raw_settlement",
-      `persist captureVisibleTab raw settlement failed: ${errorMessage(persistError)}`
-    );
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      "captureVisibleTab raw Chrome promise settled, but its durable terminal transition " +
-        `failed; lease_id=${lease.id} outcome=${outcome} ` +
-        `error=${errorMessage(persistError)}; the slot remains quarantined`
-    );
-  }
-  return settlement;
-}
-
 async function captureVisibleTabWithQuota(windowId, options, timeoutMs, context = {}) {
-  await DURABLE_OWNER_STATE_READY;
-  if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
-    throw bridgeError(
-      ERROR_ACTION_TARGET_INVALID,
-      "chrome.tabs.captureVisibleTab refused because its durable lease ledger is unavailable; " +
-        `loaded=${DURABLE_OWNER_STATE_LOADED} ` +
-        `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}`
-    );
-  }
-  if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
-    throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
-  }
-
   const queuedAtMs = Date.now();
-  const requestedTimeoutMs = Math.floor(Number(timeoutMs));
-  if (!Number.isSafeInteger(requestedTimeoutMs) || requestedTimeoutMs <= 0) {
-    throw bridgeError(
-      ERROR_EXTENSION_TIMEOUT,
-      `chrome.tabs.captureVisibleTab received invalid timeout_ms=${String(timeoutMs)}`
-    );
-  }
-  const callerDeadlineMs = queuedAtMs + requestedTimeoutMs;
-  // Reserve a place in the queue synchronously, before the first queue/quota
-  // await. Without this reservation, two callers can both observe an empty
-  // lease, sleep for the same quota interval, and then overwrite each other's
-  // durable admission row. Each reservation resolves only after its raw Chrome
-  // promise and durable terminal transition settle.
-  const priorCaptureQueue = captureVisibleTabQueue.catch(() => undefined);
-  let releaseCaptureQueue;
-  const captureQueueOwnership = new Promise((resolve) => {
-    releaseCaptureQueue = resolve;
-  });
-  captureVisibleTabQueue = priorCaptureQueue.then(() => captureQueueOwnership);
-  let queueReleaseBoundToRawSettlement = false;
-  try {
-    await priorCaptureQueue;
-    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
-      throw bridgeError(
-        ERROR_ACTION_TARGET_INVALID,
-        "chrome.tabs.captureVisibleTab queue admission refused because the durable lease " +
-          `ledger became unavailable while waiting; loaded=${DURABLE_OWNER_STATE_LOADED} ` +
-          `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}; ` +
-          "remediation=fully restart Chrome so a new browser session independently reconciles storage"
-      );
-    }
-    if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
-      throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
-    }
-    const queueWaitMs = Date.now() - queuedAtMs;
-    const quotaWaitMs = Math.max(
+  let queueWaitMs = 0;
+  let quotaWaitMs = 0;
+  let effectiveTimeoutMs = 0;
+  let captureStartedAtMs = 0;
+  let captureElapsedMs = 0;
+  const run = captureVisibleTabQueue.catch(() => undefined).then(async () => {
+    queueWaitMs = Date.now() - queuedAtMs;
+    quotaWaitMs = Math.max(
       0,
       lastCaptureVisibleTabAtMs + CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS - Date.now()
     );
     if (quotaWaitMs > 0) {
       await sleep(quotaWaitMs);
     }
-    let effectiveTimeoutMs = callerDeadlineMs - Date.now();
-    if (effectiveTimeoutMs <= 0) {
+    effectiveTimeoutMs = Math.floor(Number(timeoutMs) - queueWaitMs - quotaWaitMs);
+    if (!Number.isFinite(effectiveTimeoutMs) || effectiveTimeoutMs <= 0) {
       throw bridgeError(
         ERROR_EXTENSION_TIMEOUT,
-        "chrome.tabs.captureVisibleTab was not started because queue/quota wait exhausted the " +
-          `screenshot deadline; ${formatPageScreenshotCaptureContext(context)} ` +
-          `timeout_ms=${requestedTimeoutMs} queue_wait_ms=${queueWaitMs} ` +
-          `quota_wait_ms=${quotaWaitMs} queue_recovered=true`
-      );
-    }
-
-    const lease = {
-      id: typeof globalThis.crypto?.randomUUID === "function"
-        ? globalThis.crypto.randomUUID()
-        : `capture-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      browserSessionId: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
-      workerBootId: DURABLE_OWNER_WORKER_BOOT_ID,
-      tabId: Number(context.tabId),
-      windowId: Number(windowId),
-      targetId: String(context.targetId || ""),
-      tileIndex: Number(context.tileIndex),
-      tileCount: Number(context.tileCount),
-      requestedTimeoutMs,
-      effectiveTimeoutMs,
-      queuedAtUnixMs: queuedAtMs,
-      startedAtUnixMs: null,
-      deadlineUnixMs: callerDeadlineMs,
-      callerTimedOutAtUnixMs: null,
-      status: "admitted"
-    };
-    normalizeStoredCaptureVisibleTabLease(lease);
-    DURABLE_OWNER_LEDGER.captureVisibleTabLease = lease;
-    try {
-      await persistDurableOwnerLedger();
-    } catch (error) {
-      DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
-      recordDurableOwnerStateFailure(
-        "persist_capture_visible_tab_durable_admission",
-        `persist captureVisibleTab durable admission failed: ${errorMessage(error)}`
-      );
-      throw bridgeError(
-        ERROR_ACTION_TARGET_INVALID,
-        "chrome.tabs.captureVisibleTab was not started because durable admission could not " +
-          `be proven; lease_id=${lease.id} raw_promise_started=false ` +
-          `error=${errorMessage(error)}; remediation=fully restart Chrome so the next browser ` +
-          "session independently reconciles any ambiguous storage row before retrying"
-      );
-    }
-
-    effectiveTimeoutMs = callerDeadlineMs - Date.now();
-    if (effectiveTimeoutMs <= 0) {
-      await settleCaptureVisibleTabLease(
-        lease.id,
-        "rejected",
-        bridgeError(ERROR_EXTENSION_TIMEOUT, "durable lease persistence exhausted deadline")
-      );
-      throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        "chrome.tabs.captureVisibleTab was not started because durable admission exhausted the " +
-          `screenshot deadline; lease_id=${lease.id} ` +
-          `${formatPageScreenshotCaptureContext(context)} timeout_ms=${requestedTimeoutMs} ` +
+        "chrome.tabs.captureVisibleTab was not started because queue/quota wait exhausted the screenshot deadline; " +
+          `${formatPageScreenshotCaptureContext(context)} timeout_ms=${timeoutMs} ` +
           `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} queue_recovered=true`
       );
     }
-
-    lease.startedAtUnixMs = Date.now();
-    lease.effectiveTimeoutMs = callerDeadlineMs - lease.startedAtUnixMs;
-    lease.status = "active";
-    lastCaptureVisibleTabAtMs = lease.startedAtUnixMs;
-    let rawPromise;
+    captureStartedAtMs = Date.now();
     try {
-      rawPromise = chrome.tabs.captureVisibleTab(windowId, options);
-    } catch (error) {
-      await settleCaptureVisibleTabLease(lease.id, "rejected", error);
-      throw error;
-    }
-    const activeLeasePersisted = persistDurableOwnerLedger();
-    const settlementPromise = rawPromise.then(
-      async (result) => {
-        await activeLeasePersisted;
-        await settleCaptureVisibleTabLease(lease.id, "fulfilled");
-        return result;
-      },
-      async (error) => {
-        await activeLeasePersisted;
-        await settleCaptureVisibleTabLease(lease.id, "rejected", error);
-        throw error;
-      }
-    );
-    settlementPromise.then(releaseCaptureQueue, releaseCaptureQueue);
-    queueReleaseBoundToRawSettlement = true;
-    try {
-      await activeLeasePersisted;
-    } catch (error) {
-      recordDurableOwnerStateFailure(
-        "persist_capture_visible_tab_active_lease",
-        `persist captureVisibleTab active lease failed: ${errorMessage(error)}`
+      return await withTimeout(
+        chrome.tabs.captureVisibleTab(windowId, options),
+        effectiveTimeoutMs,
+        "chrome.tabs.captureVisibleTab"
       );
-      throw bridgeError(
-        ERROR_ACTION_TARGET_INVALID,
-        "chrome.tabs.captureVisibleTab raw promise started, but its active durable lease could " +
-          `not be proven; lease_id=${lease.id} error=${errorMessage(error)}; ` +
-          "the queue remains bound to the raw promise settlement and the bridge is fail-closed; " +
-          "remediation=fully restart Chrome after this call returns"
-      );
-    }
-
-    let callerTimeoutTriggered = false;
-    let callerTimeoutCompletion = null;
-    let timeoutId = null;
-    const timeoutPromise = new Promise((_, reject) => {
-      const remainingMs = Math.max(0, callerDeadlineMs - Date.now());
-      timeoutId = setTimeout(() => {
-        callerTimeoutTriggered = true;
-        callerTimeoutCompletion = markCaptureVisibleTabCallerTimedOut(lease.id)
-          .then((timedOutAtUnixMs) => bridgeError(
-            ERROR_EXTENSION_TIMEOUT,
-            "chrome.tabs.captureVisibleTab did not settle before the screenshot command " +
-              `deadline; lease_id=${lease.id} ${formatPageScreenshotCaptureContext(context)} ` +
-              `timeout_ms=${requestedTimeoutMs} effective_timeout_ms=${lease.effectiveTimeoutMs} ` +
-              `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} ` +
-              `capture_elapsed_ms=${Math.max(0, timedOutAtUnixMs - lease.startedAtUnixMs)} ` +
-              "queue_recovered=false late_fulfillment_discarded=true"
-          ));
-        callerTimeoutCompletion.then(reject, reject);
-      }, remainingMs);
-    });
-    const callerSettlement = settlementPromise.then(
-      async (result) => {
-        if (callerTimeoutTriggered) {
-          throw await callerTimeoutCompletion;
-        }
-        return result;
-      },
-      async (error) => {
-        if (callerTimeoutTriggered) {
-          throw await callerTimeoutCompletion;
-        }
-        throw error;
-      }
-    );
-    try {
-      return await Promise.race([callerSettlement, timeoutPromise]);
     } finally {
-      if (timeoutId !== null && !callerTimeoutTriggered) {
-        clearTimeout(timeoutId);
-      }
+      captureElapsedMs = Date.now() - captureStartedAtMs;
+      lastCaptureVisibleTabAtMs = Date.now();
     }
-  } finally {
-    if (!queueReleaseBoundToRawSettlement) {
-      releaseCaptureQueue();
+  });
+  captureVisibleTabQueue = run.catch(() => undefined);
+  try {
+    return await run;
+  } catch (error) {
+    const detail = errorMessage(error);
+    if (detail.includes("timed out after")) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        "chrome.tabs.captureVisibleTab did not settle before the screenshot command deadline; " +
+          `${formatPageScreenshotCaptureContext(context)} ` +
+          `timeout_ms=${timeoutMs} effective_timeout_ms=${effectiveTimeoutMs} ` +
+          `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} ` +
+          `capture_elapsed_ms=${captureElapsedMs || Math.max(0, Date.now() - captureStartedAtMs)} ` +
+          `queue_recovered=true`
+      );
     }
+    throw error;
   }
 }
 
@@ -29317,325 +23761,20 @@ function formatPageScreenshotCaptureContext(context) {
   ].join(" ");
 }
 
-async function commandTerminalPayload(command, ok, result, error) {
-  const id = String(command?.id || "").trim();
-  const kind = String(command?.kind || "").trim();
-  const response = { id, ok, result: result === undefined ? null : result, error };
-  let payloadJson = JSON.stringify(response);
-  let payloadBytes = new TextEncoder().encode(payloadJson).byteLength;
-  if (payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
-    response.ok = false;
-    response.result = null;
-    response.error = {
-      code: ERROR_RESPONSE_TOO_LARGE,
-      detail:
-        `Chrome executed command ${kind} but its serialized terminal response exceeded the ` +
-        `bounded WebSocket payload budget; actual_bytes=${payloadBytes} ` +
-        `limit_bytes=${COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES}; result_discarded=true; ` +
-        "reduce the requested result at the page boundary"
-    };
-    payloadJson = JSON.stringify(response);
-    payloadBytes = new TextEncoder().encode(payloadJson).byteLength;
-  }
-  if (payloadBytes <= 0 || payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
-    throw bridgeError(
-      ERROR_RESPONSE_TOO_LARGE,
-      `command terminal could not fit its typed oversize diagnostic; command_id=${id} ` +
-        `payload_bytes=${payloadBytes} limit_bytes=${COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES}`
-    );
-  }
-  return { payloadJson, payloadBytes, payloadSha256: await sha256HexText(payloadJson) };
-}
-
-function commandTerminalWireEntry(entry) {
-  return {
-    type: "command_terminal",
-    protocol_version: entry.protocolVersion,
-    original_host_id: entry.originalHostId,
-    browser_session_id: entry.browserSessionId,
-    command_id: entry.commandId,
-    command_kind: entry.commandKind,
-    terminal_sequence: entry.terminalSequence,
-    payload_json: entry.payloadJson,
-    payload_sha256: entry.payloadSha256,
-    payload_bytes: entry.payloadBytes,
-    created_at_unix_ms: entry.createdAtUnixMs,
-    worker_boot_id: entry.workerBootId
-  };
-}
-
-function sendCommandTerminal(socket, entry) {
-  if (webSocket !== socket || socket.readyState !== WebSocket.OPEN) {
-    throw bridgeError(
-      ERROR_DAEMON_UNAVAILABLE,
-      `command terminal cannot send on a non-open authoritative WebSocket; ` +
-        `command_id=${entry.commandId} ready_state=${String(socket?.readyState ?? "missing")}`
-    );
-  }
-  const serialized = JSON.stringify(commandTerminalWireEntry(entry));
-  const wireBytes = new TextEncoder().encode(serialized).byteLength;
-  if (wireBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
-    throw bridgeError(
-      ERROR_RESPONSE_TOO_LARGE,
-      `command terminal envelope exceeds the server WebSocket bound; command_id=${entry.commandId} ` +
-        `wire_bytes=${wireBytes} limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}`
-    );
-  }
-  socket.send(serialized);
-}
-
-function sendCommandDiagnostic(socket, envelope) {
-  if (webSocket !== socket || socket.readyState !== WebSocket.OPEN) {
-    throw bridgeError(
-      ERROR_DAEMON_UNAVAILABLE,
-      `read-only command diagnostic cannot send on a non-open authoritative WebSocket; ` +
-        `command_id=${envelope.command_id} ready_state=${String(socket?.readyState ?? "missing")}`
-    );
-  }
-  const serialized = JSON.stringify(envelope);
-  const wireBytes = new TextEncoder().encode(serialized).byteLength;
-  if (wireBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
-    throw bridgeError(
-      ERROR_RESPONSE_TOO_LARGE,
-      `read-only command diagnostic envelope exceeds the server WebSocket bound; ` +
-        `command_id=${envelope.command_id} wire_bytes=${wireBytes} ` +
-        `limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}`
-    );
-  }
-  socket.send(serialized);
-}
-
-async function postReadOnlyOwnerStateDiagnostic(command, ok, result, error) {
-  const id = String(command?.id || "").trim();
-  const kind = String(command?.kind || "").trim();
-  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
-  const loadError = String(DURABLE_OWNER_STATE_LOAD_ERROR || "").trim();
-  if (kind !== "operatorPanicReadback" || !id || !originalHostId || !loadError ||
-      !DURABLE_OWNER_WORKER_BOOT_ID) {
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `read-only owner-state diagnostic admission is incomplete; command_id=${id || "missing"} ` +
-        `command_kind=${kind || "missing"} original_host_id=${originalHostId || "missing"} ` +
-        `load_error_present=${Boolean(loadError)} worker_boot_id_present=${Boolean(DURABLE_OWNER_WORKER_BOOT_ID)}`
-    );
-  }
-  const loadErrorBytes = new TextEncoder().encode(loadError).byteLength;
-  const loadErrorSha256 = await sha256HexText(loadError);
-  const diagnosticResult = result && typeof result === "object" && !Array.isArray(result)
-    ? {
-        ...result,
-        diagnostic_transport: {
-          kind: "operator_panic_readback",
-          durability: "unavailable",
-          persistence: "not_attempted",
-          durable_state_load_error_sha256: loadErrorSha256,
-          durable_state_load_error_bytes: loadErrorBytes
-        }
-      }
-    : result;
-  const payload = await commandTerminalPayload(command, ok, diagnosticResult, error);
-  sendCommandDiagnostic(webSocket, {
-    type: "command_diagnostic",
-    protocol_version: PROTOCOL_VERSION,
-    original_host_id: originalHostId,
-    command_id: id,
-    command_kind: kind,
-    durability: "unavailable",
-    payload_json: payload.payloadJson,
-    payload_sha256: payload.payloadSha256,
-    payload_bytes: payload.payloadBytes,
-    durable_state_load_error: loadError,
-    durable_state_load_error_sha256: loadErrorSha256,
-    durable_state_load_error_bytes: loadErrorBytes,
-    created_at_unix_ms: Date.now(),
-    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID
+async function postResponse(id, ok, result, error) {
+  await postDaemonMessage({
+    type: "response",
+    id,
+    ok,
+    result,
+    error
   });
-}
-
-async function flushCommandTerminalOutbox(socket) {
-  await DURABLE_OWNER_STATE_READY;
-  for (const entry of DURABLE_OWNER_LEDGER.commandTerminalOutbox) {
-    sendCommandTerminal(socket, entry);
-  }
-}
-
-function waitForCommandTerminalAck(entry) {
-  const existing = COMMAND_TERMINAL_ACK_WAITERS.get(entry.commandId);
-  if (existing) {
-    return existing.promise;
-  }
-  let resolvePromise;
-  let rejectPromise;
-  const promise = new Promise((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  const timeoutId = setTimeout(() => {
-    const current = COMMAND_TERMINAL_ACK_WAITERS.get(entry.commandId);
-    if (current?.entry.payloadSha256 === entry.payloadSha256) {
-      COMMAND_TERMINAL_ACK_WAITERS.delete(entry.commandId);
-      rejectPromise(bridgeError(
-        ERROR_DAEMON_UNAVAILABLE,
-        `daemon did not acknowledge the durable command terminal before timeout; ` +
-          `command_id=${entry.commandId} terminal_sequence=${entry.terminalSequence} ` +
-          `payload_sha256=${entry.payloadSha256} timeout_ms=${COMMAND_TERMINAL_ACK_TIMEOUT_MS}; ` +
-          "the terminal remains in chrome.storage.local and only that terminal may be replayed"
-      ));
-    }
-  }, COMMAND_TERMINAL_ACK_TIMEOUT_MS);
-  COMMAND_TERMINAL_ACK_WAITERS.set(entry.commandId, {
-    entry,
-    promise,
-    resolve: resolvePromise,
-    reject: rejectPromise,
-    timeoutId
-  });
-  return promise;
-}
-
-async function acknowledgeCommandTerminal(message) {
-  await DURABLE_OWNER_STATE_READY;
-  const commandId = String(message?.command_id || "").trim();
-  const terminalSequence = Number(message?.terminal_sequence);
-  const payloadSha256 = String(message?.payload_sha256 || "").toLowerCase();
-  const payloadBytes = Number(message?.payload_bytes);
-  const daemonHostId = String(message?.host_id || "").trim();
-  const index = DURABLE_OWNER_LEDGER.commandTerminalOutbox.findIndex(
-    (entry) => entry.commandId === commandId
-  );
-  if (index < 0) {
-    const last = DURABLE_OWNER_LEDGER.lastCommandTerminalAck;
-    if (last && last.commandId === commandId && last.terminalSequence === terminalSequence &&
-        last.payloadSha256 === payloadSha256 && last.payloadBytes === payloadBytes) {
-      return;
-    }
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `daemon acknowledged an unknown command terminal; command_id=${commandId || "missing"}`
-    );
-  }
-  const entry = DURABLE_OWNER_LEDGER.commandTerminalOutbox[index];
-  if (entry.terminalSequence !== terminalSequence || entry.payloadSha256 !== payloadSha256 ||
-      entry.payloadBytes !== payloadBytes || !daemonHostId) {
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `daemon command-terminal acknowledgement contradicted durable storage; ` +
-        `command_id=${commandId} expected_sequence=${entry.terminalSequence} ` +
-        `actual_sequence=${String(terminalSequence)} expected_sha256=${entry.payloadSha256} ` +
-        `actual_sha256=${payloadSha256 || "missing"} expected_bytes=${entry.payloadBytes} ` +
-        `actual_bytes=${String(payloadBytes)}`
-    );
-  }
-  const priorRevision = DURABLE_OWNER_LEDGER.revision;
-  const priorLastAck = DURABLE_OWNER_LEDGER.lastCommandTerminalAck;
-  const priorInFlightMutation = DURABLE_OWNER_LEDGER.inFlightMutation;
-  const priorRuntimeEnabled = DURABLE_MUTATION_OWNERS_ENABLED;
-  const priorLedgerEnabled = DURABLE_OWNER_LEDGER.enabled;
-  const priorUnresolvedCount = UNRESOLVED_WORKER_RESTART_MUTATION_COUNT;
-  DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 1);
-  DURABLE_OWNER_LEDGER.lastCommandTerminalAck = {
-    commandId,
-    terminalSequence,
-    payloadSha256,
-    payloadBytes,
-    daemonHostId,
-    acknowledgedAtUnixMs: Date.now()
-  };
-  if (DURABLE_OWNER_LEDGER.inFlightMutation?.id === commandId) {
-    DURABLE_OWNER_LEDGER.inFlightMutation = null;
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
-  }
-  if (DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
-      DURABLE_OWNER_LEDGER.disableSequence === 0 &&
-      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0) {
-    DURABLE_MUTATION_OWNERS_ENABLED = true;
-  }
-  try {
-    await persistDurableOwnerLedger({ mergeLiveOwners: true });
-  } catch (error) {
-    DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 0, entry);
-    DURABLE_OWNER_LEDGER.lastCommandTerminalAck = priorLastAck;
-    DURABLE_OWNER_LEDGER.inFlightMutation = priorInFlightMutation;
-    DURABLE_OWNER_LEDGER.revision = priorRevision;
-    DURABLE_OWNER_LEDGER.enabled = priorLedgerEnabled;
-    DURABLE_MUTATION_OWNERS_ENABLED = priorRuntimeEnabled;
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = priorUnresolvedCount;
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `daemon acknowledged command ${commandId}, but chrome.storage.local could not persist ` +
-        `the matching acknowledgement; payload_sha256=${payloadSha256} ` +
-        `storage_error=${errorMessage(error)}; the durable terminal remains pending for exact replay`
-    );
-  }
-  const waiter = COMMAND_TERMINAL_ACK_WAITERS.get(commandId);
-  if (waiter && waiter.entry.terminalSequence === terminalSequence &&
-      waiter.entry.payloadSha256 === payloadSha256) {
-    clearTimeout(waiter.timeoutId);
-    COMMAND_TERMINAL_ACK_WAITERS.delete(commandId);
-    waiter.resolve(DURABLE_OWNER_LEDGER.lastCommandTerminalAck);
-  }
-}
-
-async function postResponse(command, ok, result, error) {
-  await DURABLE_OWNER_STATE_READY;
-  const id = String(command?.id || "").trim();
-  const kind = String(command?.kind || "").trim();
-  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
-  if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
-    if (kind === "operatorPanicReadback") {
-      await postReadOnlyOwnerStateDiagnostic(command, ok, result, error);
-      return;
-    }
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `command terminal persistence is unavailable; command_id=${id || "missing"} ` +
-        `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}`
-    );
-  }
-  if (DURABLE_OWNER_LEDGER.commandTerminalOutbox.length >=
-      COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES) {
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `durable command terminal outbox is full; entries=${DURABLE_OWNER_LEDGER.commandTerminalOutbox.length} ` +
-        `limit=${COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES}`
-    );
-  }
-  if (!id || !kind || !originalHostId || !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) {
-    throw bridgeError(
-      ERROR_TERMINAL_PROTOCOL,
-      `command terminal ownership is incomplete; command_id=${id || "missing"} ` +
-        `command_kind=${kind || "missing"} original_host_id=${originalHostId || "missing"} ` +
-        `browser_session_id=${DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID || "missing"}`
-    );
-  }
-  const payload = await commandTerminalPayload(command, ok, result, error);
-  const entry = {
-    protocolVersion: PROTOCOL_VERSION,
-    originalHostId,
-    browserSessionId: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
-    commandId: id,
-    commandKind: kind,
-    terminalSequence: ++DURABLE_OWNER_LEDGER.commandTerminalSequence,
-    payloadJson: payload.payloadJson,
-    payloadSha256: payload.payloadSha256,
-    payloadBytes: payload.payloadBytes,
-    createdAtUnixMs: Date.now(),
-    workerBootId: DURABLE_OWNER_WORKER_BOOT_ID
-  };
-  DURABLE_OWNER_LEDGER.commandTerminalOutbox.push(entry);
-  await persistDurableOwnerLedger({ mergeLiveOwners: true });
-  const ack = waitForCommandTerminalAck(entry);
-  sendCommandTerminal(webSocket, entry);
-  await ack;
 }
 
 async function postDaemonMessage(message) {
   if (!hostId) {
-    throw bridgeError(
-      ERROR_DAEMON_UNAVAILABLE,
-      `Synapse daemon bridge has no registered host for message_type=${String(message?.type || "missing")}; ` +
-        "the event was not accepted or reported as delivered"
-    );
+    console.warn("Synapse daemon bridge unavailable; message dropped");
+    return;
   }
   try {
     await daemonFetchJson("/chrome-debugger/native/message", {
@@ -29646,23 +23785,10 @@ async function postDaemonMessage(message) {
       }
     });
   } catch (error) {
-    const status = Number(error?.status);
-    const hasHttpStatus = Number.isInteger(status) && status >= 100 && status <= 599;
-    const requestWasRejected =
-      error?.code === ERROR_MESSAGE_BODY_EXCEEDS_LIMIT ||
-      (hasHttpStatus && status >= 400 && status < 500 && status !== 401 && status !== 403);
-    if (requestWasRejected) {
-      console.error(
-        "Synapse daemon rejected one direct message while the command WebSocket " +
-          `remained authoritative: status=${String(error?.status ?? "none")} ` +
-          `code=${String(error?.code || "none")} detail=${errorMessage(error)}`
-      );
-    } else {
-      scheduleReconnect(
-        `direct daemon message failed: ${errorMessage(error)}`,
-        ERROR_DAEMON_UNAVAILABLE
-      );
-    }
+    scheduleReconnect(
+      `direct daemon message failed: ${errorMessage(error)}`,
+      ERROR_DAEMON_UNAVAILABLE
+    );
     throw error;
   }
 }
@@ -29673,11 +23799,9 @@ async function daemonFetchJson(path, options = {}) {
     cache: "no-store",
     headers: {}
   };
-  const forceRegisterToken =
-    options.forceRegisterToken === true ||
-    path === "/chrome-debugger/native/register" ||
-    path === "/chrome-debugger/native/reconnect-probe";
-  if (forceRegisterToken) {
+  if (bridgeToken) {
+    init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
+  } else if (path === "/chrome-debugger/native/register") {
     if (!BRIDGE_REGISTER_TOKEN) {
       throw bridgeError(
         ERROR_DAEMON_UNAVAILABLE,
@@ -29685,30 +23809,10 @@ async function daemonFetchJson(path, options = {}) {
       );
     }
     init.headers[BRIDGE_REGISTER_TOKEN_HEADER] = BRIDGE_REGISTER_TOKEN;
-  } else if (bridgeToken) {
-    init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
   }
   if (Object.prototype.hasOwnProperty.call(options, "body")) {
     init.headers["Content-Type"] = "application/json";
-    const serializedBody = JSON.stringify(options.body);
-    if (path === "/chrome-debugger/native/message") {
-      if (typeof TextEncoder !== "function") {
-        throw bridgeError(
-          ERROR_MESSAGE_BODY_EXCEEDS_LIMIT,
-          "direct Chrome bridge cannot prove the native-message HTTP body length because TextEncoder is unavailable"
-        );
-      }
-      const bodyBytes = new TextEncoder().encode(serializedBody).byteLength;
-      if (bodyBytes > NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES) {
-        throw bridgeError(
-          ERROR_MESSAGE_BODY_EXCEEDS_LIMIT,
-          "direct Chrome bridge refused an event HTTP body before fetch: " +
-            `body_bytes=${bodyBytes} limit_bytes=${NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES}; ` +
-            "remediation=bound the non-command event; command terminals use the authenticated WebSocket"
-        );
-      }
-    }
-    init.body = serializedBody;
+    init.body = JSON.stringify(options.body);
   }
   const response = await fetch(`${DAEMON_BASE_URL}${path}`, init);
   const text = await response.text();
@@ -29716,27 +23820,19 @@ async function daemonFetchJson(path, options = {}) {
   if (text) {
     try {
       value = JSON.parse(text);
-    } catch (parseError) {
-      if (response.ok) {
-        throw bridgeError(
-          ERROR_DAEMON_UNAVAILABLE,
-          `daemon ${init.method} ${path} returned non-JSON success status=${response.status} ` +
-            `body=${JSON.stringify(text.slice(0, 512))} parse_error=${errorMessage(parseError)}`
-        );
-      }
+    } catch (_) {
+      throw new Error(
+        `daemon ${init.method} ${path} returned non-JSON status=${response.status} body=${JSON.stringify(text.slice(0, 512))}`
+      );
     }
   }
   if (!response.ok) {
-    const code = typeof value?.code === "string" && value.code
-      ? value.code
-      : (response.status === 413
-          ? ERROR_MESSAGE_BODY_EXCEEDS_LIMIT
-          : ERROR_DAEMON_UNAVAILABLE);
-    const error = bridgeError(
-      code,
-      `daemon ${init.method} ${path} failed status=${response.status} ` +
-        `body=${JSON.stringify(value ?? text.slice(0, 512))}`
+    const error = new Error(
+      `daemon ${init.method} ${path} failed status=${response.status} body=${JSON.stringify(value ?? text)}`
     );
+    if (value?.code) {
+      error.code = value.code;
+    }
     error.status = response.status;
     error.responseBody = value ?? text;
     throw error;
@@ -29744,65 +23840,17 @@ async function daemonFetchJson(path, options = {}) {
   return value;
 }
 
-function bridgeError(code, detail, diagnostics = null) {
+function bridgeError(code, detail) {
   const error = new Error(detail);
   error.code = code;
-  if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
-    error.diagnostics = diagnostics;
-  }
   return error;
 }
 
-function redactPublicErrorDetail(detail) {
-  let text = String(detail || "");
-  text = text.replace(
-    /(Cannot access contents of url\s+["'])([^"']+)(["'])/gi,
-    (_match, prefix, url, suffix) => `${prefix}${diagnosticUrl(url)}${suffix}`
-  );
-  text = text.replace(
-    /\b(?:https?|data|javascript|file|blob|filesystem|mailto|view-source):[^\s"')]+/gi,
-    (url) => diagnosticUrl(url)
-  );
-  return text;
-}
-
 function errorPayload(error) {
-  const receivedCode = typeof error?.code === "string" && error.code.trim()
-    ? error.code.trim()
-    : null;
-  const originalDetail = redactPublicErrorDetail(errorMessage(error));
-  if (!receivedCode || !PUBLIC_COMMAND_ERROR_CODE_SET.has(receivedCode)) {
-    return {
-      code: ERROR_CODE_CONTRACT_VIOLATION,
-      detail:
-        "Chrome bridge produced an unregistered command error code; " +
-        `received_code=${JSON.stringify(receivedCode)} ` +
-        `original_detail=${JSON.stringify(originalDetail)}; ` +
-        "remediation=register the exact machine code in PUBLIC_COMMAND_ERROR_CODES, " +
-        "TRUSTED_EXTENSION_ERROR_CODES, and synapse_core::error_codes in one change, " +
-        "then bump/redeploy the bridge build identity"
-    };
-  }
-  const diagnostics = error?.diagnostics;
-  const payload = {
-    code: receivedCode,
-    detail: originalDetail
+  return {
+    code: error?.code || ERROR_ATTACH_FAILED,
+    detail: errorMessage(error)
   };
-  if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
-    payload.diagnostics = {
-      exception_type: String(diagnostics.exception_type || "JavaScriptException").slice(0, 256),
-      exception_message: redactPublicErrorDetail(
-        String(diagnostics.exception_message || "unknown exception")
-      ).slice(0, 4096),
-      line_number: Number.isInteger(diagnostics.line_number)
-        ? diagnostics.line_number
-        : null,
-      column_number: Number.isInteger(diagnostics.column_number)
-        ? diagnostics.column_number
-        : null
-    };
-  }
-  return payload;
 }
 
 function errorMessage(error) {

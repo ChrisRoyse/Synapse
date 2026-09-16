@@ -1,0 +1,91 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.luanti.minetest.signed"
+package_version = "0.1.0"
+profile_id = "luanti.minetest"
+profile_version = "1.0.0"
+created_at = "2026-05-27T11:30:00Z"
+
+[author]
+name = "Synapse Agent"
+contact = "synthetic@example.invalid"
+attribution = "Synthetic signed Luanti benchmark package fixture for Synapse issue #459."
+
+[source]
+kind = "synthetic_fixture"
+uri = "https://github.com/ChrisRoyse/Synapse"
+revision = "m5-r05-signed-fixture"
+built_by = "codex"
+generated_by = "synapse-profile-package-manifest-v1"
+
+[[targets]]
+target_id = "luanti.minetest"
+target_kind = "game"
+app_id = "luanti"
+process_name = "luanti.exe"
+title_regex = "^Luanti 5\\.16\\.[0-9]+ \\[(Singleplayer|Multiplayer)\\].*"
+app_version = "5.16.1"
+
+[assumptions]
+os = "windows"
+synapse_schema_version = 1
+benchmark_ids = ["luanti.minetest"]
+
+[assumptions.display]
+min_width = 1280
+min_height = 720
+dpi_scale_min = 1.0
+dpi_scale_max = 2.0
+
+[input]
+backends = ["software", "vigem"]
+
+
+[[input.models]]
+id = "minecraft_like_local_world_v0"
+version = "0.1.0"
+digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[permissions]
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+use_scope = "operator_owned_test"
+
+[permissions.execution]
+local_only = true
+remote_server_allowed = false
+
+[permissions.contribution]
+export_allowed = true
+share_audit_allowed = false
+
+[[changelog]]
+version = "0.1.0"
+at = "2026-05-27T11:30:00Z"
+summary = "Initial signed synthetic Luanti package for trust verification."
+
+[hashes]
+profile_toml_sha256 = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+package_sha256 = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[hashes.assets]
+"crates/synapse-profiles/tests/fixtures/profile_registry/luanti_minetest_world/world.mt" = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+[files]
+profile_toml = "crates/synapse-profiles/profiles/luanti.minetest.toml"
+assets = ["crates/synapse-profiles/tests/fixtures/profile_registry/luanti_minetest_world/world.mt"]
+
+[trust]
+policy = "signed_required"
+required_signers = ["synapse.fixture.signer"]
+
+[[signatures]]
+signer_id = "synapse.fixture.signer"
+key_id = "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c"
+algorithm = "ed25519"
+signature = "ed25519:2f11a88b7ff47c374123b9bb5781776f1804ccdddc68b6da5a7071ea2cc4a2397cfbea97683e48b799cfbd56b6441f10529f5655841c213ac69bdedd43cd8a01"
+
+[metadata]
+registry_family = "profile-registry/audit-data"
+quality_signal = "profile_quality.luanti.minetest"
+local_registry_row = "profile_registry/v1/package/profile.luanti.minetest.signed/0.1.0"

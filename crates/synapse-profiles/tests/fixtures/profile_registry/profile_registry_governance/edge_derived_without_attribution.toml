@@ -1,0 +1,28 @@
+schema_version = 1
+kind = "profile_package"
+package_id = "profile.synthetic.edge.derived_without_attribution"
+package_version = "0.1.0"
+profile_id = "synthetic.edge.derived_without_attribution"
+profile_version = "1.0.0"
+license_spdx = "MIT OR Apache-2.0"
+contribution_terms = "DCO-1.1"
+created_at = "2026-05-27T00:30:00Z"
+revoked = false
+
+[provenance]
+source_kind = "derived_profile"
+source_uri = "https://github.com/ChrisRoyse/Synapse"
+source_commit = "synthetic-fixture"
+
+[[provenance.parents]]
+package_id = "profile.synthetic.governance"
+package_version = "0.1.0"
+profile_id = "synthetic.governance"
+profile_version = "1.0.0"
+relationship = "derived_from"
+
+[expected_policy]
+outcome = "reject"
+reason_code = "missing_attribution"
+allowed_to_export = false
+allowed_to_promote = false
