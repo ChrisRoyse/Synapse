@@ -1,5 +1,5 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-09-16-pre-calyx-preserve-extensions-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
@@ -562,7 +562,10 @@ async function requireExternalPopupRisksSuppressed(commandKind, params) {
     return;
   }
   const state = await ensureExternalPopupRiskSuppression(`command:${String(commandKind)}`);
-  if (state.ok && state.remaining_hazard_count === 0) {
+  // Other extensions belong to the operator. Their permissions are diagnostic,
+  // not evidence that this target-scoped tabs/scripting command is unsafe.
+  // Retain a failure when the diagnostic itself could not be read.
+  if (state.management_available && state.failure_count === 0) {
     return;
   }
   throw bridgeError(
@@ -646,36 +649,10 @@ async function refreshExternalPopupRiskSuppression(reason) {
   const disabled = [];
   const failures = [];
 
-  for (const hazard of hazards) {
-    if (hazard.may_disable === false) {
-      failures.push({
-        ...hazard,
-        error: "chrome.management reports mayDisable=false"
-      });
-      continue;
-    }
-    try {
-      await chrome.management.setEnabled(hazard.id, false);
-      disabled.push(hazard);
-    } catch (error) {
-      failures.push({
-        ...hazard,
-        error: errorMessage(error)
-      });
-    }
-  }
+  // Installing or restoring Synapse does not authorize changing other
+  // extensions. Report possible conflicts without disabling user software.
 
-  const after = disabled.length > 0 ? await chrome.management.getAll() : before;
-  const remaining = enabledExternalPopupRiskExtensions(after);
-  const remainingIds = new Set(remaining.map((entry) => entry.id));
-  for (const entry of disabled) {
-    if (remainingIds.has(entry.id)) {
-      failures.push({
-        ...entry,
-        error: "chrome.management.setEnabled returned but extension remained enabled"
-      });
-    }
-  }
+  const remaining = hazards;
 
   const ok = remaining.length === 0 && failures.length === 0;
   popupRiskSuppressionState = {
@@ -695,13 +672,8 @@ async function refreshExternalPopupRiskSuppression(reason) {
   };
   if (!ok) {
     console.warn(
-      `Synapse external popup risk suppression incomplete: ` +
+      `Synapse observed external extension permissions; extensions left unchanged: ` +
         formatPopupRiskSuppressionForError(popupRiskSuppressionState)
-    );
-  } else if (disabled.length > 0) {
-    console.warn(
-      `Synapse disabled ${disabled.length} external debugger/nativeMessaging extension(s): ` +
-        disabled.map((entry) => `${entry.id}:${entry.name}`).join(" | ")
     );
   }
   return popupRiskSuppressionState;

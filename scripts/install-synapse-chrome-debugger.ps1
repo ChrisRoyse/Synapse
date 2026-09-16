@@ -6,10 +6,9 @@ param(
     # debugger/nativeMessaging blockers Synapse wrote into the Chrome
     # ExtensionSettings policy, print the result, and exit.
     [switch]$RemoveExternalDebuggerPolicyOnly,
-    # Emergency/operator opt-out. Default behavior shields the normal Chrome
-    # profile from layout-shifting debugger/native-host popups by adding
-    # Synapse-authored blocked_permissions entries for detected hazards.
-    [switch]$PreserveExternalDebuggerExtensions,
+    # Preserve unrelated extensions by default. A Synapse install/rollback
+    # does not authorize changing another extension's permissions.
+    [switch]$PreserveExternalDebuggerExtensions = $true,
     # Default behavior auto-loads the bundled unpacked extension into the
     # already-open active Chrome profile when the profile row is absent.
     [switch]$SkipAutoInstall,
@@ -628,7 +627,10 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
 $stableExtensionRoot = Join-Path $env:LOCALAPPDATA 'synapse\chrome-extension'
-$extensionDir = Join-Path $stableExtensionRoot $bridgeBuildId
+# Keep the installed unpacked-extension path stable across daemon upgrades and
+# rollbacks. Build identity and the physical worker hash still detect drift;
+# changing directories would unnecessarily require another Load unpacked flow.
+$extensionDir = Join-Path $stableExtensionRoot 'active'
 $stableRootFull = [System.IO.Path]::GetFullPath($stableExtensionRoot)
 $extensionDirFull = [System.IO.Path]::GetFullPath($extensionDir)
 if (-not $extensionDirFull.StartsWith($stableRootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -2226,12 +2228,9 @@ $chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy -Extensions $
 # admin-only (owner SYSTEM, standard users get ReadKey) BY DESIGN, precisely so a
 # non-admin process cannot grant itself Chrome policy. A non-elevated setup therefore
 # cannot write it, and that denial is expected hardening — not a misconfiguration to
-# "repair". Crucially, the popup shield is NOT the hazard enforcement boundary: the
-# bridge manifest is REQUIRED to hold chrome.management (enforced earlier in this
-# script), and the daemon uses it to suppress the same debugger/nativeMessaging hazards
-# at runtime and to FAIL CLOSED before any Chrome command if suppression is not
-# confirmed — this is verified post-handoff by the live /health chrome_bridge check in
-# synapse-setup.ps1. Making an admin-only, defense-in-depth policy write a hard
+# "repair". Other extensions are now observed, never automatically disabled.
+# Synapse's own active nativeMessaging permission remains a separate runtime
+# gate. Making an admin-only, defense-in-depth policy write a hard
 # dependency would brick `synapse-update` on every properly-secured machine. So a
 # write-denied shield is surfaced LOUDLY (with exact failure + remediation) but is
 # non-fatal; only an UNEXPECTED shield failure (not the known admin-only policy-root
@@ -2248,7 +2247,7 @@ if ($unexpectedBlockingShieldRows.Count -gt 0) {
 }
 if ($popupShieldWriteDeniedRows.Count -gt 0) {
     $deniedDetail = ConvertTo-CompressedJson -Value $popupShieldWriteDeniedRows -Depth 10
-    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING the HKCU Chrome managed-policy key is admin-only on this host, so the non-elevated popup shield could not be written. This is not fatal: the bridge's required chrome.management permission enforces the same debugger/nativeMessaging hazard suppression at runtime and fails closed if suppression is not confirmed (verified post-handoff by /health chrome_bridge). To also apply the policy-level defense-in-depth, run setup once from an elevated PowerShell. detail=$deniedDetail"
+    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING Chrome managed-policy access is administrator-only; its ACL was not changed. Unrelated extensions are preserved. Synapse's own active nativeMessaging permission remains separately gated by the daemon. detail=$deniedDetail"
 }
 
 if ($staleSynapseActivePermissions.Count -gt 0) {

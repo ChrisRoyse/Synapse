@@ -41,7 +41,7 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
+    "synapse-chrome-bridge-2026-09-16-pre-calyx-preserve-extensions-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -1165,7 +1165,7 @@ fn external_chrome_popup_risk_warning(rows: &[String], suppression_ok: bool) -> 
         );
     }
     format!(
-        "external_chrome_popup_risk_blocking=true external_chrome_popup_risk_scope=external_suppression_required risk_count={} external_chrome_popup_risk={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named external debugger/nativeMessaging extensions, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings blocks debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL; normal bridge commands fail closed while this risk remains unsuppressed",
+        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=diagnostic_only risk_count={} external_chrome_popup_risk={} remediation=unrelated extensions are preserved; inspect any actual command failure without disabling operator software or changing Chrome policy",
         rows.len(),
         format_external_chrome_popup_risks(rows)
     )
@@ -1300,23 +1300,16 @@ fn ensure_normal_bridge_external_popup_suppressed(
         );
         return Ok(());
     }
-    tracing::error!(
+    tracing::warn!(
         code = "CHROME_EXTERNAL_POPUP_RISK_WARNING",
         hwnd,
         command_kind,
         risk_count = risks.len(),
         external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
         bridge_popup_risk_suppression = %suppression_summary,
-        "normal Chrome bridge refusing tabs/scripting command while external debugger/nativeMessaging risk remains unsuppressed"
+        "external extension permissions are diagnostic only; preserving operator extensions while allowing target-scoped browser commands"
     );
-    Err(ChromeDebuggerBridgeError {
-        code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
-        detail: format!(
-            "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=external debugger/nativeMessaging popup risk remains unsuppressed external_chrome_popup_risk={} bridge_popup_risk_suppression={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named extension IDs, disable them in Chrome, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings can apply blocked_permissions for debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL",
-            format_external_chrome_popup_risks(&risks),
-            suppression_summary
-        ),
-    })
+    Ok(())
 }
 
 fn note_normal_bridge_registration_external_popup_risk() {
@@ -6456,17 +6449,18 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     } else {
         stale_reasons.join("|")
     };
-    let popup_risk_blocking = !popup_risks.is_empty() && !popup_risk_suppression_ok;
+    // The presence of a different extension with nativeMessaging/debugger
+    // permission is not a failure of this bridge. Keep the warning above;
+    // authentication, build identity and Synapse's own permission gates remain.
     let tab_control_available = extension_id == EXTENSION_ID
         && host.last_disconnect_detail.is_none()
         && !extension_stale
-        && !self_permission_blocking
-        && !popup_risk_blocking;
+        && !self_permission_blocking;
     let status = if tab_control_available {
         "ok"
     } else if extension_stale {
         "stale"
-    } else if self_permission_blocking || popup_risk_blocking {
+    } else if self_permission_blocking {
         "unsafe_profile"
     } else if host.last_disconnect_detail.is_some() {
         "unavailable"
