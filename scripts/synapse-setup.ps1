@@ -12061,6 +12061,11 @@ function Install-CodexSynapseTokenLoader {
 #!/usr/bin/env pwsh
 $basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
 
+$clearLock = Join-Path $env:USERPROFILE '.codex\scripts\clear-stale-codex-lock.ps1'
+if (Test-Path -LiteralPath $clearLock) {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $clearLock
+}
+
 # Synapse MCP token loader: begin
 $synapseConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $synapseEmbeddedTokenPathBase64 = '__SYNAPSE_TOKEN_PATH_BASE64__'
@@ -12224,6 +12229,9 @@ exit $ret
         # delayed-expansion, and metacharacter corruption of configured paths.
         $cmd = @'
 @ECHO off
+IF EXIST "%USERPROFILE%\.codex\scripts\clear-stale-codex-lock.ps1" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\.codex\scripts\clear-stale-codex-lock.ps1"
+)
 SETLOCAL EnableExtensions DisableDelayedExpansion
 SET "SYNAPSE_CODEX_LAUNCHER_TOKEN_PATH_BASE64=__SYNAPSE_TOKEN_PATH_BASE64__"
 SET "SYNAPSE_CODEX_LAUNCHER_SURFACE_PATH_BASE64=__SYNAPSE_SURFACE_PATH_BASE64__"
@@ -12245,6 +12253,10 @@ ENDLOCAL & EXIT /B %_synapse_ret%
         $sh = @'
 #!/bin/sh
 basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+if [ -f "$USERPROFILE/.codex/scripts/clear-stale-codex-lock.ps1" ]; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$USERPROFILE/.codex/scripts/clear-stale-codex-lock.ps1" >/dev/null 2>&1 || true
+fi
 
 # Synapse MCP token loader: begin
 synapse_cfg="$USERPROFILE/.codex/config.toml"
