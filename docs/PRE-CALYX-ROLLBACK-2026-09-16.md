@@ -37,6 +37,15 @@ and a working local browser-control runtime. Recorded September 16, 2026.
 - The launcher refuses a Calyx database, absent executable/profile directory,
   and an already-listening port. Only the normal startup path was exercised;
   these rejection branches were inspected, not behaviorally verified.
+- Update 2026-09-24: a Start-menu restart on 9/21 closed apps (daemon exit
+  `0xC000013A`) and then aborted, so no new logon fired and the daemon stayed
+  down for three days. `scripts/install-pre-calyx-startup-task.ps1` now
+  registers the task with a logon trigger plus a 5-minute watchdog trigger
+  (`IgnoreNew` makes it a no-op while the daemon runs). Kill-and-recover was
+  verified: the daemon was listening again 293 s after being stopped.
+- Update 2026-09-24: a loopback-bound daemon no longer requires the HTTP bearer
+  token from MCP clients (Host/Origin guard still enforced; non-loopback binds
+  still require it). Claude Code and Codex configs no longer send it.
 - Original Calyx Synapse broker task is disabled; no Calyx daemon remains active.
 - Active bridge build: `synapse-chrome-bridge-2026-09-16-pre-calyx-preserve-extensions-v1`.
 - Loaded worker SHA-256:

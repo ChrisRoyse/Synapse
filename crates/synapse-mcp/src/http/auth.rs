@@ -98,6 +98,10 @@ impl HttpAuth {
         }
     }
 
+    pub(super) fn requires_bearer(&self) -> bool {
+        !self.bind_addr.ip().is_loopback()
+    }
+
     pub(super) fn validate_origin_and_host(
         &self,
         headers: &HeaderMap,
@@ -140,6 +144,12 @@ pub(super) async fn require_http_security(
     }
     if let Err(failure) = auth.validate_origin_and_host(request.headers()) {
         return forbidden(failure);
+    }
+    // Local-first trust model: a loopback-bound daemon relies on the bind plus
+    // the Host/Origin guard above, so local MCP clients need no bearer token.
+    // A non-loopback bind still requires the token.
+    if !auth.requires_bearer() {
+        return next.run(request).await;
     }
     match auth.authorize(request.headers()) {
         Ok(()) => next.run(request).await,
@@ -399,6 +409,14 @@ mod tests {
 
         headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
         assert!(auth.validate_origin_and_host(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_required_only_for_non_loopback_bind() {
+        let mut auth = HttpAuth::from_token("local-token");
+        assert!(!auth.requires_bearer());
+        auth.bind_addr = SocketAddr::from(([0, 0, 0, 0], 7700));
+        assert!(auth.requires_bearer());
     }
 
     #[test]
