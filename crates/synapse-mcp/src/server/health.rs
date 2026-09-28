@@ -146,6 +146,19 @@ impl SynapseService {
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
         subsystems.insert("action".to_owned(), self.action_health());
+        subsystems.insert(
+            "agent_spawn".to_owned(),
+            SubsystemHealth {
+                status: if super::m4_tools::agent_spawn_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .to_owned(),
+                detail: Some("Operator gate: SYNAPSE_AGENT_SPAWN_ENABLED must equal 1 in the daemon environment".to_owned()),
+                ..SubsystemHealth::default()
+            },
+        );
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert(
             "chrome_bridge".to_owned(),

@@ -119,6 +119,10 @@ fn build_spawn_manifest(
     }))
 }
 const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
+/// Only an explicit daemon-launch opt-in permits model-agent creation (#2266).
+pub(crate) fn agent_spawn_enabled() -> bool {
+    std::env::var("SYNAPSE_AGENT_SPAWN_ENABLED").is_ok_and(|value| value == "1")
+}
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
 const AGENT_SPAWN_POLL_INTERVAL_MS: u64 = 250;
 const AGENT_SPAWN_LOG_TAIL_BYTES: usize = 8 * 1024;
@@ -2179,6 +2183,12 @@ impl SynapseService {
         in_flight: &AgentSpawnInFlightGuard,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
         validate_agent_spawn_params(&params)?;
+        if !agent_spawn_enabled() {
+            return Err(mcp_error(
+                "AGENT_SPAWN_DISABLED",
+                "Agent spawning is disabled by the operator. Explicitly launch the daemon with SYNAPSE_AGENT_SPAWN_ENABLED=1 to enable it.",
+            ));
+        }
         validate_spawn_target(&params.target)?;
         let agent_kind = params.effective_cli()?;
         let local_model_row = if agent_kind.is_local_model() {

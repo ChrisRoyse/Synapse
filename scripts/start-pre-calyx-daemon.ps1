@@ -4,7 +4,8 @@
 param(
     [string]$ExePath = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$DbPath = "$env:LOCALAPPDATA\synapse\db-daemon",
-    [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles-pre-calyx"
+    [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles-pre-calyx",
+    [switch]$EnableAgentSpawn
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
@@ -23,6 +24,8 @@ if (Get-NetTCPConnection -LocalPort 7700 -State Listen -ErrorAction SilentlyCont
 $runtimeLogDir = Join-Path $env:LOCALAPPDATA 'synapse\logs'
 New-Item -ItemType Directory -Path $runtimeLogDir -Force | Out-Null
 $runtimeStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+# Explicit operator opt-in only; inherited environment cannot silently enable it.
+$env:SYNAPSE_AGENT_SPAWN_ENABLED = if ($EnableAgentSpawn) { '1' } else { '0' }
 $daemonArguments = @(
     '--mode', 'http', '--bind', '127.0.0.1:7700',
     '--db', ('"{0}"' -f $DbPath),
