@@ -95,6 +95,15 @@ Historical retained transcripts do contain earlier agent work and fixtures.
 Their aggregate is not a current burn rate. This investigation does not audit
 provider billing or rule out spending by unrelated applications/accounts.
 
+A separate read-only inspection of Codex's `%USERPROFILE%\.codex\state_5.sqlite`
+at 00:56 UTC found exactly two threads created or updated since
+`2026-09-27T00:00:00Z`: Synapse thread
+`01a0e56e-9c76-7741-a700-ae06b15c922f` and kernelweights thread
+`01a0e0d9-da13-7d70-8d5a-60d7cf901ae7`. Both had `agent_path=null` and
+`agent_role=null`; no additional child-agent thread rows appeared in that window.
+These two intended conversations do consume tokens. Their cumulative
+`tokens_used` counters are not a provider invoice or evidence of hidden agents.
+
 ## Manual acceptance record
 
 Verification followed D1 and #351. No automated behavioral tests, FSV scripts,
