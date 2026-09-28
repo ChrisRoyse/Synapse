@@ -2,6 +2,12 @@
 
 Issue: [#2266](https://github.com/ChrisRoyse/Synapse/issues/2266).
 
+**Follow-up status:** the operator reported continued flashes, including on Enter,
+after the initial PTY instruction workaround. The issue was reopened. The
+terminal-attached launcher workaround below is installed for new sessions;
+the protected existing sessions have not been restarted. The specific
+Enter-triggered burst has not been captured or accepted as fixed.
+
 ## Finding
 
 The reproduced flashing PowerShell windows came from the managed **Codex
@@ -55,12 +61,20 @@ its owned PID 52656 was stopped. No window watcher or guard is installed.
 4. `scripts/start-pre-calyx-daemon.ps1` explicitly sets the gate to `0`, ignoring
    an inherited enabling environment variable. An operator must deliberately
    pass `-EnableAgentSpawn` to this launcher to opt in.
+5. `scripts/install-codex-console-workaround.ps1` patches the npm Codex launcher
+   on Windows to add `--no-daemon`. Unlike the instruction-only workaround,
+   this also avoids the detached server for operations outside agent shell calls.
+   It preserves explicit `--remote` connections, supports an operator opt-out
+   through `SYNAPSE_CODEX_USE_SHARED_DAEMON=1`, and has a `-Restore` operation.
+   The user configuration also has `features.daemon_auto_start=false`, written
+   through `codex features disable daemon_auto_start`.
 
-The installed policy is a **Codex instruction workaround**, not a patch to the
-upstream Codex executable. An external caller that deliberately uses the
-plain-pipe runner can still reproduce the upstream window behavior. The
-Synapse spawn gate is enforced in code; the PTY instruction relies on callers
-following it. Ordinary shell commands still create necessary local helper
+The PTY policy is a **Codex instruction workaround**. The additional launcher
+change selects Codex's supported `--no-daemon` mode; neither patches the upstream
+executable. Existing sessions still use their original shared server. An external
+caller using that server's plain-pipe runner can still reproduce its window
+behavior. The Synapse spawn gate is enforced in code; the PTY instruction relies
+on callers following it. Ordinary shell commands still create necessary local helper
 processes. This change does not claim to remove those processes or prevent
 every possible API call from arbitrary shell code.
 
@@ -68,7 +82,16 @@ Reinstall the background-command policy from a PTY-backed shell:
 
 ```powershell
 pwsh -NoProfile -File scripts/install-codex-background-policy.ps1
+pwsh -NoProfile -File scripts/install-codex-console-workaround.ps1
+codex features disable daemon_auto_start
 ```
+
+An npm update can replace `codex.js`; reapply the launcher installer afterwards
+until an upstream fix is verified. The user configuration survives npm updates.
+The installer refuses unknown launcher shapes without changing them and keeps
+the first original beside the launcher as `codex.js.synapse-console-backup`.
+To remove only the launcher modification, use `-Restore`. Restoring the separate
+configuration setting requires `codex features enable daemon_auto_start`.
 
 The official [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server)
 documents PTY command execution and distinguishes `command/exec` (no model
@@ -162,3 +185,74 @@ readback and the real MCP health call agree on PID 40400. Health reports storage
 and browser bridge healthy and agent spawning disabled. Both original Codex CLI
 processes and the shared app-server remained alive with their original creation
 times. Temporary diagnostic commands exited; no diagnostic window guard remains.
+
+## Follow-up: automatic background server and Enter reports
+
+The official [Codex changelog](https://learn.chatgpt.com/docs/changelog) dates
+0.157.0 to September 25 and explicitly lists automatic background-server startup
+for eligible interactive sessions. Installed 0.157.1 is dated September 26.
+The installed CLI reports `daemon_auto_start` as stable and initially enabled.
+Its `--no-daemon` help says it avoids the shared server even when already running.
+This establishes a relevant recent default change, not proof that every reported
+flash is caused by that release.
+
+Read-only inspection of `logs_2.sqlite` correlated the operator's submissions at
+01:29:25 and 01:29:39 UTC on September 28 with the existing Synapse conversation.
+There was no corresponding new child-agent thread in `state_5.sqlite`.
+PowerShellCore recorded a shell startup at the first timestamp; that historical
+event does not contain its command or parent. The short-lived Enter burst was
+not reproduced during the subsequent four-minute process-table capture.
+Polling can miss short-lived processes. Event-based process tracing was attempted
+but Windows denied access; no privileges, audit settings, or other sessions were
+changed to bypass that denial.
+
+The passive capture also found the unrelated Poly paper keeper's hidden
+PowerShell task every five minutes. Its process/command records do not establish
+that it caused a visible window. It was left running. The managed Codex daemon
+and updater logs were empty, and the older Codex update script's last log was
+from August; neither supplied evidence of a current updater restart loop.
+
+Two additional manual, non-model `command/exec` comparisons used the same Codex
+0.157.1 runtime with an inherited terminal. Neither created a thread or submitted
+a model prompt. The source of truth was each child's console handle, followed by
+a separate process-table and `IsWindowVisible` read while that child was alive.
+
+| Invocation | Separate physical readback | Completion |
+| --- | --- | --- |
+| Direct terminal-attached stdio server PID 74900 | PowerShell PID 83492, parent 74900, HWND 29886676, invisible | Command exit 0; owned server exit 0 |
+| Installed npm launcher through node PID 29252 | Codex PID 62288 command includes `--no-daemon app-server --listen stdio://`; PowerShell PID 30788, parent 62288, HWND 9111996, invisible | Command exit 0; owned launcher/server exit 0 |
+
+These observations verify the launcher argument and attached command behavior.
+They do not stand in for a user pressing Enter in a fresh interactive session.
+New sessions inherit their terminal rather than using the shared background
+server; background work consequently depends on that session's lifetime.
+
+The launcher installer was manually exercised against physical files, with
+separate before/after reads:
+
+| Case | Before | Actual after |
+| --- | --- | --- |
+| Installed npm launcher | Exactly one upstream `spawn(binaryPath, process.argv.slice(2), ...)` site | Windows argument guard inserted; original backup retained; `node --check`, `codex --version`, and `codex mcp get synapse` succeed |
+| Empty file | Zero bytes, SHA256 `E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855` | Refused; same hash |
+| Unsupported structure | Sentinel comment, SHA256 `6861D8DDC48A28079FF378586C5132BEA76C3D472D4B30CDBE74F4741B7692BE` | Refused; same bytes/hash |
+| Missing path | File absent | Read failed; file remained absent |
+| Repeated installation | Installed launcher | Present message; unchanged SHA256 |
+| Explicit restore on a copied launcher | Copy of installed launcher | Original upstream content/hash restored; live launcher untouched |
+
+Original launcher SHA256:
+`61B0194F3BB6534439C8D26A3ED57D0805F84B884588B761795323EEB92FCF70`.
+Installed launcher SHA256:
+`1E1B7C985028B15FAE9A1A8A710C1E81C8D432B44F677C76091A21241E99BBC6`.
+PowerShell parsing and JavaScript syntax checking are structural checks, not FSV.
+
+Final independent reads still show the two original root Codex conversations,
+703 Synapse spawn directories, original CLI PIDs 29880/139048 and shared server
+PID 136520 with unchanged creation times, and Synapse PID 40400 listening at
+127.0.0.1:7700. The real wired Synapse MCP remains usable. No additional model
+agents were launched for these diagnostics.
+
+**Activation boundary:** the running shared server cannot be replaced without
+affecting the kernelweights session. It remains intact as requested. New launches
+use the installed workaround; the already-running sessions retain the PTY
+instruction mitigation until their normal restart. Do not label the overall
+Enter report resolved until it has been observed again after that transition.
