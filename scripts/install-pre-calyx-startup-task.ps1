@@ -1,7 +1,7 @@
 # Registers (or removes) the SynapseMcpPreCalyx scheduled task that keeps the
 # restored RocksDB daemon running (#2265).
 #
-# Triggers: at logon, plus every 5 minutes. The repeating trigger recovers the
+# Triggers: at logon, plus every minute. The repeating trigger recovers the
 # daemon when it dies while the user stays signed in (e.g. a Start-menu restart
 # that closes apps and then aborts leaves no new logon). While the daemon runs,
 # the launcher instance stays alive and MultipleInstances=IgnoreNew skips the
@@ -30,7 +30,7 @@ $action = New-ScheduledTaskAction `
     -WorkingDirectory $SourceDir
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)
+    -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew -StartWhenAvailable `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `

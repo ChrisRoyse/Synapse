@@ -1708,7 +1708,7 @@ function Test-CodexSynapseHttpConfig {
     $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
     return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
         $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"' -and
-        $body -match '(?m)^\s*required\s*=\s*true\s*$' -and
+        $body -match '(?m)^\s*required\s*=\s*false\s*$' -and
         $body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$')
 }
 
@@ -1769,7 +1769,9 @@ function Set-CodexSynapseClientPolicy {
     $desiredLines = @(
         ('url = "http://{0}/mcp"' -f $Bind),
         'bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"',
-        'required = true',
+        # A daemon outage must remain an MCP error, not prevent Codex from opening.
+        'required = false',
+        'startup_timeout_sec = 20',
         'default_tools_approval_mode = "approve"'
     )
     $sectionRegex = '(?ms)^\[mcp_servers\.synapse\]\s*(?<body>.*?)(?=^\[|\z)'
@@ -1779,7 +1781,7 @@ function Set-CodexSynapseClientPolicy {
         $body = [string]$section.Groups['body'].Value
         $preserved = @()
         foreach ($line in ($body -split "`r?`n")) {
-            if ($line -match '^\s*(url|bearer_token_env_var|required|default_tools_approval_mode)\s*=') {
+            if ($line -match '^\s*(url|bearer_token_env_var|required|startup_timeout_sec|startup_timeout_ms|default_tools_approval_mode)\s*=') {
                 continue
             }
             if ([string]::IsNullOrWhiteSpace($line) -and $preserved.Count -eq 0) {
@@ -6673,10 +6675,10 @@ if (-not $SkipClientWiring) {
         }
         Set-CodexSynapseClientPolicy -ConfigPath $codexCfg -Bind $Bind
         if (-not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
-            Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=true, and default_tools_approval_mode=approve."
+            Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=false, and default_tools_approval_mode=approve."
         }
         Install-CodexSynapseTokenLoader -CodexCommandPath $codex.Source -TokenPath $TokenPath
-        Info "Codex (Windows) wired via Streamable HTTP transport with required=true and default_tools_approval_mode=approve."
+        Info "Codex (Windows) wired via Streamable HTTP transport with required=false and default_tools_approval_mode=approve; Synapse failures remain visible without blocking Codex startup."
     } elseif (Test-Path $codexCfg) {
         $c = Get-Content -Raw $codexCfg
         if ($c -match '(?m)^\[mcp_servers\.synapse\]' -and
