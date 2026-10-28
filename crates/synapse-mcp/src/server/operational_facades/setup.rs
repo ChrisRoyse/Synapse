@@ -57,17 +57,34 @@ pub(super) async fn handle(
                         "repair the exact unreadable setup file/env prerequisite and retry setup status",
                     )
                 })?;
-            Ok(Json(setup_response(
-                operation,
-                "setup status physical files read".to_owned(),
-                |out| {
-                    if operation == SetupOperation::Status {
-                        out.status = Some(status);
-                    } else {
-                        out.doctor = Some(status);
-                    }
-                },
-            )))
+            // #2267: diagnose a closed bridge without first asking it to reload.
+            // The owner readback is an existing recovery command admitted while
+            // ordinary browser mutations are disabled. Never infer owner health
+            // from transport health or clear the owner ledger here.
+            let readback = if operation == SetupOperation::Doctor {
+                match chrome_debugger_bridge::operator_panic_readback().await {
+                    Ok(owners) => format!(
+                        "setup status physical files read; chrome_extension_owner_readback={}",
+                        serde_json::to_string(&owners).map_err(|error| {
+                            mcp_error(error_codes::TOOL_INTERNAL_ERROR, error.to_string())
+                        })?
+                    ),
+                    Err(error) => format!(
+                        "setup status physical files read; chrome_extension_owner_readback_failed code={} detail={}",
+                        error.code(),
+                        error.detail()
+                    ),
+                }
+            } else {
+                "setup status physical files read".to_owned()
+            };
+            Ok(Json(setup_response(operation, readback, |out| {
+                if operation == SetupOperation::Status {
+                    out.status = Some(status);
+                } else {
+                    out.doctor = Some(status);
+                }
+            })))
         }
         SetupOperation::Repair => {
             let spec = params
@@ -85,7 +102,18 @@ pub(super) async fn handle(
                 "synapse_setup_repair",
                 SETUP_SOT,
             )?;
-            let chrome_bridge_preflight = preflight_setup_repair_chrome_bridge().await?;
+            let (chrome_bridge_preflight, browser_recovered) =
+                preflight_setup_repair_chrome_bridge().await?;
+            if browser_recovered {
+                let status = setup_status(service)?;
+                return Ok(Json(setup_response(
+                    operation,
+                    chrome_bridge_preflight,
+                    |out| {
+                        out.status = Some(status);
+                    },
+                )));
+            }
             let launched = launch_setup_repair(service, &spec.reason, &chrome_bridge_preflight)?;
             let status = setup_status(service).map_err(|error| {
                 facade_delegate_error(
@@ -282,20 +310,103 @@ fn launch_setup_repair(
     })
 }
 
-async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
+async fn preflight_setup_repair_chrome_bridge() -> Result<(String, bool), ErrorData> {
+    // #2267: a clean but closed gate must be reopened through its existing
+    // generation-checked recovery command before reloadSelf can be admitted.
+    // Prior-session cleanup only reconciles independently proven absent targets;
+    // it archives their evidence and refuses current or uncertain targets.
+    if let Ok(mut before) = chrome_debugger_bridge::operator_panic_readback().await
+        && !before.enabled
+    {
+        if !before.browser_session_continuity_matched
+            && before.stale_browser_session_owner_count > 0
+        {
+            crate::server::operator_panic_boundary::ensure_mcp_mutation(
+                "setup_repair_before_absent_owner_reconciliation",
+            )?;
+            let cleanup = chrome_debugger_bridge::operator_panic_cleanup(before.disable_sequence)
+                .await
+                .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+            let reconciled = chrome_debugger_bridge::operator_panic_readback()
+                .await
+                .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+            if !cleanup.failures.is_empty()
+                || reconciled.disable_sequence != before.disable_sequence
+                || reconciled.worker_boot_id != before.worker_boot_id
+            {
+                return Err(setup_repair_error(
+                    "SYNAPSE_SETUP_REPAIR_BROWSER_OWNERS_UNRESOLVED",
+                    "chrome_bridge_owners",
+                    format!(
+                        "prior-session reconciliation refused; cleanup={cleanup:?} after={reconciled:?}"
+                    ),
+                    "preserve the owner evidence and inspect setup doctor; no live targets were authorized for cleanup",
+                ));
+            }
+            before = reconciled;
+        }
+        if !before.fully_drained || !before.owner_continuity_healthy {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_REPAIR_BROWSER_OWNERS_UNRESOLVED",
+                "chrome_bridge_owners",
+                format!(
+                    "browser recovery requires resolved owners and healthy continuity; readback={before:?}"
+                ),
+                "use setup doctor to inspect live owner records; resolve the reported owners before retrying; do not reset the ledger",
+            ));
+        }
+        crate::server::operator_panic_boundary::ensure_mcp_mutation(
+            "setup_repair_before_extension_recovery",
+        )?;
+        let enable_result =
+            chrome_debugger_bridge::operator_panic_enable_if_unchanged(before.disable_sequence)
+                .await
+                .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+        let after = chrome_debugger_bridge::operator_panic_readback()
+            .await
+            .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+        crate::server::operator_panic_boundary::ensure_mcp_mutation(
+            "setup_repair_after_extension_recovery",
+        )?;
+        let enable_applied = enable_result.enable_applied;
+        if !enable_applied
+            || !after.enabled
+            || after.disable_sequence != before.disable_sequence
+            || after.worker_boot_id != before.worker_boot_id
+            || !after.owner_continuity_healthy
+        {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_REPAIR_BROWSER_RECOVERY_NOT_CONFIRMED",
+                "chrome_bridge_owners",
+                format!(
+                    "generation-checked browser recovery was not confirmed; before={before:?} enable={enable_result:?} after={after:?}"
+                ),
+                "read setup doctor again; preserve the current stop generation and unresolved owner records",
+            ));
+        }
+        // Browser recovery is complete without replacing an already-running daemon.
+        return Ok((
+            format!("chrome_bridge_recovery=enabled before={before:?} after={after:?}"),
+            true,
+        ));
+    }
     match chrome_debugger_bridge::reload_bridge(30_000).await {
-        Ok(result) => Ok(format!(
-            "chrome_bridge_preflight=reload_bridge_ok before_host={} after_host={} reconnected={} waited_ms={}",
-            result.before.host_id, result.after.host_id, result.reconnected, result.waited_ms
+        Ok(result) => Ok((
+            format!(
+                "chrome_bridge_preflight=reload_bridge_ok before_host={} after_host={} reconnected={} waited_ms={}",
+                result.before.host_id, result.after.host_id, result.reconnected, result.waited_ms
+            ),
+            false,
         )),
         Err(error)
             if error.code() == error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
                 && error.detail().contains("no_active_chrome_bridge_host") =>
         {
-            Ok(
+            Ok((
                 "chrome_bridge_preflight=reload_bridge_skipped reason=no_active_chrome_bridge_host"
                     .to_owned(),
-            )
+                false,
+            ))
         }
         Err(error) => Err(setup_repair_error(
             "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_RELOAD_FAILED",

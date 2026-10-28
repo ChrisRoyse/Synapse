@@ -12089,6 +12089,85 @@ async function cleanupOperatorPanicEmulationOverrides(failures) {
   });
 }
 
+// Prior-session IDs cannot authorize actions against current tabs. Reconcile only
+// the narrow, target-scoped records whose target absence can be proven without
+// mutating a browser target. Keep the original ledger and evidence in local storage.
+async function reconcileAbsentPriorSessionOwners(expectedDisableSequence) {
+  const before = JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
+  const expectedError = "durable owners belong to a prior browser session; stale tab ids will not be mutated";
+  const supportedCount = before.openedTabs.length + before.unresolvedDebuggerCommandTimeouts.length;
+  const unchanged = () => !DURABLE_MUTATION_OWNERS_ENABLED &&
+    DURABLE_MUTATION_DISABLE_SEQUENCE === expectedDisableSequence &&
+    IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0 &&
+    DURABLE_OWNER_LEDGER.revision === before.revision &&
+    DURABLE_OWNER_STATE_LOADED && DURABLE_OWNER_STATE_LOAD_ERROR === expectedError &&
+    !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+    !DURABLE_OWNER_LEDGER.inFlightMutation &&
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
+    MUTATION_HANDLER_IN_FLIGHT_COUNT === 0 &&
+    supportedCount > 0 && durableOwnerRowCount() === supportedCount;
+  const refuse = (detail) => ({
+    ...operatorPanicOwnerReadback(), expected_disable_sequence: expectedDisableSequence,
+    failures: [detail], fully_drained: false
+  });
+  if (!unchanged()) return refuse("prior-session recovery requires unchanged, loaded, target-scoped owners only");
+  const tabIds = [...new Set([
+    ...before.openedTabs.map((entry) => entry.tabId),
+    ...before.unresolvedDebuggerCommandTimeouts.map((entry) => entry.tabId)
+  ])];
+  const readAbsence = async () => {
+    const tabs = await chrome.tabs.query({});
+    const targets = await chrome.debugger.getTargets();
+    const session = await chrome.storage.session.get(DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY);
+    if (session[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY] !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
+        tabIds.some((id) => tabs.some((tab) => tab.id === id) ||
+          targets.some((target) => target.tabId === id))) {
+      throw new Error("prior-session owner target is present or browser-session identity changed");
+    }
+    return { absent_tab_ids: tabIds, live_tab_ids: tabs.map((tab) => tab.id),
+      debugger_target_ids: targets.map((target) => target.id), read_at_unix_ms: Date.now() };
+  };
+  try {
+    const first = await readAbsence();
+    const second = await readAbsence();
+    if (!unchanged()) return refuse("prior-session recovery generation or ledger changed during readback");
+    const archiveKey = `${DURABLE_OWNER_STORAGE_KEY}:recovery:${DURABLE_OWNER_WORKER_BOOT_ID}:${before.revision}`;
+    const archive = { ledger: before, first, second, worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+      current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID };
+    const archiveJson = JSON.stringify(archive);
+    await chrome.storage.local.set({ [archiveKey]: archiveJson });
+    const saved = await chrome.storage.local.get(archiveKey);
+    if (saved[archiveKey] !== archiveJson) {
+      return refuse("prior-session recovery archive readback mismatch");
+    }
+    // Archive I/O is asynchronous: require fresh absence and generation evidence
+    // at the synchronous ledger mutation boundary as well.
+    await readAbsence();
+    if (!unchanged()) return refuse("prior-session recovery changed before commit");
+    DURABLE_OWNER_LEDGER.openedTabs = [];
+    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts = [];
+    DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+    await persistDurableOwnerLedger();
+    const persisted = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
+    const after = normalizeDurableOwnerLedger(persisted[DURABLE_OWNER_STORAGE_KEY]);
+    if (after.enabled || after.disableSequence !== expectedDisableSequence ||
+        after.browserSessionId !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
+        after.inFlightMutation || durableOwnerRowCount(after) !== 0 ||
+        DURABLE_MUTATION_DISABLE_SEQUENCE !== expectedDisableSequence ||
+        IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT !== 0) {
+      throw new Error("prior-session recovery persisted state or stop generation changed");
+    }
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+    STALE_BROWSER_SESSION_OWNER_COUNT = 0;
+    DURABLE_OWNER_STATE_LOAD_ERROR = null;
+    return { ...operatorPanicOwnerReadback(), expected_disable_sequence: expectedDisableSequence,
+      failures: [], recovery_archive_key: archiveKey, reconciled_absent_tab_ids: tabIds };
+  } catch (error) {
+    // Never enable here; setup requires a separate readback and enable command.
+    return refuse(`prior-session recovery failed: ${errorMessage(error)}`);
+  }
+}
+
 async function handleOperatorPanicCleanup(params) {
   const expectedDisableSequence = normalizeOperatorPanicSequence(
     params?.expectedDisableSequence,
@@ -12107,21 +12186,7 @@ async function handleOperatorPanicCleanup(params) {
   }
   if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
       STALE_BROWSER_SESSION_OWNER_COUNT !== 0) {
-    return {
-      ...operatorPanicOwnerReadback(),
-      expected_disable_sequence: expectedDisableSequence,
-      failures: [
-        "operator panic cleanup refused stale browser-session owner ids; " +
-          `current_session=${String(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID || "missing")} ` +
-          `ledger_session=${String(DURABLE_OWNER_LEDGER.browserSessionId || "missing")} ` +
-          `stale_owner_count=${STALE_BROWSER_SESSION_OWNER_COUNT}`
-      ],
-      remaining_opened_tabs: DURABLE_OWNER_LEDGER.openedTabs.map((entry) => ({
-        tab_id: entry.tabId,
-        target_id: entry.targetId
-      })),
-      fully_drained: false
-    };
+    return reconcileAbsentPriorSessionOwners(expectedDisableSequence);
   }
   const failures = [];
 
