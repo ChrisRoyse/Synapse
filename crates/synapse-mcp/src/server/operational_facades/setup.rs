@@ -57,17 +57,34 @@ pub(super) async fn handle(
                         "repair the exact unreadable setup file/env prerequisite and retry setup status",
                     )
                 })?;
-            Ok(Json(setup_response(
-                operation,
-                "setup status physical files read".to_owned(),
-                |out| {
-                    if operation == SetupOperation::Status {
-                        out.status = Some(status);
-                    } else {
-                        out.doctor = Some(status);
-                    }
-                },
-            )))
+            // #2267: diagnose a closed bridge without first asking it to reload.
+            // The owner readback is an existing recovery command admitted while
+            // ordinary browser mutations are disabled. Never infer owner health
+            // from transport health or clear the owner ledger here.
+            let readback = if operation == SetupOperation::Doctor {
+                match chrome_debugger_bridge::operator_panic_readback().await {
+                    Ok(owners) => format!(
+                        "setup status physical files read; chrome_extension_owner_readback={}",
+                        serde_json::to_string(&owners).map_err(|error| {
+                            mcp_error(error_codes::TOOL_INTERNAL_ERROR, error.to_string())
+                        })?
+                    ),
+                    Err(error) => format!(
+                        "setup status physical files read; chrome_extension_owner_readback_failed code={} detail={}",
+                        error.code(),
+                        error.detail()
+                    ),
+                }
+            } else {
+                "setup status physical files read".to_owned()
+            };
+            Ok(Json(setup_response(operation, readback, |out| {
+                if operation == SetupOperation::Status {
+                    out.status = Some(status);
+                } else {
+                    out.doctor = Some(status);
+                }
+            })))
         }
         SetupOperation::Repair => {
             let spec = params
@@ -283,6 +300,51 @@ fn launch_setup_repair(
 }
 
 async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
+    // #2267: a clean but closed gate must be reopened through its existing
+    // generation-checked recovery command before reloadSelf can be admitted.
+    // Never clean up live owners or discard unresolved records as setup work.
+    if let Ok(before) = chrome_debugger_bridge::operator_panic_readback().await
+        && !before.enabled
+    {
+        if !before.fully_drained || !before.owner_continuity_healthy {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_REPAIR_BROWSER_OWNERS_UNRESOLVED",
+                "chrome_bridge_owners",
+                format!(
+                    "browser recovery requires resolved owners and healthy continuity; readback={before:?}"
+                ),
+                "use setup doctor to inspect live owner records; resolve the reported owners before retrying; do not reset the ledger",
+            ));
+        }
+        crate::server::operator_panic_boundary::ensure_mcp_mutation(
+            "setup_repair_before_extension_recovery",
+        )?;
+        let enabled =
+            chrome_debugger_bridge::operator_panic_enable_if_unchanged(before.disable_sequence)
+                .await
+                .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+        let after = chrome_debugger_bridge::operator_panic_readback()
+            .await
+            .map_err(|error| mcp_error(error.code(), error.detail().to_owned()))?;
+        crate::server::operator_panic_boundary::ensure_mcp_mutation(
+            "setup_repair_after_extension_recovery",
+        )?;
+        if !enabled.enable_applied
+            || !after.enabled
+            || after.disable_sequence != before.disable_sequence
+            || after.worker_boot_id != before.worker_boot_id
+            || !after.owner_continuity_healthy
+        {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_REPAIR_BROWSER_RECOVERY_NOT_CONFIRMED",
+                "chrome_bridge_owners",
+                format!(
+                    "generation-checked browser recovery was not confirmed; before={before:?} enable={enabled:?} after={after:?}"
+                ),
+                "read setup doctor again; preserve the current stop generation and unresolved owner records",
+            ));
+        }
+    }
     match chrome_debugger_bridge::reload_bridge(30_000).await {
         Ok(result) => Ok(format!(
             "chrome_bridge_preflight=reload_bridge_ok before_host={} after_host={} reconnected={} waited_ms={}",
