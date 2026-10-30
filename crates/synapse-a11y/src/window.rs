@@ -2,6 +2,11 @@ use synapse_core::{ForegroundContext, Point};
 
 use crate::{A11yResult, UIElement, platform};
 
+/// Native-window lifetime cache of a separately verified Chrome bridge identity.
+/// These operations do not grant tab ownership or change foreground state.
+#[cfg(windows)]
+pub use platform::{chrome_window_id, forget_chrome_window_id, remember_chrome_window_id};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForegroundActivationIntent {
     OperatorRequested { caller: &'static str },

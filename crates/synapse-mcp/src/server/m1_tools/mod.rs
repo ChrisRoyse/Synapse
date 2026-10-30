@@ -6051,7 +6051,7 @@ impl SynapseService {
         crate::chrome_debugger_bridge::target_info(
             window_hwnd,
             cdp_target_id,
-            None,
+            native_chrome_window_identity(window_hwnd, None)?,
             expected_context
                 .as_ref()
                 .map(|context| context.window_bounds),
@@ -6249,6 +6249,8 @@ impl SynapseService {
         let expected_chrome_window_id = self
             .active_cdp_target_owner_for_window("cdp_open_tab", session_id, window_hwnd)?
             .and_then(|owner| owner.chrome_window_id);
+        let expected_chrome_window_id =
+            native_chrome_window_identity(window_hwnd, expected_chrome_window_id)?;
         super::operator_panic_boundary::ensure_mcp_mutation(
             "cdp_open_tab_before_bridge_create_target",
         )?;
@@ -7159,6 +7161,8 @@ impl SynapseService {
         let expected_chrome_window_id = active_owner
             .as_ref()
             .and_then(|owner| owner.chrome_window_id);
+        let expected_chrome_window_id =
+            native_chrome_window_identity(window_context.hwnd, expected_chrome_window_id)?;
         let listed = match crate::chrome_debugger_bridge::list_tabs(
             window_context.hwnd,
             expected_chrome_window_id,
@@ -7185,6 +7189,10 @@ impl SynapseService {
                     .map(|owner| self.clear_owner_cached_chrome_window_id(owner))
                     .transpose()?
                     .unwrap_or(false);
+                if let Some(stale_id) = expected_chrome_window_id {
+                    synapse_a11y::forget_chrome_window_id(window_context.hwnd, stale_id)
+                        .map_err(chrome_window_identity_error)?;
+                }
                 tracing::warn!(
                     code = "BROWSER_TABS_STALE_CHROME_WINDOW_ID_SELF_HEAL",
                     session_id = %session_id,
@@ -7222,6 +7230,17 @@ impl SynapseService {
                 ));
             }
         };
+        if let Some(identity) = listed.chrome_window_id {
+            let current = validate_target_window_context(window_context.hwnd)?;
+            if current.pid != window_context.pid {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    "Chrome window process changed during passive identity discovery",
+                ));
+            }
+            synapse_a11y::remember_chrome_window_id(window_context.hwnd, identity)
+                .map_err(chrome_window_identity_error)?;
+        }
         let endpoint = listed
             .extension_id
             .as_deref()
@@ -15998,6 +16017,31 @@ fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String 
 pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
     let context = validate_target_window_context(hwnd)?;
     Ok((context.window_title, context.process_name))
+}
+
+#[cfg(windows)]
+fn chrome_window_identity_error(error: synapse_a11y::A11yError) -> ErrorData {
+    mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        format!("Chrome native-window identity failed: {error}"),
+    )
+}
+
+#[cfg(windows)]
+fn native_chrome_window_identity(
+    hwnd: i64,
+    owner_id: Option<i64>,
+) -> Result<Option<i64>, ErrorData> {
+    let remembered = synapse_a11y::chrome_window_id(hwnd).map_err(chrome_window_identity_error)?;
+    if let (Some(native_id), Some(owned_id)) = (remembered, owner_id) {
+        if native_id != owned_id {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                "Chrome native-window identity conflicts with the active tab owner; inspect the original window and target",
+            ));
+        }
+    }
+    Ok(remembered.or(owner_id))
 }
 
 fn validate_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {

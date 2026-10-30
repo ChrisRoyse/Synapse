@@ -10,7 +10,7 @@ use uiautomation::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM},
         System::SystemInformation::GetTickCount,
         System::Threading::{
             AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
@@ -21,14 +21,14 @@ use windows::{
             KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_MENU,
         },
         UI::WindowsAndMessaging::{
-            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow,
+            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow, GetPropW,
             GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-            IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
-            SwitchToThisWindow, WM_CLOSE,
+            IsWindowVisible, PostMessageW, RemovePropW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos,
+            ShowWindow, SwitchToThisWindow, WM_CLOSE,
         },
     },
-    core::{BOOL, PWSTR},
+    core::{BOOL, PWSTR, w},
 };
 
 use crate::{A11yError, A11yResult, ForegroundActivationIntent};
@@ -289,6 +289,66 @@ pub fn visible_top_level_window_contexts() -> A11yResult<Vec<ForegroundContext>>
         .filter_map(|hwnd| foreground_context(hwnd_to_wire(hwnd.0 as isize)).ok())
         .filter(|context| !context.window_title.is_empty())
         .collect())
+}
+
+// #2270: a property belongs to the native window lifetime, not its recyclable
+// numeric HWND or an MCP session. It contains an integer identity, never a
+// pointer to allocated data. Reading it does not adopt or activate any tab.
+pub fn chrome_window_id(hwnd: i64) -> A11yResult<Option<i64>> {
+    let window = valid_hwnd(hwnd)?;
+    let value = unsafe { GetPropW(window, w!("Synapse.ChromeWindowId.v1")) };
+    let number = value.0.addr();
+    if number == 0 {
+        Ok(None)
+    } else {
+        i32::try_from(number)
+            .ok()
+            .filter(|id| *id > 0)
+            .map(|id| Some(i64::from(id)))
+            .ok_or_else(|| A11yError::internal("Invalid native Chrome window identity property"))
+    }
+}
+
+pub fn remember_chrome_window_id(hwnd: i64, id: i64) -> A11yResult<()> {
+    let number = i32::try_from(id)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| A11yError::internal("Chrome window identity must be a positive i32"))?;
+    let window = valid_hwnd(hwnd)?;
+    if let Some(previous) = chrome_window_id(hwnd)? {
+        if previous != id {
+            return Err(A11yError::internal(
+                "Native Chrome window identity conflict",
+            ));
+        }
+        return Ok(());
+    }
+    let number = usize::try_from(number)
+        .map_err(|_| A11yError::internal("Chrome window identity exceeds native property range"))?;
+    let value = HANDLE(std::ptr::without_provenance_mut(number));
+    unsafe { SetPropW(window, w!("Synapse.ChromeWindowId.v1"), Some(value)) }
+        .map_err(|error| A11yError::internal(format!("Retain Chrome window identity: {error}")))?;
+    if chrome_window_id(hwnd)? != Some(id) {
+        return Err(A11yError::internal(
+            "Native Chrome window identity readback mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub fn forget_chrome_window_id(hwnd: i64, expected: i64) -> A11yResult<()> {
+    let window = valid_hwnd(hwnd)?;
+    if chrome_window_id(hwnd)? == Some(expected) {
+        unsafe { RemovePropW(window, w!("Synapse.ChromeWindowId.v1")) }.map_err(|error| {
+            A11yError::internal(format!("Clear stale Chrome window identity: {error}"))
+        })?;
+    }
+    if chrome_window_id(hwnd)? == Some(expected) {
+        return Err(A11yError::internal(
+            "Stale native Chrome window identity survived removal",
+        ));
+    }
+    Ok(())
 }
 
 pub fn focused_element() -> A11yResult<UIElement> {
