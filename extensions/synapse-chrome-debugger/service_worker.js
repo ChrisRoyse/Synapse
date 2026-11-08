@@ -210,6 +210,7 @@ let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
 let maintenanceReconnectPauseUntilMs = 0;
 let maintenanceReconnectPauseReason = "";
+let maintenanceReconnectPauseDaemonPid = 0;
 let maintenanceReconnectPauseLoaded = false;
 let maintenanceReconnectPauseLoadInFlight = null;
 const agentNavigationClaims = new Map();
@@ -257,10 +258,51 @@ function normalizeStoredMaintenanceReconnectPause(record) {
   if (!Number.isFinite(pauseUntilMs) || pauseUntilMs <= 0 || !reason) {
     return null;
   }
+  const daemonPid = Number(record.daemon_pid_at_pause);
   return {
     pauseUntilMs,
-    reason
+    reason,
+    daemonPid: Number.isSafeInteger(daemonPid) && daemonPid > 0 ? daemonPid : 0
   };
+}
+
+// #2271: a maintenance pause exists so the worker does not reconnect to the daemon
+// being replaced. It ends as soon as a DIFFERENT daemon instance answers /health,
+// instead of waiting out the whole window and forcing setup into foreground
+// chrome://extensions UI repair (which steals focus from a fullscreen game).
+async function probeDaemonHealthPid() {
+  try {
+    const response = await promiseWithTimeout(
+      fetch(`${DAEMON_BASE_URL}/health`, { cache: "no-store" }),
+      2000,
+      "daemon /health probe timed out"
+    );
+    if (!response.ok) return 0;
+    const body = await response.json();
+    const pid = Number(body?.pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function endMaintenancePauseIfDaemonReplaced(trigger) {
+  if (!maintenanceReconnectPauseDaemonPid || maintenanceReconnectPauseRemainingMs() <= 0) {
+    return false;
+  }
+  const pid = await probeDaemonHealthPid();
+  if (!pid || pid === maintenanceReconnectPauseDaemonPid) {
+    return false;
+  }
+  console.warn(
+    `Synapse maintenance pause ended early: daemon replaced pid ${maintenanceReconnectPauseDaemonPid} -> ${pid} ` +
+      `trigger=${trigger} reason=${maintenanceReconnectPauseReason}`
+  );
+  maintenanceReconnectPauseUntilMs = 0;
+  maintenanceReconnectPauseReason = "";
+  maintenanceReconnectPauseDaemonPid = 0;
+  await removeStoredMaintenanceReconnectPause(`daemon_replaced:${trigger}`);
+  return true;
 }
 
 async function removeStoredMaintenanceReconnectPause(reason) {
@@ -290,6 +332,7 @@ async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
     pause_until_unix_ms: pauseUntilMs,
     reason,
     stored_at_unix_ms: Date.now(),
+    daemon_pid_at_pause: maintenanceReconnectPauseDaemonPid || 0,
     bridge_build_id: BRIDGE_BUILD_ID,
     extension_id: chrome.runtime.id
   };
@@ -334,6 +377,7 @@ async function loadMaintenanceReconnectPause(reason) {
     if (stored && stored.pauseUntilMs > now) {
       maintenanceReconnectPauseUntilMs = stored.pauseUntilMs;
       maintenanceReconnectPauseReason = stored.reason;
+      maintenanceReconnectPauseDaemonPid = stored.daemonPid;
       ensureReconnectWakeAlarm();
       console.warn(
         `Synapse daemon bridge restored persisted maintenance pause: ` +
@@ -2439,8 +2483,13 @@ function handleReconnectWakeAlarm(alarm) {
         return;
       }
       if (maintenanceReconnectPauseRemainingMs() > 0) {
-        ensureReconnectWakeAlarm();
-        return;
+        return endMaintenancePauseIfDaemonReplaced("reconnectWakeAlarm").then((ended) => {
+          if (ended) {
+            startBridgeFromEvent();
+          } else {
+            ensureReconnectWakeAlarm();
+          }
+        });
       }
       startBridgeFromEvent();
     })
@@ -13875,6 +13924,7 @@ async function handleMaintenancePauseReconnect(params = {}) {
   const reason = normalizeMaintenanceReconnectPauseReason(params.reason);
   const now = Date.now();
   const pauseUntilMs = now + pauseMs;
+  maintenanceReconnectPauseDaemonPid = await probeDaemonHealthPid();
   await persistMaintenanceReconnectPause(pauseUntilMs, reason);
   maintenanceReconnectPauseLoaded = true;
   maintenanceReconnectPauseUntilMs = pauseUntilMs;

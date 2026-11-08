@@ -3119,11 +3119,13 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
             $pauseRemainingMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$currentMs)
         }
         if ($pauseRemainingMs -gt 0) {
-            Info ("Chrome bridge host absent after daemon start while maintenance reconnect pause remains active; skipping alarmReconnect wait and invoking bounded existing-Chrome UI repair. attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2}" -f `
+            # #2271: the bridge worker ends its maintenance pause itself once /health
+            # reports a different daemon pid (checked on its 30 s wake alarm), so keep
+            # waiting instead of jumping to foreground chrome://extensions UI repair.
+            Info ("Chrome bridge host absent after daemon start while maintenance reconnect pause remains active; waiting for the worker to observe the replaced daemon pid and end the pause. attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2}" -f `
                 $attempt,
                 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
                 $pauseRemainingMs)
-            break
         }
         $waitRemainingMs = [Math]::Max(0, [int64]$deadlineMs - [int64]$currentMs)
         Info ("Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2} wait_remaining_ms={3}" -f `

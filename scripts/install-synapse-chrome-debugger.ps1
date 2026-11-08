@@ -1506,6 +1506,27 @@ function Read-SynapseChromeExtensionDetailsUiState {
     }
 }
 
+function Assert-SynapseHumanNotInFullscreenForUiRepair {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    # #2271: chrome://extensions UI repair calls SetForegroundWindow. Never steal the
+    # foreground from a fullscreen game, a busy fullscreen app or a presentation.
+    if (-not ('SynapseChromeBridgeHumanGuard.Shell' -as [type])) {
+        Add-Type -Namespace SynapseChromeBridgeHumanGuard -Name Shell -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll")]
+public static extern int SHQueryUserNotificationState(out int state);
+'@
+    }
+    $state = 0
+    $hr = [SynapseChromeBridgeHumanGuard.Shell]::SHQueryUserNotificationState([ref]$state)
+    if ($hr -ne 0) {
+        throw "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_HUMAN_STATE_UNREADABLE stage=$Stage hresult=$hr remediation=foreground UI repair refuses when the human notification state cannot be read; the bridge worker reconnects on its own 30 s wake alarm"
+    }
+    # 2=QUNS_BUSY 3=QUNS_RUNNING_D3D_FULL_SCREEN 4=QUNS_PRESENTATION_MODE
+    if ($state -in @(2, 3, 4)) {
+        throw "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_REFUSED_HUMAN_FULLSCREEN stage=$Stage user_notification_state=$state remediation=the human is in a fullscreen/busy/presentation app; foreground chrome://extensions repair is refused. The bridge worker re-registers on its own wake alarm (it ends a maintenance pause when /health reports a new daemon pid); re-read health later"
+    }
+}
+
 function Invoke-SynapseChromeBridgeExistingUiReload {
     param(
         [Parameter(Mandatory = $true)]
@@ -1543,6 +1564,7 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
 
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
     [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 9) | Out-Null
+    Assert-SynapseHumanNotInFullscreenForUiRepair -Stage 'existing_ui_reload'
     [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
@@ -1705,6 +1727,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     }
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
     [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 5) | Out-Null
+    Assert-SynapseHumanNotInFullscreenForUiRepair -Stage 'first_install_ui'
     [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
