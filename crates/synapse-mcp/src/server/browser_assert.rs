@@ -636,12 +636,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            ARIA_TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            resolution_target.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                ARIA_TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                resolution_target.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             ARIA_TOOL,
             &session_id,

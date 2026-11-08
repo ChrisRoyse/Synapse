@@ -352,7 +352,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Stable browser debugger facade. Visible for static clients, but operations fail closed until this session is set to browser_debugger. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
+        description = "Stable browser debugger facade. evaluate, console_messages and network run under any profile against a tab this session owns/has bound, or an explicitly named unowned chrome-tab cdp_target_id (auto-adopted: refused if another session owns/claims it or it is the active tab of the human's foreground window without an exact claim). All other operations fail closed until this session is set to browser_debugger. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
         input_schema = browser_debugger_input_schema()
     )]
     pub async fn browser_debugger(
@@ -944,7 +944,7 @@ fn browser_debugger_response(
     let mut response = BrowserDebuggerResponse {
         operation,
         source_of_truth: format!(
-            "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile=browser_debugger + delegated browser operation={}",
+            "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile row (browser_debugger, or any profile for owned-target evaluate/console_messages/network) + delegated browser operation={}",
             operation.as_str()
         ),
         readback_source_of_truth,
@@ -970,6 +970,37 @@ fn browser_debugger_response(
     response
 }
 
+/// Operations admissible under every profile (normal_agent/browser_control
+/// included) because the delegate itself only ever acts on a target this MCP
+/// session owns, has bound as its active target, or has just auto-adopted under
+/// the claim + human-foreground guards (`resolve_cdp_tab_mutation_target` /
+/// `_adopting`); the human's unrelated foreground tab is never a fallback.
+///
+/// - `evaluate`: page-scope Runtime.evaluate in that owned tab — the same
+///   authority the debugger-free browser_dom/browser_form/act routes already
+///   grant over the page; the call is single-shot and leaves no persistent
+///   instrumentation (contrast add_init_script/route/overrides).
+/// - `console_messages` / `network`: read-only buffers (contract
+///   mutates_state=false) on raw-CDP automation-profile targets owned by this
+///   session.
+///
+/// Everything else stays gated on browser_debugger/break_glass/full_capability:
+/// reload_bridge restarts the shared bridge for all sessions; pdf/file_upload
+/// cross the file-system boundary; dialog answers page prompts; init/script/
+/// style injection, expose_binding, emulate, route, network_overrides and
+/// network_har leave persistent per-target instrumentation; drag/drop are
+/// synthetic input.
+const fn browser_debugger_operation_admissible_on_owned_target(
+    operation: BrowserDebuggerOperation,
+) -> bool {
+    matches!(
+        operation,
+        BrowserDebuggerOperation::Evaluate
+            | BrowserDebuggerOperation::ConsoleMessages
+            | BrowserDebuggerOperation::Network
+    )
+}
+
 impl SynapseService {
     fn require_browser_debugger_facade_profile(
         &self,
@@ -992,7 +1023,8 @@ impl SynapseService {
             ToolProfileKind::BrowserDebugger
                 | ToolProfileKind::BreakGlass
                 | ToolProfileKind::FullCapability
-        ) {
+        ) || browser_debugger_operation_admissible_on_owned_target(operation)
+        {
             return Ok(());
         }
         let error = ErrorData::new(

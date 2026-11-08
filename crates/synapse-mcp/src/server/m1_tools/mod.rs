@@ -116,6 +116,25 @@ type OperatorPanicCdpTargetOwnerRows = (
     Vec<(String, PersistedCdpTargetOwner)>,
 );
 
+const CDP_TARGET_AUTO_ADOPT_AUDIT_TOOL: &str = "cdp_target_auto_adopt";
+const CHROME_TAB_TARGET_PREFIX: &str = "chrome-tab:";
+
+/// The human's current OS foreground HWND for the auto-adoption guard. "No
+/// foreground window" (locked desktop, transient switch) means no human-focused
+/// tab exists; any other read failure fails closed.
+fn human_os_foreground_hwnd_for_adoption(tool: &str) -> Result<Option<i64>, ErrorData> {
+    match synapse_a11y::current_foreground_context() {
+        Ok(context) => Ok(Some(context.hwnd)),
+        Err(synapse_a11y::A11yError::NoForeground { .. }) => Ok(None),
+        Err(error) => Err(mcp_error(
+            error.code(),
+            format!(
+                "{tool} could not read the human OS foreground window before auto-adopting a tab: {error}"
+            ),
+        )),
+    }
+}
+
 fn operator_panic_rollback_failed(
     stage: &'static str,
     panic_error: ErrorData,
@@ -2669,7 +2688,8 @@ impl SynapseService {
             TOOL,
             &session_id,
             &request_details,
-            self.resolve_cdp_target_info_target(&session_id, &params.0),
+            self.resolve_cdp_target_info_target_adopting(&session_id, &params.0)
+                .await,
         )?;
         let request_details = json!({
             "session_id": &session_id,
@@ -3075,12 +3095,14 @@ impl SynapseService {
             .clone()
             .or_else(|| element.as_ref().map(|(_, target)| target.clone()));
         let request_details = browser_evaluate_resolution_request_details(&session_id, &params.0);
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            resolution_target.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                resolution_target.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3568,12 +3590,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3621,12 +3645,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3674,12 +3700,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3731,12 +3759,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3791,12 +3821,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3910,12 +3942,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            wait.locate.window_hwnd,
-            resolution_target.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                wait.locate.window_hwnd,
+                resolution_target.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -3977,12 +4011,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -4038,12 +4074,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -4159,12 +4197,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                params.0.cdp_target_id.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -4249,12 +4289,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            Some(element_target.as_str()),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                Some(element_target.as_str()),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -4348,12 +4390,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            Some(element_target.as_str()),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                Some(element_target.as_str()),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -4580,12 +4624,14 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            resolution_target.as_deref(),
-        );
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                resolution_target.as_deref(),
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
@@ -5898,6 +5944,369 @@ impl SynapseService {
             ));
         }
         Ok((window_hwnd, target_id))
+    }
+
+    /// Async front door for explicit-target resolution that may auto-adopt an
+    /// explicitly named, completely unowned `chrome-tab:*` target (operator
+    /// mandate 2026-11-08: evaluate/DOM on an existing tab must not need a
+    /// profile switch + explicit hwnd + select round-trip).
+    ///
+    /// The strict resolver always runs first and stays authoritative: adoption
+    /// is attempted only when it refused an explicit `chrome-tab:*` id that no
+    /// MCP session owns in the CDP owner registry and that is not this session's
+    /// active target. Adoption then (under this session's authority gate)
+    /// refuses when another session has the tab as its active target or holds a
+    /// live conflicting claim, refuses the active tab of the human's OS
+    /// foreground window unless this session holds an exact target claim, binds
+    /// the tab as this session's target exactly like `browser_tabs
+    /// operation=select` (same panic boundaries, audited), and re-runs the strict
+    /// resolver so every identity/owner check still applies unchanged. Window
+    /// discovery is passive (`chrome.tabs.query` per window): it never changes
+    /// OS foreground and never focuses or activates anything.
+    pub(crate) async fn resolve_cdp_tab_mutation_target_adopting(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        window_hwnd_param: Option<i64>,
+        cdp_target_id_param: Option<&str>,
+    ) -> Result<(i64, String), ErrorData> {
+        let strict_error = match self.resolve_cdp_tab_mutation_target(
+            tool,
+            session_id,
+            window_hwnd_param,
+            cdp_target_id_param,
+        ) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => error,
+        };
+        let Some(target_id) = cdp_target_id_param else {
+            return Err(strict_error);
+        };
+        if !self.cdp_target_auto_adopt_eligible(session_id, target_id)? {
+            return Err(strict_error);
+        }
+        self.auto_adopt_cdp_target(
+            tool,
+            session_id,
+            window_hwnd_param,
+            target_id,
+            &strict_error,
+        )
+        .await?;
+        self.resolve_cdp_tab_mutation_target(
+            tool,
+            session_id,
+            window_hwnd_param,
+            cdp_target_id_param,
+        )
+    }
+
+    /// Target-info twin of [`Self::resolve_cdp_tab_mutation_target_adopting`].
+    async fn resolve_cdp_target_info_target_adopting(
+        &self,
+        session_id: &str,
+        params: &CdpTargetInfoParams,
+    ) -> Result<(i64, String), ErrorData> {
+        const TOOL: &str = "cdp_target_info";
+        let strict_error = match self.resolve_cdp_target_info_target(session_id, params) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => error,
+        };
+        let Some(target_id) = params.cdp_target_id.as_deref() else {
+            return Err(strict_error);
+        };
+        if !self.cdp_target_auto_adopt_eligible(session_id, target_id)? {
+            return Err(strict_error);
+        }
+        self.auto_adopt_cdp_target(
+            TOOL,
+            session_id,
+            params.window_hwnd,
+            target_id,
+            &strict_error,
+        )
+        .await?;
+        self.resolve_cdp_target_info_target(session_id, params)
+    }
+
+    /// Adoption is only ever considered for a well-formed normal-bridge
+    /// `chrome-tab:*` id that is absent from the CDP owner registry (no session,
+    /// including this one, owns it) and is not already this session's target.
+    /// Anything else keeps the strict resolver's refusal.
+    fn cdp_target_auto_adopt_eligible(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<bool, ErrorData> {
+        if validate_cdp_target_id(target_id).is_err()
+            || !target_id
+                .get(..CHROME_TAB_TARGET_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(CHROME_TAB_TARGET_PREFIX))
+        {
+            return Ok(false);
+        }
+        if !self.cdp_target_owners_for_target_id(target_id)?.is_empty() {
+            return Ok(false);
+        }
+        let already_active = matches!(
+            self.session_target(Some(session_id))?,
+            Some(SessionTarget::Cdp { ref cdp_target_id, .. })
+                if cdp_target_id.eq_ignore_ascii_case(target_id)
+        );
+        Ok(!already_active)
+    }
+
+    async fn auto_adopt_cdp_target(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        window_hwnd_param: Option<i64>,
+        target_id: &str,
+        strict_error: &ErrorData,
+    ) -> Result<(), ErrorData> {
+        let _authority_gate = self
+            .lock_session_authority_for_tool(tool, session_id)
+            .await?;
+        // Re-check under the gate: a concurrent call may have adopted it or
+        // another session may have opened it meanwhile.
+        if !self.cdp_target_owners_for_target_id(target_id)?.is_empty() {
+            return Err(strict_error.clone());
+        }
+        if matches!(
+            self.session_target(Some(session_id))?,
+            Some(SessionTarget::Cdp { ref cdp_target_id, .. })
+                if cdp_target_id.eq_ignore_ascii_case(target_id)
+        ) {
+            return Ok(());
+        }
+        self.refuse_target_active_in_other_session(tool, session_id, target_id)?;
+        let human_foreground_hwnd = human_os_foreground_hwnd_for_adoption(tool)?;
+        let (window_hwnd, tab) = self
+            .resolve_hwnd_for_cdp_target(
+                tool,
+                session_id,
+                window_hwnd_param,
+                target_id,
+                human_foreground_hwnd,
+            )
+            .await?;
+        let target = SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id: tab.cdp_target_id.clone(),
+        };
+        self.ensure_target_claim_allows_session(tool, session_id, &target)?;
+        let exact_claim = self.target_claim_for_session(session_id, &target)?;
+        let human_focused_active_tab = tab.active && human_foreground_hwnd == Some(window_hwnd);
+        if human_focused_active_tab && exact_claim.is_none() {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} refused to auto-adopt {target_id:?}: it is the active tab of the human's OS foreground Chrome window {window_hwnd:#x} and this session holds no exact claim on it; claim it deliberately first with target operation=claim target={{\"kind\":\"cdp\",\"window_hwnd\":{window_hwnd},\"cdp_target_id\":\"{}\"}} and retry, or open your own tab with browser_tabs operation=new",
+                    tab.cdp_target_id
+                ),
+            ));
+        }
+        let request_details = json!({
+            "session_id": session_id,
+            "requesting_tool": tool,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &tab.cdp_target_id,
+            "tab_active": tab.active,
+            "human_os_foreground_hwnd": human_foreground_hwnd,
+            "human_focused_active_tab": human_focused_active_tab,
+            "exact_claim_held": exact_claim.is_some(),
+            "window_discovery": if window_hwnd_param.is_some() {
+                "explicit_window_hwnd"
+            } else {
+                "passive_chromium_window_scan"
+            },
+            "required_foreground": false,
+            "no_debugger_attach": true,
+        });
+        self.audit_action_started_with_details_for_session(
+            CDP_TARGET_AUTO_ADOPT_AUDIT_TOOL,
+            &request_details,
+            session_id,
+        )?;
+        let result = self.write_auto_adopted_session_target(session_id, target, tool);
+        self.audit_action_result_for_session(
+            CDP_TARGET_AUTO_ADOPT_AUDIT_TOOL,
+            &result,
+            session_id,
+        )?;
+        let adoption = result?;
+        let previous = adoption
+            .get("previous")
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        tracing::info!(
+            code = "CDP_TARGET_AUTO_ADOPTED",
+            session_id = %session_id,
+            tool,
+            window_hwnd,
+            cdp_target_id = %tab.cdp_target_id,
+            previous = %previous,
+            "explicitly named unowned chrome-tab target bound as this session's target (browser_tabs select semantics)"
+        );
+        Ok(())
+    }
+
+    /// Same session-target write + operator-panic boundaries as
+    /// `browser_tabs operation=select`.
+    fn write_auto_adopted_session_target(
+        &self,
+        session_id: &str,
+        target: SessionTarget,
+        tool: &'static str,
+    ) -> Result<Value, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_target_auto_adopt_before_session_target_write",
+        )?;
+        let current = target_wire(&target);
+        let previous = self.set_session_target_authority_locked(session_id, target)?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_target_auto_adopt_after_session_target_write",
+        ) {
+            if let Err(cleanup_error) =
+                self.restore_session_target_wire(session_id, previous.as_ref())
+            {
+                return Err(operator_panic_rollback_failed(
+                    "cdp_target_auto_adopt_after_session_target_write",
+                    panic_error,
+                    cleanup_error.message.to_string(),
+                ));
+            }
+            return Err(panic_error);
+        }
+        let readback = self.get_session_target_wire(session_id)?;
+        Ok(json!({
+            "source_of_truth": "CF_SESSIONS session target row + in-memory session target registry",
+            "requesting_tool": tool,
+            "previous": previous,
+            "current": current,
+            "readback": readback,
+        }))
+    }
+
+    /// Cross-session guard: an unowned tab that another session already bound
+    /// as its active target (via select/adoption) is not adoptable here.
+    fn refuse_target_active_in_other_session(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<(), ErrorData> {
+        let holders = {
+            let guard = self.lock_session_targets()?;
+            guard
+                .iter()
+                .filter(|(holder, target)| {
+                    holder.as_str() != session_id
+                        && matches!(
+                            target,
+                            SessionTarget::Cdp { cdp_target_id, .. }
+                                if cdp_target_id.eq_ignore_ascii_case(target_id)
+                        )
+                })
+                .map(|(holder, _)| holder.clone())
+                .collect::<Vec<_>>()
+        };
+        if holders.is_empty() {
+            return Ok(());
+        }
+        Err(mcp_error(
+            error_codes::TARGET_CO_OWNED,
+            format!(
+                "{tool} refused to auto-adopt {target_id:?}: it is the active session target of other MCP session(s) {holders:?}; open your own tab with browser_tabs operation=new, or coordinate via target operation=status/adopt"
+            ),
+        ))
+    }
+
+    /// Map an explicit `chrome-tab:*` id back to the single Chrome window that
+    /// lists it. Passive only: enumerates visible Chromium top-level windows and
+    /// runs the normal bridge `chrome.tabs.query` readback per window; it never
+    /// focuses, activates, or attaches a debugger. Exactly one match is
+    /// required; zero or several fail closed with the searched windows named.
+    #[cfg(windows)]
+    async fn resolve_hwnd_for_cdp_target(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        window_hwnd_param: Option<i64>,
+        target_id: &str,
+        human_foreground_hwnd: Option<i64>,
+    ) -> Result<(i64, BrowserTabEntry), ErrorData> {
+        let candidates = match window_hwnd_param {
+            Some(hwnd) => vec![validate_target_window_context(hwnd)?],
+            None => passive_chromium_window_candidates(tool, None)?,
+        };
+        let mut matches: Vec<(i64, BrowserTabEntry)> = Vec::new();
+        let mut searched = Vec::new();
+        let mut failures = Vec::new();
+        for context in candidates {
+            let hwnd = context.hwnd;
+            // Raw-CDP automation windows never host normal-bridge chrome-tab ids.
+            if synapse_a11y::endpoint_for_window(hwnd).is_some() {
+                continue;
+            }
+            searched.push(format!("{hwnd:#x}"));
+            match self
+                .browser_tabs_impl(
+                    session_id,
+                    context,
+                    human_foreground_hwnd == Some(hwnd),
+                    BrowserTabsOperation::List,
+                    None,
+                )
+                .await
+            {
+                Ok(listed) => {
+                    if let Some(tab) = listed
+                        .tabs
+                        .into_iter()
+                        .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(target_id))
+                    {
+                        matches.push((hwnd, tab));
+                    }
+                }
+                Err(error) => failures.push(format!("{hwnd:#x}: {}", error.message)),
+            }
+        }
+        if matches.len() > 1 {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} found target {target_id:?} in more than one Chrome window (hwnds {:?}); pass window_hwnd explicitly to disambiguate",
+                    matches
+                        .iter()
+                        .map(|(hwnd, _)| format!("{hwnd:#x}"))
+                        .collect::<Vec<_>>()
+                ),
+            ));
+        }
+        matches.pop().ok_or_else(|| {
+            mcp_error(
+                error_codes::TARGET_NOT_SET,
+                format!(
+                    "{tool} could not find target {target_id:?} in any Chrome window's tab list (searched hwnds {searched:?}; listing failures {failures:?}); list tabs with browser_tabs operation=list and pass a listed cdp_target_id, or pass window_hwnd explicitly"
+                ),
+            )
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn resolve_hwnd_for_cdp_target(
+        &self,
+        tool: &'static str,
+        _session_id: &str,
+        _window_hwnd_param: Option<i64>,
+        _target_id: &str,
+        _human_foreground_hwnd: Option<i64>,
+    ) -> Result<(i64, BrowserTabEntry), ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            format!("{tool} chrome-tab auto-adoption is only available on Windows in this build"),
+        ))
     }
 
     fn cdp_target_owner_for_navigation(
@@ -15698,6 +16107,7 @@ fn prepare_browser_screenshot_foreground(
     );
 
     if required_foreground {
+        ensure_browser_screenshot_may_take_foreground(window_hwnd, &before, &target)?;
         synapse_a11y::focus_window_with_intent(
             window_hwnd,
             synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
@@ -15792,6 +16202,57 @@ fn prepare_browser_screenshot_foreground(
         },
         before,
     })
+}
+
+/// OS-input safety: browser_screenshot's captureVisibleTab path needs the
+/// Chrome window foreground (the extension also focuses it itself). Never take
+/// the foreground from a human whose foreground root belongs to a different
+/// process — refuse before any focus change or bridge call instead.
+#[cfg(windows)]
+fn ensure_browser_screenshot_may_take_foreground(
+    window_hwnd: i64,
+    before: &ForegroundContext,
+    target: &ForegroundContext,
+) -> Result<(), ErrorData> {
+    let human = synapse_a11y::foreground_root_identity().map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_HUMAN_FOREGROUND_PROTECTED,
+            format!(
+                "browser_screenshot refused: the human foreground could not be read before taking focus for Chrome HWND {window_hwnd:#x} (fail closed): {error}"
+            ),
+        )
+    })?;
+    if human.pid == target.pid {
+        return Ok(());
+    }
+    let notification_state = synapse_a11y::human_notification_state();
+    let state_text = notification_state.as_ref().map_or_else(
+        |error| format!("unreadable({error})"),
+        |state| state.as_str().to_owned(),
+    );
+    let code = if matches!(&notification_state, Ok(state) if state.protects_foreground()) {
+        error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
+    } else {
+        error_codes::ACTION_HUMAN_FOREGROUND_PROTECTED
+    };
+    tracing::warn!(
+        code,
+        hwnd = window_hwnd,
+        human_foreground_root_hwnd = human.root_hwnd,
+        human_foreground_pid = human.pid,
+        human_foreground_process = %before.process_name,
+        target_pid = target.pid,
+        notification_state = %state_text,
+        "browser_screenshot refused to take the foreground from another process"
+    );
+    Err(mcp_error(
+        code,
+        format!(
+            "browser_screenshot refused: Chrome HWND {window_hwnd:#x} is not foreground and the human foreground ({}; root_hwnd={:#x}; notification_state={state_text}) belongs to a different process, so captureVisibleTab would have to steal focus. No focus change was made. Background-capable alternatives: browser_dom (content/page text/accessibility tree) or browser_capture/screenshot with the target window's HWND (passive per-window capture), or retry when Chrome is the foreground.",
+            browser_screenshot_foreground_summary(before),
+            human.root_hwnd
+        ),
+    ))
 }
 
 #[cfg(not(windows))]

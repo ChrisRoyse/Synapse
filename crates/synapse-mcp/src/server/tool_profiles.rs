@@ -867,19 +867,19 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "evaluate",
                 true,
                 true,
-                "browser_debugger profile row + Runtime.evaluate response",
+                "session-owned/adopted target + Runtime.evaluate response (any profile)",
                 Some("Runtime.evaluate target/url/ready_state/value readback"),
-                error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to browser_debugger with reason/confirmation before evaluation",
+                error_codes::ACTION_TARGET_INVALID,
+                "name a cdp_target_id this session owns or can adopt (not another session's tab, not the human's focused active tab without target operation=claim)",
             ),
             op(
                 "console_messages",
                 false,
                 true,
-                "browser_debugger profile row + console buffer cursor",
+                "session-owned raw-CDP target console buffer cursor (any profile)",
                 None,
-                error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to browser_debugger and read the target console buffer",
+                error_codes::ACTION_TARGET_INVALID,
+                "bind a session-owned raw-CDP target and read its console buffer",
             ),
             op(
                 "reload_bridge",
@@ -948,10 +948,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "network",
                 false,
                 true,
-                "browser_debugger profile row + captured network rows",
+                "session-owned raw-CDP target captured network rows (any profile)",
                 None,
-                error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to browser_debugger and read the captured network rows",
+                error_codes::ACTION_TARGET_INVALID,
+                "bind a session-owned raw-CDP target and read its captured network rows",
             ),
             op(
                 "network_har",
@@ -2642,6 +2642,15 @@ pub(crate) struct ProfileParams {
     #[serde(default)]
     #[schemars(default)]
     pub confirm_break_glass: bool,
+    /// When true, operation=status/set return the full before/after
+    /// `ToolProfileSnapshot` (facade contract for every operation, public
+    /// registry, Codex client surface; ~190 KB). Default false returns the
+    /// compact `status_summary`/`set_summary` readback (profile, visible tool
+    /// count + sha, tool-surface delta, policy row key/sha, audit keys, lease
+    /// proof) so routine profile switches stay small.
+    #[serde(default)]
+    #[schemars(default)]
+    pub detail: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2649,10 +2658,19 @@ pub(crate) struct ProfileParams {
 pub(crate) struct ProfileResponse {
     pub operation: ProfileOperation,
     pub source_of_truth: &'static str,
+    /// Full status readback; present only when detail=true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ToolProfileStatusResponse>,
+    /// Full set readback (complete before/after snapshots); present only when
+    /// detail=true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<ToolProfileSetResponse>,
+    /// Compact status readback (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_summary: Option<ToolProfileStatusSummary>,
+    /// Compact set readback (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_summary: Option<ToolProfileSetSummary>,
     /// #1559: grant/revoke result for the runtime reality-write overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_write: Option<RealityWriteGrantResponse>,
@@ -2710,10 +2728,133 @@ pub(crate) struct ToolProfileSetResponse {
     pub lease_proof: ToolProfileLeaseProof,
 }
 
+const PROFILE_DETAIL_HINT: &str = "compact readback; pass detail=true for the full ToolProfileSnapshot (facade contract, public registry, Codex client surface, hidden routes)";
+
+/// Compact per-snapshot readback used by the default (detail=false) profile
+/// responses. Every field is copied from the same `ToolProfileSnapshot` the
+/// full response would carry, so the compact form never diverges from it.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileSnapshotSummary {
+    pub profile: ToolProfileKind,
+    pub profile_label: &'static str,
+    pub source: String,
+    pub implementation_tool_count: usize,
+    pub visible_tool_count: usize,
+    pub visible_tool_sha256: String,
+    pub facade_contract_sha256: String,
+    pub foreground_route: ToolProfileForegroundRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_row_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_row_value_sha256: Option<String>,
+}
+
+impl ToolProfileSnapshot {
+    pub(crate) fn summary(&self) -> ToolProfileSnapshotSummary {
+        ToolProfileSnapshotSummary {
+            profile: self.profile,
+            profile_label: self.profile_label,
+            source: self.source.clone(),
+            implementation_tool_count: self.implementation_tool_count,
+            visible_tool_count: self.visible_tool_count,
+            visible_tool_sha256: self.visible_tool_sha256.clone(),
+            facade_contract_sha256: self.facade_contract.facade_contract_sha256.clone(),
+            foreground_route: self.foreground_route.clone(),
+            policy_row_key_hex: self.policy_row.as_ref().map(|row| row.key_hex.clone()),
+            policy_row_value_sha256: self.policy_row.as_ref().map(|row| row.value_sha256.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileStatusSummary {
+    pub source_of_truth: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub snapshot: ToolProfileSnapshotSummary,
+    pub m3_permissions: M3PermissionStatus,
+    pub detail_hint: &'static str,
+}
+
+impl ToolProfileStatusResponse {
+    pub(crate) fn summary(&self) -> ToolProfileStatusSummary {
+        ToolProfileStatusSummary {
+            source_of_truth: self.snapshot.source_of_truth,
+            session_id: self.snapshot.session_id.clone(),
+            snapshot: self.snapshot.summary(),
+            m3_permissions: self.m3_permissions.clone(),
+            detail_hint: PROFILE_DETAIL_HINT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileSetSummary {
+    pub source_of_truth: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub before: ToolProfileSnapshotSummary,
+    pub after: ToolProfileSnapshotSummary,
+    pub profile_changed: bool,
+    pub visible_tool_surface_changed: bool,
+    pub tools_newly_visible: Vec<String>,
+    pub tools_newly_hidden: Vec<String>,
+    pub row_readback: ToolProfileAuditReadback,
+    pub intent_audit: ToolProfileAuditReadback,
+    pub final_audit: ToolProfileAuditReadback,
+    pub lease_proof: ToolProfileLeaseProof,
+    pub detail_hint: &'static str,
+}
+
+impl ToolProfileSetResponse {
+    pub(crate) fn summary(&self) -> ToolProfileSetSummary {
+        let before_names = self
+            .before
+            .visible_tool_names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after_names = self
+            .after
+            .visible_tool_names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        ToolProfileSetSummary {
+            source_of_truth: self.after.source_of_truth,
+            session_id: self.after.session_id.clone(),
+            before: self.before.summary(),
+            after: self.after.summary(),
+            profile_changed: self.before.profile != self.after.profile,
+            visible_tool_surface_changed: self.before.visible_tool_sha256
+                != self.after.visible_tool_sha256,
+            tools_newly_visible: after_names
+                .difference(&before_names)
+                .map(|name| (*name).clone())
+                .collect(),
+            tools_newly_hidden: before_names
+                .difference(&after_names)
+                .map(|name| (*name).clone())
+                .collect(),
+            row_readback: ToolProfileAuditReadback {
+                cf_name: self.row_readback.cf_name,
+                key_hex: self.row_readback.key_hex.clone(),
+                value_len_bytes: self.row_readback.value_len_bytes,
+                value_sha256: self.row_readback.value_sha256.clone(),
+            },
+            intent_audit: self.intent_audit.clone(),
+            final_audit: self.final_audit.clone(),
+            lease_proof: self.lease_proof.clone(),
+            detail_hint: PROFILE_DETAIL_HINT,
+        }
+    }
+}
+
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself."
+        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself. status/set return a compact status_summary/set_summary by default (profile, visible tool count+sha, tool-surface delta, policy row key/sha, audit keys, lease proof); pass detail=true for the full before/after snapshots."
     )]
     pub async fn profile(
         &self,
@@ -2737,13 +2878,23 @@ impl SynapseService {
             None
         };
         match params.operation {
-            ProfileOperation::Status => Ok(Json(ProfileResponse {
-                operation: ProfileOperation::Status,
-                source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
-                status: Some(self.tool_profile_status_response(&request_context)?),
-                set: None,
-                reality_write: None,
-            })),
+            ProfileOperation::Status => {
+                let status = self.tool_profile_status_response(&request_context)?;
+                let (status, status_summary) = if params.detail {
+                    (Some(status), None)
+                } else {
+                    (None, Some(status.summary()))
+                };
+                Ok(Json(ProfileResponse {
+                    operation: ProfileOperation::Status,
+                    source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+                    status,
+                    set: None,
+                    status_summary,
+                    set_summary: None,
+                    reality_write: None,
+                }))
+            }
             ProfileOperation::Set => {
                 let profile = params.profile.ok_or_else(|| {
                     profile_facade_error(
@@ -2765,11 +2916,18 @@ impl SynapseService {
                         true,
                     )
                     .await?;
+                let (set, set_summary) = if params.detail {
+                    (Some(set), None)
+                } else {
+                    (None, Some(set.summary()))
+                };
                 Ok(Json(ProfileResponse {
                     operation: ProfileOperation::Set,
                     source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
                     status: None,
-                    set: Some(set),
+                    set,
+                    status_summary: None,
+                    set_summary,
                     reality_write: None,
                 }))
             }
@@ -2793,6 +2951,8 @@ impl SynapseService {
                     source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
                     status: None,
                     set: None,
+                    status_summary: None,
+                    set_summary: None,
                     reality_write: Some(reality_write),
                 }))
             }
@@ -2812,6 +2972,8 @@ impl SynapseService {
                     source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
                     status: None,
                     set: None,
+                    status_summary: None,
+                    set_summary: None,
                     reality_write: Some(reality_write),
                 }))
             }
