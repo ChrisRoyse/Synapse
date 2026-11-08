@@ -124,6 +124,7 @@ fn synthetic_extension_owner_readback(
         owner_continuity_healthy: true,
         active_after: crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerCounts::default(),
         fully_drained: true,
+        ..Default::default()
     }
 }
 

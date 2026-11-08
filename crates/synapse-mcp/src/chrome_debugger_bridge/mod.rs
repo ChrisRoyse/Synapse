@@ -4662,6 +4662,29 @@ pub struct ChromeDebuggerExtensionOwnerReadback {
     pub owner_continuity_healthy: bool,
     pub active_after: ChromeDebuggerExtensionOwnerCounts,
     pub fully_drained: bool,
+    /// #2271 self-heal readback. Absent on older extension builds.
+    #[serde(default)]
+    pub gate_closed_reason: Option<String>,
+    #[serde(default)]
+    pub operator_panic_active: bool,
+    #[serde(default)]
+    pub quarantined_tab_count: usize,
+    #[serde(default)]
+    pub quarantined_tabs: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub browser_continuity: Option<serde_json::Value>,
+    #[serde(default)]
+    pub browser_instance_anchor_count: Option<u64>,
+    #[serde(default)]
+    pub owner_reconcile_count: u64,
+    #[serde(default)]
+    pub owner_reconcile_last: Option<serde_json::Value>,
+    #[serde(default)]
+    pub owner_evidence_last: Option<serde_json::Value>,
+    #[serde(default)]
+    pub command_watchdog_fired_count: u64,
+    #[serde(default)]
+    pub worker_reload_pending: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
