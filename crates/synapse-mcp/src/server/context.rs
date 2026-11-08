@@ -158,11 +158,17 @@ impl SynapseService {
         &self,
         session_id: Option<String>,
     ) -> Result<M2ActionContext, ErrorData> {
+        let session_delivery_target =
+            self.session_target_input_delivery_target(session_id.as_deref())?;
         self.m2_state
             .lock()
             .map(|state| {
                 (
-                    state.emitter_handle.clone().with_session_id(session_id),
+                    state
+                        .emitter_handle
+                        .clone()
+                        .with_session_id(session_id)
+                        .with_delivery_target(session_delivery_target),
                     state.recording.clone(),
                     state.connection_closed_cancel.clone(),
                 )
@@ -173,6 +179,61 @@ impl SynapseService {
                     "M2 service state lock poisoned",
                 )
             })
+    }
+
+    /// OS-input safety: the intended delivery window implied by the session's
+    /// bound target (`target set` / CDP binding). A dead target window yields
+    /// `None`, so keyboard input then fails closed with
+    /// `ACTION_INPUT_TARGET_REQUIRED` instead of typing into the foreground.
+    fn session_target_input_delivery_target(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<synapse_action::InputDeliveryTarget>, ErrorData> {
+        let Some(target) = self.session_target(session_id)? else {
+            return Ok(None);
+        };
+        let hwnd = match target {
+            crate::server::SessionTarget::Window { hwnd } => hwnd,
+            crate::server::SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
+        };
+        match synapse_action::InputDeliveryTarget::resolve_window(hwnd, "session_target") {
+            Ok(target) => Ok(Some(target)),
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    hwnd,
+                    error = %error,
+                    "session target window could not be resolved as an OS-input delivery target"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// OS-input safety: resolves the intended delivery window for one action
+    /// call — an explicit per-call HWND wins, then the session target, then
+    /// the window this session last focused explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_TARGET_INVALID` when an explicit HWND is not a live
+    /// window.
+    pub(crate) fn resolve_input_delivery_target(
+        &self,
+        explicit_hwnd: Option<i64>,
+        handle: &synapse_action::ActionHandle,
+    ) -> Result<Option<synapse_action::InputDeliveryTarget>, ErrorData> {
+        if let Some(hwnd) = explicit_hwnd {
+            return synapse_action::InputDeliveryTarget::resolve_window(
+                hwnd,
+                "explicit_window_hwnd",
+            )
+            .map(Some)
+            .map_err(|error| crate::m2::action_error_to_mcp(&error));
+        }
+        handle
+            .delivery_target()
+            .map_err(|error| crate::m2::action_error_to_mcp(&error))
     }
 
     fn m2_unscoped_action_handle(&self) -> Result<synapse_action::ActionHandle, ErrorData> {

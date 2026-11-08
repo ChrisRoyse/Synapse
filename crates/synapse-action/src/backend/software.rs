@@ -4,6 +4,7 @@ use synapse_core::{Action, ComboInput, Point};
 
 use crate::{ActionBackend, ActionError, EmitState, recovery};
 
+mod delivery_guard;
 mod input;
 mod keyboard;
 mod mouse;
@@ -46,6 +47,9 @@ impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
         crate::validate_action(action)?;
+        // OS-input safety: every batch below re-verifies the live foreground
+        // against this intended target immediately before delivery.
+        let _delivery_scope = delivery_guard::enter_scope(state.delivery_target().cloned());
         match action {
             Action::KeyPress { key, hold_ms, .. } => keyboard::press_key(key, *hold_ms, state),
             Action::KeyDown { key, .. } => keyboard::key_down(key, state),

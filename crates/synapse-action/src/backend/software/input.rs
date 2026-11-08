@@ -62,6 +62,7 @@ pub(super) fn send_input_batch(inputs: &[INPUT], detail: &'static str) -> Result
     if inputs.is_empty() {
         return Ok(());
     }
+    super::delivery_guard::ensure_send_input_batch(inputs, detail)?;
     let cb_size =
         i32::try_from(mem::size_of::<INPUT>()).map_err(|_err| ActionError::BackendUnavailable {
             detail: "INPUT struct size does not fit SendInput cbSize".to_owned(),

@@ -4,11 +4,22 @@ use synapse_core::{Action, ComboInput, error_codes};
 
 use super::routing::{action_consumes_rate_limit, action_kind, resolved_backend_for_action};
 use super::{ActionEmitter, EmitState, HeldKeyTimerKey};
-use crate::{ActionBackend, ActionError, ActionResult, ResolvedBackend};
+use crate::{ActionBackend, ActionError, ActionResult, InputDeliveryTarget, ResolvedBackend};
 
 impl ActionEmitter {
     #[tracing::instrument(skip_all, fields(action_kind = %action_kind(&action)))]
     pub(super) async fn execute(&mut self, action: Action) -> ActionResult<()> {
+        self.execute_with_delivery_target(action, None).await
+    }
+
+    /// Executes `action` with its intended OS-input delivery window; the
+    /// software backend re-verifies the live foreground against it immediately
+    /// before every input batch.
+    pub(super) async fn execute_with_delivery_target(
+        &mut self,
+        action: Action,
+        delivery_target: Option<InputDeliveryTarget>,
+    ) -> ActionResult<()> {
         crate::validate_action(&action)?;
 
         if matches!(action, Action::ReleaseAll) {
@@ -25,7 +36,7 @@ impl ActionEmitter {
 
         let backend = self.backends.pick(resolved);
         let result = self
-            .dispatch_via_backend(resolved, backend, action.clone())
+            .dispatch_via_backend(resolved, backend, action.clone(), delivery_target)
             .await;
 
         if result.is_ok() {
@@ -40,11 +51,14 @@ impl ActionEmitter {
         resolved: ResolvedBackend,
         backend: Arc<dyn ActionBackend>,
         action: Action,
+        delivery_target: Option<InputDeliveryTarget>,
     ) -> ActionResult<()> {
         let mut state = std::mem::take(&mut self.state);
         let task = tokio::task::spawn_blocking(move || {
             state.set_active_backend(resolved);
+            state.set_delivery_target(delivery_target);
             let result = backend.execute(&action, &mut state);
+            state.set_delivery_target(None);
             state.clear_active_backend();
             (result, state)
         });
@@ -149,7 +163,12 @@ impl ActionEmitter {
         let mut release_backends = vec![resolved.as_str()];
         let mut hardware_release_ok = None;
         let mut result = self
-            .dispatch_via_backend(resolved, Arc::clone(&primary_backend), Action::ReleaseAll)
+            .dispatch_via_backend(
+                resolved,
+                Arc::clone(&primary_backend),
+                Action::ReleaseAll,
+                None,
+            )
             .await;
 
         let vigem_has_held_state = snapshot_has_backend_held_state(&before, ResolvedBackend::Vigem);
@@ -157,7 +176,12 @@ impl ActionEmitter {
             release_backends.push("vigem");
             let vigem_backend = self.backends.pick_vigem_for_release();
             let vigem_result = self
-                .dispatch_via_backend(ResolvedBackend::Vigem, vigem_backend, Action::ReleaseAll)
+                .dispatch_via_backend(
+                    ResolvedBackend::Vigem,
+                    vigem_backend,
+                    Action::ReleaseAll,
+                    None,
+                )
                 .await;
             result = combine_release_results(result, vigem_result);
         }
@@ -174,6 +198,7 @@ impl ActionEmitter {
                     ResolvedBackend::Hardware,
                     hardware_backend,
                     Action::ReleaseAll,
+                    None,
                 )
                 .await;
             hardware_release_ok = Some(hardware_result.is_ok());

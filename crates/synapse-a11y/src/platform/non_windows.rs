@@ -68,6 +68,39 @@ pub fn is_top_level_window(_hwnd: i64) -> A11yResult<bool> {
     ))
 }
 
+pub fn window_root_identity(_hwnd: i64) -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "window root identity readback requires Windows",
+    ))
+}
+
+pub fn foreground_root_identity() -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "foreground root identity readback requires Windows",
+    ))
+}
+
+pub fn window_root_identity_at_point(_x: i32, _y: i32) -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "window-under-point readback requires Windows",
+    ))
+}
+
+pub fn human_notification_state() -> A11yResult<crate::HumanNotificationState> {
+    Err(A11yError::not_available(
+        "user notification state readback requires Windows",
+    ))
+}
+
+pub fn ensure_human_foreground_allows_focus_change(
+    _target: crate::WindowRootIdentity,
+    _caller: &'static str,
+) -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "human foreground protection requires Windows",
+    ))
+}
+
 pub fn top_level_root_hwnd(_hwnd: i64) -> A11yResult<i64> {
     Err(A11yError::not_available(
         "top-level root HWND readback requires Windows",

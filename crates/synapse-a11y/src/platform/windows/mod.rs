@@ -1,5 +1,6 @@
 mod common;
 mod events;
+mod human_guard;
 mod resolve;
 mod snapshot;
 mod window;
@@ -9,6 +10,10 @@ pub fn uia_worker_readback() -> crate::A11yResult<crate::UiaWorkerReadback> {
 }
 
 pub use events::{WinEventSubscription, retained_live_owner_count, subscribe_win_events};
+pub use human_guard::{
+    ensure_human_foreground_allows_focus_change, foreground_root_identity,
+    human_notification_state, window_root_identity, window_root_identity_at_point,
+};
 pub use resolve::{
     append_element_text, click_element_action, element_bounding_rect, element_metadata,
     element_scroll_state, element_value, expand_state_of, expand_state_of_id, focus_element,

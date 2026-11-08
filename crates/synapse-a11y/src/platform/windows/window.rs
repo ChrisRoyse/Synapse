@@ -76,6 +76,13 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
         hwnd = hwnd.0 as isize,
         "foreground activation entered explicit-intent guard"
     );
+    // OS-input safety: never steal focus from a human in a protected
+    // fullscreen/busy/presentation app (e.g. a game) that is not the target.
+    let target_identity = super::human_guard::window_root_identity(hwnd_to_wire(hwnd.0 as isize))?;
+    super::human_guard::ensure_human_foreground_allows_focus_change(
+        target_identity,
+        intent.caller(),
+    )?;
     restore_window_for_focus(hwnd);
     let _ = unsafe { SetForegroundWindow(hwnd) };
     if native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize) {
@@ -89,11 +96,39 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
             unsafe { GetWindowThreadProcessId(foreground, None) }
         };
         let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
-        if let Err(error) = send_foreground_activation_nudge() {
-            tracing::debug!(
+        // The Alt nudge is an OS input batch delivered to whatever is
+        // foreground. Send it only when that foreground root belongs to the
+        // target's own process (re-checked immediately before delivery), and
+        // re-run the fullscreen guard so a human who entered a game since the
+        // first check is never disturbed.
+        super::human_guard::ensure_human_foreground_allows_focus_change(
+            target_identity,
+            intent.caller(),
+        )?;
+        match super::human_guard::foreground_root_identity() {
+            Ok(foreground_identity) if foreground_identity.pid == target_identity.pid => {
+                if let Err(error) = send_foreground_activation_nudge() {
+                    tracing::debug!(
+                        error = %error,
+                        "foreground activation input nudge failed before SetForegroundWindow retry"
+                    );
+                }
+            }
+            Ok(foreground_identity) => tracing::info!(
+                code = "FOREGROUND_ACTIVATION_NUDGE_SKIPPED_OTHER_PROCESS",
+                caller = intent.caller(),
+                foreground_root_hwnd = foreground_identity.root_hwnd,
+                foreground_pid = foreground_identity.pid,
+                target_root_hwnd = target_identity.root_hwnd,
+                target_pid = target_identity.pid,
+                "Alt nudge not sent: the foreground belongs to another process"
+            ),
+            Err(error) => tracing::info!(
+                code = "FOREGROUND_ACTIVATION_NUDGE_SKIPPED_NO_FOREGROUND",
+                caller = intent.caller(),
                 error = %error,
-                "foreground activation input nudge failed before SetForegroundWindow retry"
-            );
+                "Alt nudge not sent: the foreground could not be read"
+            ),
         }
         let attached_foreground = foreground_thread != 0
             && foreground_thread != current_thread

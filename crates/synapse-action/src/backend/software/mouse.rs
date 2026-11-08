@@ -525,7 +525,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     // desktops Windows can map MOUSEEVENTF_ABSOLUTE through a logical desktop
     // surface and move the cursor away from the physical UIA point.
     let compensation = dpi_compensation_for_point(point);
-    if set_physical_cursor_pos(point, detail) {
+    if set_physical_cursor_pos(point, detail)? {
         let first_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, first_actual) {
             return Ok(());
@@ -545,7 +545,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
                 detail,
                 "physical cursor move read back a scaled coordinate; retrying with monitor-DPI compensation"
             );
-            if set_physical_cursor_pos(compensation.adjusted, detail) {
+            if set_physical_cursor_pos(compensation.adjusted, detail)? {
                 let compensated_actual = read_physical_cursor_position(detail)?;
                 if cursor_readback_matches(point, compensated_actual) {
                     return Ok(());
@@ -580,7 +580,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     }
 
     if let Some(compensation) = compensation
-        && set_physical_cursor_pos(compensation.adjusted, detail)
+        && set_physical_cursor_pos(compensation.adjusted, detail)?
     {
         let compensated_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, compensated_actual) {
@@ -869,8 +869,9 @@ fn extract_sample_index(detail: &str) -> Option<usize> {
         .flatten()
 }
 
-fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
-    match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
+fn set_physical_cursor_pos(point: Point, detail: &'static str) -> Result<bool, ActionError> {
+    super::delivery_guard::ensure_pointer(super::delivery_guard::PointerDelivery::Move, detail)?;
+    Ok(match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
         Ok(()) => true,
         Err(error) if error.code() != windows::core::HRESULT(0) => {
             tracing::warn!(
@@ -893,7 +894,7 @@ fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
             );
             false
         }
-    }
+    })
 }
 
 fn read_physical_cursor_position(detail: &'static str) -> Result<WinPoint, ActionError> {

@@ -8619,11 +8619,55 @@ async fn target_act_key_press(
     let verb = params.verb.as_str();
     let keys = target_act_key_chord_keys(params, verb)?;
     let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb)?;
+    ensure_target_act_key_press_has_input_target(service, request_context, verb)?;
     ensure_target_act_operator_panic_boundary("key_before_input_delivery")?;
     let response = service
         .act_press(Parameters(press_params), request_context.clone())
         .await;
     target_act_delegate_response("act_press", response)
+}
+
+/// OS-input safety: a raw key chord has no locator, so it may only be
+/// delivered to a resolved target window (session target or the window this
+/// session explicitly focused). With none, refuse instead of falling through
+/// to raw `SendInput` into whatever the human has in the foreground.
+fn ensure_target_act_key_press_has_input_target(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    verb: &str,
+) -> Result<(), ErrorData> {
+    let (handle, recording, _cancel) = service.m2_action_context_for_request(request_context)?;
+    if recording.is_some() {
+        return Ok(());
+    }
+    if handle
+        .delivery_target()
+        .map_err(|error| crate::m2::action_error_to_mcp(&error))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let foreground = synapse_a11y::foreground_root_identity().map_or_else(
+        |error| format!("foreground unreadable: {error}"),
+        |identity| {
+            format!(
+                "human foreground root_hwnd={:#x} pid={}",
+                identity.root_hwnd, identity.pid
+            )
+        },
+    );
+    tracing::warn!(
+        code = error_codes::ACTION_INPUT_TARGET_REQUIRED,
+        verb,
+        foreground = %foreground,
+        "target_act key chord refused: no resolvable target window"
+    );
+    Err(mcp_error(
+        error_codes::ACTION_INPUT_TARGET_REQUIRED,
+        format!(
+            "target_act verb={verb} refused: no target window is resolvable for this session (no session target and no explicitly focused window), so the key chord would be raw SendInput into whatever is foreground ({foreground}). Set a session target (target operation=set) or act_focus_window an explicit window first; prefer background routes (browser_dom / CDP / PostMessage)."
+        ),
+    ))
 }
 
 async fn target_act_insert_or_append_text(
@@ -9754,6 +9798,16 @@ fn target_act_window_coordinate_foreground_preflight(
                 caller: "target_act",
             },
         ) {
+            if error.code() == error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND {
+                // OS-input safety: the human is in a fullscreen app; never
+                // re-steal focus for a coordinate click.
+                return Err(mcp_error(
+                    error.code(),
+                    format!(
+                        "target_act coordinate click refused: target root 0x{target_root:x} is not foreground and the human is in a protected fullscreen app; {error}"
+                    ),
+                ));
+            }
             return Err(target_act_foreground_lost_error(
                 target_root,
                 foreground_root,

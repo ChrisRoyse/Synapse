@@ -10,7 +10,7 @@ use synapse_core::{
 };
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-use crate::{ActionError, ActionResult, validate_action};
+use crate::{ActionError, ActionResult, InputDeliveryTarget, validate_action};
 
 pub const ACTION_QUEUE_CAPACITY: usize = 256;
 
@@ -18,7 +18,17 @@ pub const ACTION_QUEUE_CAPACITY: usize = 256;
 ///
 /// A normal action must still match this epoch at physical dispatch; otherwise
 /// an item queued before K1 could resume after a fully finalized K2 wave.
-pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>, Option<u64>);
+pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>, ActionEnqueueMeta);
+
+/// Per-action metadata captured at the enqueue edge.
+#[derive(Clone, Debug, Default)]
+pub struct ActionEnqueueMeta {
+    /// Operator-panic epoch captured when the action was enqueued.
+    pub operator_panic_epoch_at_enqueue: Option<u64>,
+    /// Window the action is meant for; the software backend re-verifies the
+    /// live foreground against it immediately before every OS input batch.
+    pub delivery_target: Option<InputDeliveryTarget>,
+}
 
 pub static RELEASE_ALL_HANDLE: OnceLock<ActionHandle> = OnceLock::new();
 
@@ -45,6 +55,8 @@ pub struct ActionHandle {
     session_id: Option<String>,
     session_inputs: Arc<Mutex<SessionInputOwnership>>,
     session_input_gate: Arc<AsyncMutex<()>>,
+    delivery_target: Option<InputDeliveryTarget>,
+    session_delivery_targets: Arc<Mutex<BTreeMap<String, InputDeliveryTarget>>>,
 }
 
 impl std::fmt::Debug for ActionHandle {
@@ -65,6 +77,8 @@ impl ActionHandle {
             session_id: None,
             session_inputs: Arc::new(Mutex::new(SessionInputOwnership::default())),
             session_input_gate: Arc::new(AsyncMutex::new(())),
+            delivery_target: None,
+            session_delivery_targets: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -90,6 +104,8 @@ impl ActionHandle {
                 session_id: None,
                 session_inputs: Arc::new(Mutex::new(SessionInputOwnership::default())),
                 session_input_gate: Arc::new(AsyncMutex::new(())),
+                delivery_target: None,
+                session_delivery_targets: Arc::new(Mutex::new(BTreeMap::new())),
             },
             rx,
             safety_rx,
@@ -105,7 +121,66 @@ impl ActionHandle {
             session_id,
             session_inputs: Arc::clone(&self.session_inputs),
             session_input_gate: Arc::clone(&self.session_input_gate),
+            delivery_target: self.delivery_target.clone(),
+            session_delivery_targets: Arc::clone(&self.session_delivery_targets),
         }
+    }
+
+    /// Returns a handle whose actions carry `target` as their intended OS-input
+    /// delivery window. `None` keeps the current (or session-bound) target.
+    #[must_use]
+    pub fn with_delivery_target(&self, target: Option<InputDeliveryTarget>) -> Self {
+        let mut handle = self.clone();
+        if target.is_some() {
+            handle.delivery_target = target;
+        }
+        handle
+    }
+
+    /// The intended OS-input delivery target for actions sent through this
+    /// handle: an explicit per-call target wins over the session-bound target
+    /// recorded by a verified focus of an explicitly chosen window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_BACKEND_UNAVAILABLE` if the session target map is
+    /// poisoned.
+    pub fn delivery_target(&self) -> ActionResult<Option<InputDeliveryTarget>> {
+        if let Some(target) = &self.delivery_target {
+            return Ok(Some(target.clone()));
+        }
+        let Some(session_id) = self.session_id.as_deref() else {
+            return Ok(None);
+        };
+        self.session_delivery_targets
+            .lock()
+            .map(|targets| targets.get(session_id).cloned())
+            .map_err(|_err| ActionError::BackendUnavailable {
+                detail: "session delivery target map is poisoned".to_owned(),
+            })
+    }
+
+    /// Records `target` as this session's intended OS-input window after an
+    /// explicit, verified focus of that window. Returns `false` (and records
+    /// nothing) for an unscoped handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_BACKEND_UNAVAILABLE` if the session target map is
+    /// poisoned.
+    pub fn bind_session_delivery_target(&self, target: InputDeliveryTarget) -> ActionResult<bool> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(false);
+        };
+        self.session_delivery_targets
+            .lock()
+            .map(|mut targets| {
+                targets.insert(session_id, target);
+            })
+            .map_err(|_err| ActionError::BackendUnavailable {
+                detail: "session delivery target map is poisoned".to_owned(),
+            })?;
+        Ok(true)
     }
 
     /// Installs the scheduler used to route [`Action::Combo`] through the
@@ -377,6 +452,10 @@ impl ActionHandle {
         ack_tx: oneshot::Sender<ActionResult<()>>,
     ) -> ActionResult<Option<u64>> {
         let operator_panic_epoch_at_enqueue = capture_operator_panic_action_epoch(&action)?;
+        let meta = ActionEnqueueMeta {
+            operator_panic_epoch_at_enqueue,
+            delivery_target: self.delivery_target()?,
+        };
         if matches!(action, Action::ReleaseAll) {
             crate::request_release_interrupt();
         }
@@ -384,12 +463,12 @@ impl ActionHandle {
             && let Some(safety_tx) = &self.safety_tx
         {
             safety_tx
-                .send((action, ack_tx, operator_panic_epoch_at_enqueue))
+                .send((action, ack_tx, meta))
                 .map_err(map_unbounded_send)?;
             return Ok(operator_panic_epoch_at_enqueue);
         }
         self.tx
-            .try_send((action, ack_tx, operator_panic_epoch_at_enqueue))
+            .try_send((action, ack_tx, meta))
             .map_err(map_try_send)?;
         Ok(operator_panic_epoch_at_enqueue)
     }
@@ -402,11 +481,11 @@ impl ActionHandle {
         crate::request_release_interrupt();
         if let Some(safety_tx) = &self.safety_tx {
             return safety_tx
-                .send((action, ack_tx, None))
+                .send((action, ack_tx, ActionEnqueueMeta::default()))
                 .map_err(map_unbounded_send);
         }
         self.tx
-            .try_send((action, ack_tx, None))
+            .try_send((action, ack_tx, ActionEnqueueMeta::default()))
             .map_err(map_try_send)
     }
 

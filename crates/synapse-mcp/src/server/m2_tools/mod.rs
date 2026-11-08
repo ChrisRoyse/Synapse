@@ -428,6 +428,27 @@ impl SynapseService {
             act_type_requires_foreground_route(&params, foreground_fallback.as_ref());
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
+        // OS-input safety: carry the window this text is meant for so the
+        // software backend verifies it is still the foreground before every
+        // character batch (and refuses when no target is known).
+        let explicit_type_target_hwnd = params
+            .verify_target_window_hwnd
+            .or_else(|| foreground_fallback.as_ref().map(|target| target.root_hwnd))
+            .or_else(|| {
+                params
+                    .into_element
+                    .as_ref()
+                    .and_then(|element_id| element_id.parts().ok())
+                    .map(|parts| parts.hwnd)
+            });
+        let handle = match self.resolve_input_delivery_target(explicit_type_target_hwnd, &handle) {
+            Ok(target) => handle.with_delivery_target(target),
+            Err(error) => {
+                let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_type", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
         if requires_foreground_route
             && let Err(error) = self.ensure_act_type_foreground(&preflight, recording.as_ref())
         {
@@ -1020,8 +1041,49 @@ impl SynapseService {
             };
         lease_guard.disable_context_restore("act_focus_window_intentional_foreground_change");
         let result = act_focus_window_with_boundary(params, boundary).await;
+        if let Ok(response) = &result
+            && response.ok
+            && response.after_foreground.hwnd == response.matched_window.hwnd
+        {
+            self.bind_focused_window_as_input_target(
+                response.matched_window.hwnd,
+                &request_context,
+            );
+        }
         self.audit_action_result_for_request("act_focus_window", &result, &request_context)?;
         result.map(Json)
+    }
+
+    /// OS-input safety: after an explicit, verified focus of a chosen window,
+    /// record it as this session's intended OS-input target so later
+    /// foreground keyboard/text input is delivered only while that window
+    /// (root HWND + pid) is still the foreground.
+    fn bind_focused_window_as_input_target(
+        &self,
+        hwnd: i64,
+        request_context: &RequestContext<RoleServer>,
+    ) {
+        let bound = self
+            .m2_action_context_for_request(request_context)
+            .and_then(|(handle, _recording, _cancel)| {
+                synapse_action::InputDeliveryTarget::resolve_window(hwnd, "act_focus_window")
+                    .and_then(|target| handle.bind_session_delivery_target(target))
+                    .map_err(|error| crate::m2::action_error_to_mcp(&error))
+            });
+        match bound {
+            Ok(bound) => tracing::info!(
+                code = "ACTION_INPUT_TARGET_BOUND",
+                hwnd,
+                bound,
+                "act_focus_window recorded the session's intended OS-input target"
+            ),
+            Err(error) => tracing::warn!(
+                code = "ACTION_INPUT_TARGET_BIND_FAILED",
+                hwnd,
+                error = %error.message,
+                "act_focus_window could not record the session's intended OS-input target"
+            ),
+        }
     }
 
     #[tool(
@@ -1142,6 +1204,16 @@ impl SynapseService {
             lease_ttl_for_hold_ms(params.hold_ms),
         ) {
             Ok(guard) => guard,
+            Err(error) => {
+                let result: Result<ActPressResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_press", &result, &request_context)?;
+                return result.map(Json);
+            }
+        };
+        // OS-input safety: an explicit window_hwnd is the intended delivery
+        // window; otherwise the session/focus-bound target carried by `handle`.
+        let handle = match self.resolve_input_delivery_target(params.window_hwnd, &handle) {
+            Ok(target) => handle.with_delivery_target(target),
             Err(error) => {
                 let result: Result<ActPressResponse, ErrorData> = Err(error);
                 self.audit_action_result_for_request("act_press", &result, &request_context)?;

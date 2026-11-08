@@ -69,6 +69,16 @@ pub const ACTION_ELEMENT_NOT_RESOLVED: &str = "ACTION_ELEMENT_NOT_RESOLVED";
 pub const ACTION_ELEMENT_PATTERN_UNSUPPORTED: &str = "ACTION_ELEMENT_PATTERN_UNSUPPORTED";
 pub const TRANSIENT_ELEMENT_EXPIRED: &str = "TRANSIENT_ELEMENT_EXPIRED";
 pub const ACTION_FOREGROUND_LOST: &str = "ACTION_FOREGROUND_LOST";
+/// OS input (keyboard/text) was refused because no intended target window
+/// (root HWND + pid) was resolved for the action; Synapse never types into
+/// whatever window happens to be foreground.
+pub const ACTION_INPUT_TARGET_REQUIRED: &str = "ACTION_INPUT_TARGET_REQUIRED";
+/// The human is in a fullscreen/D3D, busy, or presentation-mode foreground app
+/// that is not the action target; focus changes and OS input are refused.
+pub const ACTION_HUMAN_FULLSCREEN_FOREGROUND: &str = "ACTION_HUMAN_FULLSCREEN_FOREGROUND";
+/// The human's foreground window belongs to a different process than the
+/// target; a capture/action that would need to steal focus was refused.
+pub const ACTION_HUMAN_FOREGROUND_PROTECTED: &str = "ACTION_HUMAN_FOREGROUND_PROTECTED";
 pub const ACTION_NO_OBSERVED_DELTA: &str = "ACTION_NO_OBSERVED_DELTA";
 pub const ACTION_VERIFY_SURFACE_UNAVAILABLE: &str = "ACTION_VERIFY_SURFACE_UNAVAILABLE";
 pub const ACTION_POSTCONDITION_FAILED: &str = "ACTION_POSTCONDITION_FAILED";

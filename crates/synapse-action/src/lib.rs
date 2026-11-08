@@ -4,6 +4,7 @@ pub mod backend;
 pub mod click_timing;
 pub mod clipboard;
 pub mod curve;
+pub mod delivery_target;
 pub mod dynamics;
 pub mod emitter;
 pub mod error;
@@ -37,6 +38,7 @@ pub use clipboard::{
     snapshot as snapshot_clipboard, with_restored_clipboard, write_text as write_clipboard_text,
 };
 pub use curve::sample_curve;
+pub use delivery_target::InputDeliveryTarget;
 pub use dynamics::{BIGRAMS, KeystrokeEvent, ModifierMask, sample_typing_schedule};
 pub use emitter::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
@@ -45,9 +47,10 @@ pub use emitter::{
 };
 pub use error::{ActionError, ActionResult};
 pub use handle::{
-    ACTION_QUEUE_CAPACITY, ActionComboScheduler, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE,
-    SessionInputLeaseReleaseSummary, SessionInputSessionSnapshot, SessionInputSnapshot,
-    SessionKeyInput, SessionMouseButtonInput, SessionPadInput, SessionReleaseSummary,
+    ACTION_QUEUE_CAPACITY, ActionComboScheduler, ActionEnqueueMeta, ActionHandle, ActionMessage,
+    RELEASE_ALL_HANDLE, SessionInputLeaseReleaseSummary, SessionInputSessionSnapshot,
+    SessionInputSnapshot, SessionKeyInput, SessionMouseButtonInput, SessionPadInput,
+    SessionReleaseSummary,
 };
 #[cfg(feature = "test-support")]
 pub use hotkey::isolate_interrupt_epochs_for_test;

@@ -41,6 +41,10 @@ pub enum ActionError {
     },
     #[error("action foreground lost: {detail}")]
     ForegroundLost { detail: String },
+    #[error("action input target required: {detail}")]
+    InputTargetRequired { detail: String },
+    #[error("human fullscreen foreground protected: {detail}")]
+    HumanFullscreenForeground { detail: String },
     #[error("action unsupported key: {detail}")]
     UnsupportedKey { detail: String },
     #[error("action observed no state delta: {detail}")]
@@ -74,6 +78,10 @@ impl ActionError {
             }
             Self::TransientElementExpired { .. } => error_codes::TRANSIENT_ELEMENT_EXPIRED,
             Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
+            Self::InputTargetRequired { .. } => error_codes::ACTION_INPUT_TARGET_REQUIRED,
+            Self::HumanFullscreenForeground { .. } => {
+                error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
+            }
             Self::UnsupportedKey { .. } => error_codes::ACTION_UNSUPPORTED_KEY,
             Self::NoObservedDelta { .. } => error_codes::ACTION_NO_OBSERVED_DELTA,
             Self::DragDistanceExceedsLimit { .. } => {
@@ -101,6 +109,8 @@ impl ActionError {
             | Self::ElementPatternUnsupported { detail, .. }
             | Self::TransientElementExpired { detail, .. }
             | Self::ForegroundLost { detail }
+            | Self::InputTargetRequired { detail }
+            | Self::HumanFullscreenForeground { detail }
             | Self::UnsupportedKey { detail }
             | Self::NoObservedDelta { detail }
             | Self::DragDistanceExceedsLimit { detail }
@@ -146,6 +156,8 @@ impl ActionError {
                 Self::TransientElementExpired { element_id, detail }
             }
             Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
+            Self::InputTargetRequired { .. } => Self::InputTargetRequired { detail },
+            Self::HumanFullscreenForeground { .. } => Self::HumanFullscreenForeground { detail },
             Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
             Self::NoObservedDelta { .. } => Self::NoObservedDelta { detail },
             Self::DragDistanceExceedsLimit { .. } => Self::DragDistanceExceedsLimit { detail },
@@ -171,6 +183,8 @@ impl ActionError {
             | Self::ElementPatternUnsupported { .. }
             | Self::TransientElementExpired { .. }
             | Self::ForegroundLost { .. }
+            | Self::InputTargetRequired { .. }
+            | Self::HumanFullscreenForeground { .. }
             | Self::UnsupportedKey { .. }
             | Self::NoObservedDelta { .. }
             | Self::DragDistanceExceedsLimit { .. }

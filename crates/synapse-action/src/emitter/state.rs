@@ -31,6 +31,7 @@ pub struct EmitState {
     held_button_backends: HashMap<usize, BTreeSet<ResolvedBackend>>,
     pub(crate) pad_state: HashMap<PadId, GamepadReport>,
     active_backend: Option<ResolvedBackend>,
+    delivery_target: Option<crate::InputDeliveryTarget>,
 }
 
 impl EmitState {
@@ -46,6 +47,7 @@ impl EmitState {
             held_button_backends: HashMap::new(),
             pad_state: HashMap::new(),
             active_backend: None,
+            delivery_target: None,
         }
     }
 
@@ -176,6 +178,18 @@ impl EmitState {
 
     pub(crate) const fn clear_active_backend(&mut self) {
         self.active_backend = None;
+    }
+
+    /// Sets the intended OS-input window for the action being dispatched; the
+    /// software backend verifies the live foreground against it before every
+    /// input batch.
+    pub const fn set_delivery_target(&mut self, target: Option<crate::InputDeliveryTarget>) {
+        self.delivery_target = target;
+    }
+
+    #[must_use]
+    pub const fn delivery_target(&self) -> Option<&crate::InputDeliveryTarget> {
+        self.delivery_target.as_ref()
     }
 
     fn key_index(&mut self, key: &Key) -> usize {

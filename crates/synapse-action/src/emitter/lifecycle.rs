@@ -253,8 +253,8 @@ impl ActionEmitter {
         loop {
             tokio::select! {
                 biased;
-                Some((action, ack, operator_panic_epoch_at_enqueue)) = self.safety_rx.recv() => {
-                    self.execute_actor_message(action, ack, operator_panic_epoch_at_enqueue).await;
+                Some((action, ack, meta)) = self.safety_rx.recv() => {
+                    self.execute_actor_message(action, ack, meta).await;
                 },
                 Some(auto_release) = self.auto_release_rx.recv() => {
                     if let Some(emitted_action) = self.auto_release_held_key(&auto_release) {
@@ -272,8 +272,8 @@ impl ActionEmitter {
                     self.release_all("connection_closed").await;
                     return self.snapshot();
                 },
-                Some((action, ack, operator_panic_epoch_at_enqueue)) = self.rx.recv() => {
-                    self.execute_actor_message(action, ack, operator_panic_epoch_at_enqueue).await;
+                Some((action, ack, meta)) = self.rx.recv() => {
+                    self.execute_actor_message(action, ack, meta).await;
                 },
                 else => {
                     self.release_all("connection_closed").await;
@@ -296,14 +296,17 @@ impl ActionEmitter {
         &mut self,
         action: Action,
         ack: tokio::sync::oneshot::Sender<ActionResult<()>>,
-        operator_panic_epoch_at_enqueue: Option<u64>,
+        meta: crate::ActionEnqueueMeta,
     ) {
         let is_release_all = matches!(action, Action::ReleaseAll);
         let result = match crate::handle::ensure_operator_panic_allows_action_since(
             &action,
-            operator_panic_epoch_at_enqueue,
+            meta.operator_panic_epoch_at_enqueue,
         ) {
-            Ok(()) => self.execute(action).await,
+            Ok(()) => {
+                self.execute_with_delivery_target(action, meta.delivery_target)
+                    .await
+            }
             Err(error) => Err(error),
         };
         let _send_result = ack.send(result);

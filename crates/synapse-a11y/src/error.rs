@@ -33,6 +33,8 @@ pub enum A11yError {
     UiaWorkerTimeout { detail: String },
     #[error("foreground activation refused: {detail}")]
     ForegroundActivationRefused { detail: String },
+    #[error("human fullscreen foreground protected: {detail}")]
+    HumanFullscreenForeground { detail: String },
     #[error("invalid element id: {detail}")]
     InvalidElementId { detail: String },
     #[error("accessibility backend failed: {detail}")]
@@ -60,6 +62,9 @@ impl A11yError {
             Self::CdpEvaluateTimeout { .. } => error_codes::BROWSER_EVALUATE_TIMEOUT,
             Self::UiaWorkerTimeout { .. } => error_codes::A11Y_UIA_WORKER_TIMEOUT,
             Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            Self::HumanFullscreenForeground { .. } => {
+                error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
+            }
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,
         }
     }

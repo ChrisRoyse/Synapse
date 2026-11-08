@@ -222,6 +222,9 @@ fn a11y_error_to_action(
         synapse_a11y::A11yError::ForegroundActivationRefused { .. } => {
             crate::ActionError::ForegroundActivationRefused { detail }
         }
+        synapse_a11y::A11yError::HumanFullscreenForeground { .. } => {
+            crate::ActionError::HumanFullscreenForeground { detail }
+        }
     }
 }
 
