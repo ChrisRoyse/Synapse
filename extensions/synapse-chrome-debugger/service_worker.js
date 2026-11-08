@@ -166,6 +166,37 @@ let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
+// #2271: identity of the BROWSER instance must survive an extension reload (which
+// clears chrome.storage.session) but not a browser restart (which invalidates tab
+// ids). DevTools target ids are random per target and stable across extension
+// reloads, so persisted {tabId, devtoolsTargetId} anchors prove continuity.
+const BROWSER_INSTANCE_ANCHOR_STORAGE_KEY = "synapseBrowserInstanceAnchorsV1";
+const BROWSER_INSTANCE_ANCHOR_MAX = 32;
+const OWNER_EVIDENCE_STORAGE_KEY = "synapseOwnerReconcileEvidenceV1";
+const OWNER_EVIDENCE_MAX = 64;
+const OWNER_RECONCILE_ALARM_NAME = "synapse-owner-reconcile";
+const OWNER_RECONCILE_PERIOD_MINUTES = 0.5;
+const OWNER_RECONCILE_CHROME_CALL_TIMEOUT_MS = 3000;
+const COMMAND_WATCHDOG_DEFAULT_DEADLINE_MS = 30000;
+const COMMAND_WATCHDOG_GRACE_MS = 30000;
+const COMMAND_WATCHDOG_MAX_DEADLINE_MS = 30 * 60 * 1000;
+const ERROR_COMMAND_DEADLINE_EXCEEDED = "CHROME_COMMAND_DEADLINE_EXCEEDED";
+const ERROR_TARGET_QUARANTINED = "CHROME_TARGET_QUARANTINED";
+const ERROR_WORKER_RELOAD_PENDING = "CHROME_WORKER_RELOAD_PENDING";
+const GATE_CLOSED_REASON_OPERATOR_PANIC = "operator_panic";
+const GATE_CLOSED_REASON_DURABLE_STORAGE = "durable_storage";
+// Only an explicit operator panic closes the gate globally and survives reloads.
+// Inferred staleness is target-scoped (QUARANTINED_TABS); storage failures reopen
+// automatically once a durable write reads back.
+let OPERATOR_PANIC_ACTIVE = false;
+let BROWSER_CONTINUITY_EVIDENCE = { method: "not_resolved" };
+let OWNER_RECONCILE_LAST = null;
+let OWNER_RECONCILE_PENDING = null;
+let OWNER_RECONCILE_COUNT = 0;
+let OWNER_EVIDENCE_TAIL = Promise.resolve();
+let OWNER_EVIDENCE_LAST = null;
+let COMMAND_WATCHDOG_FIRED_COUNT = 0;
+let WORKER_RELOAD_PENDING = null;
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
 let hostId = null;
@@ -797,6 +828,15 @@ function enqueueCommand(command) {
   if (String(command?.kind || "") === "operatorPanicDisable") {
     return enqueueImmediateOperatorPanicDisable(command);
   }
+  if (String(command?.kind || "") === "reloadSelf") {
+    // Reloading the worker never touches a page; it is the recovery for a jammed
+    // queue, so it must not wait behind the jam (2026-11-08: reloadSelf 5329 sat
+    // behind wedged locateElements 5299 for hours).
+    return DURABLE_OWNER_STATE_READY.then(
+      () => handleCommand(command),
+      () => handleCommand(command)
+    );
+  }
   const queued = COMMAND_EXECUTION_TAIL.then(
     () => handleTrackedCommand(command),
     () => handleTrackedCommand(command)
@@ -809,10 +849,12 @@ function enqueueCommand(command) {
 
 function enqueueImmediateOperatorPanicDisable(command) {
   IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT += 1;
+  OPERATOR_PANIC_ACTIVE = true;
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   const admit = async () => {
     try {
       await DURABLE_OWNER_STATE_READY;
+      OPERATOR_PANIC_ACTIVE = true;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       DURABLE_MUTATION_DISABLE_SEQUENCE += 1;
       try {
@@ -861,7 +903,9 @@ function emptyDurableOwnerLedger() {
     geolocationOverrides: [],
     localeOverrides: [],
     mediaOverrides: [],
-    networkOverrides: []
+    networkOverrides: [],
+    gateClosedReason: null,
+    quarantinedTabs: []
   };
 }
 
@@ -924,6 +968,15 @@ function normalizeDurableOwnerLedger(value) {
   ledger.browserSessionId = source.browserSessionId.trim();
   ledger.enabled = source.enabled;
   ledger.disableSequence = source.disableSequence;
+  ledger.gateClosedReason = typeof source.gateClosedReason === "string" &&
+    source.gateClosedReason.trim()
+    ? source.gateClosedReason.trim()
+    : null;
+  ledger.quarantinedTabs = Array.isArray(source.quarantinedTabs)
+    ? source.quarantinedTabs
+      .map((entry) => ({ ...entry, tabId: normalizeStoredTabId(entry?.tabId) }))
+      .filter((entry) => entry.tabId !== null)
+    : [];
   if (source.inFlightMutation) {
     const activitySequence = source.inFlightMutation.activitySequence;
     const id = String(source.inFlightMutation.id || "").trim();
@@ -990,6 +1043,14 @@ function normalizeDurableOwnerLedger(value) {
         timedOutAtUnixMs,
         neutralizationMethod: typeof entry?.neutralizationMethod === "string"
           ? entry.neutralizationMethod
+          : null,
+        neutralization: entry?.neutralization &&
+          typeof entry.neutralization.method === "string" &&
+          entry.neutralization.params && typeof entry.neutralization.params === "object"
+          ? { method: entry.neutralization.method, params: entry.neutralization.params }
+          : null,
+        devtoolsTargetId: typeof entry?.devtoolsTargetId === "string" && entry.devtoolsTargetId
+          ? entry.devtoolsTargetId
           : null
       });
     }
@@ -1010,7 +1071,10 @@ function normalizeDurableOwnerLedger(value) {
         : null,
       openedAtUnixMs: Number.isSafeInteger(entry?.openedAtUnixMs)
         ? Math.max(0, entry.openedAtUnixMs)
-        : 0
+        : 0,
+      devtoolsTargetId: typeof entry?.devtoolsTargetId === "string" && entry.devtoolsTargetId
+        ? entry.devtoolsTargetId
+        : null
     });
   }
   ledger.openedTabs = Array.from(openedTabsById.values());
@@ -1087,7 +1151,7 @@ async function restoreDurableOwnerLedger() {
       throw new Error("chrome.storage.local/session are required for durable owner continuity");
     }
     const [localStored, sessionStored] = await Promise.all([
-      chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY),
+      chrome.storage.local.get([DURABLE_OWNER_STORAGE_KEY, BROWSER_INSTANCE_ANCHOR_STORAGE_KEY]),
       chrome.storage.session.get([
         DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY,
         LEGACY_DURABLE_OWNER_STORAGE_KEY
@@ -1097,82 +1161,731 @@ async function restoreDurableOwnerLedger() {
       localStored || {},
       DURABLE_OWNER_STORAGE_KEY
     );
-    const storedBrowserSessionId = typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]
-      === "string"
-      ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
-      : "";
-    if (!hasLocalLedger && sessionStored?.[LEGACY_DURABLE_OWNER_STORAGE_KEY] !== undefined) {
-      throw new Error(
-        "legacy session-only durable owner ledger is present; refusing to claim continuity after storage migration"
-      );
-    }
-    if (!hasLocalLedger) {
-      if (storedBrowserSessionId) {
-        throw new Error(
-          "durable local owner ledger is missing while the current browser-session token exists"
-        );
-      }
-      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
-      DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
-      DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-      await chrome.storage.session.set({
-        [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-      });
-      await persistDurableOwnerLedger();
-    } else {
-      DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(
-        localStored[DURABLE_OWNER_STORAGE_KEY]
-      );
-      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
-        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
-      if (!storedBrowserSessionId) {
-        await chrome.storage.session.set({
-          [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-            DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+    let ledger = emptyDurableOwnerLedger();
+    if (hasLocalLedger) {
+      try {
+        ledger = normalizeDurableOwnerLedger(localStored[DURABLE_OWNER_STORAGE_KEY]);
+      } catch (error) {
+        // A ledger this worker cannot parse cannot authorize or refuse anything
+        // target-specific. Archive the exact bytes as evidence and start clean,
+        // instead of latching every tab closed forever (#2271).
+        await appendOwnerEvidence("malformed_ledger_archived", {
+          error: errorMessage(error),
+          raw: JSON.stringify(localStored[DURABLE_OWNER_STORAGE_KEY] ?? null).slice(0, 16384)
         });
-      }
-      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
-        DURABLE_OWNER_LEDGER.browserSessionId ===
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-      const staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
-        (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners === 0) {
-        DURABLE_OWNER_LEDGER.browserSessionId =
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-        await persistDurableOwnerLedger();
-      } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-        STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
-        DURABLE_MUTATION_OWNERS_ENABLED = false;
-        DURABLE_OWNER_LEDGER.enabled = false;
-        DURABLE_OWNER_STATE_LOAD_ERROR =
-          "durable owners belong to a prior browser session; stale tab ids will not be mutated";
+        ledger = emptyDurableOwnerLedger();
       }
     }
-    DURABLE_MUTATION_OWNERS_ENABLED = DURABLE_OWNER_LEDGER.enabled &&
-      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
-    DURABLE_MUTATION_DISABLE_SEQUENCE = DURABLE_OWNER_LEDGER.disableSequence;
+    if (sessionStored?.[LEGACY_DURABLE_OWNER_STORAGE_KEY] !== undefined) {
+      await appendOwnerEvidence("legacy_session_ledger_archived", {
+        raw: JSON.stringify(sessionStored[LEGACY_DURABLE_OWNER_STORAGE_KEY]).slice(0, 16384)
+      });
+      await chrome.storage.session.remove(LEGACY_DURABLE_OWNER_STORAGE_KEY);
+    }
+    const storedBrowserSessionId =
+      typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY] === "string"
+        ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
+        : "";
+    const continuity = await resolveBrowserInstanceContinuity(
+      storedBrowserSessionId,
+      localStored?.[BROWSER_INSTANCE_ANCHOR_STORAGE_KEY],
+      ledger
+    );
+    BROWSER_CONTINUITY_EVIDENCE = continuity;
+    DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = continuity.browser_session_id;
+    if (!continuity.pending && storedBrowserSessionId !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) {
+      await chrome.storage.session.set({
+        [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+      });
+    }
+    if (!ledger.browserSessionId) {
+      ledger.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+    }
+    DURABLE_OWNER_LEDGER = ledger;
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = !continuity.pending &&
+      ledger.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+    if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && durableOwnerRowCount(ledger) === 0) {
+      ledger.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+    }
+    // Rows of an unproven prior browser instance are classified per target by the
+    // reconciler (absent => resolved, present => that tab alone is quarantined).
+    // They never close the global gate.
+    STALE_BROWSER_SESSION_OWNER_COUNT = DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED
+      ? 0
+      : durableOwnerRowCount(ledger);
+    // Only an explicit operator panic survives restore as a closed gate. A legacy
+    // closed ledger without a reason is a panic only if a panic ever happened
+    // (every panic increments disableSequence); sequence 0 proves none did.
+    OPERATOR_PANIC_ACTIVE = ledger.gateClosedReason === GATE_CLOSED_REASON_OPERATOR_PANIC ||
+      (!ledger.enabled && !ledger.gateClosedReason && ledger.disableSequence > 0) ||
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT > 0;
+    DURABLE_MUTATION_OWNERS_ENABLED = !OPERATOR_PANIC_ACTIVE;
+    DURABLE_MUTATION_DISABLE_SEQUENCE = ledger.disableSequence;
+    if (!ledger.enabled && !OPERATOR_PANIC_ACTIVE) {
+      await appendOwnerEvidence("non_panic_gate_closure_reopened_at_boot", {
+        gate_closed_reason: ledger.gateClosedReason,
+        disable_sequence: ledger.disableSequence,
+        ledger_revision: ledger.revision
+      });
+    }
     if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-      for (const tabId of DURABLE_OWNER_LEDGER.clockTabs) {
+      for (const tabId of ledger.clockTabs) {
         CLOCK_INSTALLED_TABS.add(tabId);
       }
     }
-    if (DURABLE_OWNER_LEDGER.inFlightMutation) {
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
-      DURABLE_MUTATION_OWNERS_ENABLED = false;
-      DURABLE_OWNER_LEDGER.enabled = false;
-      if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-        await persistDurableOwnerLedger({ mergeLiveOwners: true });
-      }
+    if (ledger.inFlightMutation) {
+      // Exactly one service-worker instance runs per extension; a marker written by
+      // another worker boot belongs to a dead worker whose JS (and, after an
+      // extension reload, whose debugger sessions) no longer exist. Its concrete
+      // target owners were persisted separately and are reconciled per target.
+      await appendOwnerEvidence("dead_worker_in_flight_resolved", {
+        in_flight: ledger.inFlightMutation,
+        current_worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID
+      });
+      ledger.inFlightMutation = null;
     }
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+    DURABLE_OWNER_STATE_LOAD_ERROR = null;
     DURABLE_OWNER_STATE_LOADED = true;
+    await persistDurableOwnerLedger();
+    try {
+      await refreshBrowserInstanceAnchors();
+    } catch (error) {
+      console.warn(`Synapse browser-instance anchor refresh failed: ${errorMessage(error)}`);
+    }
   } catch (error) {
     DURABLE_OWNER_STATE_LOAD_ERROR = errorMessage(error);
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   }
+}
+
+function ownerChromeCall(promise, label) {
+  return promiseWithTimeout(
+    Promise.resolve(promise),
+    OWNER_RECONCILE_CHROME_CALL_TIMEOUT_MS,
+    `${label} timed out after ${OWNER_RECONCILE_CHROME_CALL_TIMEOUT_MS}ms`
+  );
+}
+
+async function readDevtoolsTabTargets() {
+  const targets = await ownerChromeCall(chrome.debugger.getTargets(), "chrome.debugger.getTargets");
+  const byTab = new Map();
+  for (const target of targets || []) {
+    // OOPIF/worker targets also carry tabId; only the page target identifies the tab.
+    if (target?.type !== "page") continue;
+    if (!Number.isInteger(target?.tabId) || byTab.has(target.tabId)) continue;
+    byTab.set(target.tabId, {
+      id: String(target.id || ""),
+      attached: Boolean(target.attached),
+      type: String(target.type || "")
+    });
+  }
+  return byTab;
+}
+
+async function devtoolsTargetIdForTab(tabId) {
+  try {
+    const live = await readDevtoolsTabTargets();
+    return live.get(tabId)?.id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function fingerprintedOwnerRows(ledger) {
+  return [
+    ...ledger.openedTabs,
+    ...ledger.unresolvedDebuggerCommandTimeouts
+  ].filter((row) => typeof row.devtoolsTargetId === "string" && row.devtoolsTargetId);
+}
+
+async function resolveBrowserInstanceContinuity(storedSessionId, anchorRecord, ledger) {
+  if (storedSessionId) {
+    // Same extension load: chrome.storage.session survives worker restarts.
+    return { browser_session_id: storedSessionId, method: "session_storage_token" };
+  }
+  const anchors = [
+    ...(Array.isArray(anchorRecord?.anchors) ? anchorRecord.anchors : []),
+    ...fingerprintedOwnerRows(ledger)
+  ].filter((anchor) => Number.isInteger(anchor?.tabId) &&
+    typeof anchor?.devtoolsTargetId === "string" && anchor.devtoolsTargetId);
+  let live = new Map();
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      live = await readDevtoolsTabTargets();
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      await sleep(500 * (attempt + 1));
+    }
+  }
+  if (lastError) {
+    // Undecidable now: keep the ledger's identity provisionally and leave every row
+    // unclassified; the reconciler re-runs this proof once getTargets reads.
+    return {
+      browser_session_id: ledger.browserSessionId || newDurableOwnerBrowserSessionId(),
+      method: "unresolved_devtools_targets_unreadable",
+      pending: true,
+      error: errorMessage(lastError)
+    };
+  }
+  const matched = anchors.filter((anchor) => live.get(anchor.tabId)?.id === anchor.devtoolsTargetId);
+  const anchorSessionId = typeof anchorRecord?.browserSessionId === "string"
+    ? anchorRecord.browserSessionId.trim()
+    : "";
+  const priorSessionId = anchorSessionId || ledger.browserSessionId;
+  if (matched.length > 0 && priorSessionId) {
+    // At least one random DevTools target id from the prior identity is still
+    // live: this is the same browser instance (extension reload/update).
+    return {
+      browser_session_id: priorSessionId,
+      method: "devtools_target_anchor",
+      anchor_count: anchors.length,
+      matched_anchor_count: matched.length
+    };
+  }
+  return {
+    browser_session_id: newDurableOwnerBrowserSessionId(),
+    method: anchors.length ? "anchors_absent_new_browser_instance" : "no_anchors_new_identity",
+    anchor_count: anchors.length,
+    matched_anchor_count: 0
+  };
+}
+
+async function refreshBrowserInstanceAnchors() {
+  if (!DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) return;
+  const live = await readDevtoolsTabTargets();
+  const anchors = Array.from(live.entries())
+    .filter(([, target]) => target.id && target.type === "page")
+    .slice(0, BROWSER_INSTANCE_ANCHOR_MAX)
+    .map(([tabId, target]) => ({ tabId, devtoolsTargetId: target.id }));
+  const record = {
+    browserSessionId: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+    anchors,
+    writtenAtUnixMs: Date.now()
+  };
+  const signature = JSON.stringify([record.browserSessionId, anchors]);
+  if (signature === refreshBrowserInstanceAnchors.lastSignature) return;
+  await chrome.storage.local.set({ [BROWSER_INSTANCE_ANCHOR_STORAGE_KEY]: record });
+  refreshBrowserInstanceAnchors.lastSignature = signature;
+  refreshBrowserInstanceAnchors.lastAnchorCount = anchors.length;
+}
+
+function appendOwnerEvidence(kind, detail) {
+  const write = async () => {
+    try {
+      const stored = await chrome.storage.local.get(OWNER_EVIDENCE_STORAGE_KEY);
+      const entries = Array.isArray(stored?.[OWNER_EVIDENCE_STORAGE_KEY])
+        ? stored[OWNER_EVIDENCE_STORAGE_KEY]
+        : [];
+      entries.push({
+        kind,
+        at_unix_ms: Date.now(),
+        worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+        detail
+      });
+      await chrome.storage.local.set({
+        [OWNER_EVIDENCE_STORAGE_KEY]: entries.slice(-OWNER_EVIDENCE_MAX)
+      });
+      OWNER_EVIDENCE_LAST = { kind, at_unix_ms: Date.now() };
+    } catch (error) {
+      console.warn(`Synapse owner evidence write failed kind=${kind}: ${errorMessage(error)}`);
+    }
+  };
+  const queued = OWNER_EVIDENCE_TAIL.then(write, write);
+  OWNER_EVIDENCE_TAIL = queued.catch(() => undefined);
+  return queued;
+}
+
+// #2271: every durable owner row has a proven resolution path, executed
+// automatically (worker boot, a 30 s alarm, tab removal, debugger detach) on the
+// serialized command tail so it never interleaves with a command.
+//   * target absent (two readbacks)            -> every row of that tab resolved
+//   * prior-instance row whose fingerprint no longer matches the live target
+//                                               -> that row's target is gone, resolved
+//   * prior-instance rows on a live tab, identity unprovable
+//                                               -> ONLY that tab is quarantined
+//   * debugger-command timeout, continuity proven:
+//       - pending input neutralization          -> release is re-sent, then resolved
+//       - Runtime.* on a still-attached session  -> Runtime.terminateExecution, resolved
+//       - anything else                          -> resolved once this extension holds
+//                                                   no debugger session on the tab
+//   * quarantine                                -> resolved on tab close or new document
+// During an explicit operator panic only non-mutating resolutions run.
+function enqueueOwnerReconcile(trigger) {
+  if (OWNER_RECONCILE_PENDING) return OWNER_RECONCILE_PENDING;
+  const run = async () => {
+    OWNER_RECONCILE_PENDING = null;
+    await DURABLE_OWNER_STATE_READY;
+    try {
+      return await reconcileDurableOwners(trigger);
+    } catch (error) {
+      OWNER_RECONCILE_LAST = {
+        trigger,
+        ok: false,
+        error: errorMessage(error),
+        at_unix_ms: Date.now()
+      };
+      return OWNER_RECONCILE_LAST;
+    }
+  };
+  const queued = COMMAND_EXECUTION_TAIL.then(run, run);
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+  OWNER_RECONCILE_PENDING = queued;
+  return queued;
+}
+
+function ownerRowTabIds(ledger) {
+  const ids = new Set();
+  for (const field of [
+    "openedTabs", "initScripts", "bindings", "unresolvedDebuggerCommandTimeouts",
+    "executedInitScriptEffects", "viewportOverrides", "deviceOverrides",
+    "geolocationOverrides", "localeOverrides", "mediaOverrides", "networkOverrides"
+  ]) {
+    for (const entry of ledger[field]) ids.add(entry.tabId);
+  }
+  for (const field of ["debuggerTabs", "dialogTabs", "fileChooserTabs", "clockTabs"]) {
+    for (const tabId of ledger[field]) ids.add(tabId);
+  }
+  return ids;
+}
+
+function ownerRowsForTab(ledger, tabId) {
+  const rows = [];
+  for (const field of [
+    "openedTabs", "initScripts", "bindings", "unresolvedDebuggerCommandTimeouts",
+    "executedInitScriptEffects", "viewportOverrides", "deviceOverrides",
+    "geolocationOverrides", "localeOverrides", "mediaOverrides", "networkOverrides"
+  ]) {
+    for (const entry of ledger[field]) {
+      if (entry.tabId === tabId) rows.push({ field, ...entry });
+    }
+  }
+  for (const field of ["debuggerTabs", "dialogTabs", "fileChooserTabs", "clockTabs"]) {
+    if (ledger[field].includes(tabId)) rows.push({ field, tabId });
+  }
+  return rows;
+}
+
+async function mainFrameDocumentIdOrNull(tabId) {
+  try {
+    const frame = await ownerChromeCall(
+      chrome.webNavigation.getFrame({ tabId, frameId: 0 }),
+      "chrome.webNavigation.getFrame"
+    );
+    return String(frame?.documentId || "") || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function ourPersistentDebuggerSessionOnTab(tabId) {
+  return persistentDebuggerSessionIsAttached(tabId) || INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId);
+}
+
+// Proves this extension holds no debugger session on the tab. chrome.debugger.detach
+// only ever detaches the caller's own session, so it cannot disturb DevTools or
+// another client; "not attached" is the proof.
+async function proveNoOwnDebuggerSession(tabId, liveTarget, allowMutation) {
+  if (!liveTarget?.attached) return { proven: true, via: "getTargets.attached=false" };
+  if (ourPersistentDebuggerSessionOnTab(tabId)) return { proven: false, via: "own_persistent_session" };
+  if (!allowMutation) return { proven: false, via: "attached_and_panic_active" };
+  try {
+    await ownerChromeCall(chrome.debugger.detach({ tabId }), "chrome.debugger.detach");
+    return { proven: true, via: "detached_leaked_own_session" };
+  } catch (error) {
+    const detail = errorMessage(error).toLowerCase();
+    if (detail.includes("not attached")) {
+      return { proven: true, via: "detach_reports_not_attached(other_client)" };
+    }
+    return { proven: false, via: `detach_failed:${errorMessage(error)}` };
+  }
+}
+
+async function resolveTimeoutRowsForTab(tabId, liveTarget, allowMutation, resolved, pending) {
+  const rows = DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
+    .filter((entry) => entry.tabId === tabId);
+  if (!rows.length) return;
+  let sessionProof = null;
+  for (const row of rows) {
+    let resolution = null;
+    if (row.neutralization) {
+      if (!allowMutation) {
+        pending.push({ id: row.id, tab_id: tabId, reason: "neutralization_deferred_operator_panic" });
+        continue;
+      }
+      let attachedHere = false;
+      try {
+        if (!ourPersistentDebuggerSessionOnTab(tabId)) {
+          await ownerChromeCall(chrome.debugger.attach({ tabId }, "1.3"), "chrome.debugger.attach");
+          attachedHere = true;
+        }
+        await ownerChromeCall(
+          chrome.debugger.sendCommand({ tabId }, row.neutralization.method, row.neutralization.params),
+          row.neutralization.method
+        );
+        resolution = `neutralized:${row.neutralization.method}`;
+      } catch (error) {
+        row.neutralizationMethod = `${row.neutralization.method}:failed:${errorMessage(error)}`;
+      } finally {
+        if (attachedHere) {
+          try {
+            await ownerChromeCall(chrome.debugger.detach({ tabId }), "chrome.debugger.detach");
+          } catch (_) {
+            // The next pass proves session absence independently.
+          }
+        }
+      }
+    } else if (ourPersistentDebuggerSessionOnTab(tabId)) {
+      // The issuing session is one of our long-lived sessions. A non-input command
+      // leaves nothing to release; a script still running is terminated.
+      if (/^Runtime\./.test(row.method)) {
+        if (!allowMutation) {
+          pending.push({ id: row.id, tab_id: tabId, reason: "terminate_deferred_operator_panic" });
+          continue;
+        }
+        try {
+          await ownerChromeCall(
+            chrome.debugger.sendCommand({ tabId }, "Runtime.terminateExecution", {}),
+            "Runtime.terminateExecution"
+          );
+          resolution = "persistent_session:Runtime.terminateExecution";
+        } catch (error) {
+          if (!errorMessage(error).toLowerCase().includes("not attached")) {
+            pending.push({ id: row.id, tab_id: tabId, reason: `terminate_failed:${errorMessage(error)}` });
+            continue;
+          }
+          resolution = "persistent_session_already_detached";
+        }
+      } else {
+        resolution = "persistent_session_non_input_command_abandoned";
+      }
+    } else {
+      sessionProof = sessionProof || await proveNoOwnDebuggerSession(tabId, liveTarget, allowMutation);
+      if (sessionProof.proven) resolution = `issuing_session_ended:${sessionProof.via}`;
+    }
+    if (resolution) {
+      DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts =
+        DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.filter((entry) => entry.id !== row.id);
+      resolved.push({ kind: "debugger_command_timeout", id: row.id, tab_id: tabId, method: row.method, resolution });
+    } else {
+      pending.push({ id: row.id, tab_id: tabId, reason: row.neutralizationMethod || sessionProof?.via || "unresolved" });
+    }
+  }
+}
+
+async function reconcileDurableOwners(trigger, options = {}) {
+  const startedAt = Date.now();
+  OWNER_RECONCILE_COUNT += 1;
+  if (BROWSER_CONTINUITY_EVIDENCE?.pending) {
+    const anchorStored = await chrome.storage.local.get(BROWSER_INSTANCE_ANCHOR_STORAGE_KEY);
+    const retried = await resolveBrowserInstanceContinuity(
+      "",
+      anchorStored?.[BROWSER_INSTANCE_ANCHOR_STORAGE_KEY],
+      DURABLE_OWNER_LEDGER
+    );
+    if (retried.pending) {
+      OWNER_RECONCILE_LAST = { trigger, ok: false, error: "browser continuity still undecidable", at_unix_ms: startedAt };
+      return OWNER_RECONCILE_LAST;
+    }
+    BROWSER_CONTINUITY_EVIDENCE = retried;
+    DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = retried.browser_session_id;
+    await chrome.storage.session.set({
+      [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+    });
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
+      DURABLE_OWNER_LEDGER.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+  }
+  const allowMutation = typeof options.allowMutation === "boolean"
+    ? options.allowMutation
+    : !OPERATOR_PANIC_ACTIVE && IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
+  const resolved = [];
+  const pending = [];
+  const quarantinedNow = [];
+  if (!DURABLE_OWNER_STATE_LOADED) {
+    await restoreDurableOwnerLedger();
+    if (!DURABLE_OWNER_STATE_LOADED) {
+      OWNER_RECONCILE_LAST = { trigger, ok: false, error: DURABLE_OWNER_STATE_LOAD_ERROR, at_unix_ms: startedAt };
+      return OWNER_RECONCILE_LAST;
+    }
+    resolved.push({ kind: "durable_state_reloaded" });
+  }
+  const revisionBefore = DURABLE_OWNER_LEDGER.revision;
+  const rowCountBefore = durableOwnerRowCount() + DURABLE_OWNER_LEDGER.quarantinedTabs.length;
+  mergeLiveOwnersIntoDurableLedger();
+  const [tabs, live] = await Promise.all([
+    ownerChromeCall(chrome.tabs.query({}), "chrome.tabs.query"),
+    readDevtoolsTabTargets()
+  ]);
+  const presentTabIds = new Set((tabs || []).map((tab) => tab.id));
+  const isPresent = (tabId) => presentTabIds.has(tabId) || live.has(tabId);
+
+  // Any fingerprinted row whose DevTools target id is still live proves this is the
+  // same browser instance as the ledger's.
+  if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+      fingerprintedOwnerRows(DURABLE_OWNER_LEDGER)
+        .some((row) => live.get(row.tabId)?.id === row.devtoolsTargetId)) {
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+    BROWSER_CONTINUITY_EVIDENCE = { ...BROWSER_CONTINUITY_EVIDENCE, row_fingerprint_proof: true };
+  }
+  const continuity = DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED;
+
+  for (const tabId of ownerRowTabIds(DURABLE_OWNER_LEDGER)) {
+    try {
+    if (!isPresent(tabId)) {
+      if (await confirmTabAbsentTwice(tabId)) {
+        resolved.push({ kind: "target_absent", tab_id: tabId, rows: ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId).length });
+        pruneDurableOwnerLedgerForClosedTab(tabId);
+      }
+      continue;
+    }
+    const liveTarget = live.get(tabId) || null;
+    if (!continuity) {
+      // Continuity is unproven (no fingerprinted row matched a live target), so
+      // every fingerprinted row here refers to a target that no longer exists.
+      // CDP-session state (debugger sessions, init scripts, bindings, emulation,
+      // dialog/file-chooser policy) cannot survive an extension reload or a
+      // browser restart, and timeouts/opened-tab rows carry no residual page
+      // effect, so those rows resolve. Only page-world residue (clock shim,
+      // executed init-script effects) on a live tab is quarantined, and only
+      // until that tab loads a new document.
+      const residue = ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId)
+        .filter((row) => row.field === "clockTabs" || row.field === "executedInitScriptEffects");
+      const resolvedRows = ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId).length - residue.length;
+      if (resolvedRows > 0) {
+        resolved.push({ kind: "prior_instance_session_state_resolved", tab_id: tabId, rows: resolvedRows });
+      }
+      const ambiguous = residue;
+      if (!ambiguous.length) {
+        pruneDurableOwnerLedgerForClosedTab(tabId);
+        continue;
+      }
+      const entry = {
+        tabId,
+        reason: "prior_browser_instance_page_world_residue",
+        sinceUnixMs: Date.now(),
+        devtoolsTargetId: liveTarget?.id || null,
+        documentId: await mainFrameDocumentIdOrNull(tabId),
+        rows: ambiguous.slice(0, 32)
+      };
+      DURABLE_OWNER_LEDGER.quarantinedTabs = DURABLE_OWNER_LEDGER.quarantinedTabs
+        .filter((candidate) => candidate.tabId !== tabId);
+      DURABLE_OWNER_LEDGER.quarantinedTabs.push(entry);
+      // The rows move into the quarantine record (kept as evidence) so they stop
+      // counting as live owners of the current browser instance.
+      pruneOwnerRowsKeepingQuarantine(tabId);
+      quarantinedNow.push({ tab_id: tabId, rows: ambiguous.length });
+      continue;
+    }
+    await resolveTimeoutRowsForTab(tabId, liveTarget, allowMutation, resolved, pending);
+    } catch (error) {
+      pending.push({ tab_id: tabId, reason: `reconcile_tab_failed:${errorMessage(error)}` });
+    }
+  }
+
+  if (!continuity) {
+    // Every prior-instance row is now resolved or quarantined per target; the
+    // ledger adopts the current browser identity.
+    DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+    resolved.push({ kind: "browser_identity_adopted", browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID });
+  }
+  STALE_BROWSER_SESSION_OWNER_COUNT = 0;
+
+  // Quarantine resolves when its target is gone, replaced, or has a new document
+  // (page-world state from the prior instance cannot survive a navigation, and no
+  // debugger session survives an extension reload).
+  for (const entry of Array.from(DURABLE_OWNER_LEDGER.quarantinedTabs)) {
+    let resolution = null;
+    if (!isPresent(entry.tabId) && await confirmTabAbsentTwice(entry.tabId)) {
+      resolution = "target_absent";
+    } else if (entry.devtoolsTargetId && live.get(entry.tabId)?.id &&
+               live.get(entry.tabId).id !== entry.devtoolsTargetId) {
+      resolution = "target_replaced";
+    } else {
+      const documentId = await mainFrameDocumentIdOrNull(entry.tabId);
+      if (entry.documentId && documentId && documentId !== entry.documentId &&
+          !live.get(entry.tabId)?.attached) {
+        resolution = "new_document_without_debugger";
+      }
+    }
+    if (resolution) {
+      DURABLE_OWNER_LEDGER.quarantinedTabs = DURABLE_OWNER_LEDGER.quarantinedTabs
+        .filter((candidate) => candidate.tabId !== entry.tabId);
+      resolved.push({ kind: "quarantine_released", tab_id: entry.tabId, resolution });
+    }
+  }
+
+  // A gate closed for anything other than an explicit operator panic (a durable
+  // write failure) reopens once a durable write reads back.
+  let gateReopened = false;
+  if (!DURABLE_MUTATION_OWNERS_ENABLED && !OPERATOR_PANIC_ACTIVE &&
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0) {
+    DURABLE_MUTATION_OWNERS_ENABLED = true;
+    try {
+      await persistDurableOwnerLedger();
+      const readback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
+      const after = normalizeDurableOwnerLedger(readback[DURABLE_OWNER_STORAGE_KEY]);
+      if (after.revision !== DURABLE_OWNER_LEDGER.revision || !after.enabled) {
+        throw new Error("durable gate reopen readback mismatch");
+      }
+      if (OPERATOR_PANIC_ACTIVE || IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT > 0) {
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        await persistDurableOwnerLedger();
+        throw new Error("operator panic arrived during gate reopen; gate stays closed");
+      }
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+      DURABLE_OWNER_STATE_LOAD_ERROR = null;
+      gateReopened = true;
+      resolved.push({ kind: "non_panic_gate_reopened" });
+    } catch (error) {
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      pending.push({ kind: "gate", reason: `durable write still failing: ${errorMessage(error)}` });
+    }
+  }
+
+  const changed = resolved.length > 0 || quarantinedNow.length > 0 ||
+    rowCountBefore !== durableOwnerRowCount() + DURABLE_OWNER_LEDGER.quarantinedTabs.length;
+  if (changed && !gateReopened) {
+    await persistDurableOwnerLedger();
+  }
+  if (resolved.length || quarantinedNow.length) {
+    await appendOwnerEvidence("owner_reconcile", {
+      trigger,
+      revision_before: revisionBefore,
+      revision_after: DURABLE_OWNER_LEDGER.revision,
+      resolved: resolved.slice(0, 64),
+      quarantined: quarantinedNow,
+      pending: pending.slice(0, 64)
+    });
+  }
+  try {
+    await refreshBrowserInstanceAnchors();
+  } catch (error) {
+    pending.push({ kind: "anchors", reason: errorMessage(error) });
+  }
+  OWNER_RECONCILE_LAST = {
+    trigger,
+    ok: true,
+    at_unix_ms: startedAt,
+    duration_ms: Date.now() - startedAt,
+    allow_mutation: allowMutation,
+    resolved_count: resolved.length,
+    quarantined_count: quarantinedNow.length,
+    pending,
+    revision_before: revisionBefore,
+    revision_after: DURABLE_OWNER_LEDGER.revision
+  };
+  return OWNER_RECONCILE_LAST;
+}
+
+async function confirmTabAbsentTwice(tabId) {
+  try {
+    if (!await operatorPanicConfirmTabAbsent(tabId)) return false;
+    await sleep(100);
+    return await operatorPanicConfirmTabAbsent(tabId);
+  } catch (_) {
+    return false;
+  }
+}
+
+function pruneOwnerRowsKeepingQuarantine(tabId) {
+  const quarantine = DURABLE_OWNER_LEDGER.quarantinedTabs;
+  pruneDurableOwnerLedgerForClosedTab(tabId);
+  DURABLE_OWNER_LEDGER.quarantinedTabs = quarantine;
+}
+
+function ensureOwnerReconcileAlarm() {
+  if (!chrome.alarms?.create) return;
+  try {
+    const created = chrome.alarms.create(OWNER_RECONCILE_ALARM_NAME, {
+      delayInMinutes: OWNER_RECONCILE_PERIOD_MINUTES,
+      periodInMinutes: OWNER_RECONCILE_PERIOD_MINUTES
+    });
+    if (created && typeof created.catch === "function") {
+      created.catch((error) => {
+        console.warn(`Synapse owner reconcile alarm setup failed: ${errorMessage(error)}`);
+      });
+    }
+  } catch (error) {
+    console.warn(`Synapse owner reconcile alarm setup threw: ${errorMessage(error)}`);
+  }
+}
+
+function quarantineReadback() {
+  return DURABLE_OWNER_LEDGER.quarantinedTabs.map((entry) => ({
+    tab_id: entry.tabId,
+    reason: entry.reason,
+    since_unix_ms: entry.sinceUnixMs,
+    devtools_target_id: entry.devtoolsTargetId,
+    row_count: Array.isArray(entry.rows) ? entry.rows.length : 0
+  }));
+}
+
+function ownerSelfHealReadback() {
+  return {
+    gate_closed_reason: DURABLE_MUTATION_OWNERS_ENABLED
+      ? null
+      : (OPERATOR_PANIC_ACTIVE ? GATE_CLOSED_REASON_OPERATOR_PANIC : GATE_CLOSED_REASON_DURABLE_STORAGE),
+    operator_panic_active: OPERATOR_PANIC_ACTIVE,
+    quarantined_tab_count: DURABLE_OWNER_LEDGER.quarantinedTabs.length,
+    quarantined_tabs: quarantineReadback(),
+    browser_continuity: BROWSER_CONTINUITY_EVIDENCE,
+    browser_instance_anchor_count: refreshBrowserInstanceAnchors.lastAnchorCount ?? null,
+    owner_reconcile_count: OWNER_RECONCILE_COUNT,
+    owner_reconcile_last: OWNER_RECONCILE_LAST,
+    owner_evidence_last: OWNER_EVIDENCE_LAST,
+    command_watchdog_fired_count: COMMAND_WATCHDOG_FIRED_COUNT,
+    worker_reload_pending: WORKER_RELOAD_PENDING
+  };
+}
+
+// A command that outlives its deadline is answered with a typed error and the
+// worker reloads: the reload is the only way to kill the zombie continuation
+// (JS promises cannot be cancelled), and #2271 made reloads lossless (identity
+// anchors, dead in-flight resolution, per-target reconcile).
+function normalizeCommandDeadlineMs(value) {
+  const deadline = Number(value);
+  if (!Number.isFinite(deadline) || deadline <= 0) return COMMAND_WATCHDOG_DEFAULT_DEADLINE_MS;
+  return Math.min(Math.floor(deadline), COMMAND_WATCHDOG_MAX_DEADLINE_MS);
+}
+
+async function commandWatchdogFired(command, deadlineMs, startedAtUnixMs) {
+  COMMAND_WATCHDOG_FIRED_COUNT += 1;
+  const id = String(command?.id || "");
+  const kind = String(command?.kind || "");
+  const elapsedMs = Date.now() - startedAtUnixMs;
+  WORKER_RELOAD_PENDING = {
+    reason: "command_watchdog",
+    command_id: id,
+    command_kind: kind,
+    requested_at_unix_ms: Date.now()
+  };
+  await appendOwnerEvidence("command_watchdog_fired", {
+    command_id: id,
+    command_kind: kind,
+    deadline_ms: deadlineMs,
+    grace_ms: COMMAND_WATCHDOG_GRACE_MS,
+    elapsed_ms: elapsedMs
+  });
+  console.error(
+    `Synapse command watchdog: ${kind} ${id} exceeded deadline ${deadlineMs}ms + grace ` +
+      `${COMMAND_WATCHDOG_GRACE_MS}ms (elapsed ${elapsedMs}ms); reloading worker`
+  );
+  try {
+    await postResponse(id, false, null, {
+      code: ERROR_COMMAND_DEADLINE_EXCEEDED,
+      detail: `${kind} exceeded its ${deadlineMs}ms deadline plus ${COMMAND_WATCHDOG_GRACE_MS}ms grace ` +
+        `(elapsed ${elapsedMs}ms); the extension worker is reloading to cancel it`
+    });
+  } catch (error) {
+    console.warn(`Synapse watchdog response failed: ${errorMessage(error)}`);
+  }
+  scheduleRuntimeReload(250);
 }
 
 function mergeLiveOwnersIntoDurableLedger() {
@@ -1255,6 +1968,11 @@ async function persistDurableOwnerLedger({ mergeLiveOwners = false } = {}) {
   }
   DURABLE_OWNER_LEDGER.enabled = DURABLE_MUTATION_OWNERS_ENABLED;
   DURABLE_OWNER_LEDGER.disableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
+  DURABLE_OWNER_LEDGER.gateClosedReason = DURABLE_MUTATION_OWNERS_ENABLED
+    ? null
+    : (OPERATOR_PANIC_ACTIVE
+      ? GATE_CLOSED_REASON_OPERATOR_PANIC
+      : GATE_CLOSED_REASON_DURABLE_STORAGE);
   DURABLE_OWNER_LEDGER.revision += 1;
   const snapshot = typeof globalThis.structuredClone === "function"
     ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
@@ -1334,6 +2052,14 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
     .filter((candidate) => candidate !== tabId);
   DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
     .filter((candidate) => candidate !== tabId);
+  // #2271: a closed tab ends every debugger session and every pending command on
+  // it, so its timeout rows are resolved too (previously the only kind never
+  // pruned, which accumulated 13+ unresolvable rows and latched the gate).
+  DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts =
+    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
+      .filter((entry) => entry.tabId !== tabId);
+  DURABLE_OWNER_LEDGER.quarantinedTabs = DURABLE_OWNER_LEDGER.quarantinedTabs
+    .filter((entry) => entry.tabId !== tabId);
   for (const field of [
     "viewportOverrides",
     "deviceOverrides",
@@ -1460,10 +2186,60 @@ function isMutationCapableCommand(kind) {
   ].includes(String(kind || ""));
 }
 
-function assertPhysicalMutationAdmission(boundary) {
+
+function assertTabNotQuarantined(tabId, boundary) {
   const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
   if (context?.kind === "operatorPanicCleanup" || context?.kind === "operatorPanicCloseTab") {
     return;
+  }
+  const quarantine = quarantineEntryForTab(normalizeStoredTabId(tabId));
+  if (quarantine) {
+    throw bridgeError(
+      ERROR_TARGET_QUARANTINED,
+      `tab ${tabId} is quarantined (${quarantine.reason}) since ${quarantine.sinceUnixMs}; ` +
+        `refusing ${boundary}. It resolves automatically when the tab closes or navigates ` +
+        `to a new document; other tabs remain fully operational`
+    );
+  }
+}
+
+// Every page-touching chrome.* call on a named tab passes here (#2271 D7), so a
+// quarantined tab cannot be scripted, activated or navigated by any handler.
+function quarantineGuardedExecuteScript(details) {
+  assertTabNotQuarantined(details?.target?.tabId, "chrome.scripting.executeScript");
+  return chrome.scripting.executeScript(details);
+}
+
+function quarantineGuardedTabsUpdate(tabId, properties) {
+  assertTabNotQuarantined(tabId, `chrome.tabs.update:${Object.keys(properties || {}).join(",")}`);
+  return chrome.tabs.update(tabId, properties);
+}
+
+function tabIdFromBoundary(boundary) {
+  const match = /(?:^|[:\s])tab=(\d+)/.exec(String(boundary || ""));
+  return match ? Number(match[1]) : null;
+}
+
+function quarantineEntryForTab(tabId) {
+  if (!Number.isSafeInteger(tabId)) return null;
+  return DURABLE_OWNER_LEDGER.quarantinedTabs.find((entry) => entry.tabId === tabId) || null;
+}
+
+function assertPhysicalMutationAdmission(boundary, tabId = tabIdFromBoundary(boundary)) {
+  const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
+  if (context?.kind === "operatorPanicCleanup" || context?.kind === "operatorPanicCloseTab") {
+    return;
+  }
+  const quarantine = quarantineEntryForTab(tabId);
+  // Closing a quarantined tab is how it resolves; every other physical mutation
+  // of that one tab is refused. Other tabs are unaffected (#2271 target scope).
+  if (quarantine && !String(boundary).startsWith("chrome.tabs.remove:")) {
+    throw bridgeError(
+      ERROR_TARGET_QUARANTINED,
+      `tab ${tabId} is quarantined (${quarantine.reason}) since ${quarantine.sinceUnixMs}; ` +
+        `refusing ${boundary}. It resolves automatically when the tab closes or navigates ` +
+        `to a new document; other tabs remain fully operational`
+    );
   }
   if (!context) {
     throw bridgeError(
@@ -1483,13 +2259,23 @@ function assertPhysicalMutationAdmission(boundary) {
 }
 
 async function executeScriptMutation(details, boundary) {
-  assertPhysicalMutationAdmission(`chrome.scripting.executeScript:${boundary}`);
-  return chrome.scripting.executeScript(details);
+  assertPhysicalMutationAdmission(
+    `chrome.scripting.executeScript:${boundary}`,
+    normalizeStoredTabId(details?.target?.tabId)
+  );
+  return quarantineGuardedExecuteScript(details);
 }
 
 async function handleTrackedCommand(command) {
   await DURABLE_OWNER_STATE_READY;
   const kind = String(command?.kind || "");
+  if (WORKER_RELOAD_PENDING && kind !== "operatorPanicDisable") {
+    await postResponse(String(command?.id || ""), false, null, {
+      code: ERROR_WORKER_RELOAD_PENDING,
+      detail: `extension worker reload pending (${JSON.stringify(WORKER_RELOAD_PENDING)}); retry after re-registration`
+    });
+    return;
+  }
   const mutationCapable = isMutationCapableCommand(kind);
   const activitySequence = ++COMMAND_ACTIVITY_SEQUENCE;
   const admittedDisableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
@@ -1516,9 +2302,28 @@ async function handleTrackedCommand(command) {
       disableSequence: admittedDisableSequence,
       activitySequence
     };
+    const deadlineMs = normalizeCommandDeadlineMs(command?.deadlineMs);
+    const startedAtUnixMs = Date.now();
+    let watchdogTimer = null;
+    const watchdog = new Promise((resolve) => {
+      watchdogTimer = setTimeout(() => resolve("watchdog"), deadlineMs + COMMAND_WATCHDOG_GRACE_MS);
+    });
     try {
-      await handleCommand(command);
+      const outcome = await Promise.race([
+        handleCommand(command).then(() => "done"),
+        watchdog
+      ]);
+      if (outcome === "watchdog") {
+        ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
+        // The command is still running; its in-flight marker stays as evidence and
+        // is resolved as a dead-worker marker by the reload this triggers.
+        persistedMutationMarker = false;
+        await commandWatchdogFired(command, deadlineMs, startedAtUnixMs);
+      }
     } finally {
+      clearTimeout(watchdogTimer);
+      // Restoring the context also strands a zombie continuation: its next physical
+      // boundary has no admission context and fails closed until the reload lands.
       ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
     }
   } finally {
@@ -1715,7 +2520,14 @@ chrome.runtime.onInstalled.addListener(startBridgeFromEvent);
 chrome.runtime.onStartup.addListener(startBridgeFromEvent);
 if (chrome.alarms?.onAlarm?.addListener) {
   chrome.alarms.onAlarm.addListener(handleReconnectWakeAlarm);
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name === OWNER_RECONCILE_ALARM_NAME) {
+      enqueueOwnerReconcile("alarm");
+    }
+  });
 }
+ensureOwnerReconcileAlarm();
+enqueueOwnerReconcile("worker_boot");
 // MV3 service workers are (re)started for reasons that do NOT fire onInstalled or
 // onStartup: a chrome://extensions "Reload", a browser respawn of an idle worker,
 // or any non-bridge event listener firing. Without a top-level bootstrap the worker
@@ -1772,6 +2584,10 @@ if (chrome.debugger?.onDetach?.addListener) {
       markDialogDebuggerDetached(source.tabId);
       markFileChooserDebuggerDetached(source.tabId);
       console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
+      if (DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
+        .some((entry) => entry.tabId === source.tabId)) {
+        enqueueOwnerReconcile("debugger_detach");
+      }
     }
   });
 }
@@ -1882,13 +2698,18 @@ async function handleCommand(command) {
     let result;
     let reloadAfterResponse = false;
     let closeWebSocketAfterResponse = null;
-    if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
+    const reloadAdmissible = kind === "reloadSelf" && !OPERATOR_PANIC_ACTIVE;
+    if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED && !reloadAdmissible) {
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
-        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+        OPERATOR_PANIC_ACTIVE
+          ? `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+          : `extension mutation admission is closed (reason=${GATE_CLOSED_REASON_DURABLE_STORAGE}, ` +
+            `error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}); it reopens automatically once a durable ` +
+            `owner write reads back (owner reconciler every ${OWNER_RECONCILE_PERIOD_MINUTES * 60}s); refusing ${String(kind)}`
       );
     }
-    if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable"]
+    if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable", "reloadSelf"]
       .includes(String(kind || ""))) {
       await requireExternalPopupRisksSuppressed(kind, params);
     }
@@ -2090,6 +2911,7 @@ function bridgeIdentity() {
     buildId: BRIDGE_BUILD_ID,
     buildSha256: BRIDGE_DECLARED_BUILD_SHA256,
     declaredBuildSha256: BRIDGE_DECLARED_BUILD_SHA256,
+    workerBootId: DURABLE_OWNER_WORKER_BOOT_ID,
     serviceWorkerSha256: serviceWorkerIntegrityState.serviceWorkerSha256,
     serviceWorkerSha256Status: serviceWorkerIntegrityState.status,
     serviceWorkerSha256Source: serviceWorkerIntegrityState.source,
@@ -2160,7 +2982,8 @@ async function handleOpenTab(params) {
     tabId: tab.id,
     targetId: targetIdForTabId(tab.id),
     chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
-    openedAtUnixMs: Date.now()
+    openedAtUnixMs: Date.now(),
+    devtoolsTargetId: await devtoolsTargetIdForTab(tab.id)
   };
   upsertLedgerOpenedTab(openedOwner);
   try {
@@ -2931,7 +3754,7 @@ async function handleStorageState(params) {
     const cookies = chrome.cookies && typeof chrome.cookies.getAll === "function"
       ? await chrome.cookies.getAll(cookieGetAllDetails(params, cookieUrl))
       : [];
-    const injected = await chrome.scripting.executeScript({
+    const injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, allFrames: true },
       func: readStorageStateInPage,
       args: [includeSessionStorage]
@@ -3151,7 +3974,7 @@ async function seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, bef
   });
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.update:setContentSeed:tab=${selected.tabId}`);
-    await chrome.tabs.update(selected.tabId, { url: seedUrl });
+    await quarantineGuardedTabsUpdate(selected.tabId, { url: seedUrl });
   } catch (error) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
@@ -3200,7 +4023,7 @@ async function handleAriaSnapshot(params) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: root.frameId === null ? { tabId: selected.tabId } : { tabId: selected.tabId, frameIds: [root.frameId] },
       func: runAriaSnapshotInPage,
       args: [{ rootPath: root.path, maxNodes, maxDepth }]
@@ -3277,7 +4100,7 @@ async function handleAssertPoll(params) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: root.frameId === null ? { tabId: selected.tabId, allFrames: true } : { tabId: selected.tabId, frameIds: [root.frameId] },
       func: runAssertPollInPage,
       args: [{ locator, limit, rootPath: root.path }]
@@ -3370,7 +4193,7 @@ async function handleLocateElements(params) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: frameScope.target,
       func: runAssertPollInPage,
       args: [{ locator, limit, rootPath: root.path }]
@@ -3464,7 +4287,7 @@ async function handleInspectElement(params) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, frameIds: [parsed.frameId] },
       func: runBridgeElementCommandInPage,
       args: [{ operation: "inspect", elementPath: parsed.path, maxHtmlBytes }]
@@ -3524,7 +4347,7 @@ async function handleScrollIntoView(params) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, frameIds: [parsed.frameId] },
       func: runBridgeElementCommandInPage,
       args: [{ operation: "scroll", elementPath: parsed.path }]
@@ -3994,7 +4817,7 @@ async function drainPageWorkerEvents(tabId, state) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: true },
       world: "MAIN",
       func: runPageEventsWorkerProbe
@@ -4081,7 +4904,7 @@ async function handlePageScreenshot(params) {
       );
     }
     if (!before.active) {
-      await chrome.tabs.update(selected.tabId, { active: true });
+      await quarantineGuardedTabsUpdate(selected.tabId, { active: true });
       await waitForTabActiveState(
         selected.tabId,
         true,
@@ -4185,7 +5008,7 @@ async function handlePageScreenshot(params) {
       activeForCapture
     ) {
       try {
-        await chrome.tabs.update(previousActiveTabId, { active: true });
+        await quarantineGuardedTabsUpdate(previousActiveTabId, { active: true });
         await waitForTabActiveState(previousActiveTabId, true, 2000);
         restoredPreviousActive = true;
       } catch (error) {
@@ -4422,7 +5245,7 @@ async function runPageScreenshotSetup(tabId, request) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId },
       func: pageScreenshotSetupInPage,
       args: [request]
@@ -4443,7 +5266,7 @@ async function runPageScreenshotSetup(tabId, request) {
 async function runPageScreenshotScroll(tabId, position) {
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId },
       func: pageScreenshotScrollInPage,
       args: [position]
@@ -4471,7 +5294,7 @@ async function runPageScreenshotCleanup(tabId, request) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     return null;
   }
-  const injected = await chrome.scripting.executeScript({
+  const injected = await quarantineGuardedExecuteScript({
     target: { tabId },
     func: pageScreenshotCleanupInPage,
     args: [request]
@@ -5366,7 +6189,8 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
       tabId: tab.id,
       targetId: targetIdForTabId(tab.id),
       chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
-      openedAtUnixMs: Date.now()
+      openedAtUnixMs: Date.now(),
+      devtoolsTargetId: await devtoolsTargetIdForTab(tab.id)
     };
     upsertLedgerOpenedTab(openedOwner);
     try {
@@ -5448,7 +6272,7 @@ async function handleNavigateTab(params) {
       });
       downloadSeqBefore = downloadEventSeq;
       assertPhysicalMutationAdmission(`chrome.tabs.update:navigate:tab=${selected.tabId}`);
-      await chrome.tabs.update(selected.tabId, { url: requestedUrl });
+      await quarantineGuardedTabsUpdate(selected.tabId, { url: requestedUrl });
       if (requestedUrl !== before.url) {
         readbackExpectation = {
           description: `tab url to become ${JSON.stringify(requestedUrl)} or differ from ${JSON.stringify(before.url)}`,
@@ -5687,7 +6511,7 @@ async function handleActivateTab(params) {
   const before = await tabPageState(selected.tabId, selected.target);
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.update:activate:tab=${selected.tabId}`);
-    await chrome.tabs.update(selected.tabId, { active: true });
+    await quarantineGuardedTabsUpdate(selected.tabId, { active: true });
   } catch (error) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
@@ -5767,7 +6591,7 @@ async function handleDomAction(params) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: resolveTarget,
       func: performDomActionInPage,
       args: [{ ...request, resolveOnly: true }]
@@ -5811,7 +6635,7 @@ async function handleDomAction(params) {
 
   let actionInjected;
   try {
-    actionInjected = await chrome.scripting.executeScript({
+    actionInjected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, frameIds: [first.frame_id] },
       world: "MAIN",
       func: performDomActionInPage,
@@ -5953,7 +6777,7 @@ async function handleCdpInput(params) {
     }
     let injected;
     try {
-      injected = await chrome.scripting.executeScript({
+      injected = await quarantineGuardedExecuteScript({
         target: resolveTarget,
         func: performDomActionInPage,
         args: [request]
@@ -6702,7 +7526,7 @@ async function cdpTextInputTargetScript(selected, action, params, options) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: scriptTarget,
       func: cdpTextInputTargetInPage,
       args: [request]
@@ -8714,7 +9538,7 @@ async function applyViewportDprShim(tabId, deviceScaleFactor) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installViewportDprShimInPage,
@@ -8737,7 +9561,7 @@ async function applyDeviceEmulationShim(tabId, descriptor) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installDeviceEmulationShimInPage,
@@ -8760,7 +9584,7 @@ async function clearDeviceEmulationShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearDeviceEmulationShimInPage
@@ -8782,7 +9606,7 @@ async function applyGeolocationEmulationShim(tabId, state) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installGeolocationEmulationShimInPage,
@@ -8805,7 +9629,7 @@ async function clearGeolocationEmulationShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearGeolocationEmulationShimInPage
@@ -8827,7 +9651,7 @@ async function applyLocaleEmulationShim(tabId, requested) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installLocaleEmulationShimInPage,
@@ -8850,7 +9674,7 @@ async function clearLocaleEmulationShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearLocaleEmulationShimInPage
@@ -8872,7 +9696,7 @@ async function applyMediaEmulationShim(tabId, requested) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installMediaEmulationShimInPage,
@@ -8895,7 +9719,7 @@ async function clearMediaEmulationShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearMediaEmulationShimInPage
@@ -8917,7 +9741,7 @@ async function applyNetworkConditionsShim(tabId, requested) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: installNetworkConditionsShimInPage,
@@ -8940,7 +9764,7 @@ async function clearNetworkConditionsShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearNetworkConditionsShimInPage
@@ -8962,7 +9786,7 @@ async function clearViewportDprShim(tabId) {
     );
   }
   try {
-    await chrome.scripting.executeScript({
+    await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: clearViewportDprShimInPage
@@ -9111,7 +9935,7 @@ async function tabViewportMetricsState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readViewportMetricsInPage
@@ -9141,7 +9965,7 @@ async function tabDeviceMetricsState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readDeviceMetricsInPage
@@ -9171,7 +9995,7 @@ async function tabGeolocationState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readGeolocationStateInPage
@@ -9201,7 +10025,7 @@ async function tabLocaleState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readLocaleStateInPage
@@ -9231,7 +10055,7 @@ async function tabMediaState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readMediaStateInPage
@@ -9261,7 +10085,7 @@ async function tabNetworkState(tabId) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: false },
       world: "MAIN",
       func: readNetworkConditionsStateInPage
@@ -10634,7 +11458,7 @@ async function resolveCdpInputSelector(selected, action, label, selector, autoWa
   };
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, allFrames: true },
       func: performDomActionInPage,
       args: [request]
@@ -10989,7 +11813,7 @@ async function dispatchHtml5DragDrop(tabId, sourceSelector, targetSelector, para
   };
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId, frameIds: [0] },
       world: "MAIN",
       func: performHtml5DragDropInPage,
@@ -11043,7 +11867,7 @@ async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
     );
   }
   try {
-    await chrome.tabs.update(tabId, { active: true });
+    await quarantineGuardedTabsUpdate(tabId, { active: true });
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
@@ -11073,7 +11897,10 @@ async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
 }
 
 async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
-  assertPhysicalMutationAdmission(`chrome.debugger.sendCommand:${String(method)}`);
+  assertPhysicalMutationAdmission(
+    `chrome.debugger.sendCommand:${String(method)}`,
+    normalizeStoredTabId(debuggee?.tabId)
+  );
   try {
     return await promiseWithTimeout(
       chrome.debugger.sendCommand(debuggee, method, params),
@@ -11150,13 +11977,17 @@ async function recordUnresolvedDebuggerCommandTimeout(
   const tabId = normalizeStoredTabId(debuggee?.tabId);
   const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
   if (tabId === null || !context?.activitySequence) {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`;
-    DURABLE_MUTATION_OWNERS_ENABLED = false;
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    // No tab identity means no target to quarantine; the command already failed.
+    // Record evidence instead of closing mutation for every tab (#2271).
+    await appendOwnerEvidence("debugger_timeout_without_tab_identity", {
+      method,
+      debuggee: JSON.stringify(debuggee || null).slice(0, 512),
+      activity_sequence: context?.activitySequence ?? null
+    });
     return;
   }
   const timeoutSequence = ++DEBUGGER_COMMAND_TIMEOUT_SEQUENCE;
+  const neutralization = neutralizingInputCommand(method, params);
   const row = {
     id: `${DURABLE_OWNER_WORKER_BOOT_ID}:${context.activitySequence}:${timeoutSequence}`,
     tabId,
@@ -11164,7 +11995,9 @@ async function recordUnresolvedDebuggerCommandTimeout(
     activitySequence: context.activitySequence,
     workerBootId: DURABLE_OWNER_WORKER_BOOT_ID,
     timedOutAtUnixMs: Date.now(),
-    neutralizationMethod: null
+    neutralizationMethod: null,
+    neutralization,
+    devtoolsTargetId: await devtoolsTargetIdForTab(tabId)
   };
   DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.push(row);
   try {
@@ -11176,7 +12009,8 @@ async function recordUnresolvedDebuggerCommandTimeout(
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     return;
   }
-  const neutralization = neutralizingInputCommand(method, params);
+  // Rows without an input neutralization resolve once the issuing debugger
+  // session has ended (owner reconciler), which is immediate for one-shot attaches.
   if (!neutralization) return;
   row.neutralizationMethod = neutralization.method;
   try {
@@ -11898,6 +12732,7 @@ function operatorPanicOwnerReadback() {
         neutralization_method: entry.neutralizationMethod
       })),
     unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
+    ...ownerSelfHealReadback(),
     owner_continuity_healthy: DURABLE_OWNER_STATE_LOADED &&
       !DURABLE_OWNER_STATE_LOAD_ERROR &&
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
@@ -11915,6 +12750,7 @@ function operatorPanicOwnerReadback() {
 }
 
 async function handleOperatorPanicDisable(admission) {
+  OPERATOR_PANIC_ACTIVE = true;
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   if (!admission || typeof admission.then !== "function") {
     DURABLE_OWNER_STATE_LOAD_ERROR =
@@ -12089,111 +12925,12 @@ async function cleanupOperatorPanicEmulationOverrides(failures) {
   });
 }
 
-// Prior-session IDs cannot authorize actions against current tabs. Reconcile only
-// the narrow, target-scoped records whose target absence can be proven without
-// mutating a browser target. Keep the original ledger and evidence in local storage.
-async function reconcileAbsentPriorSessionOwners(expectedDisableSequence) {
-  const before = JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
-  const expectedError = "durable owners belong to a prior browser session; stale tab ids will not be mutated";
-  const supportedCount = before.openedTabs.length + before.unresolvedDebuggerCommandTimeouts.length;
-  // An in-flight record written by a worker of a PRIOR browser session cannot still be running:
-  // the browser restart that rotated the session id ended that worker and every debugger
-  // session it held. Without this, one dead record refused recovery forever (Poly 2026-11-08:
-  // a locateElements row from worker a3d8477f kept the gate closed across reloads).
-  const priorInFlight = before.inFlightMutation;
-  const deadPriorInFlight = Boolean(priorInFlight) &&
-    before.browserSessionId !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
-    String(priorInFlight.workerBootId || "") !== "" &&
-    priorInFlight.workerBootId !== DURABLE_OWNER_WORKER_BOOT_ID;
-  const inFlightUnchanged = () => deadPriorInFlight
-    ? (DURABLE_OWNER_LEDGER.inFlightMutation?.id === priorInFlight.id &&
-       DURABLE_OWNER_LEDGER.inFlightMutation?.workerBootId === priorInFlight.workerBootId &&
-       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 1)
-    : (!DURABLE_OWNER_LEDGER.inFlightMutation && UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0);
-  const unchanged = () => !DURABLE_MUTATION_OWNERS_ENABLED &&
-    DURABLE_MUTATION_DISABLE_SEQUENCE === expectedDisableSequence &&
-    IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0 &&
-    DURABLE_OWNER_LEDGER.revision === before.revision &&
-    DURABLE_OWNER_STATE_LOADED && DURABLE_OWNER_STATE_LOAD_ERROR === expectedError &&
-    !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
-    inFlightUnchanged() &&
-    MUTATION_HANDLER_IN_FLIGHT_COUNT === 0 &&
-    supportedCount + (deadPriorInFlight ? 1 : 0) > 0 && durableOwnerRowCount() === supportedCount;
-  const refuse = (detail) => ({
-    ...operatorPanicOwnerReadback(), expected_disable_sequence: expectedDisableSequence,
-    failures: [detail], fully_drained: false
-  });
-  if (!unchanged()) return refuse("prior-session recovery requires unchanged, loaded, target-scoped owners only");
-  const tabIds = [...new Set([
-    ...before.openedTabs.map((entry) => entry.tabId),
-    ...before.unresolvedDebuggerCommandTimeouts.map((entry) => entry.tabId)
-  ])];
-  const readAbsence = async () => {
-    const tabs = await chrome.tabs.query({});
-    const targets = await chrome.debugger.getTargets();
-    const session = await chrome.storage.session.get(DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY);
-    if (session[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY] !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) {
-      throw new Error("prior-session recovery: browser-session identity changed during readback");
-    }
-    const present = tabIds.filter((id) => tabs.some((tab) => tab.id === id) ||
-      targets.some((target) => target.tabId === id));
-    if (present.length) {
-      // Name the live targets so an operator can close them (proving absence) instead of guessing.
-      throw new Error(`prior-session owner targets are still present: tab_ids=${JSON.stringify(present)} ` +
-        `urls=${JSON.stringify(present.map((id) => String(tabs.find((tab) => tab.id === id)?.url || "").slice(0, 80)))}`);
-    }
-    return { absent_tab_ids: tabIds, live_tab_ids: tabs.map((tab) => tab.id),
-      debugger_target_ids: targets.map((target) => target.id), read_at_unix_ms: Date.now() };
-  };
-  try {
-    const first = await readAbsence();
-    const second = await readAbsence();
-    if (!unchanged()) return refuse("prior-session recovery generation or ledger changed during readback");
-    const archiveKey = `${DURABLE_OWNER_STORAGE_KEY}:recovery:${DURABLE_OWNER_WORKER_BOOT_ID}:${before.revision}`;
-    const archive = { ledger: before, first, second, worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
-      current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID };
-    const archiveJson = JSON.stringify(archive);
-    await chrome.storage.local.set({ [archiveKey]: archiveJson });
-    const saved = await chrome.storage.local.get(archiveKey);
-    if (saved[archiveKey] !== archiveJson) {
-      return refuse("prior-session recovery archive readback mismatch");
-    }
-    // Archive I/O is asynchronous: require fresh absence and generation evidence
-    // at the synchronous ledger mutation boundary as well.
-    await readAbsence();
-    if (!unchanged()) return refuse("prior-session recovery changed before commit");
-    DURABLE_OWNER_LEDGER.openedTabs = [];
-    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts = [];
-    if (deadPriorInFlight) DURABLE_OWNER_LEDGER.inFlightMutation = null;
-    DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-    await persistDurableOwnerLedger();
-    const persisted = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
-    const after = normalizeDurableOwnerLedger(persisted[DURABLE_OWNER_STORAGE_KEY]);
-    if (after.enabled || after.disableSequence !== expectedDisableSequence ||
-        after.browserSessionId !== DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
-        after.inFlightMutation || durableOwnerRowCount(after) !== 0 ||
-        DURABLE_MUTATION_DISABLE_SEQUENCE !== expectedDisableSequence ||
-        IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT !== 0) {
-      throw new Error("prior-session recovery persisted state or stop generation changed");
-    }
-    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-    STALE_BROWSER_SESSION_OWNER_COUNT = 0;
-    DURABLE_OWNER_STATE_LOAD_ERROR = null;
-    if (deadPriorInFlight) UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
-    return { ...operatorPanicOwnerReadback(), expected_disable_sequence: expectedDisableSequence,
-      failures: [], recovery_archive_key: archiveKey, reconciled_absent_tab_ids: tabIds,
-      reconciled_prior_session_in_flight: deadPriorInFlight ? priorInFlight : null };
-  } catch (error) {
-    // Never enable here; setup requires a separate readback and enable command.
-    return refuse(`prior-session recovery failed: ${errorMessage(error)}`);
-  }
-}
-
 async function handleOperatorPanicCleanup(params) {
   const expectedDisableSequence = normalizeOperatorPanicSequence(
     params?.expectedDisableSequence,
     "operatorPanicCleanup expectedDisableSequence"
   );
+  OPERATOR_PANIC_ACTIVE = true;
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   if (expectedDisableSequence !== DURABLE_MUTATION_DISABLE_SEQUENCE) {
     return {
@@ -12205,11 +12942,14 @@ async function handleOperatorPanicCleanup(params) {
       fully_drained: false
     };
   }
-  if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
-      STALE_BROWSER_SESSION_OWNER_COUNT !== 0) {
-    return reconcileAbsentPriorSessionOwners(expectedDisableSequence);
-  }
   const failures = [];
+  // Prior-instance rows are classified per target (absent => resolved, live =>
+  // that tab quarantined) instead of refusing the whole cleanup.
+  try {
+    await reconcileDurableOwners("operator_panic_cleanup_pre", { allowMutation: false });
+  } catch (error) {
+    failures.push(`owner reconcile before cleanup: ${errorMessage(error)}`);
+  }
 
   mergeLiveOwnersIntoDurableLedger();
   const openedTabsFound = DURABLE_OWNER_LEDGER.openedTabs.length;
@@ -12428,6 +13168,13 @@ async function handleOperatorPanicCleanup(params) {
       failures.push(`debuggerAttachment tab=${tabId}: ${errorMessage(error)}`);
     }
   }
+  // Debugger-command timeouts: every session is now detached, so non-input rows
+  // resolve; pending input releases are re-sent (de-escalation inside cleanup).
+  try {
+    await reconcileDurableOwners("operator_panic_cleanup_post", { allowMutation: true });
+  } catch (error) {
+    failures.push(`owner reconcile after cleanup: ${errorMessage(error)}`);
+  }
   try {
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
   } catch (error) {
@@ -12474,6 +13221,7 @@ async function handleOperatorPanicCleanup(params) {
         neutralization_method: entry.neutralizationMethod
       })),
     unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
+    ...ownerSelfHealReadback(),
     owner_continuity_healthy: continuityHealthy,
     opened_tabs_found: openedTabsFound,
     opened_tabs_closed: openedTabsClosed,
@@ -12509,6 +13257,7 @@ async function handleOperatorPanicCloseTab(params) {
     params?.expectedDisableSequence,
     "operatorPanicCloseTab expectedDisableSequence"
   );
+  OPERATOR_PANIC_ACTIVE = true;
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   if (expectedDisableSequence !== DURABLE_MUTATION_DISABLE_SEQUENCE) {
     throw bridgeError(
@@ -12532,14 +13281,18 @@ async function handleOperatorPanicEnable(params) {
   const before = operatorPanicOwnerReadback();
   const ownersEmpty = Object.values(before.active_after).every((count) => count === 0);
   let enabled = !before.enabled &&
+    IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0 &&
     before.disable_sequence === expectedDisableSequence &&
     ownersEmpty &&
     before.owner_continuity_healthy;
   if (enabled) {
+    const panicWasActive = OPERATOR_PANIC_ACTIVE;
+    OPERATOR_PANIC_ACTIVE = false;
     DURABLE_MUTATION_OWNERS_ENABLED = true;
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (error) {
+      OPERATOR_PANIC_ACTIVE = panicWasActive;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       enabled = false;
       DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic enable failed: ${errorMessage(error)}`;
@@ -13277,7 +14030,7 @@ async function handleCoordinateClick(params) {
   const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId },
       func: performCoordinateClickInPage,
       args: [{
@@ -13840,7 +14593,7 @@ async function tabActiveElementState(tabId) {
     };
   }
   try {
-    const results = await chrome.scripting.executeScript({
+    const results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: true },
       func: readActiveElementInPage
     });
@@ -13907,7 +14660,7 @@ async function tabPageTextState(tabId, suppressPageText = false) {
     };
   }
   try {
-    const results = await chrome.scripting.executeScript({
+    const results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: true },
       func: readPageTextInPage,
       args: [MAX_PAGE_TEXT_CHARS]
@@ -13959,7 +14712,7 @@ async function tabPageContentState(tabId, maxBytes) {
     };
   }
   try {
-    const results = await chrome.scripting.executeScript({
+    const results = await quarantineGuardedExecuteScript({
       target: { tabId },
       func: readPageContentInPage,
       args: [maxBytes]
@@ -14048,7 +14801,7 @@ async function tabFrameMetadata(tabId) {
     return { byFrameId, errors };
   }
   try {
-    const injected = await chrome.scripting.executeScript({
+    const injected = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: true },
       func: readFrameMetadataInPage
     });
@@ -14482,7 +15235,7 @@ async function waitForFunctionProbe(selected, expression, args) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId },
       world: "MAIN",
       func: runWaitForFunctionProbeInPage,
@@ -14559,7 +15312,7 @@ async function loadStateProbe(selected) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId },
       world: "MAIN",
       func: runLoadStateProbeInPage,
@@ -14893,7 +15646,7 @@ async function waitForSelectorPoll(selected, locator, limit, root, state) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: frameScope.target,
       func: runAssertPollInPage,
       args: [{ locator, limit, rootPath: root.path }]
@@ -15459,7 +16212,7 @@ async function tabPageVitalsState(tabId) {
     };
   }
   try {
-    const results = await chrome.scripting.executeScript({
+    const results = await quarantineGuardedExecuteScript({
       target: { tabId, allFrames: true },
       func: readPageVitalsInPage
     });
@@ -18841,7 +19594,7 @@ async function handleSetFieldValue(params) {
   }
   let results;
   try {
-    results = await chrome.scripting.executeScript({
+    results = await quarantineGuardedExecuteScript({
       target: scriptTarget,
       func: setFieldValueInPage,
       args: [{ ...scriptArgs, resolveOnly: true }]
@@ -18900,7 +19653,7 @@ async function handleSetFieldValue(params) {
 
   let actionResults;
   try {
-    actionResults = await chrome.scripting.executeScript({
+    actionResults = await quarantineGuardedExecuteScript({
       target: { tabId: selected.tabId, frameIds: [first.frame_id] },
       func: setFieldValueInPage,
       args: [scriptArgs]
@@ -22422,7 +23175,7 @@ async function ensureInPageNetworkRecorder(tabId) {
     return { available: false, reason: "chrome.scripting unavailable" };
   }
   try {
-    const injected = await chrome.scripting.executeScript({
+    const injected = await quarantineGuardedExecuteScript({
       target: { tabId },
       world: "MAIN",
       func: installSynapseNetworkRecorderInPage
@@ -22450,7 +23203,7 @@ async function mergeInPageNetworkEvents(tabId, buffer, recorder) {
   }
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await quarantineGuardedExecuteScript({
       target: { tabId },
       world: "MAIN",
       func: readSynapseNetworkRecorderInPage
@@ -23819,7 +24572,18 @@ function formatPageScreenshotCaptureContext(context) {
   ].join(" ");
 }
 
+const RESPONDED_COMMAND_IDS = new Set();
 async function postResponse(id, ok, result, error) {
+  if (id) {
+    if (RESPONDED_COMMAND_IDS.has(id)) {
+      console.warn(`Synapse suppressed a second response for command ${id} (watchdog already answered)`);
+      return;
+    }
+    RESPONDED_COMMAND_IDS.add(id);
+    if (RESPONDED_COMMAND_IDS.size > 4096) {
+      RESPONDED_COMMAND_IDS.delete(RESPONDED_COMMAND_IDS.values().next().value);
+    }
+  }
   await postDaemonMessage({
     type: "response",
     id,
