@@ -104,6 +104,57 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "setFieldValue",
 ];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Typed refusal for a bridge host whose serialized extension command queue is
+/// wedged: it keeps sending keepalives but has stopped answering commands.
+/// Kept local because this module owns the only producer; callers read it via
+/// `ChromeDebuggerBridgeError::code()`.
+const CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED: &str = "CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED";
+/// Typed error the extension's per-command watchdog answers before it reloads
+/// its worker; the command is answered (terminal), never still running.
+const CHROME_COMMAND_DEADLINE_EXCEEDED: &str = "CHROME_COMMAND_DEADLINE_EXCEEDED";
+/// A host is wedged only when at least this many delivered commands have each
+/// outlived their caller budget without an answer.
+const QUEUE_WEDGE_MIN_CALLER_TIMED_OUT: usize = 2;
+/// ... and the oldest delivered, unanswered command (the head of the
+/// extension's FIFO queue) has been outstanding longer than this.
+const QUEUE_WEDGE_MIN_HEAD_AGE_MS: u64 = 2 * COMMAND_TIMEOUT.as_secs() * 1_000;
+/// ... while the host still proved liveness this recently (keepalive/poll).
+const QUEUE_WEDGE_KEEPALIVE_FRESH_MS: u64 = COMMAND_TIMEOUT.as_secs() * 1_000;
+/// Bound on command ids carried in one wedge / resolution evidence record.
+const MAX_BRIDGE_EVIDENCE_IDS: usize = 32;
+/// Command kinds that only read browser state. They never own a physical
+/// mutation, so a caller timeout or transport loss ends their ownership. Kept
+/// deliberately narrower than "everything the extension does not call a
+/// mutation": anything that can write state, run page script, install
+/// listeners or move the viewport stays mutation-capable (fail closed).
+const READ_ONLY_COMMAND_KINDS: &[&str] = &[
+    "listTabs",
+    "operatorPanicReadback",
+    "targetInfo",
+    "targetInfoPageText",
+    "pageContent",
+    "pageVitals",
+    "frames",
+    "locateElements",
+    "inspectElement",
+    "ariaSnapshot",
+    "assertPoll",
+    "waitForText",
+    "waitForLoadState",
+    "waitForUrl",
+    "waitForSelector",
+];
+/// Kinds still admitted to a host marked `extension_command_queue_wedged`:
+/// operator panic must always reach the extension, and `reloadSelf` is the
+/// repair (the extension handles it outside its serialized queue).
+const WEDGED_HOST_ADMITTED_COMMAND_KINDS: &[&str] = &[
+    "reloadSelf",
+    "operatorPanicDisable",
+    "operatorPanicCleanup",
+    "operatorPanicCloseTab",
+    "operatorPanicReadback",
+    "operatorPanicEnable",
+];
 /// Extra daemon-side response headroom added on top of a caller's evaluate
 /// `timeout_ms` so the daemon waits out the in-extension evaluate budget (plus
 /// attach/round-trip overhead) before declaring a transport timeout (#1596).
@@ -263,11 +314,23 @@ impl ChromeDebuggerBridgeError {
             Some(error_codes::BROWSER_WAIT_TIMEOUT) => error_codes::BROWSER_WAIT_TIMEOUT,
             Some(error_codes::BROWSER_EVALUATE_TIMEOUT) => error_codes::BROWSER_EVALUATE_TIMEOUT,
             Some(error_codes::BROWSER_NAVIGATION_FAILED) => error_codes::BROWSER_NAVIGATION_FAILED,
+            Some(CHROME_COMMAND_DEADLINE_EXCEEDED) => CHROME_COMMAND_DEADLINE_EXCEEDED,
+            Some(CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED) => CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
             _ => error_codes::A11Y_CDP_ATTACH_FAILED,
         };
         Self {
             code,
             detail: detail.into(),
+        }
+    }
+
+    fn queue_wedged(command_kind: &str, host_id: &str, wedge: &HostQueueWedge) -> Self {
+        Self {
+            code: CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
+            detail: format!(
+                "Chrome bridge refused command {command_kind:?} because host {host_id} is extension_command_queue_wedged: {}; remediation=call browser_debugger.reload_bridge (reloadSelf is still admitted) or wait for the extension worker to reconnect with a new worker boot",
+                wedge.evidence()
+            ),
         }
     }
 
@@ -957,7 +1020,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_missing_or_unreadable {policy_write_access}"
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings policy_shield_status=value_missing_or_unreadable {policy_write_access}"
             ),
         };
     };
@@ -965,7 +1028,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_empty {policy_write_access}"
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings policy_shield_status=value_empty {policy_write_access}"
             ),
         };
     }
@@ -973,7 +1036,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=parse_error raw_len={} {policy_write_access}",
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings policy_shield_status=parse_error raw_len={} {policy_write_access}",
                 raw.len(),
             ),
         };
@@ -982,7 +1045,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=self_entry_missing {policy_write_access}"
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings policy_shield_status=self_entry_missing {policy_write_access}"
             ),
         };
     };
@@ -1006,7 +1069,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
     SynapseChromeSelfPolicyShieldStatus {
         present,
         detail: format!(
-            "synapse_chrome_self_policy_shield_present={} policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings blocked_permissions={} marker_matches={} reason={} {policy_write_access}",
+            "synapse_chrome_self_policy_shield_present={} policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings blocked_permissions={} marker_matches={} policy_shield_status={} {policy_write_access}",
             present,
             if blocked.is_empty() {
                 "<none>".to_owned()
@@ -1070,7 +1133,8 @@ fn chrome_policy_set_value_access_status(_subkey: &str) -> String {
 fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldStatus {
     SynapseChromeSelfPolicyShieldStatus {
         present: false,
-        detail: "synapse_chrome_self_policy_shield_present=false reason=non_windows".to_owned(),
+        detail: "synapse_chrome_self_policy_shield_present=false policy_shield_status=non_windows"
+            .to_owned(),
     }
 }
 
@@ -4436,6 +4500,12 @@ struct ChromeCommand {
     id: String,
     kind: String,
     params: Value,
+    /// The caller's effective daemon-side response budget for this command.
+    /// The extension runs a per-command watchdog of `deadlineMs` plus grace and
+    /// answers `CHROME_COMMAND_DEADLINE_EXCEEDED` when it fires; a missing
+    /// field means the extension's 30 s default.
+    #[serde(rename = "deadlineMs", default)]
+    deadline_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4747,6 +4817,326 @@ struct BridgeInner {
     hosts: HashMap<String, HostRecord>,
     commands: VecDeque<QueuedCommand>,
     pending: HashMap<String, PendingResponse>,
+    /// Queue/delivery clocks and delivering worker boot per pending command id
+    /// (pruned to `pending` keys on every enqueue).
+    pending_clocks: HashMap<String, PendingClock>,
+    /// Extension service-worker boot id reported in `hello` (`workerBootId`)
+    /// per host id. Retained after a host disconnects so its delivered
+    /// commands can be compared against the next worker boot.
+    host_worker_boot_ids: HashMap<String, String>,
+    /// Hosts whose serialized extension command queue is wedged.
+    queue_wedges: HashMap<String, HostQueueWedge>,
+    queue_wedge_events_total: u64,
+    transport_lost_resolved_total: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingClock {
+    queued_unix_ms: u64,
+    delivered_unix_ms: Option<u64>,
+    delivered_worker_boot_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct HostQueueWedge {
+    detected_unix_ms: u64,
+    worker_boot_id: Option<String>,
+    head_command_id: String,
+    head_command_kind: String,
+    head_outstanding_ms: u64,
+    caller_timed_out_commands: Vec<String>,
+    /// The owning transport loop must close this host's socket once so the
+    /// extension worker reconnects. False for a wedge inherited by a
+    /// reconnect of the same worker boot (closing again would only churn).
+    close_pending: bool,
+    inherited_from_host_id: Option<String>,
+}
+
+impl HostQueueWedge {
+    fn evidence(&self) -> String {
+        format!(
+            "reason=extension_command_queue_wedged detected_unix_ms={} worker_boot_id={} head_command_id={} head_command_kind={} head_outstanding_ms={} caller_timed_out_count={} caller_timed_out_commands={} inherited_from_host_id={}",
+            self.detected_unix_ms,
+            self.worker_boot_id.as_deref().unwrap_or("unknown"),
+            self.head_command_id,
+            self.head_command_kind,
+            self.head_outstanding_ms,
+            self.caller_timed_out_commands.len(),
+            self.caller_timed_out_commands.join(","),
+            self.inherited_from_host_id.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+/// Pending-entry aggregates surfaced by bridge health.
+#[derive(Clone, Debug, Default)]
+struct BridgeQueueHealth {
+    oldest_pending_age_ms: u64,
+    caller_timed_out_pending_count: usize,
+    transport_lost_pending_count: usize,
+    wedged: bool,
+    wedge_evidence: Option<String>,
+    queue_wedge_events_total: u64,
+    transport_lost_resolved_total: u64,
+}
+
+fn command_kind_is_read_only(kind: &str) -> bool {
+    READ_ONLY_COMMAND_KINDS.contains(&kind)
+}
+
+fn wedged_host_admits_command_kind(kind: &str) -> bool {
+    WEDGED_HOST_ADMITTED_COMMAND_KINDS.contains(&kind)
+}
+
+fn bounded_command_evidence(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    entries.into_iter().take(MAX_BRIDGE_EVIDENCE_IDS).collect()
+}
+
+fn fail_pending_response(pending: PendingResponse, id: &str, code: &str, detail: &str) {
+    if let Some(sender) = pending.sender {
+        let _ = sender.send(ChromeResponse {
+            id: id.to_owned(),
+            ok: false,
+            result: None,
+            error: Some(ChromeResponseError {
+                code: Some(code.to_owned()),
+                detail: Some(detail.to_owned()),
+            }),
+        });
+    }
+}
+
+/// Marks `host_id` as `extension_command_queue_wedged` when the head of its
+/// delivered FIFO (oldest delivered, unanswered command) and at least one more
+/// delivered command have each outlived their caller budget, the head has been
+/// outstanding longer than 2x`COMMAND_TIMEOUT`, and the host still proves
+/// liveness. A head still inside its caller budget means the queue is busy,
+/// not wedged. Returns true only when the wedge is newly marked; queued (not
+/// yet delivered) non-admitted commands for the host are failed immediately.
+fn detect_host_queue_wedge(inner: &mut BridgeInner, host_id: &str, now: u64) -> bool {
+    if inner.queue_wedges.contains_key(host_id) {
+        return false;
+    }
+    let Some(host) = inner.hosts.get(host_id) else {
+        return false;
+    };
+    if host.last_disconnect_detail.is_some()
+        || now.saturating_sub(host.last_seen_unix_ms) > QUEUE_WEDGE_KEEPALIVE_FRESH_MS
+    {
+        return false;
+    }
+    let mut delivered = inner
+        .pending
+        .iter()
+        .filter(|(_id, pending)| {
+            pending.host_id == host_id && pending.delivered && !pending.transport_lost
+        })
+        .filter_map(|(id, pending)| {
+            let delivered_ms = inner.pending_clocks.get(id)?.delivered_unix_ms?;
+            Some((
+                delivered_ms,
+                id.clone(),
+                pending.kind.clone(),
+                pending.caller_timed_out,
+            ))
+        })
+        .collect::<Vec<_>>();
+    delivered.sort();
+    let Some((head_delivered_ms, head_id, head_kind, head_timed_out)) = delivered.first().cloned()
+    else {
+        return false;
+    };
+    let head_outstanding_ms = now.saturating_sub(head_delivered_ms);
+    let timed_out = delivered
+        .iter()
+        .filter(|(_, _, _, caller_timed_out)| *caller_timed_out)
+        .map(|(_, id, kind, _)| format!("{kind}:{id}"))
+        .collect::<Vec<_>>();
+    if !head_timed_out
+        || timed_out.len() < QUEUE_WEDGE_MIN_CALLER_TIMED_OUT
+        || head_outstanding_ms <= QUEUE_WEDGE_MIN_HEAD_AGE_MS
+    {
+        return false;
+    }
+    let wedge = HostQueueWedge {
+        detected_unix_ms: now,
+        worker_boot_id: inner.host_worker_boot_ids.get(host_id).cloned(),
+        head_command_id: head_id,
+        head_command_kind: head_kind,
+        head_outstanding_ms,
+        caller_timed_out_commands: bounded_command_evidence(timed_out),
+        close_pending: true,
+        inherited_from_host_id: None,
+    };
+    let evidence = wedge.evidence();
+    let failed_queued = fail_queued_commands_for_wedged_host(inner, host_id, &evidence);
+    tracing::error!(
+        code = CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
+        host_id = %host_id,
+        evidence = %evidence,
+        queued_commands_failed = failed_queued,
+        "Chrome bridge extension command queue wedged: delivered commands outlived caller budgets while the host keeps sending keepalives; refusing non-panic commands and closing the host transport so the worker re-registers"
+    );
+    inner.queue_wedges.insert(host_id.to_owned(), wedge);
+    inner.queue_wedge_events_total = inner.queue_wedge_events_total.saturating_add(1);
+    true
+}
+
+fn fail_queued_commands_for_wedged_host(
+    inner: &mut BridgeInner,
+    host_id: &str,
+    evidence: &str,
+) -> usize {
+    let refused_ids = inner
+        .commands
+        .iter()
+        .filter(|queued| {
+            queued.host_id == host_id && !wedged_host_admits_command_kind(&queued.command.kind)
+        })
+        .map(|queued| queued.command.id.clone())
+        .collect::<Vec<_>>();
+    inner
+        .commands
+        .retain(|queued| !refused_ids.contains(&queued.command.id));
+    let detail = format!(
+        "Chrome bridge host {host_id} is extension_command_queue_wedged; command was never delivered: {evidence}"
+    );
+    for id in &refused_ids {
+        if let Some(pending) = inner.pending.remove(id) {
+            fail_pending_response(pending, id, CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED, &detail);
+        }
+    }
+    refused_ids.len()
+}
+
+/// Called on `hello` from `host_id` reporting `worker_boot_id`. The extension
+/// service worker's command queue dies with its worker, so a command that was
+/// delivered to a *disconnected* host under a different, known worker boot can
+/// no longer execute: resolve it as `transport_lost_resolved` with evidence.
+/// An unknown boot on either side, or the same boot (a reconnect of the same
+/// live worker, whose queue may still run it), stays owned (fail closed).
+/// Also carries a queue wedge across a same-boot reconnect.
+fn reconcile_worker_boot_on_hello(inner: &mut BridgeInner, host_id: &str, worker_boot_id: &str) {
+    let resolved = inner
+        .pending
+        .iter()
+        .filter(|(_id, pending)| {
+            pending.delivered
+                && pending.transport_lost
+                && pending.sender.is_none()
+                && pending.host_id != host_id
+                && inner
+                    .hosts
+                    .get(&pending.host_id)
+                    .is_none_or(|old| old.last_disconnect_detail.is_some())
+        })
+        .filter_map(|(id, pending)| {
+            let boot = inner
+                .pending_clocks
+                .get(id)
+                .and_then(|clock| clock.delivered_worker_boot_id.as_deref())?;
+            (boot != worker_boot_id).then(|| {
+                (
+                    id.clone(),
+                    format!("{}:{}@{}", pending.kind, id, pending.host_id),
+                    boot.to_owned(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (id, _, _) in &resolved {
+        inner.pending.remove(id);
+        inner.pending_clocks.remove(id);
+    }
+    if !resolved.is_empty() {
+        inner.transport_lost_resolved_total = inner
+            .transport_lost_resolved_total
+            .saturating_add(u64::try_from(resolved.len()).unwrap_or(u64::MAX));
+        let old_boots = resolved
+            .iter()
+            .map(|(_, _, boot)| boot.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            code = "CHROME_DEBUGGER_DELIVERED_TRANSPORT_LOST_RESOLVED",
+            new_host_id = %host_id,
+            new_worker_boot_id = %worker_boot_id,
+            old_worker_boot_ids = %old_boots,
+            resolved_count = resolved.len(),
+            resolved_commands = ?bounded_command_evidence(resolved.iter().map(|(_, label, _)| label.clone())),
+            "transport_lost_resolved: delivered commands of a disconnected host died with their extension worker boot; a new worker boot registered"
+        );
+    }
+    let inherited = inner
+        .queue_wedges
+        .iter()
+        .find(|(old_host_id, wedge)| {
+            old_host_id.as_str() != host_id
+                && wedge.worker_boot_id.as_deref() == Some(worker_boot_id)
+                && inner
+                    .hosts
+                    .get(old_host_id.as_str())
+                    .is_none_or(|old| old.last_disconnect_detail.is_some())
+        })
+        .map(|(old_host_id, wedge)| (old_host_id.clone(), wedge.clone()));
+    if let Some((old_host_id, mut wedge)) = inherited {
+        inner.queue_wedges.remove(&old_host_id);
+        wedge.close_pending = false;
+        wedge.inherited_from_host_id = Some(old_host_id.clone());
+        tracing::error!(
+            code = CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
+            host_id = %host_id,
+            inherited_from_host_id = %old_host_id,
+            evidence = %wedge.evidence(),
+            "Chrome bridge host reconnected from the same wedged extension worker boot; non-panic commands stay refused until it answers a command or a new worker boot registers"
+        );
+        inner.queue_wedges.insert(host_id.to_owned(), wedge);
+    }
+    // Bound retained per-host records to hosts still registered or still
+    // referenced by a pending command.
+    let referenced = inner
+        .pending
+        .values()
+        .map(|pending| pending.host_id.clone())
+        .chain(inner.hosts.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    inner
+        .host_worker_boot_ids
+        .retain(|id, _| referenced.contains(id));
+    inner.queue_wedges.retain(|id, _| referenced.contains(id));
+}
+
+fn bridge_queue_health(inner: &BridgeInner, now: u64) -> BridgeQueueHealth {
+    let oldest_pending_age_ms = inner
+        .pending
+        .keys()
+        .filter_map(|id| inner.pending_clocks.get(id))
+        .map(|clock| now.saturating_sub(clock.queued_unix_ms))
+        .max()
+        .unwrap_or(0);
+    let active_wedge = inner
+        .active_host_id
+        .as_deref()
+        .and_then(|host_id| inner.queue_wedges.get(host_id));
+    BridgeQueueHealth {
+        oldest_pending_age_ms,
+        caller_timed_out_pending_count: inner
+            .pending
+            .values()
+            .filter(|pending| pending.caller_timed_out)
+            .count(),
+        transport_lost_pending_count: inner
+            .pending
+            .values()
+            .filter(|pending| pending.transport_lost)
+            .count(),
+        wedged: active_wedge.is_some(),
+        wedge_evidence: active_wedge.map(HostQueueWedge::evidence),
+        queue_wedge_events_total: inner.queue_wedge_events_total,
+        transport_lost_resolved_total: inner.transport_lost_resolved_total,
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -4798,7 +5188,7 @@ fn preserve_delivered_mutations_on_transport_loss(
                     command_id = %id,
                     command_kind = %pending.kind,
                     detail = %detail,
-                    "delivered Chrome mutation remains owned until daemon owner-registry teardown; extension cleanup/readback cannot reconcile a lost transport lineage"
+                    "delivered Chrome mutation remains owned (transport_lost) until a new extension worker boot registers (transport_lost_resolved), an authoritative empty extension readback, or daemon owner-registry teardown"
                 );
             }
         } else if let Some(pending) = inner.pending.remove(&id) {
@@ -5404,11 +5794,48 @@ impl ChromeDebuggerBridge {
                     registered_unix_ms = host.registered_unix_ms,
                     "Chrome debugger extension connected through native host"
                 );
+                let worker_boot_id = request
+                    .message
+                    .get("workerBootId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|boot| !boot.is_empty())
+                    .map(ToOwned::to_owned);
+                if let Some(worker_boot_id) = worker_boot_id {
+                    inner
+                        .host_worker_boot_ids
+                        .insert(request.host_id.clone(), worker_boot_id.clone());
+                    reconcile_worker_boot_on_hello(&mut inner, &request.host_id, &worker_boot_id);
+                }
             }
             "response" => {
                 let response = serde_json::from_value::<ChromeResponse>(request.message)
                     .map_err(|error| format!("decode chrome debugger response: {error}"))?;
                 let id = response.id.clone();
+                // Any answer proves this host's serialized queue advanced.
+                if let Some(wedge) = inner.queue_wedges.remove(&request.host_id) {
+                    tracing::warn!(
+                        code = "CHROME_BRIDGE_EXTENSION_QUEUE_UNWEDGED",
+                        host_id = %request.host_id,
+                        command_id = %id,
+                        evidence = %wedge.evidence(),
+                        "Chrome bridge host answered a command; extension_command_queue_wedged cleared"
+                    );
+                }
+                inner.pending_clocks.remove(&id);
+                if response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.code.as_deref())
+                    == Some(CHROME_COMMAND_DEADLINE_EXCEEDED)
+                {
+                    tracing::warn!(
+                        code = CHROME_COMMAND_DEADLINE_EXCEEDED,
+                        host_id = %request.host_id,
+                        command_id = %id,
+                        "extension per-command watchdog answered a command past its deadline; the command is terminal (answered) and its owner is released"
+                    );
+                }
                 if inner
                     .pending
                     .get(&id)
@@ -5743,8 +6170,25 @@ impl ChromeDebuggerBridge {
                         "unknown chrome debugger native host_id {host_id:?}"
                     ));
                 }
+                let now = now_unix_ms();
                 if let Some(host) = inner.hosts.get_mut(host_id) {
-                    host.last_seen_unix_ms = now_unix_ms();
+                    host.last_seen_unix_ms = now;
+                }
+                detect_host_queue_wedge(&mut inner, host_id, now);
+                if let Some(wedge) = inner.queue_wedges.get_mut(host_id)
+                    && wedge.close_pending
+                {
+                    wedge.close_pending = false;
+                    let evidence = wedge.evidence();
+                    tracing::error!(
+                        code = CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
+                        host_id = %host_id,
+                        evidence = %evidence,
+                        "closing wedged Chrome bridge host transport so the extension worker reconnects and re-registers"
+                    );
+                    return Err(format!(
+                        "{CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED}: daemon closed wedged host {host_id}: {evidence}"
+                    ));
                 }
                 if let Some(index) = inner
                     .commands
@@ -5758,6 +6202,16 @@ impl ChromeDebuggerBridge {
                     if let Some(pending) = inner.pending.get_mut(&queued.command.id) {
                         pending.delivered = true;
                     }
+                    let worker_boot_id = inner.host_worker_boot_ids.get(host_id).cloned();
+                    let clock = inner
+                        .pending_clocks
+                        .entry(queued.command.id.clone())
+                        .or_insert_with(|| PendingClock {
+                            queued_unix_ms: now,
+                            ..PendingClock::default()
+                        });
+                    clock.delivered_unix_ms = Some(now);
+                    clock.delivered_worker_boot_id = worker_boot_id;
                     tracing::info!(
                         code = "CHROME_DEBUGGER_COMMAND_DELIVERED",
                         host_id = %host_id,
@@ -5811,7 +6265,9 @@ impl ChromeDebuggerBridge {
             id: id.clone(),
             kind: kind.to_owned(),
             params,
+            deadline_ms: duration_millis_u64(command_timeout),
         };
+        let mutation_capable = !command_kind_is_read_only(kind);
         {
             let mut inner = self.inner.lock().map_err(|_| {
                 ChromeDebuggerBridgeError::protocol(
@@ -5846,16 +6302,48 @@ impl ChromeDebuggerBridge {
                 .as_deref()
                 .unwrap_or("native_messaging")
                 .to_owned();
+            let now = now_unix_ms();
+            let wedge_newly_detected = detect_host_queue_wedge(&mut inner, &host_id, now);
+            if let Some(wedge) = inner.queue_wedges.get(&host_id)
+                && !wedged_host_admits_command_kind(kind)
+            {
+                let error = ChromeDebuggerBridgeError::queue_wedged(kind, &host_id, wedge);
+                tracing::warn!(
+                    code = error.code(),
+                    host_id = %host_id,
+                    command_kind = %kind,
+                    detail = %error.detail(),
+                    "Chrome debugger command refused before enqueue because the host's extension command queue is wedged"
+                );
+                drop(inner);
+                if wedge_newly_detected {
+                    self.notify.notify_waiters();
+                }
+                return Err(error);
+            }
             inner.pending.insert(
                 id.clone(),
                 PendingResponse {
                     host_id: host_id.clone(),
                     kind: kind.to_owned(),
                     sender: Some(sender),
-                    mutation_capable: true,
+                    mutation_capable,
                     delivered: false,
                     caller_timed_out: false,
                     transport_lost: false,
+                },
+            );
+            let BridgeInner {
+                pending,
+                pending_clocks,
+                ..
+            } = &mut *inner;
+            pending_clocks.retain(|pending_id, _| pending.contains_key(pending_id));
+            pending_clocks.insert(
+                id.clone(),
+                PendingClock {
+                    queued_unix_ms: now,
+                    ..PendingClock::default()
                 },
             );
             inner.commands.push_back(QueuedCommand {
@@ -5869,9 +6357,11 @@ impl ChromeDebuggerBridge {
                 command_kind = %kind,
                 transport = %transport_label,
                 queue_depth = inner.commands.len(),
+                mutation_capable,
                 "Chrome debugger command queued for bridge host"
             );
         }
+        // Also wakes a transport loop that must close a newly wedged host.
         self.notify.notify_waiters();
 
         let response = match timeout(command_timeout, receiver).await {
@@ -5908,25 +6398,48 @@ impl ChromeDebuggerBridge {
             synapse_action::record_operator_panic_safety_incident();
             return;
         };
-        let keep_delivered_mutation = inner
+        let delivered = inner
             .pending
             .get(id)
-            .is_some_and(|pending| pending.delivered && pending.mutation_capable);
-        if keep_delivered_mutation {
+            .is_some_and(|pending| pending.delivered);
+        if delivered {
+            let mut wedge_host_id = None;
             if let Some(pending) = inner.pending.get_mut(id) {
                 pending.sender = None;
                 pending.caller_timed_out = true;
-                tracing::error!(
-                    code = "CHROME_DEBUGGER_DELIVERED_MUTATION_UNRESOLVED",
-                    command_id = %id,
-                    command_kind = %pending.kind,
-                    reason,
-                    "delivered Chrome mutation remains owned until terminal extension acknowledgement"
-                );
+                wedge_host_id = Some(pending.host_id.clone());
+                if pending.mutation_capable {
+                    tracing::error!(
+                        code = "CHROME_DEBUGGER_DELIVERED_MUTATION_UNRESOLVED",
+                        command_id = %id,
+                        command_kind = %pending.kind,
+                        reason,
+                        "delivered Chrome mutation remains owned until terminal extension acknowledgement"
+                    );
+                } else {
+                    // Read-only: no mutation ownership survives the caller.
+                    // The tombstone only records that this host's queue has
+                    // not answered it; it is dropped on any answer or on
+                    // transport loss and never blocks the mutation drain.
+                    tracing::warn!(
+                        code = "CHROME_DEBUGGER_DELIVERED_READ_ONLY_CALLER_TIMEOUT",
+                        command_id = %id,
+                        command_kind = %pending.kind,
+                        reason,
+                        "delivered read-only Chrome command outlived its caller; ownership released, kept only as queue-wedge evidence"
+                    );
+                }
+            }
+            if let Some(host_id) = wedge_host_id
+                && detect_host_queue_wedge(&mut inner, &host_id, now_unix_ms())
+            {
+                drop(inner);
+                self.notify.notify_waiters();
             }
             return;
         }
         inner.commands.retain(|queued| queued.command.id != id);
+        inner.pending_clocks.remove(id);
         if let Some(pending) = inner.pending.remove(id) {
             tracing::warn!(
                 code = "CHROME_DEBUGGER_PENDING_DROPPED_BEFORE_DELIVERY",
@@ -6098,6 +6611,10 @@ fn resolve_abandoned_delivered_mutations_after_extension_empty_readback(
             "Chrome debugger mutation-owner registry lock poisoned while reconciling authoritative extension readback",
         )
     })?;
+    // Caller-timeout owners on the authoritative host, plus transport-lost
+    // owners of hosts that are gone: the serialized readback ran with nothing
+    // else in flight in the single extension worker and with no persisted or
+    // worker-restart in-flight mutation, so neither can still execute.
     let resolved_ids = inner
         .pending
         .iter()
@@ -6105,21 +6622,41 @@ fn resolve_abandoned_delivered_mutations_after_extension_empty_readback(
             pending.mutation_capable
                 && pending.delivered
                 && pending.sender.is_none()
-                && pending.caller_timed_out
-                && !pending.transport_lost
-                && pending.host_id == authoritative_host_id
+                && ((pending.caller_timed_out
+                    && !pending.transport_lost
+                    && pending.host_id == authoritative_host_id)
+                    || (pending.transport_lost
+                        && pending.host_id != authoritative_host_id
+                        && inner
+                            .hosts
+                            .get(&pending.host_id)
+                            .is_none_or(|old| old.last_disconnect_detail.is_some())))
         })
         .map(|(id, _pending)| id.clone())
         .collect::<Vec<_>>();
+    let transport_lost_resolved = resolved_ids
+        .iter()
+        .filter(|id| {
+            inner
+                .pending
+                .get(id.as_str())
+                .is_some_and(|pending| pending.transport_lost)
+        })
+        .count();
     for id in &resolved_ids {
         inner.pending.remove(id);
+        inner.pending_clocks.remove(id);
     }
+    inner.transport_lost_resolved_total = inner
+        .transport_lost_resolved_total
+        .saturating_add(u64::try_from(transport_lost_resolved).unwrap_or(u64::MAX));
     if !resolved_ids.is_empty() {
         tracing::warn!(
             code = "CHROME_DEBUGGER_ABANDONED_MUTATIONS_RESOLVED_BY_EXTENSION_READBACK",
             disable_sequence = readback.disable_sequence,
             resolved_count = resolved_ids.len(),
-            resolved_command_ids = ?resolved_ids,
+            transport_lost_resolved = transport_lost_resolved,
+            resolved_command_ids = ?bounded_command_evidence(resolved_ids.iter().cloned()),
             "authoritative serialized extension cleanup/readback proved abandoned delivered mutations terminal"
         );
     }
@@ -6168,11 +6705,12 @@ fn active_bridge_host_lineage_snapshot() -> Result<(Option<String>, u64), Chrome
 
 /// Cancels commands which have not crossed the extension delivery boundary,
 /// then waits for every delivered mutation to publish a terminal response.
-/// Transport teardown deliberately preserves delivered ownership until daemon
-/// owner-registry teardown; a replacement transport lineage cannot reconcile
-/// it. Only caller-timeout ownership on the same continuous host lineage may be
-/// reconciled by serialized cleanup plus an independent empty readback. A
-/// timeout is a fail-closed unresolved verdict, never terminal ownership.
+/// Transport teardown preserves delivered mutation ownership (`transport_lost`)
+/// until a new extension worker boot registers (the dead worker's queue died
+/// with it) or serialized cleanup plus an independent authoritative empty
+/// readback proves nothing is in flight. Read-only commands never hold
+/// ownership. A timeout is a fail-closed unresolved verdict, never terminal
+/// ownership.
 pub async fn drain_mutation_command_owners(
     wait_timeout: Duration,
 ) -> ChromeDebuggerMutationOwnersDrainReadback {
@@ -6298,6 +6836,7 @@ pub fn health_subsystem() -> SubsystemHealth {
                 inner.hosts.len(),
                 inner.commands.len(),
                 inner.pending.len(),
+                bridge_queue_health(&inner, now_unix_ms()),
             )
         }
         Err(_poisoned) => {
@@ -6311,7 +6850,7 @@ pub fn health_subsystem() -> SubsystemHealth {
         }
     };
     let self_policy_shield = synapse_chrome_self_policy_shield_status();
-    chrome_bridge_health_from_snapshot_with_self_policy(
+    chrome_bridge_health_from_snapshot_with_queue(
         snapshot.0.as_ref(),
         snapshot.1,
         snapshot.2,
@@ -6321,6 +6860,7 @@ pub fn health_subsystem() -> SubsystemHealth {
         &layout_infobar_risks,
         &self_policy_shield,
         &profile_install_state,
+        &snapshot.4,
     )
 }
 
@@ -6349,6 +6889,7 @@ fn chrome_bridge_health_from_snapshot(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn chrome_bridge_health_from_snapshot_with_self_policy(
     active_host: Option<&ChromeBridgeHealthRecord>,
@@ -6361,6 +6902,46 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     self_policy_shield: &SynapseChromeSelfPolicyShieldStatus,
     profile_install_state: &SynapseChromeProfileInstallState,
 ) -> SubsystemHealth {
+    chrome_bridge_health_from_snapshot_with_queue(
+        active_host,
+        host_count,
+        queued_count,
+        pending_count,
+        popup_risks,
+        self_profile_risks,
+        layout_infobar_risks,
+        self_policy_shield,
+        profile_install_state,
+        &BridgeQueueHealth::default(),
+    )
+}
+
+fn bridge_queue_health_detail(queue: &BridgeQueueHealth) -> String {
+    format!(
+        "oldest_pending_age_ms={} caller_timed_out_pending_count={} transport_lost_pending_count={} wedged={} queue_wedge_events_total={} transport_lost_resolved_total={}",
+        queue.oldest_pending_age_ms,
+        queue.caller_timed_out_pending_count,
+        queue.transport_lost_pending_count,
+        queue.wedged,
+        queue.queue_wedge_events_total,
+        queue.transport_lost_resolved_total,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chrome_bridge_health_from_snapshot_with_queue(
+    active_host: Option<&ChromeBridgeHealthRecord>,
+    host_count: usize,
+    queued_count: usize,
+    pending_count: usize,
+    popup_risks: &[String],
+    self_profile_risks: &[String],
+    layout_infobar_risks: &[String],
+    self_policy_shield: &SynapseChromeSelfPolicyShieldStatus,
+    profile_install_state: &SynapseChromeProfileInstallState,
+    queue: &BridgeQueueHealth,
+) -> SubsystemHealth {
+    let queue_detail = bridge_queue_health_detail(queue);
     let layout_warning = external_chrome_layout_infobar_warning(layout_infobar_risks);
     let self_permission_warning =
         synapse_chrome_self_permission_warning(self_profile_risks, self_policy_shield.present);
@@ -6372,7 +6953,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         return SubsystemHealth {
             status: "unavailable".to_owned(),
             detail: Some(format!(
-                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} {} install_guidance={}",
+                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} {queue_detail} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} {} install_guidance={}",
                 host_count,
                 queued_count,
                 pending_count,
@@ -6455,9 +7036,12 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     let tab_control_available = extension_id == EXTENSION_ID
         && host.last_disconnect_detail.is_none()
         && !extension_stale
-        && !self_permission_blocking;
+        && !self_permission_blocking
+        && !queue.wedged;
     let status = if tab_control_available {
         "ok"
+    } else if queue.wedged {
+        "wedged"
     } else if extension_stale {
         "stale"
     } else if self_permission_blocking {
@@ -6469,11 +7053,25 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     };
     let disconnect_detail = host.last_disconnect_detail.as_deref().unwrap_or("");
     let detach_reason = host.last_detach_reason.as_deref().unwrap_or("");
+    // `reason` leads the blob so the first-occurrence key parser never picks up
+    // an unrelated sub-status (e.g. the policy shield) as the bridge reason.
+    let bridge_reason = match status {
+        "ok" => "ok",
+        "wedged" => "extension_command_queue_wedged",
+        "stale" => "extension_stale",
+        "unsafe_profile" => "self_permission_blocking",
+        "unavailable" => "host_disconnected",
+        _ => "connecting",
+    };
+    let wedge_evidence = queue
+        .wedge_evidence
+        .as_deref()
+        .map_or_else(|| "none".to_owned(), |evidence| evidence.replace(' ', ";"));
 
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=true extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} {} install_guidance={}",
+            "reason={bridge_reason} tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=true extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} {queue_detail} queue_wedge_evidence={wedge_evidence} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
