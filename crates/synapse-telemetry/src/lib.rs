@@ -376,6 +376,23 @@ fn prepare_log_dir(log_dir: &Path) -> Result<(), TelemetryError> {
     })
 }
 
+/// Deletes one log file during retention GC. A file another process still holds
+/// open (Windows sharing violation / access denied, e.g. the live daemon's own
+/// stderr log while a setup candidate boots) is skipped instead of failing
+/// daemon startup: retention is housekeeping and the next GC pass retries it.
+fn remove_log_file_unless_in_use(path: &Path) -> Result<bool, String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err)
+            if err.raw_os_error() == Some(32)
+                || err.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(format!("{}: {err}", path.display())),
+    }
+}
+
 fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), String> {
     let keep = Duration::from_secs(u64::from(keep_days) * 24 * 60 * 60);
     let now = SystemTime::now();
@@ -389,8 +406,9 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
         }
 
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if now.duration_since(modified).unwrap_or_default() > keep {
-            fs::remove_file(entry.path()).map_err(|err| err.to_string())?;
+        if now.duration_since(modified).unwrap_or_default() > keep
+            && remove_log_file_unless_in_use(&entry.path())?
+        {
             continue;
         }
 
@@ -404,7 +422,9 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
 
     entries.sort_by_key(|(_, modified, _)| *modified);
     for (path, _, len) in entries {
-        fs::remove_file(path).map_err(|err| err.to_string())?;
+        if !remove_log_file_unless_in_use(&path)? {
+            continue;
+        }
         total = total.saturating_sub(len);
         if total <= max_dir_bytes {
             break;
