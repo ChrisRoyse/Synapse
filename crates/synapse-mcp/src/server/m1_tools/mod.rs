@@ -906,7 +906,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. When the tab is the visible tab of the foreground Chrome window it uses chrome.tabs.captureVisibleTab tiles; otherwise (Chrome behind another app such as a fullscreen game, or an inactive tab) it never touches OS focus or the user's active tab and captures through chrome.debugger Page.captureScreenshot, briefly rendering a hidden tab in a temporary unfocused window on an uncovered display and returning it to its original window/index. The response reports required_foreground, backend_tier_used, and foreground readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
     )]
     pub async fn browser_screenshot(
         &self,
@@ -942,12 +942,16 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self.resolve_cdp_tab_mutation_target(
-            TOOL,
-            &session_id,
-            params.0.window_hwnd,
-            resolution_target,
-        );
+        // Same adoption rules as browser_nav/browser_dom: an explicitly named
+        // unowned (or idle-owner) tab is adopted instead of refused.
+        let resolution = self
+            .resolve_cdp_tab_mutation_target_adopting(
+                TOOL,
+                &session_id,
+                params.0.window_hwnd,
+                resolution_target,
+            )
+            .await;
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
             &session_id,
