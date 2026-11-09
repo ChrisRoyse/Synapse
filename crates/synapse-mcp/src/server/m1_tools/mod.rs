@@ -5491,6 +5491,13 @@ impl SynapseService {
         if persisted.is_empty() {
             return Ok(None);
         }
+        let owner_sessions = persisted
+            .iter()
+            .map(|(_key, row)| row.owner_session_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
         let mut authorized = Vec::new();
         for (owner_key, row) in persisted {
             let target = SessionTarget::Cdp {
@@ -5511,7 +5518,8 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "{tool} refused recovered target {target_id:?}: this session must hold an exact target_claim, exact active CDP session target, or exact explicit set_target request for the persisted CDP target before durable owner authority can be restored"
+                    "{tool} refused target {target_id:?}: it belongs to another active MCP session ({owner_sessions}). Its lock releases automatically after {} minutes without MCP calls from that session. Open your own tab with browser_tabs operation=new, or coordinate via target operation=status/claim.",
+                    CDP_TARGET_IDLE_LOCK_RELEASE_MS / 60_000
                 ),
             ));
         }
