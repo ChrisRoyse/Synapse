@@ -6051,7 +6051,11 @@ impl SynapseService {
             return Ok(false);
         }
         self.release_idle_cdp_target_owners("cdp_target_auto_adopt", session_id, target_id)?;
-        if !self.cdp_target_owners_for_target_id(target_id)?.is_empty() {
+        if self
+            .cdp_target_owners_for_target_id(target_id)?
+            .iter()
+            .any(|(_key, owner)| owner.session_id != session_id)
+        {
             return Ok(false);
         }
         let already_active = matches!(
@@ -6085,49 +6089,45 @@ impl SynapseService {
         requester: &str,
         target_id: &str,
     ) -> Result<usize, ErrorData> {
+        // Ownership is transferred, not dropped: the requester inherits the
+        // Synapse-created provenance, so it can also close the tab (#2276).
         let now = unix_ms_now();
-        let mut released = 0_usize;
+        let mut transferred = 0_usize;
+        let mut idle_rows: Vec<(String, CdpTargetOwner, String)> = Vec::new();
         for (owner_key, owner) in self.cdp_target_owners_for_target_id(target_id)? {
-            if owner.session_id == requester
-                || !self.cdp_lock_holder_idle(&owner.session_id, now)?
-            {
-                continue;
-            }
-            if self.remove_cdp_target_owner(&owner_key)?.is_some() {
-                released += 1;
-                tracing::warn!(
-                    code = "CDP_TARGET_IDLE_OWNER_RELEASED",
-                    tool,
-                    requester_session_id = %requester,
-                    idle_owner_session_id = %owner.session_id,
-                    owner_key = %owner_key,
-                    cdp_target_id = %owner.cdp_target_id,
-                    idle_release_ms = CDP_TARGET_IDLE_LOCK_RELEASE_MS,
-                    "readback=session_registry outcome=idle_session_tab_lock_released"
-                );
+            if owner.session_id != requester && self.cdp_lock_holder_idle(&owner.session_id, now)? {
+                let prior = owner.session_id.clone();
+                idle_rows.push((owner_key, owner, prior));
             }
         }
         for (owner_key, row) in self.read_persisted_cdp_target_owners_for_target_id(target_id)? {
-            if row.owner_session_id == requester
-                || !self.cdp_lock_holder_idle(&row.owner_session_id, now)?
+            if row.owner_session_id != requester
+                && !idle_rows.iter().any(|(key, _, _)| key == &owner_key)
+                && self.cdp_lock_holder_idle(&row.owner_session_id, now)?
             {
-                continue;
-            }
-            if self.delete_persisted_cdp_target_owner(&owner_key, &row.owner.cdp_target_id)? {
-                released += 1;
-                tracing::warn!(
-                    code = "CDP_TARGET_IDLE_OWNER_RELEASED",
-                    tool,
-                    requester_session_id = %requester,
-                    idle_owner_session_id = %row.owner_session_id,
-                    owner_key = %owner_key,
-                    cdp_target_id = %row.owner.cdp_target_id,
-                    idle_release_ms = CDP_TARGET_IDLE_LOCK_RELEASE_MS,
-                    "readback=CF_SESSIONS outcome=idle_session_persisted_tab_lock_released"
-                );
+                idle_rows.push((owner_key, row.owner.clone(), row.owner_session_id.clone()));
             }
         }
-        Ok(released)
+        for (owner_key, mut owner, prior_owner) in idle_rows {
+            owner.session_id = requester.to_owned();
+            self.persist_cdp_target_owner(&owner_key, &owner)?;
+            {
+                let mut guard = self.lock_cdp_target_owners()?;
+                guard.insert(owner_key.clone(), owner.clone());
+            }
+            transferred += 1;
+            tracing::warn!(
+                code = "CDP_TARGET_IDLE_OWNER_RELEASED",
+                tool,
+                requester_session_id = %requester,
+                idle_owner_session_id = %prior_owner,
+                owner_key = %owner_key,
+                cdp_target_id = %owner.cdp_target_id,
+                idle_release_ms = CDP_TARGET_IDLE_LOCK_RELEASE_MS,
+                "readback=CF_SESSIONS+owner_registry outcome=idle_session_tab_lock_transferred_to_requester"
+            );
+        }
+        Ok(transferred)
     }
 
     async fn auto_adopt_cdp_target(
@@ -6141,9 +6141,13 @@ impl SynapseService {
         let _authority_gate = self
             .lock_session_authority_for_tool(tool, session_id)
             .await?;
-        // Re-check under the gate: a concurrent call may have adopted it or
-        // another session may have opened it meanwhile.
-        if !self.cdp_target_owners_for_target_id(target_id)?.is_empty() {
+        // Re-check under the gate: another session may have opened or taken
+        // it meanwhile. Rows this session just inherited (#2276) are fine.
+        if self
+            .cdp_target_owners_for_target_id(target_id)?
+            .iter()
+            .any(|(_key, owner)| owner.session_id != session_id)
+        {
             return Err(strict_error.clone());
         }
         if matches!(
