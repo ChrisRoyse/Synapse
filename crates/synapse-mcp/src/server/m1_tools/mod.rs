@@ -118,6 +118,10 @@ type OperatorPanicCdpTargetOwnerRows = (
 
 const CDP_TARGET_AUTO_ADOPT_AUDIT_TOOL: &str = "cdp_target_auto_adopt";
 const CHROME_TAB_TARGET_PREFIX: &str = "chrome-tab:";
+/// A session silent this long stops blocking other sessions from its tabs
+/// (ownership and active-target binding). HTTP sessions themselves live 24 h
+/// so idle agents stay connected; tab locks must not live that long.
+const CDP_TARGET_IDLE_LOCK_RELEASE_MS: u64 = 10 * 60 * 1000;
 
 /// The human's current OS foreground HWND for the auto-adoption guard. "No
 /// foreground window" (locked desktop, transient switch) means no human-focused
@@ -6034,6 +6038,7 @@ impl SynapseService {
         {
             return Ok(false);
         }
+        self.release_idle_cdp_target_owners("cdp_target_auto_adopt", session_id, target_id)?;
         if !self.cdp_target_owners_for_target_id(target_id)?.is_empty() {
             return Ok(false);
         }
@@ -6043,6 +6048,74 @@ impl SynapseService {
                 if cdp_target_id.eq_ignore_ascii_case(target_id)
         );
         Ok(!already_active)
+    }
+
+    /// True when `holder_session_id` should no longer block other sessions
+    /// from a tab: its session is gone/closed, or it made no MCP call for
+    /// [`CDP_TARGET_IDLE_LOCK_RELEASE_MS`]. The session itself stays connected.
+    fn cdp_lock_holder_idle(&self, holder_session_id: &str, now: u64) -> Result<bool, ErrorData> {
+        Ok(
+            match self.session_registry_read_optional_at(holder_session_id, now)? {
+                None => true,
+                Some(read) => {
+                    read.lifecycle != "live"
+                        || read.last_seen_ms_ago >= CDP_TARGET_IDLE_LOCK_RELEASE_MS
+                }
+            },
+        )
+    }
+
+    /// Drops tab ownership held by idle sessions (in memory and persisted) so
+    /// `requester` can adopt the tab. The tab itself stays open.
+    fn release_idle_cdp_target_owners(
+        &self,
+        tool: &'static str,
+        requester: &str,
+        target_id: &str,
+    ) -> Result<usize, ErrorData> {
+        let now = unix_ms_now();
+        let mut released = 0_usize;
+        for (owner_key, owner) in self.cdp_target_owners_for_target_id(target_id)? {
+            if owner.session_id == requester
+                || !self.cdp_lock_holder_idle(&owner.session_id, now)?
+            {
+                continue;
+            }
+            if self.remove_cdp_target_owner(&owner_key)?.is_some() {
+                released += 1;
+                tracing::warn!(
+                    code = "CDP_TARGET_IDLE_OWNER_RELEASED",
+                    tool,
+                    requester_session_id = %requester,
+                    idle_owner_session_id = %owner.session_id,
+                    owner_key = %owner_key,
+                    cdp_target_id = %owner.cdp_target_id,
+                    idle_release_ms = CDP_TARGET_IDLE_LOCK_RELEASE_MS,
+                    "readback=session_registry outcome=idle_session_tab_lock_released"
+                );
+            }
+        }
+        for (owner_key, row) in self.read_persisted_cdp_target_owners_for_target_id(target_id)? {
+            if row.owner_session_id == requester
+                || !self.cdp_lock_holder_idle(&row.owner_session_id, now)?
+            {
+                continue;
+            }
+            if self.delete_persisted_cdp_target_owner(&owner_key, &row.owner.cdp_target_id)? {
+                released += 1;
+                tracing::warn!(
+                    code = "CDP_TARGET_IDLE_OWNER_RELEASED",
+                    tool,
+                    requester_session_id = %requester,
+                    idle_owner_session_id = %row.owner_session_id,
+                    owner_key = %owner_key,
+                    cdp_target_id = %row.owner.cdp_target_id,
+                    idle_release_ms = CDP_TARGET_IDLE_LOCK_RELEASE_MS,
+                    "readback=CF_SESSIONS outcome=idle_session_persisted_tab_lock_released"
+                );
+            }
+        }
+        Ok(released)
     }
 
     async fn auto_adopt_cdp_target(
@@ -6185,7 +6258,7 @@ impl SynapseService {
         session_id: &str,
         target_id: &str,
     ) -> Result<(), ErrorData> {
-        let holders = {
+        let candidates = {
             let guard = self.lock_session_targets()?;
             guard
                 .iter()
@@ -6200,13 +6273,22 @@ impl SynapseService {
                 .map(|(holder, _)| holder.clone())
                 .collect::<Vec<_>>()
         };
+        // An idle session's binding no longer blocks anyone.
+        let now = unix_ms_now();
+        let mut holders = Vec::new();
+        for holder in candidates {
+            if !self.cdp_lock_holder_idle(&holder, now)? {
+                holders.push(holder);
+            }
+        }
         if holders.is_empty() {
             return Ok(());
         }
         Err(mcp_error(
             error_codes::TARGET_CO_OWNED,
             format!(
-                "{tool} refused to auto-adopt {target_id:?}: it is the active session target of other MCP session(s) {holders:?}; open your own tab with browser_tabs operation=new, or coordinate via target operation=status/adopt"
+                "{tool} refused to auto-adopt {target_id:?}: it is the active session target of other active MCP session(s) {holders:?} (released automatically after {} minutes without MCP calls); open your own tab with browser_tabs operation=new, or coordinate via target operation=status/adopt",
+                CDP_TARGET_IDLE_LOCK_RELEASE_MS / 60_000
             ),
         ))
     }
@@ -12018,7 +12100,8 @@ fn cdp_owner_session_mismatch_error(
     mcp_error(
         error_codes::ACTION_TARGET_INVALID,
         format!(
-            "{tool} refused target {target_id:?}: owner_session_id(s)={owner_sessions:?}, requesting_session_id={session_id:?}",
+            "{tool} refused target {target_id:?}: owner_session_id(s)={owner_sessions:?}, requesting_session_id={session_id:?}. The owner is active; its lock releases automatically after {} minutes without MCP calls. Open your own tab with browser_tabs operation=new meanwhile.",
+            CDP_TARGET_IDLE_LOCK_RELEASE_MS / 60_000,
         ),
     )
 }
