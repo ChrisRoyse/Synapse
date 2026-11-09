@@ -5173,7 +5173,16 @@ async function handlePageScreenshotBackground(params) {
   const captureAttempts = [];
   let setup = null;
   let attachment = null;
+  let renderWindow = null;
+  let renderWindowRestore = null;
+  const visibilityBefore = await pageVisibilityState(selected.tabId);
   try {
+    // Chrome does not paint hidden pages (inactive tab, or a window covered by
+    // a fullscreen app), so a capture would hang. Render it in a temporary
+    // unfocused window on an uncovered display instead.
+    if (visibilityBefore !== "visible") {
+      renderWindow = await moveTabToRenderWindow(selected.tabId, commandDeadlineMs);
+    }
     // Attach before measuring: the debugger infobar can shrink the viewport.
     attachment = await attachDebuggerForCommand(selected.tabId);
     setup = await runPageScreenshotSetup(selected.tabId, { ...request, token });
@@ -5271,6 +5280,16 @@ async function handlePageScreenshotBackground(params) {
         // The image readback is the verdict; detach is host hygiene only.
       }
     }
+    if (renderWindow) {
+      renderWindowRestore = await restoreTabFromRenderWindow(renderWindow);
+    }
+  }
+  if (renderWindowRestore && !renderWindowRestore.ok) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `pageScreenshot captured tab ${selected.tabId} but could not return it to window ` +
+        `${renderWindow.originWindowId} index ${renderWindow.originIndex}: ${renderWindowRestore.error}`
+    );
   }
   const after = await tabPageState(selected.tabId, selected.target);
   const afterWindow = Number.isInteger(after.chrome_window_id)
@@ -5312,12 +5331,136 @@ async function handlePageScreenshotBackground(params) {
     capture_attempts: captureAttempts,
     mask_count: setup.mask_count,
     masks: setup.masks,
+    visibility_before: visibilityBefore,
+    render_window: renderWindow
+      ? { ...renderWindow, restore: renderWindowRestore }
+      : null,
     readback_backend: "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot(captureBeyondViewport)",
     backend_tier_used: "chrome_debugger_background_capture",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
+}
+
+async function pageVisibilityState(tabId) {
+  try {
+    const injected = await quarantineGuardedExecuteScript({
+      target: { tabId },
+      func: () => document.visibilityState
+    });
+    return String(injected?.[0]?.result || "unknown");
+  } catch (_) {
+    return "unknown";
+  }
+}
+
+// Moves the tab into a new unfocused window placed beside the tab's own
+// window, trying each side until Chrome reports the page visible (that is,
+// the spot is not covered). Never focuses anything.
+async function moveTabToRenderWindow(tabId, deadlineMs) {
+  const tab = await chrome.tabs.get(tabId);
+  const origin = await chrome.windows.get(tab.windowId);
+  const originActive = await activeTabForWindow(tab.windowId);
+  const width = Math.max(800, Math.min(1600, Number(origin.width) || 1280));
+  const height = Math.max(600, Math.min(1000, Number(origin.height) || 900));
+  const left0 = Number(origin.left) || 0;
+  const top0 = Number(origin.top) || 0;
+  const candidates = [
+    { side: "right", left: left0 + (Number(origin.width) || width) + 40, top: top0 + 40 },
+    { side: "left", left: left0 - width - 40, top: top0 + 40 },
+    { side: "below", left: left0 + 40, top: top0 + (Number(origin.height) || height) + 40 },
+    { side: "above", left: left0 + 40, top: top0 - height - 40 }
+  ];
+  const record = {
+    tabId,
+    windowId: null,
+    originWindowId: tab.windowId,
+    originIndex: tab.index,
+    originWasActive: Boolean(tab.active),
+    originActiveTabId: Number.isInteger(originActive?.id) ? originActive.id : null,
+    width,
+    height,
+    placements: []
+  };
+  assertPhysicalMutationAdmission(`chrome.windows.create:renderWindow:tab=${tabId}`);
+  const first = candidates[0];
+  const created = await chrome.windows.create({
+    tabId,
+    focused: false,
+    state: "normal",
+    type: "normal",
+    left: first.left,
+    top: first.top,
+    width,
+    height
+  });
+  record.windowId = created.id;
+  for (const [index, candidate] of candidates.entries()) {
+    if (index > 0) {
+      await chrome.windows.update(created.id, { left: candidate.left, top: candidate.top, focused: false });
+    }
+    const placed = await chrome.windows.get(created.id);
+    const waitUntil = Math.min(Date.now() + 1500, deadlineMs - 3000);
+    let visibility = await pageVisibilityState(tabId);
+    while (visibility !== "visible" && Date.now() < waitUntil) {
+      await sleep(100);
+      visibility = await pageVisibilityState(tabId);
+    }
+    record.placements.push({
+      side: candidate.side,
+      left: placed.left,
+      top: placed.top,
+      width: placed.width,
+      height: placed.height,
+      visibility
+    });
+    if (visibility === "visible") {
+      return record;
+    }
+  }
+  const restore = await restoreTabFromRenderWindow(record);
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `pageScreenshot found no uncovered display spot to render hidden tab ${tabId}; ` +
+      `tried ${JSON.stringify(record.placements)}; tab returned=${restore.ok}. ` +
+      `Use browser_dom (content/aria_snapshot) for page state instead.`
+  );
+}
+
+// Puts the tab back at its original window and index and restores which tab
+// was active there. The temporary window closes when its last tab leaves.
+async function restoreTabFromRenderWindow(record) {
+  try {
+    await chrome.tabs.move(record.tabId, { windowId: record.originWindowId, index: record.originIndex });
+    if (record.originWasActive) {
+      await chrome.tabs.update(record.tabId, { active: true });
+    } else if (record.originActiveTabId !== null) {
+      const nowActive = await activeTabForWindow(record.originWindowId);
+      if (nowActive?.id !== record.originActiveTabId) {
+        await chrome.tabs.update(record.originActiveTabId, { active: true });
+      }
+    }
+    const back = await chrome.tabs.get(record.tabId);
+    const activeNow = await activeTabForWindow(record.originWindowId);
+    let renderWindowClosed = true;
+    try {
+      await chrome.windows.get(record.windowId);
+      renderWindowClosed = false;
+    } catch (_) {
+      renderWindowClosed = true;
+    }
+    return {
+      ok: back.windowId === record.originWindowId,
+      window_id: back.windowId,
+      index: back.index,
+      origin_active_tab_id_after: Number.isInteger(activeNow?.id) ? activeNow.id : null,
+      render_window_closed: renderWindowClosed,
+      error: null
+    };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) };
+  }
 }
 
 function normalizePageScreenshotRequest(params, selectedTabId) {
