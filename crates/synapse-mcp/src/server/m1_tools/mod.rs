@@ -1953,7 +1953,26 @@ impl SynapseService {
             ));
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
-        let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        let mut bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        // Chrome not foreground (e.g. a fullscreen game): capture in the
+        // background through the debugger and never touch OS focus.
+        if let Some(background_guard) = browser_screenshot_background_guard(window_hwnd)? {
+            bridge_payload["background"] = json!(true);
+            return self
+                .browser_screenshot_background_impl(
+                    params,
+                    validation,
+                    session_id,
+                    window_hwnd,
+                    cdp_target_id,
+                    bridge_payload,
+                    background_guard,
+                )
+                .await;
+        }
+        // Chrome is foreground: the extension still renders in the background
+        // unless the target tab is the visible tab of the focused window.
+        bridge_payload["background"] = json!("auto");
         // #1359: serialize the brief foreground-capture critical section so
         // concurrent browser_screenshot captures (multi-agent / batched) cannot
         // interleave their Chrome-window activation and corrupt each other's
@@ -2030,104 +2049,74 @@ impl SynapseService {
             Ok(captured) => captured,
             Err(error) => return Err(error),
         };
-        if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
-            return Err(mcp_error(
-                error_codes::ACTION_POSTCONDITION_FAILED,
+        browser_screenshot_write_response(
+            params,
+            validation,
+            session_id,
+            window_hwnd,
+            cdp_target_id,
+            captured,
+            foreground_readback,
+        )
+    }
+
+    async fn browser_screenshot_background_impl(
+        &self,
+        params: &BrowserScreenshotParams,
+        validation: &BrowserScreenshotValidation,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        bridge_payload: Value,
+        background_guard: BrowserScreenshotBackgroundGuard,
+    ) -> Result<BrowserScreenshotResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_background_capture",
+        )?;
+        let mut captured_result = crate::chrome_debugger_bridge::page_screenshot(
+            window_hwnd,
+            cdp_target_id,
+            bridge_payload.clone(),
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
                 format!(
-                    "browser_screenshot Chrome bridge returned target {:?} for requested target {:?}",
-                    captured.target_id, cdp_target_id
+                    "browser_screenshot background Chrome bridge capture failed: {}",
+                    error.detail()
                 ),
-            ));
+            )
+        });
+        if let Err(error) = &captured_result
+            && browser_screenshot_bridge_disconnected(error)
+        {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_screenshot_before_background_retry",
+            )?;
+            captured_result = browser_screenshot_retry_after_bridge_disconnect(
+                window_hwnd,
+                cdp_target_id,
+                bridge_payload,
+                error,
+            )
+            .await;
         }
-        tracing::info!(
-            code = "BROWSER_SCREENSHOT_BRIDGE_CAPTURED",
-            session_id = %session_id,
-            hwnd = window_hwnd,
-            cdp_target_id = %captured.target_id,
-            tab_id = captured.tab_id,
-            chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
-            before_active = captured.before_active,
-            active_for_capture = captured.active_for_capture,
-            restored_previous_active = captured.restored_previous_active,
-            required_foreground = foreground_readback.required_foreground || captured.required_foreground,
-            human_os_foreground_before_hwnd = foreground_readback.before_hwnd.unwrap_or_default(),
-            human_os_foreground_capture_hwnd = foreground_readback.capture_hwnd.unwrap_or_default(),
-            human_os_foreground_after_restore_hwnd = foreground_readback.after_restore_hwnd.unwrap_or_default(),
-            restored_human_os_foreground = foreground_readback.restored_human_os_foreground,
-            capture_attempt_count = captured.capture_attempt_count,
-            capture_attempts = ?captured.capture_attempts,
-            tile_count = captured.tile_count,
-            output_path = %validation.output_path.display(),
-            "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
-        );
-        let bitmap =
-            stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
-        let bitmap_sha256 = sha256_hex(&bitmap.bytes);
-        let write_params = CaptureScreenshotParams {
-            path: params.path.clone(),
-            region: Some(bitmap.region),
-            window_hwnd: None,
-            overwrite: params.overwrite,
-            max_pixels: params.max_pixels,
-            max_long_edge: params.max_long_edge,
-        };
+        let foreground_readback =
+            finish_browser_screenshot_background(window_hwnd, background_guard)?;
         super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_screenshot_before_output_write",
+            "browser_screenshot_after_background_capture",
         )?;
-        let screenshot = write_screenshot_bitmap_with_quality(
-            &write_params,
-            validation.output_path.clone(),
-            validation.format,
-            bitmap,
-            "chrome_tabs_capture_visible_tab_stitched_bgra",
-            bitmap_sha256,
-            None,
-            params.quality,
-            None,
-        )?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_screenshot_after_output_write",
-        )?;
-        let page_region = browser_screenshot_page_region(captured.clip_css)?;
-        Ok(BrowserScreenshotResponse {
-            path: screenshot.path,
-            format: screenshot.format,
-            capture_backend: screenshot.capture_backend,
-            scope: params.scope,
-            page_region,
-            width: screenshot.width,
-            height: screenshot.height,
-            native_width: screenshot.native_width,
-            native_height: screenshot.native_height,
-            scale: screenshot.scale,
-            bytes_written: screenshot.bytes_written,
-            bitmap_sha256: screenshot.bitmap_sha256,
-            cdp_target_id: captured.target_id,
-            tab_id: captured.tab_id,
-            chrome_window_id: captured.chrome_window_id,
-            url: redact_url_for_public_readback(&captured.url),
-            title: captured.title,
-            device_pixel_ratio: captured.device_pixel_ratio,
-            viewport_width_css: captured.viewport_width_css,
-            viewport_height_css: captured.viewport_height_css,
-            scroll_width_css: captured.scroll_width_css,
-            scroll_height_css: captured.scroll_height_css,
-            tile_count: captured.tile_count,
-            mask_count: captured.mask_count,
-            omit_background: captured.omit_background,
-            required_foreground: foreground_readback.required_foreground || captured.required_foreground,
-            human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
-            human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
-            human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
-            restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
-            backend_tier_used: captured.backend_tier_used,
-            source_of_truth:
-                "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
-                    .to_owned(),
-            degradation_code: None,
-            fallback_metadata_source: None,
-            fallback_reason: None,
-        })
+        let captured = captured_result?;
+        browser_screenshot_write_response(
+            params,
+            validation,
+            session_id,
+            window_hwnd,
+            cdp_target_id,
+            captured,
+            foreground_readback,
+        )
     }
 
     async fn browser_pdf_impl(
@@ -16449,6 +16438,81 @@ fn finish_browser_screenshot_foreground(
     Ok(BrowserScreenshotForegroundReadback::default())
 }
 
+/// Pre-capture foreground for the background (debugger) screenshot path.
+#[cfg(windows)]
+struct BrowserScreenshotBackgroundGuard {
+    before: ForegroundContext,
+}
+
+#[cfg(not(windows))]
+struct BrowserScreenshotBackgroundGuard;
+
+/// `Some` when the Chrome HWND is not the OS foreground. The capture then runs
+/// in the background and never changes focus.
+#[cfg(windows)]
+fn browser_screenshot_background_guard(
+    window_hwnd: i64,
+) -> Result<Option<BrowserScreenshotBackgroundGuard>, ErrorData> {
+    let before = read_browser_screenshot_current_foreground("before_background_capture")?;
+    if before.hwnd == window_hwnd {
+        return Ok(None);
+    }
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_BACKGROUND_SELECTED",
+        hwnd = window_hwnd,
+        human_os_foreground_before_hwnd = before.hwnd,
+        human_os_foreground_before_pid = before.pid,
+        human_os_foreground_before_process = %before.process_name,
+        "readback=GetForegroundWindow outcome=chrome_not_foreground_background_capture"
+    );
+    Ok(Some(BrowserScreenshotBackgroundGuard { before }))
+}
+
+#[cfg(not(windows))]
+fn browser_screenshot_background_guard(
+    _window_hwnd: i64,
+) -> Result<Option<BrowserScreenshotBackgroundGuard>, ErrorData> {
+    Ok(None)
+}
+
+/// Reads the foreground again after a background capture. It must still be
+/// the window that was in front before; Synapse never moved it.
+#[cfg(windows)]
+fn finish_browser_screenshot_background(
+    window_hwnd: i64,
+    guard: BrowserScreenshotBackgroundGuard,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    let before = guard.before;
+    let after = read_browser_screenshot_current_foreground("after_background_capture")?;
+    let unchanged = after.hwnd == before.hwnd && after.pid == before.pid;
+    if !unchanged {
+        tracing::warn!(
+            code = "BROWSER_SCREENSHOT_BACKGROUND_FOREGROUND_CHANGED",
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_process = %before.process_name,
+            after_hwnd = after.hwnd,
+            after_process = %after.process_name,
+            "foreground changed during a background capture; Synapse made no focus call, so the human moved it"
+        );
+    }
+    Ok(BrowserScreenshotForegroundReadback {
+        required_foreground: false,
+        before_hwnd: Some(before.hwnd),
+        capture_hwnd: Some(before.hwnd),
+        after_restore_hwnd: Some(after.hwnd),
+        restored_human_os_foreground: unchanged,
+    })
+}
+
+#[cfg(not(windows))]
+fn finish_browser_screenshot_background(
+    _window_hwnd: i64,
+    _guard: BrowserScreenshotBackgroundGuard,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    Ok(BrowserScreenshotForegroundReadback::default())
+}
+
 #[cfg(windows)]
 fn read_browser_screenshot_current_foreground(
     phase: &'static str,
@@ -17588,6 +17652,123 @@ fn f64_to_i32_rounded(value: f64, label: &str) -> Result<i32, ErrorData> {
         ));
     }
     Ok(value.round() as i32)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn browser_screenshot_write_response(
+    params: &BrowserScreenshotParams,
+    validation: &BrowserScreenshotValidation,
+    session_id: &str,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    captured: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
+    foreground_readback: BrowserScreenshotForegroundReadback,
+) -> Result<BrowserScreenshotResponse, ErrorData> {
+    if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot Chrome bridge returned target {:?} for requested target {:?}",
+                captured.target_id, cdp_target_id
+            ),
+        ));
+    }
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_BRIDGE_CAPTURED",
+        session_id = %session_id,
+        hwnd = window_hwnd,
+        cdp_target_id = %captured.target_id,
+        tab_id = captured.tab_id,
+        chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+        before_active = captured.before_active,
+        active_for_capture = captured.active_for_capture,
+        restored_previous_active = captured.restored_previous_active,
+        required_foreground = foreground_readback.required_foreground || captured.required_foreground,
+        human_os_foreground_before_hwnd = foreground_readback.before_hwnd.unwrap_or_default(),
+        human_os_foreground_capture_hwnd = foreground_readback.capture_hwnd.unwrap_or_default(),
+        human_os_foreground_after_restore_hwnd = foreground_readback.after_restore_hwnd.unwrap_or_default(),
+        restored_human_os_foreground = foreground_readback.restored_human_os_foreground,
+        capture_attempt_count = captured.capture_attempt_count,
+        capture_attempts = ?captured.capture_attempts,
+        tile_count = captured.tile_count,
+        output_path = %validation.output_path.display(),
+        "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
+    );
+    let background = captured.backend_tier_used == "chrome_debugger_background_capture";
+    let (capture_backend, source_of_truth) = if background {
+        (
+            "chrome_debugger_capture_screenshot_stitched_bgra",
+            "human OS foreground readback (no focus call) plus normal Chrome bridge chrome.scripting page metrics/masks and chrome.debugger Page.captureScreenshot chunks stitched by synapse-mcp",
+        )
+    } else {
+        (
+            "chrome_tabs_capture_visible_tab_stitched_bgra",
+            "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp",
+        )
+    };
+    let bitmap =
+        stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
+    let bitmap_sha256 = sha256_hex(&bitmap.bytes);
+    let write_params = CaptureScreenshotParams {
+        path: params.path.clone(),
+        region: Some(bitmap.region),
+        window_hwnd: None,
+        overwrite: params.overwrite,
+        max_pixels: params.max_pixels,
+        max_long_edge: params.max_long_edge,
+    };
+    super::operator_panic_boundary::ensure_mcp_mutation("browser_screenshot_before_output_write")?;
+    let screenshot = write_screenshot_bitmap_with_quality(
+        &write_params,
+        validation.output_path.clone(),
+        validation.format,
+        bitmap,
+        capture_backend,
+        bitmap_sha256,
+        None,
+        params.quality,
+        None,
+    )?;
+    super::operator_panic_boundary::ensure_mcp_mutation("browser_screenshot_after_output_write")?;
+    let page_region = browser_screenshot_page_region(captured.clip_css)?;
+    Ok(BrowserScreenshotResponse {
+        path: screenshot.path,
+        format: screenshot.format,
+        capture_backend: screenshot.capture_backend,
+        scope: params.scope,
+        page_region,
+        width: screenshot.width,
+        height: screenshot.height,
+        native_width: screenshot.native_width,
+        native_height: screenshot.native_height,
+        scale: screenshot.scale,
+        bytes_written: screenshot.bytes_written,
+        bitmap_sha256: screenshot.bitmap_sha256,
+        cdp_target_id: captured.target_id,
+        tab_id: captured.tab_id,
+        chrome_window_id: captured.chrome_window_id,
+        url: redact_url_for_public_readback(&captured.url),
+        title: captured.title,
+        device_pixel_ratio: captured.device_pixel_ratio,
+        viewport_width_css: captured.viewport_width_css,
+        viewport_height_css: captured.viewport_height_css,
+        scroll_width_css: captured.scroll_width_css,
+        scroll_height_css: captured.scroll_height_css,
+        tile_count: captured.tile_count,
+        mask_count: captured.mask_count,
+        omit_background: captured.omit_background,
+        required_foreground: foreground_readback.required_foreground
+            || captured.required_foreground,
+        human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
+        human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
+        human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
+        restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
+        backend_tier_used: captured.backend_tier_used,
+        source_of_truth: source_of_truth.to_owned(),
+        degradation_code: None,
+        fallback_metadata_source: None,
+        fallback_reason: None,
+    })
 }
 
 fn stitch_browser_screenshot_tiles(

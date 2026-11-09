@@ -4910,7 +4910,22 @@ async function handleCapturePageScreenshot(params) {
 }
 
 async function handlePageScreenshot(params) {
+  if (params?.background === true) {
+    return handlePageScreenshotBackground(params);
+  }
   const selected = await selectTabTarget(params, { requireTargetId: true });
+  if (params?.background === "auto") {
+    // captureVisibleTab needs the tab active in a focused window. Anything
+    // else would switch the user's visible tab or window, so render it in
+    // the background instead.
+    const probe = await tabPageState(selected.tabId, selected.target);
+    const probeWindow = Number.isInteger(probe.chrome_window_id)
+      ? await chromeWindowState(probe.chrome_window_id)
+      : null;
+    if (!(probe.active && probeWindow?.focused)) {
+      return handlePageScreenshotBackground(params);
+    }
+  }
   const request = normalizePageScreenshotRequest(params, selected.tabId);
   const commandStartedAtMs = Date.now();
   const commandDeadlineMs =
@@ -5123,6 +5138,176 @@ async function handlePageScreenshot(params) {
     readback_backend: "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: requiredForeground,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+// Max CSS-pixel height of one background capture chunk. Keeps each
+// Page.captureScreenshot bitmap well under Chrome's texture limits on
+// high-DPI displays.
+const PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS = 4096;
+
+// Background capture for when Chrome is not the OS foreground (for example a
+// fullscreen game). Page.captureScreenshot renders the tab itself, so the
+// window is never focused and the user's active tab never changes.
+async function handlePageScreenshotBackground(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const request = normalizePageScreenshotRequest(params, selected.tabId);
+  const commandStartedAtMs = Date.now();
+  const commandDeadlineMs =
+    commandStartedAtMs + Math.min(request.waitTimeoutMs, PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS);
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforeWindow = Number.isInteger(before.chrome_window_id)
+    ? await chromeWindowState(before.chrome_window_id)
+    : null;
+  const token = `synapse-page-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tiles = [];
+  const captureAttempts = [];
+  let setup = null;
+  let attachment = null;
+  try {
+    // Attach before measuring: the debugger infobar can shrink the viewport.
+    attachment = await attachDebuggerForCommand(selected.tabId);
+    setup = await runPageScreenshotSetup(selected.tabId, { ...request, token });
+    if (!setup.ok) {
+      throw bridgeError(
+        String(setup.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+        `pageScreenshot setup failed: ${String(setup.error_detail || "")}`
+      );
+    }
+    const clip = setup.clip_css;
+    const chunkCount = Math.max(1, Math.ceil(Number(clip.h) / PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS));
+    if (chunkCount > 400) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `pageScreenshot would require ${chunkCount} background chunks; limit is 400`
+      );
+    }
+    for (let index = 0; index < chunkCount; index += 1) {
+      const y = Number(clip.y) + index * PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS;
+      const h = Math.min(PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS, Number(clip.y) + Number(clip.h) - y);
+      const startedAtMs = Date.now();
+      const attempt = {
+        attempt: index + 1,
+        scroll_x_css: Number(clip.x),
+        scroll_y_css: y,
+        requested_scroll_x_css: Number(clip.x),
+        requested_scroll_y_css: y,
+        ok: false,
+        elapsed_ms: 0,
+        timeout_ms: 0,
+        retryable: false,
+        image_data_url_len: 0,
+        error_detail: ""
+      };
+      let captured;
+      try {
+        const timeoutMs = remainingPageScreenshotBudgetMs(commandDeadlineMs, `background_chunk_${index + 1}`);
+        attempt.timeout_ms = timeoutMs;
+        const captureParams = {
+          format: request.format,
+          clip: { x: Number(clip.x), y, width: Number(clip.w), height: h, scale: 1 },
+          captureBeyondViewport: true,
+          fromSurface: true
+        };
+        if (request.format === "jpeg") {
+          captureParams.quality = request.quality;
+        }
+        captured = await sendDebuggerCommand(attachment.debuggee, "Page.captureScreenshot", captureParams, timeoutMs);
+      } catch (error) {
+        attempt.error_detail = errorMessage(error);
+        attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
+        throw bridgeError(
+          error?.code === ERROR_EXTENSION_TIMEOUT ? ERROR_EXTENSION_TIMEOUT : ERROR_ATTACH_FAILED,
+          `pageScreenshot background chrome.debugger Page.captureScreenshot failed for tab ${selected.tabId}: ${errorMessage(error)}`
+        );
+      } finally {
+        attempt.elapsed_ms = Date.now() - startedAtMs;
+        captureAttempts.push(attempt);
+      }
+      if (typeof captured?.data !== "string" || captured.data.length === 0) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `pageScreenshot background capture returned no image data for tab ${selected.tabId}`
+        );
+      }
+      const imageDataUrl = `data:image/${request.format};base64,${captured.data}`;
+      attempt.ok = true;
+      attempt.image_data_url_len = imageDataUrl.length;
+      tiles.push({
+        scroll_x_css: Number(clip.x),
+        scroll_y_css: y,
+        viewport_width_css: Number(clip.w),
+        viewport_height_css: h,
+        image_data_url: imageDataUrl,
+        image_data_url_len: imageDataUrl.length
+      });
+    }
+  } finally {
+    if (setup?.ok) {
+      try {
+        await runPageScreenshotCleanup(selected.tabId, {
+          token,
+          scrollX: setup.before_scroll_x,
+          scrollY: setup.before_scroll_y,
+          backgroundRestore: setup.background_restore
+        });
+      } catch (error) {
+        console.warn(`Synapse background pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
+      }
+    }
+    if (attachment?.shouldDetach) {
+      try {
+        await chrome.debugger.detach(attachment.debuggee);
+      } catch (_) {
+        // The image readback is the verdict; detach is host hygiene only.
+      }
+    }
+  }
+  const after = await tabPageState(selected.tabId, selected.target);
+  const afterWindow = Number.isInteger(after.chrome_window_id)
+    ? await chromeWindowState(after.chrome_window_id)
+    : null;
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.chrome_window_id,
+    url: after.url || before.url || "",
+    title: after.title || before.title || "",
+    ready_state: after.ready_state || before.ready_state || "",
+    before_page: before,
+    after_page: after,
+    before_active: Boolean(before.active),
+    active_for_capture: Boolean(after.active),
+    previous_active_tab_id: null,
+    restored_previous_active: Boolean(before.active) === Boolean(after.active),
+    before_window: beforeWindow,
+    after_window: afterWindow,
+    focused_window_for_capture: Boolean(afterWindow?.focused),
+    restored_previous_window_focus: Boolean(beforeWindow?.focused) === Boolean(afterWindow?.focused),
+    image_format: request.format,
+    quality: request.quality,
+    omit_background: request.omitBackground,
+    scope: request.scope,
+    clip_css: setup.clip_css,
+    output_css_width: setup.clip_css.w,
+    output_css_height: setup.clip_css.h,
+    device_pixel_ratio: setup.metrics.device_pixel_ratio,
+    scroll_width_css: setup.metrics.scroll_width,
+    scroll_height_css: setup.metrics.scroll_height,
+    viewport_width_css: setup.metrics.viewport_width,
+    viewport_height_css: setup.metrics.viewport_height,
+    tile_count: tiles.length,
+    tiles,
+    capture_attempt_count: captureAttempts.length,
+    capture_attempts: captureAttempts,
+    mask_count: setup.mask_count,
+    masks: setup.masks,
+    readback_backend: "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot(captureBeyondViewport)",
+    backend_tier_used: "chrome_debugger_background_capture",
+    required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
