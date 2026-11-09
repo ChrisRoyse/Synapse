@@ -1411,10 +1411,49 @@ function Install-CodexSynapseTokenLoader {
         [Parameter(Mandatory=$true)][string]$TokenPath
     )
 
-    $npmDir = Split-Path -Parent $CodexCommandPath
-    if (-not $npmDir -or -not (Test-Path $npmDir)) {
+    $launcherDir = Split-Path -Parent $CodexCommandPath
+    if (-not $launcherDir -or -not (Test-Path $launcherDir)) {
         Die "Cannot resolve Codex launcher directory from '$CodexCommandPath'."
     }
+    # The launcher that wins on PATH is not always npm's own shim directory
+    # (e.g. %USERPROFILE%\.codex\bin ahead of %APPDATA%\npm). npm shims find
+    # codex.js relative to themselves, so a copied shim breaks `codex` outright.
+    # Resolve the real package entry point and bake its absolute path in.
+    $npmGlobalDir = Join-Path $env:APPDATA 'npm'
+    $codexJs = @(
+        (Join-Path $launcherDir 'node_modules\@openai\codex\bin\codex.js'),
+        (Join-Path $npmGlobalDir 'node_modules\@openai\codex\bin\codex.js')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $codexJs) {
+        Die "SYNAPSE_CODEX_PACKAGE_MISSING launcher=$CodexCommandPath remediation=install Codex with 'npm install -g @openai/codex@latest' (or %USERPROFILE%\.codex\bin\codex-update.ps1), then rerun setup."
+    }
+    $codexJs = (Resolve-Path -LiteralPath $codexJs).Path
+    $dirs = @($launcherDir, $npmGlobalDir) |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'codex.ps1') } |
+        ForEach-Object { (Resolve-Path -LiteralPath $_).Path } |
+        Select-Object -Unique
+    foreach ($dir in $dirs) {
+        Install-CodexSynapseTokenLoaderInDir -LauncherDir $dir -CodexJsPath $codexJs -TokenPath $TokenPath
+    }
+
+    # Structural readback: the PATH-winning launcher must actually start Codex.
+    $versionOut = & $CodexCommandPath --version 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $versionOut -notmatch 'codex') {
+        Die "SYNAPSE_CODEX_LAUNCHER_BROKEN launcher=$CodexCommandPath codex_js=$codexJs exit=$LASTEXITCODE output=$($versionOut.Trim()) remediation=inspect the launcher; restore $CodexCommandPath.synapse-bak if needed."
+    }
+    Info "Codex launcher verified: $CodexCommandPath -> $codexJs ($($versionOut.Trim()))"
+}
+
+function Install-CodexSynapseTokenLoaderInDir {
+    param(
+        [Parameter(Mandatory=$true)][string]$LauncherDir,
+        [Parameter(Mandatory=$true)][string]$CodexJsPath,
+        [Parameter(Mandatory=$true)][string]$TokenPath
+    )
+
+    $npmDir = $LauncherDir
+    $codexJsWin = $CodexJsPath
+    $codexJsPosix = $CodexJsPath -replace '\\', '/'
 
     $ps1Path = Join-Path $npmDir 'codex.ps1'
     $cmdPath = Join-Path $npmDir 'codex.cmd'
@@ -1512,6 +1551,7 @@ if (Test-Path "$basedir/node$exe") {
 }
 exit $ret
 '@
+        $ps1 = $ps1.Replace('"$basedir/node_modules/@openai/codex/bin/codex.js"', "`"$codexJsWin`"")
         Copy-Item $ps1Path "$ps1Path.synapse-bak" -Force
         Set-Content -Path $ps1Path -Value $ps1 -Encoding utf8
         Info "Installed Synapse token loader in Codex PowerShell launcher: $ps1Path"
@@ -1604,6 +1644,7 @@ IF EXIST "%dp0%\node.exe" (
 
 endLocal & SET "SYNAPSE_BEARER_TOKEN=%SYNAPSE_BEARER_TOKEN%" & SET "SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START%" & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
 '@
+        $cmd = $cmd.Replace('"%dp0%\node_modules\@openai\codex\bin\codex.js"', "`"$codexJsWin`"")
         Copy-Item $cmdPath "$cmdPath.synapse-bak" -Force
         Set-Content -Path $cmdPath -Value $cmd -Encoding ascii
         Info "Installed Synapse token loader in Codex CMD launcher: $cmdPath"
@@ -1680,6 +1721,7 @@ else
   exec node  "$basedir/node_modules/@openai/codex/bin/codex.js" "$@"
 fi
 '@
+        $sh = $sh.Replace('"$basedir/node_modules/@openai/codex/bin/codex.js"', "`"$codexJsPosix`"")
         Copy-Item $shPath "$shPath.synapse-bak" -Force
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($shPath, ($sh -replace "`r?`n", "`n"), $utf8NoBom)
