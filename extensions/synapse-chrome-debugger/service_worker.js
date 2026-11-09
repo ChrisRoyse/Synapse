@@ -2911,6 +2911,13 @@ async function handleCommand(command) {
 }
 
 async function refreshServiceWorkerIntegrity(reason) {
+  // Hash once per worker lifetime. The file on disk is the loaded code only
+  // when the worker boots; after a deploy the disk holds the NEW file while
+  // this worker still runs the OLD code. Re-hashing on reconnect would make a
+  // stale worker report itself as fresh.
+  if (serviceWorkerIntegrityState.status === "ok") {
+    return;
+  }
   const source = chrome.runtime.getURL("service_worker.js");
   const checkedAtUnixMs = Date.now();
   try {
