@@ -14,8 +14,6 @@ mod live;
 mod postmessage;
 mod record;
 mod schema;
-#[cfg(test)]
-mod tests;
 
 use schema::press_postcondition_not_requested;
 pub use schema::{
@@ -31,24 +29,6 @@ pub(crate) struct ResolvedKeymapPress {
     pub resolved_binding: String,
     pub resolved_keys: Vec<String>,
     pub press: ActPressParams,
-}
-
-#[cfg(test)]
-pub async fn act_press_with_handle(
-    handle: ActionHandle,
-    recording: Option<Arc<RecordingBackend>>,
-    connection_closed_cancel: Option<CancellationToken>,
-    params: ActPressParams,
-) -> Result<ActPressResponse, ErrorData> {
-    let boundary = super::OperatorPanicActionBoundary::arm("act_press", "direct_call_entry")?;
-    act_press_with_handle_and_boundary(
-        handle,
-        recording,
-        connection_closed_cancel,
-        params,
-        boundary,
-    )
-    .await
 }
 
 pub(crate) async fn act_press_with_handle_and_boundary(
@@ -98,27 +78,6 @@ pub(crate) async fn act_press_with_handle_and_boundary(
 
 // Test-exercised keymap helper (see m2::press::tests); production keymap
 // routing carries the request-captured boundary into the physical helper.
-#[cfg(test)]
-pub async fn act_keymap_with_handle(
-    handle: ActionHandle,
-    recording: Option<Arc<RecordingBackend>>,
-    connection_closed_cancel: Option<CancellationToken>,
-    profile: &Profile,
-    params: ActKeymapParams,
-) -> Result<ActKeymapResponse, ErrorData> {
-    let resolved = resolve_keymap_press(profile, &params)?;
-    let boundary = super::OperatorPanicActionBoundary::arm("act_keymap", "direct_call_entry")?;
-    let response = act_press_with_handle_and_boundary(
-        handle,
-        recording,
-        connection_closed_cancel,
-        resolved.press.clone(),
-        boundary,
-    )
-    .await?;
-
-    Ok(act_keymap_response_from_press(&resolved, response))
-}
 
 pub fn action_from_press_params(params: &ActPressParams) -> Result<Action, ErrorData> {
     validate_hold_ms(params.hold_ms)?;

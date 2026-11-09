@@ -1372,7 +1372,6 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "Bash(git branch:*)",
     "Bash(cargo build:*)",
     "Bash(cargo check:*)",
-    "Bash(cargo test:*)",
     "Bash(cargo clippy:*)",
     "Bash(cargo fmt:*)",
 ];
@@ -2320,11 +2319,6 @@ pub(super) fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-#[cfg(test)]
-pub(super) fn agent_spawn_wait_deadline(wait_timeout_ms: u64) -> Result<Instant, ErrorData> {
-    agent_spawn_wait_deadline_from(Instant::now(), wait_timeout_ms)
-}
-
 pub(super) fn agent_spawn_wait_deadline_from(
     start: Instant,
     wait_timeout_ms: u64,
@@ -2693,24 +2687,6 @@ pub(super) fn spawn_session_observation_from_read(
     })
 }
 
-#[cfg(test)]
-pub(super) fn spawn_session_candidate_readiness(
-    summary: &crate::server::session_tools::SessionSummary,
-    agent_kind: ActSpawnAgentCli,
-    target: Option<&ActSpawnAgentTarget>,
-    before_session_ids: &BTreeSet<String>,
-    launched_at_unix_ms: u64,
-) -> Value {
-    spawn_session_candidate_readiness_from_read(
-        &summary.registry,
-        summary.active_target.as_ref(),
-        agent_kind,
-        target,
-        before_session_ids,
-        launched_at_unix_ms,
-    )
-}
-
 pub(super) fn spawn_session_candidate_readiness_from_read(
     registry: &SessionRegistryRead,
     active_target: Option<&TargetWire>,
@@ -2801,21 +2777,6 @@ pub(super) fn task_start_session_id_for_spawn(
         .and_then(Value::as_str)
         .filter(|session_id| !session_id.is_empty())
         .map(str::to_owned)
-}
-
-#[cfg(test)]
-pub(super) fn spawn_session_identity_matches(
-    summary: &crate::server::session_tools::SessionSummary,
-    agent_kind: ActSpawnAgentCli,
-    before_session_ids: &BTreeSet<String>,
-    launched_at_unix_ms: u64,
-) -> bool {
-    spawn_session_identity_matches_from_read(
-        &summary.registry,
-        agent_kind,
-        before_session_ids,
-        launched_at_unix_ms,
-    )
 }
 
 pub(super) fn spawn_session_identity_matches_from_read(

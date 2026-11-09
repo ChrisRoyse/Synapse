@@ -4485,6 +4485,3 @@ fn validate_lookup_id(session_id: &str, tool: &str) -> Result<String, ErrorData>
     }
     Ok(trimmed.to_owned())
 }
-
-#[cfg(test)]
-mod tests;

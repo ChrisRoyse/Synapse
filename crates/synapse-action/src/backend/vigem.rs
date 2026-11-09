@@ -11,12 +11,9 @@ mod pad;
 mod reports;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 use client::VigemBackendInner;
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[allow(unused_imports)]
 pub(crate) use state::{apply_pad_button, apply_pad_report, apply_pad_stick, apply_pad_trigger};
 

@@ -33,22 +33,6 @@ impl Backends {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub(super) fn from_parts(
-        software: Arc<dyn ActionBackend>,
-        vigem: Arc<dyn ActionBackend>,
-        hardware: Arc<dyn ActionBackend>,
-        hardware_release_enabled: bool,
-    ) -> Self {
-        Self {
-            software,
-            vigem,
-            hardware,
-            hardware_release_enabled,
-        }
-    }
-
     pub(super) fn pick(&self, resolved: ResolvedBackend) -> Arc<dyn ActionBackend> {
         match resolved {
             ResolvedBackend::Software => Arc::clone(&self.software),

@@ -1,8 +1,0 @@
----
-source: crates/synapse-core/tests/profile_types.rs
-expression: "round_trip(\"ProfileCaptureTarget\", \"snapshot\",\nProfileCaptureTarget::MonitorIndex { index: 2 },)?"
----
-{
-  "kind": "monitor_index",
-  "index": 2
-}

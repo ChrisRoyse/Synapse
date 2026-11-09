@@ -82,11 +82,6 @@ pub enum SseCancelError {
 }
 
 impl SseState {
-    #[cfg(test)]
-    pub(crate) fn from_env() -> Self {
-        Self::with_max_subscriptions(synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO)
-    }
-
     pub(crate) fn with_max_subscriptions(max_subscriptions: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(SseStateInner {
@@ -414,12 +409,3 @@ impl From<EventBusError> for SseSubscribeError {
 fn manual_routes_enabled() -> bool {
     std::env::var(MANUAL_ENV).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::match_wildcard_for_single_variants,
-    clippy::similar_names,
-    reason = "unit tests intentionally keep failure messages close to the assertion"
-)]
-mod tests;

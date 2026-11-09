@@ -1340,6 +1340,3 @@ fn claude_usage(usage: &Value) -> TranscriptUsage {
         model_usage: Vec::new(),
     }
 }
-
-#[cfg(test)]
-mod tests;

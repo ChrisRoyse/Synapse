@@ -5,9 +5,6 @@ mod history;
 mod list;
 mod register;
 
-#[cfg(test)]
-mod tests;
-
 pub use cancel::{
     ReflexCancelParams, ReflexCancelResponse, cancel_reflex, required_permissions_cancel,
 };

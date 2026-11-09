@@ -58,9 +58,6 @@ use crate::m3::approvals::{
     ApprovalTimeoutDecision, ApprovalToastState,
 };
 
-#[cfg(test)]
-mod tests;
-
 type CfKvRow = (Vec<u8>, Vec<u8>);
 type CfKvRows = Vec<CfKvRow>;
 

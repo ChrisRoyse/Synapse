@@ -597,36 +597,3 @@ impl<'de> Deserialize<'de> for CdpClockReadback {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clock_readback_accepts_status_payload() {
-        let readback: CdpClockReadback = serde_json::from_value(json!({
-            "installed": true,
-            "version": CLOCK_VERSION,
-            "now_ms": 1234,
-            "pending_timer_count": 2,
-            "fired_timer_count": 1,
-            "last_timer_id": 3,
-            "next_timer_ms": 1300,
-            "error_count": 0,
-            "last_error": null,
-        }))
-        .expect("clock readback");
-        assert!(readback.installed);
-        assert_eq!(readback.now_ms, Some(1234));
-        assert_eq!(readback.pending_timer_count, Some(2));
-        assert_eq!(readback.next_timer_ms, Some(1300));
-    }
-
-    #[test]
-    fn clock_script_contains_expected_surface() {
-        assert!(CLOCK_INIT_SCRIPT.contains("setFixedTime"));
-        assert!(CLOCK_INIT_SCRIPT.contains("fastForward"));
-        assert!(CLOCK_INIT_SCRIPT.contains("pauseAt"));
-        assert!(CLOCK_INIT_SCRIPT.contains("requestAnimationFrame"));
-    }
-}

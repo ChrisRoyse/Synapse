@@ -29,9 +29,6 @@ synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
-
 [lints.rust]
 unsafe_code = "forbid"
 unused = { level = "warn", priority = -1 }

@@ -1,11 +1,11 @@
 #![allow(clippy::redundant_pub_crate)]
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use synapse_core::{
     ButtonAction, GamepadController, GamepadReport, PadButton, PadId, Stick, Trigger,
 };
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use crate::EmitState;
 
 #[cfg(windows)]
@@ -17,7 +17,7 @@ pub(super) fn report_for_pad(state: &EmitState, pad: PadId) -> GamepadReport {
         .unwrap_or_else(neutral_x360_gamepad_report)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn apply_pad_button(
     state: &mut EmitState,
     pad: PadId,
@@ -43,7 +43,7 @@ pub(crate) fn apply_pad_button(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn apply_pad_stick(state: &mut EmitState, pad: PadId, stick: Stick, x: f32, y: f32) {
     let should_remove = {
         let report = state
@@ -62,7 +62,7 @@ pub(crate) fn apply_pad_stick(state: &mut EmitState, pad: PadId, stick: Stick, x
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn apply_pad_trigger(state: &mut EmitState, pad: PadId, trigger: Trigger, value: f32) {
     let should_remove = {
         let report = state
@@ -81,7 +81,7 @@ pub(crate) fn apply_pad_trigger(state: &mut EmitState, pad: PadId, trigger: Trig
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn apply_pad_report(state: &mut EmitState, pad: PadId, report: GamepadReport) {
     if is_neutral_report(&report) {
         state.pad_state.remove(&pad);
@@ -90,17 +90,17 @@ pub(crate) fn apply_pad_report(state: &mut EmitState, pad: PadId, report: Gamepa
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(super) const fn neutral_gamepad_report(controller: GamepadController) -> GamepadReport {
     GamepadReport::neutral(controller)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const fn neutral_x360_gamepad_report() -> GamepadReport {
     neutral_gamepad_report(GamepadController::X360)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(super) fn is_neutral_report(report: &GamepadReport) -> bool {
     report.buttons.is_empty()
         && report.thumb_l == (0.0, 0.0)
@@ -109,7 +109,7 @@ pub(super) fn is_neutral_report(report: &GamepadReport) -> bool {
         && report.rt == 0.0
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(super) fn push_unique(buttons: &mut Vec<PadButton>, button: PadButton) {
     if !buttons.contains(&button) {
         buttons.push(button);

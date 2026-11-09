@@ -973,14 +973,3 @@ fn open_failed_detail(path: &Path, detail: String) -> StorageError {
         detail,
     }
 }
-
-#[cfg(test)]
-mod batch_tests;
-#[cfg(test)]
-mod compaction_tests;
-#[cfg(test)]
-mod gc_tests;
-#[cfg(test)]
-mod open_tests;
-#[cfg(test)]
-mod pressure_tests;

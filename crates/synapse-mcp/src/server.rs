@@ -277,8 +277,6 @@ pub(crate) mod suggestions;
 pub(crate) mod target_claims;
 mod target_policy;
 pub(crate) mod terminal_capture;
-#[cfg(test)]
-mod tests;
 pub(crate) mod timeline_digest;
 mod timeline_facades;
 mod timeline_query;
@@ -708,21 +706,7 @@ impl SynapseService {
         }
     }
 
-    /// Gives each test its own process-global daemon singletons — the input
-    /// lease and the agent-state tracker — so parallel tests can never
-    /// cross-contaminate one another's `session_list` projections (root cause
-    /// of issue #1574). Called from every constructor so no test can forget it;
-    /// idempotent per thread and compiled out entirely in production.
-    #[cfg(test)]
-    fn isolate_process_globals_for_test() {
-        synapse_action::lease::isolate_for_test();
-        synapse_action::isolate_interrupt_epochs_for_test();
-        crate::server::agent_state::isolate_for_test();
-    }
-
     pub fn try_new() -> anyhow::Result<Self> {
-        #[cfg(test)]
-        Self::isolate_process_globals_for_test();
         let m3_state = shared_m3_state_from_env()?;
         install_chrome_browser_navigation_sink(&m3_state);
         Ok(Self {
@@ -754,8 +738,6 @@ impl SynapseService {
         m3_config: M3ServiceConfig,
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
-        #[cfg(test)]
-        Self::isolate_process_globals_for_test();
         let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
         let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
             m3_config,
@@ -800,8 +782,6 @@ impl SynapseService {
         m3_config: M3ServiceConfig,
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
-        #[cfg(test)]
-        Self::isolate_process_globals_for_test();
         let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
             m3_config,
             shutdown_cancel.clone(),

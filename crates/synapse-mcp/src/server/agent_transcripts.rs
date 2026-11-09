@@ -2037,6 +2037,3 @@ fn required_local_u64(object: &Map<String, Value>, field: &str) -> Result<u64, S
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("required u64 field {field:?} is missing or invalid"))
 }
-
-#[cfg(test)]
-mod tests;

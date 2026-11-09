@@ -1,7 +1,7 @@
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use synapse_core::{GamepadReport, PadButton};
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct X360ReportSnapshot {
     pub(super) buttons_raw: u16,
@@ -13,7 +13,7 @@ pub(super) struct X360ReportSnapshot {
     pub(super) thumb_ry: i16,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct Ds4ReportSnapshot {
     pub(super) buttons: u16,
@@ -26,7 +26,7 @@ pub(super) struct Ds4ReportSnapshot {
     pub(super) thumb_ry: u8,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(super) fn x360_report_snapshot(report: &GamepadReport) -> X360ReportSnapshot {
     X360ReportSnapshot {
         buttons_raw: x360_buttons_raw(&report.buttons),
@@ -39,7 +39,7 @@ pub(super) fn x360_report_snapshot(report: &GamepadReport) -> X360ReportSnapshot
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(super) fn ds4_report_snapshot(report: &GamepadReport) -> Ds4ReportSnapshot {
     let trigger_l = normalized_trigger_to_u8(report.lt);
     let trigger_r = normalized_trigger_to_u8(report.rt);
@@ -86,7 +86,7 @@ pub(super) const fn xgamepad_from_snapshot(snapshot: X360ReportSnapshot) -> vige
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn x360_buttons_raw(buttons: &[PadButton]) -> u16 {
     buttons.iter().fold(0, |raw, button| {
         raw | match button {
@@ -109,7 +109,7 @@ fn x360_buttons_raw(buttons: &[PadButton]) -> u16 {
     })
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn ds4_buttons_raw(buttons: &[PadButton], trigger_l: u8, trigger_r: u8) -> u16 {
     let mut raw = ds4_dpad_raw(buttons);
     for button in buttons {
@@ -140,7 +140,7 @@ fn ds4_buttons_raw(buttons: &[PadButton], trigger_l: u8, trigger_r: u8) -> u16 {
     raw
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn ds4_dpad_raw(buttons: &[PadButton]) -> u16 {
     let up = buttons.contains(&PadButton::Up);
     let right = buttons.contains(&PadButton::Right);
@@ -159,12 +159,12 @@ fn ds4_dpad_raw(buttons: &[PadButton]) -> u16 {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn ds4_special_raw(buttons: &[PadButton]) -> u8 {
     u8::from(buttons.contains(&PadButton::Guide))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn normalized_trigger_to_u8(value: f32) -> u8 {
     if !value.is_finite() {
@@ -173,7 +173,7 @@ fn normalized_trigger_to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[allow(clippy::cast_possible_truncation)]
 fn normalized_axis_to_i16(value: f32) -> i16 {
     if !value.is_finite() {
@@ -187,7 +187,7 @@ fn normalized_axis_to_i16(value: f32) -> i16 {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn normalized_axis_to_ds4_x(value: f32) -> u8 {
     if !value.is_finite() {
@@ -196,7 +196,7 @@ fn normalized_axis_to_ds4_x(value: f32) -> u8 {
     ((value.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn normalized_axis_to_ds4_y(value: f32) -> u8 {
     normalized_axis_to_ds4_x(-value)
 }

@@ -24,28 +24,6 @@ uuid.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
-[dev-dependencies]
-criterion.workspace = true
-synapse-action = { version = "0.1.0", path = "../synapse-action", features = ["test-support"] }
-tempfile.workspace = true
-tokio-util.workspace = true
-
-[[bench]]
-name = "reflex_tick_jitter_idle"
-harness = false
-
-[[bench]]
-name = "reflex_tick_jitter_under_load"
-harness = false
-
-[[bench]]
-name = "event_to_subscriber"
-harness = false
-
-[[bench]]
-name = "reflex_combo_step_interval"
-harness = false
-
 [lints.rust]
 unsafe_code = "allow"
 unused = { level = "warn", priority = -1 }

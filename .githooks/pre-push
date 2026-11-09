@@ -10,14 +10,32 @@
 # Bypass for a genuine emergency (e.g. a docs-only hotfix you cannot compile):
 #   git push --no-verify   (use sparingly — you are skipping the only gate).
 #
-# Scope: clippy --workspace --all-targets compiles + lints everything (the full
-# `cargo test --workspace` suite is intentionally NOT run here — it is minutes
-# long and the agent runs it manually per doctrine D1/D5). This hook is the fast
-# compile+lint backstop, not a substitute for manual FSV. The gate is deny-level:
-# warning-only output is accepted, captured to a local log, and summarized so
-# push output clearly distinguishes accepted warnings from blocking failures.
+# Scope: D1 Gate 0 (no automated test surface) on every push, then rustfmt and
+# clippy --workspace --all-targets -D warnings when Rust/Cargo files changed.
+# The repo has no tests to run (D1). This hook is the structural compile+lint
+# backstop, never a substitute for manual FSV.
 
 set -e
+
+# D1 Gate 0 (every push, including docs/script-only pushes): the repo carries
+# ZERO automated tests (AGENTS.md D1, operator decision 2026-07-15). Scans the
+# pushed commit's tree itself, not the working copy, for any test surface:
+# test/bench paths, FSV driver files, #[test]/#[tokio::test]/#[cfg(test)], and
+# [dev-dependencies]/[[test]]/[[bench]] manifest sections. The 2026-09-16
+# pre-Calyx rollback (#2265) silently restored 396 test files because this gate
+# had been rolled back with it.
+d1_gate0() {
+  sha="$1"
+  bad_paths=$(git ls-tree -r --name-only "$sha" | grep -E '(^|/)(tests|benches)/|(^|/)tests\.rs$|_fsv_(driver|support)' || true)
+  bad_src=$(git grep -n -E '#\[(tokio::)?test([( ]|\]|$)|#\[cfg\(test\)\]' "$sha" -- '*.rs' || true)
+  bad_manifest=$(git grep -n -E '^\[(dev-dependencies|\[test\]|\[bench\])\]' "$sha" -- '*Cargo.toml' || true)
+  if [ -n "$bad_paths$bad_src$bad_manifest" ]; then
+    echo "pre-push: BLOCKED — D1 Gate 0: commit $sha carries an automated test surface."
+    echo "          The repo carries ZERO automated tests (AGENTS.md D1). Remove these:"
+    printf '%s\n' "$bad_paths" "$bad_src" "$bad_manifest" | grep -v '^$' | sed -n '1,60p'
+    exit 1
+  fi
+}
 
 # Skip the gate when the push contains no Rust / Cargo changes (docs, snapshots,
 # tool-result logs): clippy would just burn a minute for nothing. Compare each
@@ -26,6 +44,7 @@ needs_gate=0
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   # Deleted branch (local_sha all zeros) — nothing to check.
   case "$local_sha" in *[!0]*) : ;; *) continue ;; esac
+  d1_gate0 "$local_sha"
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || [ -z "$remote_sha" ]; then
     range="$local_sha"            # new branch: inspect the whole commit
     diff_base=$(git rev-list --max-parents=0 "$local_sha" | tail -1)
@@ -37,6 +56,8 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     needs_gate=1
   fi
 done
+
+echo "pre-push: D1 Gate 0 green (no automated test surface)."
 
 if [ "$needs_gate" -eq 0 ]; then
   echo "pre-push: no Rust/Cargo changes in this push — skipping clippy gate."
@@ -62,10 +83,10 @@ fi
 rm -f "$fmt_log"
 echo "pre-push: rustfmt gate green."
 
-echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets) ..."
+echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets -- -D warnings) ..."
 log_path="$log_dir/clippy-$(date +%Y%m%dT%H%M%S)-$$.log"
 
-if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then
+if cargo clippy --workspace --all-targets -- -D warnings >"$log_path" 2>&1; then
   warning_count=$(grep -c '^warning:' "$log_path" 2>/dev/null || true)
   warning_count=${warning_count:-0}
   if [ "$warning_count" -gt 0 ]; then

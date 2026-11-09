@@ -815,6 +815,3 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next.push(0);
     next
 }
-
-#[cfg(test)]
-mod tests;

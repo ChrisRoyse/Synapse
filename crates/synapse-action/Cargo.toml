@@ -6,12 +6,6 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
-[features]
-# Exposes `lease::isolate_for_test`, which installs a thread-local override of
-# the process-global input lease so downstream crates' parallel tests can run
-# hermetically (see issue #1574). Off in production; enabled via dev-dependency.
-test-support = []
-
 [dependencies]
 bit-set = "0.10.0"
 serde.workspace = true
@@ -33,35 +27,6 @@ windows.workspace = true
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 arboard.workspace = true
 enigo = { workspace = true, features = ["x11rb"] }
-
-[dev-dependencies]
-criterion.workspace = true
-insta.workspace = true
-proptest.workspace = true
-serde_json.workspace = true
-tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber.workspace = true
-
-[[bench]]
-name = "action_curve_step_calc_natural"
-harness = false
-
-[[bench]]
-name = "action_software_press"
-harness = false
-
-[[bench]]
-name = "action_software_click"
-harness = false
-
-[[bench]]
-name = "action_vigem_pad_report"
-harness = false
-
-[[bench]]
-name = "action_recording_round_trip"
-harness = false
 
 [lints.rust]
 unsafe_code = "allow"

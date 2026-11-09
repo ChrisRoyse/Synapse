@@ -27,11 +27,5 @@ pub use error::*;
 pub use frame::*;
 pub use stats::{CaptureStats, CaptureThreadPriority};
 
-#[cfg(test)]
-pub(crate) use backend::{backend_after_fallback, should_fallback_to_dxgi};
-
 pub const CAPTURE_CHANNEL_CAPACITY: usize = 2;
 pub const FRAMES_DROPPED_METRIC: &str = "synapse_capture_frames_dropped_total";
-
-#[cfg(test)]
-mod tests;

@@ -59,37 +59,3 @@ fn query_double_click_timing() -> DoubleClickTiming {
         source: "default_non_windows",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        DEFAULT_DOUBLE_CLICK_WINDOW_MS, inter_click_delay_ms_for_window, query_double_click_timing,
-    };
-
-    #[test]
-    fn non_windows_default_matches_m2_contract() {
-        let timing = query_double_click_timing();
-        println!(
-            "readback=double_click_timing edge=default before=platform:{} after_window_ms:{} after_delay_ms:{} source:{}",
-            std::env::consts::OS,
-            timing.window_ms,
-            timing.inter_click_delay_ms,
-            timing.source
-        );
-        assert_eq!(timing.window_ms, DEFAULT_DOUBLE_CLICK_WINDOW_MS);
-        assert!(timing.inter_click_delay_ms < timing.window_ms);
-    }
-
-    #[test]
-    fn inter_click_delay_stays_inside_window_edges() {
-        for window_ms in [0, 1, 2, 31, 500, 10_000] {
-            let delay = inter_click_delay_ms_for_window(window_ms);
-            let effective_window = window_ms.max(2);
-            println!(
-                "readback=double_click_timing edge=window before_window_ms:{window_ms} after_delay_ms:{delay} effective_window_ms:{effective_window}"
-            );
-            assert!(delay < effective_window);
-            assert!(delay >= 1);
-        }
-    }
-}

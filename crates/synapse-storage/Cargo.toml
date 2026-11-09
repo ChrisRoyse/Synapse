@@ -20,16 +20,5 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-criterion.workspace = true
-insta.workspace = true
-metrics.workspace = true
-proptest.workspace = true
-tempfile.workspace = true
-
-[[bench]]
-name = "batch_throughput"
-harness = false
-
 [lints]
 workspace = true

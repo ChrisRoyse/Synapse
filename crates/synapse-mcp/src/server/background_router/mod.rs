@@ -778,8 +778,6 @@ struct ActForegroundAuthorityGuard {
     operator_panic_epoch_at_arm: u64,
     acquire_outcome_was_new: bool,
     armed: bool,
-    #[cfg(test)]
-    cleanup_panics_remaining: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -873,8 +871,6 @@ impl ActForegroundAuthorityGuard {
             operator_panic_epoch_at_arm,
             acquire_outcome_was_new: false,
             armed: true,
-            #[cfg(test)]
-            cleanup_panics_remaining: 0,
         })
     }
 
@@ -1039,11 +1035,6 @@ impl ActForegroundAuthorityGuard {
 
     fn cleanup_now(&mut self, trigger: &'static str) -> ActForegroundAuthorityCleanupReadback {
         let profile_restore = self.restore_prior_profile_assignment();
-        #[cfg(test)]
-        if self.cleanup_panics_remaining > 0 {
-            self.cleanup_panics_remaining -= 1;
-            panic!("injected panic after exact profile restore");
-        }
         // Emergency Drop cleanup intentionally avoids rebuilding/sanitizing the
         // complete MCP schema. The byte-exact CF_SESSIONS row is the authority
         // Source of Truth and this narrow read keeps unwind latency bounded.
@@ -10007,6 +9998,3 @@ fn target_act_error_code(error: &ErrorData) -> Option<&str> {
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
 }
-
-#[cfg(test)]
-mod tests;

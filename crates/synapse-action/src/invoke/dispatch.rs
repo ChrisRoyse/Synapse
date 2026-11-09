@@ -1,15 +1,15 @@
 use synapse_core::MouseButton;
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 use synapse_core::{Action, AimCurve, AimNaturalParams, Backend, ButtonAction, MouseTarget};
 
 use crate::{ActionBackend, ActionResult, EmitState};
 
 use super::CoordinateFallbackPlan;
 
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) const FALLBACK_MOVE_DURATION_MS: u32 = 50;
 
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn emit_coordinate_fallback_click<B>(
     backend: &B,
     state: &mut EmitState,

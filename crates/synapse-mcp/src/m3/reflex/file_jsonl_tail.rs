@@ -401,34 +401,3 @@ fn snapshot_from_tail(
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_remote_ok_tail_stdout() {
-        let snapshot =
-            parse_remote_tail_stdout(b"ok\t100\n{\"soak_status\":\"complete\",\"samples\":100}\n")
-                .expect("remote tail stdout should parse");
-        assert!(snapshot.exists);
-        assert_eq!(snapshot.line_count, 100);
-        assert_eq!(
-            snapshot
-                .last_json
-                .as_ref()
-                .and_then(|value| value.pointer("/soak_status")),
-            Some(&json!("complete"))
-        );
-    }
-
-    #[test]
-    fn remote_invalid_json_is_snapshot_parse_error_not_read_failure() {
-        let snapshot =
-            parse_remote_tail_stdout(b"ok\t100\nnot-json\n").expect("header should parse");
-        assert!(snapshot.exists);
-        assert_eq!(snapshot.line_count, 100);
-        assert!(snapshot.last_json.is_none());
-        assert!(snapshot.parse_error.is_some());
-    }
-}

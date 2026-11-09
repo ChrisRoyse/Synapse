@@ -368,26 +368,6 @@ impl SynapseService {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn observe_without_request_context_for_test(
-        &self,
-        params: Parameters<ObserveParams>,
-    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
-        let include = observe_include(&params.0);
-        self.observe_with_target(params, include, None, None).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn observe_for_mcp_session_id_for_test(
-        &self,
-        params: Parameters<ObserveParams>,
-        mcp_session_id: &str,
-    ) -> Result<Json<synapse_core::Observation>, ErrorData> {
-        let include = observe_include(&params.0);
-        self.observe_with_target(params, include, None, Some(mcp_session_id))
-            .await
-    }
-
     async fn observe_with_target(
         &self,
         params: Parameters<ObserveParams>,
@@ -576,14 +556,6 @@ impl SynapseService {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn find_without_request_context_for_test(
-        &self,
-        params: Parameters<FindParams>,
-    ) -> Result<Json<FindResponse>, ErrorData> {
-        self.find_with_target(params, None, None).await
-    }
-
     async fn find_with_target(
         &self,
         params: Parameters<FindParams>,
@@ -667,14 +639,6 @@ impl SynapseService {
         let target = self.request_session_target(&request_context)?;
         let target_hwnd = perception_window_hwnd("read_text", &target, params.0.window_hwnd)?;
         self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_text_without_request_context_for_test(
-        &self,
-        params: Parameters<ReadTextParams>,
-    ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        self.read_text_with_target_hwnd(params, None, None)
     }
 
     fn read_text_with_target_hwnd(
@@ -5703,8 +5667,6 @@ impl SynapseService {
             &persisted.owner_session_id,
         ) {
             Ok(calls) => calls,
-            #[cfg(test)]
-            Err(error) if error.to_string().contains("ledger is not configured") => Vec::new(),
             Err(error) => {
                 return Err(mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
@@ -20689,9 +20651,6 @@ fn refresh_observation_size_fields(
 fn escape_json_pointer(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
-
-#[cfg(all(test, windows))]
-mod tests;
 
 #[cfg(windows)]
 fn gray_luma_stddev_0_1(region_image: &GrayImage) -> f32 {

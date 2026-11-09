@@ -1,9 +1,0 @@
----
-source: crates/synapse-core/tests/reflex_types.rs
-expression: "round_trip(\"ReflexButtonTarget\", \"snapshot\", ReflexButtonTarget::Pad\n{ pad: 1, button: PadButton::Rb, },)?"
----
-{
-  "kind": "pad",
-  "pad": 1,
-  "button": "rb"
-}

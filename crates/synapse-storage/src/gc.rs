@@ -155,25 +155,6 @@ impl GcConfig {
             unsupported_byte_cap_budgets: Vec::new(),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_byte_caps(
-        interval: Duration,
-        cf_name: &'static str,
-        soft_cap: u64,
-        hard_cap: u64,
-    ) -> Self {
-        Self {
-            interval,
-            budgets: vec![GcBudget {
-                cf_name,
-                soft_cap,
-                hard_cap,
-                unit: CapUnit::Bytes,
-            }],
-            unsupported_byte_cap_budgets: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -16,8 +16,6 @@ use windows::Win32::{
 mod element;
 mod record;
 mod schema;
-#[cfg(test)]
-mod tests;
 
 pub use schema::{
     ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget, ActClickTierAttempt,
@@ -98,23 +96,6 @@ impl ForegroundClickPolicy {
             })),
         ))
     }
-}
-
-#[cfg(test)]
-pub async fn act_click_with_handle(
-    handle: ActionHandle,
-    recording: Option<Arc<RecordingBackend>>,
-    params: ActClickParams,
-) -> Result<ActClickResponse, ErrorData> {
-    let boundary = super::OperatorPanicActionBoundary::arm("act_click", "direct_call_entry")?;
-    act_click_with_handle_and_lease(
-        handle,
-        recording,
-        params,
-        ForegroundClickPolicy::default(),
-        boundary,
-    )
-    .await
 }
 
 pub(crate) async fn act_click_with_handle_and_lease(

@@ -11,7 +11,7 @@ See [01_system_overview.md](01_system_overview.md) for the architectural narrati
 Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, `license-file = "LICENSE.md"`.
 
 **`[workspace] members`** (14 crates):
-`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay`.
+`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-overlay`.
 
 **`default-members`:** `synapse-mcp`, `synapse-overlay` (the two shipped binaries).
 
@@ -70,7 +70,7 @@ crates/synapse-core/src/types/stored.rs          # StoredEvent/Observation/Sessi
 crates/synapse-core/src/types/timeline.rs        # timeline actor/entry types
 crates/synapse-core/src/types/web_perception.rs  # WebPerceptionPath / CDP perception types
 ```
-Tests: `tests/*.rs` — proptest + insta snapshot coverage for action, profile, reflex, stored, reality, timeline, ocr, path, event-filter, error-code-literal types.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-storage
 RocksDB persistence: column families, batched writes, GC, disk-pressure shedding. Depends on `synapse-core`, `synapse-telemetry`.
@@ -182,7 +182,7 @@ crates/synapse-audio/src/stt.rs        # WhisperTinyStt model load + transcribe
 crates/synapse-audio/src/stt/window.rs # STT audio-window framing
 crates/synapse-audio/src/error.rs      # audio errors
 ```
-Tests: direction, ring_detectors, stt, runtime_scaffold.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-action
 Input emission: software (enigo), ViGEm gamepad, recording backends; humanized curves, leases, safety. `#![allow(unsafe_code)]`. Depends on `synapse-core`.
@@ -288,7 +288,7 @@ crates/synapse-profiles/src/package/types.rs      # package manifest type defini
 crates/synapse-profiles/src/package/digest.rs     # manifest digest computation
 crates/synapse-profiles/src/package/validation.rs # package permission/signature validation
 ```
-Tests: package_manifest, parse_bundled, runtime_refresh.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-models
 ONNX model registry, download, verification (sha256), ORT session loading (DirectML EP). Depends on `synapse-core`.
@@ -302,7 +302,7 @@ crates/synapse-models/src/ep.rs         # execution-provider order (DirectML/CPU
 crates/synapse-models/src/verify.rs     # sha256_file / digest normalization
 crates/synapse-models/src/error.rs      # model errors
 ```
-Test: model_loader.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-telemetry
 Tracing/log init (JSON file + console), log-dir GC, metrics registration, panic hook. Depends on `synapse-core`.
@@ -311,16 +311,7 @@ Tracing/log init (JSON file + console), log-dir GC, metrics registration, panic 
 crates/synapse-telemetry/src/lib.rs      # init_tracing, TelemetryGuard, log GC worker, panic hook
 crates/synapse-telemetry/src/metrics.rs   # M3 metric registration helpers
 ```
-Tests: file_sink, periodic_gc, periodic_gc_size_cap.
-
-### crates/synapse-test-utils
-Shared test helpers. Depends on `synapse-core`.
-
-```
-crates/synapse-test-utils/src/lib.rs              # crate root
-crates/synapse-test-utils/src/fixtures.rs          # test fixtures
-crates/synapse-test-utils/src/stdio_mcp_client.rs  # stdio MCP client harness for integration tests
-```
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-overlay
 System-tray companion binary (Windows). `#![allow(unsafe_op_in_unsafe_fn)]`. Depends on `synapse-core`, `synapse-telemetry`.
@@ -529,7 +520,7 @@ crates/synapse-mcp/src/server/browser_storage.rs      # cookies/storage tool
 ```
 M4 cdp tools (`cdp_open_tab`, etc.) live in m1/server modules above.
 
-Examples: `examples/dump_action_log.rs`, `dump_agent_events.rs`, `dump_agent_transcripts.rs`. ~60 integration `tests/*.rs` (m0–m5 gates, tool-list assertions, multi-agent capability matrix, lifecycle).
+Examples: `examples/dump_action_log.rs`, `dump_agent_events.rs`, `dump_agent_transcripts.rs`. Automated integration tests were removed by policy; manual FSV is the behavioral gate.
 
 ---
 
@@ -553,7 +544,6 @@ synapse-a11y       -> synapse-core
 synapse-models     -> synapse-core
 synapse-profiles   -> synapse-core
 synapse-telemetry  -> synapse-core
-synapse-test-utils -> synapse-core
 synapse-core       -> (none — root)
 ```
 
@@ -571,7 +561,6 @@ synapse-core       -> (none — root)
 | synapse-audio | core, models | loopback + STT |
 | synapse-reflex | action, core, storage | reactive automation engine |
 | synapse-mcp | all above | the daemon / MCP server (sink) |
-| synapse-test-utils | core | test harness |
 | synapse-overlay | core, telemetry | tray companion binary |
 
 ---

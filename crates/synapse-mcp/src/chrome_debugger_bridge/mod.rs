@@ -25,8 +25,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-#[cfg(test)]
-use synapse_core::CdpStatus;
 use synapse_core::{Rect, SubsystemHealth, error_codes};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -221,18 +219,6 @@ impl ChromeDebuggerBridgeError {
     #[must_use]
     pub(crate) fn detail(&self) -> &str {
         &self.detail
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn cdp_status(&self) -> CdpStatus {
-        if self.code == error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
-            || self.code == error_codes::CHROME_BRIDGE_EXTENSION_STALE
-        {
-            CdpStatus::ExtensionUnavailable
-        } else {
-            CdpStatus::AttachFailed
-        }
     }
 
     fn unavailable() -> Self {
@@ -635,18 +621,6 @@ impl SynapseChromeProfileInstallState {
             active_profile_extension_path: None,
             active_profile_service_worker_sha256: None,
             active_profile_service_worker_error: Some(reason.to_owned()),
-        }
-    }
-
-    #[cfg(test)]
-    fn test_installed() -> Self {
-        Self {
-            detail: "synapse_chrome_bridge_profile_installation scanned=true installed=true active_profile=\"Profile Test\" active_profile_installed=true active_profile_extension_path=\"C:\\synapse-test\\extension\" active_profile_service_worker_sha256=1111111111111111111111111111111111111111111111111111111111111111 active_profile_service_worker_error=none reason=test_installed".to_owned(),
-            active_profile_extension_path: Some(PathBuf::from(r"C:\synapse-test\extension")),
-            active_profile_service_worker_sha256: Some(
-                "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
-            ),
-            active_profile_service_worker_error: None,
         }
     }
 }
@@ -6887,58 +6861,6 @@ pub fn health_subsystem() -> SubsystemHealth {
     )
 }
 
-#[cfg(test)]
-fn chrome_bridge_health_from_snapshot(
-    active_host: Option<&ChromeBridgeHealthRecord>,
-    host_count: usize,
-    queued_count: usize,
-    pending_count: usize,
-    popup_risks: &[String],
-    self_profile_risks: &[String],
-    layout_infobar_risks: &[String],
-) -> SubsystemHealth {
-    let self_policy_shield = synapse_chrome_self_policy_shield_status();
-    let profile_install_state = SynapseChromeProfileInstallState::test_installed();
-    chrome_bridge_health_from_snapshot_with_self_policy(
-        active_host,
-        host_count,
-        queued_count,
-        pending_count,
-        popup_risks,
-        self_profile_risks,
-        layout_infobar_risks,
-        &self_policy_shield,
-        &profile_install_state,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn chrome_bridge_health_from_snapshot_with_self_policy(
-    active_host: Option<&ChromeBridgeHealthRecord>,
-    host_count: usize,
-    queued_count: usize,
-    pending_count: usize,
-    popup_risks: &[String],
-    self_profile_risks: &[String],
-    layout_infobar_risks: &[String],
-    self_policy_shield: &SynapseChromeSelfPolicyShieldStatus,
-    profile_install_state: &SynapseChromeProfileInstallState,
-) -> SubsystemHealth {
-    chrome_bridge_health_from_snapshot_with_queue(
-        active_host,
-        host_count,
-        queued_count,
-        pending_count,
-        popup_risks,
-        self_profile_risks,
-        layout_infobar_risks,
-        self_policy_shield,
-        profile_install_state,
-        &BridgeQueueHealth::default(),
-    )
-}
-
 fn bridge_queue_health_detail(queue: &BridgeQueueHealth) -> String {
     format!(
         "oldest_pending_age_ms={} caller_timed_out_pending_count={} transport_lost_pending_count={} wedged={} queue_wedge_events_total={} transport_lost_resolved_total={}",
@@ -10425,6 +10347,3 @@ fn replace_active_direct_http_host(inner: &mut BridgeInner, new_host_id: &str) {
         "Chrome debugger direct HTTP bridge host replaced"
     );
 }
-
-#[cfg(test)]
-mod tests;

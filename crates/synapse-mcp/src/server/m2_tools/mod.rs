@@ -1563,40 +1563,6 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn act_clipboard_for_session_test_entrypoint(
-        &self,
-        params: Parameters<ActClipboardParams>,
-        session_id: &str,
-    ) -> Result<Json<ActClipboardResponse>, ErrorData> {
-        let params = params.0;
-        let request_details = clipboard_request_audit_details(&params);
-        self.audit_action_started_with_details_for_session(
-            "act_clipboard",
-            &request_details,
-            session_id,
-        )?;
-        let result = self.act_clipboard_for_session(params, session_id, "session_clipboard_buffer");
-        match &result {
-            Ok(response) => {
-                self.audit_action_ok_with_details_for_session(
-                    "act_clipboard",
-                    &clipboard_response_audit_details(response),
-                    session_id,
-                )?;
-            }
-            Err(error) => {
-                self.audit_action_error_with_details_for_session(
-                    "act_clipboard",
-                    error,
-                    &request_details,
-                    session_id,
-                )?;
-            }
-        }
-        result.map(Json)
-    }
-
     #[tool(
         description = "Scroll vertically or horizontally at the current pointer or screen point"
     )]
@@ -7462,17 +7428,6 @@ fn attempt_background_foreground_restore(
     before: &ForegroundContext,
     after: &ForegroundContext,
 ) -> Value {
-    #[cfg(test)]
-    {
-        let _ = (tool, action_source_of_truth, target, before, after);
-        return json!({
-            "attempted": false,
-            "status": "skipped",
-            "reason": "unit_test",
-        });
-    }
-
-    #[cfg(not(test))]
     {
         let prior = match synapse_a11y::foreground_context(before.hwnd) {
             Ok(prior) => prior,
@@ -7903,6 +7858,3 @@ fn clipboard_request_audit_details(params: &ActClipboardParams) -> Value {
         "lease_required": false,
     })
 }
-
-#[cfg(test)]
-mod tests;

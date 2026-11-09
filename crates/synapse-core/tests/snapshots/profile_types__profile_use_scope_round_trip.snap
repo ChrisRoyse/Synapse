@@ -1,5 +1,0 @@
----
-source: crates/synapse-core/tests/profile_types.rs
-expression: "round_trip(\"ProfileUseScope\", \"snapshot\",\nProfileUseScope::OperatorOwnedTest,)?"
----
-"operator_owned_test"

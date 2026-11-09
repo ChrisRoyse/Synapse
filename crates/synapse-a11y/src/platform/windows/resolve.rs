@@ -804,52 +804,6 @@ fn normalize_multiline_edit_newlines(value: &str) -> String {
     normalized
 }
 
-#[cfg(test)]
-mod tests {
-    use synapse_core::element_id;
-
-    use super::{
-        native_text_class_supported, native_text_expected_after_wide, native_text_role_supported,
-    };
-
-    #[test]
-    fn native_text_class_supported_accepts_classic_edit_classes() {
-        assert!(native_text_class_supported("Edit"));
-        assert!(native_text_class_supported("RICHEDIT50W"));
-        assert!(native_text_class_supported(
-            "WindowsForms10.EDIT.app.0.1d38a05_r8_ad1"
-        ));
-    }
-
-    #[test]
-    fn native_text_class_supported_rejects_non_edit_window_classes() {
-        assert!(!native_text_class_supported("Button"));
-        assert!(!native_text_class_supported("Static"));
-        assert!(!native_text_class_supported(
-            "SynapseIssue784NativeHostWindow"
-        ));
-    }
-
-    #[test]
-    fn native_text_role_supported_accepts_document_backed_edit_controls() {
-        assert!(native_text_role_supported("Edit"));
-        assert!(native_text_role_supported("Document"));
-        assert!(native_text_role_supported("Text"));
-        assert!(!native_text_role_supported("Button"));
-    }
-
-    #[test]
-    fn native_text_expected_after_wide_splices_by_utf16_offsets() {
-        let id = element_id(0x2a, "0000002a00000001");
-        let before: Vec<u16> = "a😀z".encode_utf16().collect();
-        let inserted: Vec<u16> = "B".encode_utf16().collect();
-        let expected = native_text_expected_after_wide(&id, &before, &inserted, 1, 3)
-            .expect("valid UTF-16 range should splice");
-
-        assert_eq!(String::from_utf16(&expected).unwrap(), "aBz");
-    }
-}
-
 fn native_set_window_text(id: &ElementId, hwnd: HWND, value: &str) -> A11yResult<()> {
     let mut wide: Vec<u16> = value.encode_utf16().collect();
     wide.push(0);

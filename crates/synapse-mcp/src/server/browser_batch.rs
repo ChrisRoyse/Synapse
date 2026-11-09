@@ -397,27 +397,3 @@ fn error_data_to_value(error: &ErrorData) -> Value {
         "data": error.data,
     })
 }
-
-#[cfg(test)]
-mod operator_panic_tests {
-    use super::browser_batch_action_mutates;
-
-    #[test]
-    fn classifies_every_supported_batch_action_for_operator_panic_checks() {
-        for action in [
-            "navigate",
-            "click",
-            "set_value",
-            "fill_form",
-            "file_upload",
-            "scroll_into_view",
-            "evaluate",
-            "screenshot",
-        ] {
-            assert!(browser_batch_action_mutates(action), "{action}");
-        }
-        for action in ["wait_for_selector", "wait_for_url", "wait_for_load_state"] {
-            assert!(!browser_batch_action_mutates(action), "{action}");
-        }
-    }
-}

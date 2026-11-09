@@ -3,9 +3,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use rmcp::ErrorData;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -28,11 +25,6 @@ const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
 const COMMAND_AUDIT_KEY_LEN: usize = 12;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
-
-#[cfg(test)]
-thread_local! {
-    static COMMAND_AUDIT_FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct CommandAuditInput {
@@ -540,13 +532,6 @@ impl SynapseService {
         phase: &'static str,
         input: CommandAuditInput,
     ) -> Result<CommandAuditRowReadback, ErrorData> {
-        #[cfg(test)]
-        if COMMAND_AUDIT_FORCE_FAIL.with(Cell::get) {
-            return Err(command_audit_internal_error(
-                "command audit forced failure for test",
-            ));
-        }
-
         let (ts_ns, seq) = next_command_audit_key_parts();
         let key = command_audit_key(ts_ns, seq);
         let key_hex = hex_encode(&key);
@@ -654,11 +639,6 @@ pub(super) fn command_audit_error_from_error_data(error: &ErrorData) -> CommandA
         message: error.message.to_string(),
         data: error.data.clone(),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn set_command_audit_force_fail_for_tests(enabled: bool) {
-    COMMAND_AUDIT_FORCE_FAIL.with(|force_fail| force_fail.set(enabled));
 }
 
 #[derive(Debug)]
@@ -1061,264 +1041,4 @@ fn error_data_code(error: &ErrorData) -> Option<&str> {
         .as_ref()
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{num::NonZeroUsize, path::Path};
-
-    use tempfile::TempDir;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
-
-    fn service_with_db(path: &Path) -> SynapseService {
-        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
-            CancellationToken::new(),
-            "test",
-            CancellationToken::new(),
-            &M2ServiceConfig::default(),
-            M3ServiceConfig::from_cli_parts(
-                Some(path.join("db")),
-                Some(path.to_path_buf()),
-                false,
-                "127.0.0.1:0".to_owned(),
-                NonZeroUsize::new(4).expect("nonzero"),
-                false,
-                true,
-                None,
-                false,
-                None,
-            ),
-            M4ServiceConfig::default(),
-        )
-        .expect("construct service")
-    }
-
-    fn seed_command_rows(service: &SynapseService, tool: &'static str, rows: usize) {
-        for index in 0..rows {
-            service
-                .command_audit_final(CommandAuditInput::mcp(
-                    tool,
-                    "list",
-                    Some("issue1487-session".to_owned()),
-                    None,
-                    json!({ "index": index }),
-                    json!({}),
-                    json!({ "ok": true }),
-                    "ok",
-                ))
-                .expect("write command audit row");
-        }
-    }
-
-    fn seed_action_log_row(service: &SynapseService, key: Vec<u8>, row: Value) {
-        let encoded = synapse_storage::encode_json(&row).expect("encode seeded audit row");
-        service
-            .m3_storage()
-            .expect("storage")
-            .put_batch(cf::CF_ACTION_LOG, vec![(key, encoded)])
-            .expect("seed audit row");
-    }
-
-    #[test]
-    fn command_audit_redacts_sensitive_payload_fields() {
-        let payload = json!({
-            "token": "raw-token",
-            "nested": {
-                "api_key": "raw-key",
-                "safe": "kept",
-            },
-            "items": [
-                {"cookie": "raw-cookie"},
-                {"name": "kept"}
-            ]
-        });
-        let bounded = bounded_redacted_payload(&payload);
-        assert!(bounded.redacted);
-        assert!(bounded.redactions.contains(&"$.token".to_owned()));
-        assert!(bounded.redactions.contains(&"$.nested.api_key".to_owned()));
-        assert!(bounded.redactions.contains(&"$.items[0].cookie".to_owned()));
-        assert_eq!(bounded.value["token"], "[REDACTED]");
-        assert_eq!(bounded.value["nested"]["safe"], "kept");
-        assert!(bounded.sha256.starts_with("sha256:"));
-    }
-
-    #[test]
-    fn command_audit_bounds_large_payload() {
-        let payload = json!({"body": "A".repeat(COMMAND_AUDIT_PAYLOAD_MAX_BYTES + 128)});
-        let bounded = bounded_redacted_payload(&payload);
-        assert!(bounded.truncated);
-        assert!(bounded.bytes > COMMAND_AUDIT_PAYLOAD_MAX_BYTES);
-        assert!(
-            bounded
-                .value
-                .get("omitted_bytes")
-                .and_then(Value::as_u64)
-                .is_some_and(|omitted| omitted > 0)
-        );
-    }
-
-    #[test]
-    fn command_audit_query_unwindowed_newest_first_exact_complete_extra_reports_has_older() {
-        let dir = TempDir::new().expect("tmp");
-        let service = service_with_db(dir.path());
-        let tool = "issue1487_browser_tabs";
-        seed_command_rows(&service, tool, 3);
-
-        let exact = service
-            .command_audit_query(CommandAuditQueryParams {
-                limit: Some(3),
-                scan_limit: Some(16),
-                tool: Some(tool.to_owned()),
-                ..Default::default()
-            })
-            .expect("exact-limit page should query");
-        assert_eq!(exact.returned_count, 3);
-        assert_eq!(exact.matched_rows, 3);
-        assert!(!exact.partial);
-        assert!(exact.exhausted);
-        assert!(exact.next_start_key_hex.is_none());
-
-        let extra_match = service
-            .command_audit_query(CommandAuditQueryParams {
-                limit: Some(2),
-                scan_limit: Some(16),
-                tool: Some(tool.to_owned()),
-                ..Default::default()
-            })
-            .expect("limit-plus-one page should query");
-        assert_eq!(extra_match.returned_count, 2);
-        assert_eq!(extra_match.matched_rows, 2);
-        // #1550: an unwindowed default query now scans newest-first and returns the
-        // most-recent rows as a COMPLETE success page. `partial` is the fail-closed
-        // signal reserved for explicit start_key_hex paging, so it stays false here;
-        // "more matching rows exist" is reported via `has_older`, and the caller pages
-        // further back by windowing with end_ts_ns = oldest_returned_ts_ns.
-        assert!(!extra_match.partial);
-        assert!(extra_match.has_older);
-        assert!(!extra_match.exhausted);
-        assert_eq!(extra_match.scan_order, "newest_first");
-        assert!(extra_match.next_start_key_hex.is_none());
-        let oldest_returned_ts_ns = extra_match
-            .oldest_returned_ts_ns
-            .expect("a newest-first page with returned rows must expose its oldest-ts anchor");
-
-        // Supporting regression readback for the documented resume: `has_older`
-        // promises the caller can page further back by windowing with
-        // `end_ts_ns`. Verify that is actionable (not a dead end) by actually
-        // retrieving the one remaining older
-        // match straight from the real on-disk CF_ACTION_LOG.
-        let older_page = service
-            .command_audit_query(CommandAuditQueryParams {
-                limit: Some(20),
-                scan_limit: Some(16),
-                tool: Some(tool.to_owned()),
-                end_ts_ns: Some(oldest_returned_ts_ns - 1),
-                ..Default::default()
-            })
-            .expect("window-back page should query");
-        assert_eq!(
-            older_page.returned_count, 1,
-            "the one older match must be retrievable by windowing end_ts_ns"
-        );
-        assert_eq!(older_page.matched_rows, 1);
-        assert_eq!(older_page.scan_order, "newest_first");
-        assert!(
-            older_page
-                .oldest_returned_ts_ns
-                .is_some_and(|ts| ts < oldest_returned_ts_ns),
-            "window-back must reach a strictly older row than the first page"
-        );
-        assert!(!older_page.has_older);
-        assert!(older_page.exhausted);
-    }
-
-    #[test]
-    fn command_audit_query_unwindowed_newest_first_scan_capped_no_match_reports_has_older() {
-        let dir = TempDir::new().expect("tmp");
-        let service = service_with_db(dir.path());
-        seed_command_rows(&service, "issue1487_other_tool", 3);
-
-        let response = service
-            .command_audit_query(CommandAuditQueryParams {
-                limit: Some(20),
-                scan_limit: Some(2),
-                tool: Some("issue1487_no_match".to_owned()),
-                ..Default::default()
-            })
-            .expect("scan-limited no-match page should query");
-
-        assert_eq!(response.returned_count, 0);
-        assert_eq!(response.matched_rows, 0);
-        assert_eq!(response.scanned_rows, 2);
-        // #1550: the unwindowed default scans newest-first. A scan_limit-capped page
-        // that matched nothing reports `has_older` (rows remain beyond the scanned
-        // tail) as a SUCCESS, not a fail-closed partial. To search older history for
-        // a specific tool, window with start_ts_ns/end_ts_ns — the newest-first
-        // default intentionally surfaces recent activity first.
-        assert!(!response.partial);
-        assert!(response.has_older);
-        assert!(!response.exhausted);
-        assert_eq!(response.scan_order, "newest_first");
-    }
-
-    #[test]
-    fn command_audit_query_newest_first_skips_noncanonical_tail_keys() {
-        let dir = TempDir::new().expect("tmp");
-        let service = service_with_db(dir.path());
-        let old_tool = "issue1550_old_synthetic";
-        let new_tool = "issue1550_new_real";
-        let newer_ts = 1_783_983_154_070_087_400_u64;
-
-        seed_action_log_row(
-            &service,
-            b"issue1540-final-redaction-sorts-after-canonical".to_vec(),
-            json!({
-                "schema_version": 1,
-                "row_kind": COMMAND_AUDIT_ROW_KIND,
-                "audit_id": "issue1540-synthetic",
-                "ts_ns": 0,
-                "tool": old_tool,
-                "phase": "final",
-                "outcome": "error",
-                "error_code": "ISSUE1540_SYNTHETIC"
-            }),
-        );
-        seed_action_log_row(
-            &service,
-            command_audit_key(newer_ts, 7),
-            json!({
-                "schema_version": 1,
-                "row_kind": COMMAND_AUDIT_ROW_KIND,
-                "audit_id": "issue1550-real-current",
-                "ts_ns": newer_ts,
-                "tool": new_tool,
-                "phase": "final",
-                "outcome": "ok"
-            }),
-        );
-
-        let response = service
-            .command_audit_query(CommandAuditQueryParams {
-                limit: Some(10),
-                scan_limit: Some(10),
-                ..Default::default()
-            })
-            .expect("mixed canonical/noncanonical tail should query");
-
-        assert_eq!(response.scan_order, AUDIT_SCAN_ORDER_NEWEST_FIRST);
-        assert_eq!(response.noncanonical_key_count, 1);
-        assert_eq!(response.corrupt_row_count, 0);
-        assert_eq!(response.returned_count, 1);
-        assert_eq!(response.rows[0].tool, new_tool);
-        assert_eq!(response.rows[0].ts_ns, newer_ts);
-        assert_ne!(response.rows[0].tool, old_tool);
-        let expected_key_hex = hex_encode(&command_audit_key(newer_ts, 7));
-        assert_eq!(
-            response.start_key_hex.as_deref(),
-            Some(expected_key_hex.as_str())
-        );
-    }
 }

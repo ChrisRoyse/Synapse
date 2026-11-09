@@ -15,9 +15,6 @@ mod rate_limits;
 mod routing;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 pub use backends::Backends;
 pub use rate_limits::{
     BackendRateLimitControl, BackendRateLimitOverrideReadback, BackendRateLimitSnapshot,

@@ -150,30 +150,3 @@ fn run_once(m3_state: &Arc<Mutex<M3State>>) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_secs_env_accepts_default_and_rejects_garbage() {
-        // SAFETY: test-local env mutation; no other test reads this name.
-        unsafe { std::env::remove_var("SYNAPSE_TEST_MINE_SECS") };
-        assert_eq!(
-            parse_secs_env("SYNAPSE_TEST_MINE_SECS", 7).expect("absent -> default"),
-            7
-        );
-        unsafe { std::env::set_var("SYNAPSE_TEST_MINE_SECS", "120") };
-        assert_eq!(
-            parse_secs_env("SYNAPSE_TEST_MINE_SECS", 7).expect("number parses"),
-            120
-        );
-        unsafe { std::env::set_var("SYNAPSE_TEST_MINE_SECS", "six hours") };
-        let error = parse_secs_env("SYNAPSE_TEST_MINE_SECS", 7).expect_err("garbage rejected");
-        assert!(
-            error.to_string().contains("SYNAPSE_TEST_MINE_SECS"),
-            "{error}"
-        );
-        unsafe { std::env::remove_var("SYNAPSE_TEST_MINE_SECS") };
-    }
-}

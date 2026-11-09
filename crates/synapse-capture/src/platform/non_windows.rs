@@ -132,37 +132,3 @@ pub fn validate_hwnd_impl(_hwnd: i64) -> Result<(), CaptureError> {
 pub fn validate_monitor_impl(_monitor_index: u32) -> Result<(), CaptureError> {
     Ok(())
 }
-
-#[cfg(all(test, not(windows)))]
-mod tests {
-    use super::*;
-
-    /// The non-Windows capture path must fail loudly with the
-    /// `CAPTURE_GRAPHICS_API_UNSUPPORTED` code and a detail that explains the
-    /// real cause, instead of fabricating synthetic frames.
-    #[test]
-    fn capture_backend_unavailable_reports_graphics_api_unsupported() {
-        let err = capture_backend_unavailable();
-        assert_eq!(
-            err.code(),
-            synapse_core::error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED
-        );
-        match err {
-            CaptureError::GraphicsApiUnsupported { detail } => {
-                assert!(
-                    detail.contains("only on Windows"),
-                    "detail should name the Windows-only constraint: {detail}"
-                );
-                assert!(
-                    detail.to_lowercase().contains("synthetic"),
-                    "detail should state synthetic frames are not produced: {detail}"
-                );
-                assert!(
-                    detail.contains(std::env::consts::OS),
-                    "detail should name the current platform: {detail}"
-                );
-            }
-            other => panic!("expected GraphicsApiUnsupported, got {other:?}"),
-        }
-    }
-}

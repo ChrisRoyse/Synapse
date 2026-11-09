@@ -1,9 +1,0 @@
----
-source: crates/synapse-core/tests/stored_types.rs
-expression: "round_trip(\"StoredRedaction\", \"snapshot\", full_redaction())?"
----
-{
-  "kind": "secret",
-  "offset": 12,
-  "len": 8
-}

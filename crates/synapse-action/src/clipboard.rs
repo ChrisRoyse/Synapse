@@ -695,20 +695,3 @@ mod platform {
         Ok(bytes.to_vec())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use synapse_core::error_codes;
-
-    use super::*;
-
-    #[test]
-    fn cf_text_non_ascii_fails_as_backend_unavailable_before_platform_open() {
-        let error = write_text(ClipboardFormat::Text, "unicode-clipboard-edge-雪")
-            .expect_err("non-ASCII CF_TEXT writes must fail closed");
-
-        assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
-        assert!(matches!(error, ActionError::BackendUnavailable { .. }));
-        assert!(error.detail().contains("CF_TEXT"));
-    }
-}

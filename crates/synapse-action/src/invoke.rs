@@ -4,13 +4,8 @@ use synapse_core::{ElementId, MouseButton, Point};
 use crate::ActionError;
 use crate::{ActionBackend, ActionResult, EmitState};
 
-#[cfg(test)]
-mod dispatch;
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 mod resolver;
-
-#[cfg(test)]
-mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ElementClickOutcome {

@@ -10,8 +10,6 @@ use rocksdb::{DB, WriteBatch, WriteOptions};
 use crate::{StorageError, StorageResult};
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
-#[cfg(test)]
-pub const FLUSH_BYTES: usize = 64 * 1024;
 const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
 
 pub struct Batcher {

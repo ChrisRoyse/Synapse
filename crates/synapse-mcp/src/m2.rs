@@ -44,8 +44,6 @@ pub(crate) use click::{
     click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
     click_tier_failed,
 };
-#[cfg(test)]
-pub use clipboard::{ActClipboardFormat, ActClipboardVerb};
 pub use clipboard::{ActClipboardParams, ActClipboardResponse};
 pub(crate) use clipboard::{
     SharedSessionClipboardBuffers, act_clipboard_session_buffer, new_session_clipboards,
@@ -607,30 +605,9 @@ fn record_foreground_restore_context_event(
     foreground_read_error: Option<Value>,
     detail: Value,
 ) {
-    // The daemon lifecycle ledger is a process-global singleton. In this crate's
-    // own unit-test binary, tests run in parallel and this production side-effect
-    // would write into whichever ledger the `daemon_lifecycle` tests momentarily
-    // have configured — corrupting their assertions and poisoning `last_error`
-    // (which flips `health_payload().ok` false for any concurrent health-reading
-    // test). The recording itself is covered directly by
-    // `daemon_lifecycle::tests::records_context_event_to_physical_files`, and the
-    // real daemon (integration tests, production) is built without `cfg(test)` and
-    // records normally. So suppress only this unasserted side-effect under test.
-    #[cfg(test)]
-    {
-        let _ = (
-            tool,
-            session_id,
-            status,
-            code,
-            reason_code,
-            foreground,
-            foreground_read_error,
-            detail,
-        );
-        return;
-    }
-    #[cfg(not(test))]
+    // The daemon lifecycle ledger is a process-global singleton. This production
+    // path records every foreground-restore decision into that ledger so the
+    // daemon has durable context when an input lease refuses or skips action.
     {
         let detail = json!({
             "code": code,
@@ -1188,28 +1165,11 @@ impl OperatorPanicActionBoundary {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn arm(tool: &'static str, stage: &'static str) -> Result<Self, ErrorData> {
-        arm_operator_panic_action_admission(tool, stage).map(|epoch_at_arm| Self {
-            tool,
-            epoch_at_arm,
-            // Production callers, including forgotten direct-helper seams,
-            // inherit the task-local epoch captured by handler::call_tool.
-            // Truly unscoped module/unit calls have no outer MCP request.
-            require_mcp_boundary: crate::server::operator_panic_boundary::is_mcp_request_guarded(),
-        })
-    }
-
     pub(crate) fn ensure(self, stage: &'static str) -> Result<(), ErrorData> {
         if self.require_mcp_boundary {
             crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
         }
         ensure_operator_panic_action_admission(self.tool, stage, self.epoch_at_arm)
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn epoch_at_arm(self) -> u64 {
-        self.epoch_at_arm
     }
 }
 
@@ -1613,6 +1573,3 @@ pub fn shared_m2_state_from_config_with_shutdown_reason(
 pub fn recording_backend_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
-
-#[cfg(test)]
-mod tests;

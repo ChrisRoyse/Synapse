@@ -37,18 +37,6 @@ impl BackendRateLimitControl {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    /// # Panics
-    ///
-    /// Panics if the backend rate-limit state lock is poisoned in a test.
-    pub fn snapshot(&self) -> BackendRateLimitSnapshot {
-        match self.try_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("backend rate limit snapshot failed: {error}"),
-        }
-    }
-
     /// # Errors
     ///
     /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
@@ -132,19 +120,6 @@ impl BackendRateLimits {
             software: TokenBucket::for_backend(ResolvedBackend::Software),
             vigem: TokenBucket::for_backend(ResolvedBackend::Vigem),
             hardware: TokenBucket::for_backend(ResolvedBackend::Hardware),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) const fn with_buckets(
-        software: TokenBucket,
-        vigem: TokenBucket,
-        hardware: TokenBucket,
-    ) -> Self {
-        Self {
-            software,
-            vigem,
-            hardware,
         }
     }
 

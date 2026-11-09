@@ -81,64 +81,6 @@ impl ActionEmitter {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn with_rate_limits(
-        rx: mpsc::Receiver<ActionMessage>,
-        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
-        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
-        backends: Backends,
-        rate_limits: BackendRateLimits,
-    ) -> Self {
-        Self::with_rate_limits_and_policy(
-            rx,
-            safety_rx,
-            snapshot_rx,
-            backends,
-            rate_limits,
-            Arc::new(RwLock::new(BackendResolutionPolicy::default())),
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_rate_limits_and_policy(
-        rx: mpsc::Receiver<ActionMessage>,
-        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
-        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
-        backends: Backends,
-        rate_limits: BackendRateLimits,
-        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
-    ) -> Self {
-        let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
-        Self {
-            rx,
-            safety_rx,
-            snapshot_rx,
-            auto_release_tx,
-            auto_release_rx,
-            state: EmitState::new(),
-            backends,
-            backend_resolution,
-            rate_limits: BackendRateLimitControl::new(rate_limits),
-            held_key_timers: HashMap::new(),
-            held_key_timer_ids: HashMap::new(),
-            next_held_key_timer_id: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn channel_with_rate_limits(
-        rate_limits: BackendRateLimits,
-    ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
-        let backends = Backends::all_routed_to(Arc::new(crate::RecordingBackend::new()));
-        let (handle, rx, safety_rx) = ActionHandle::channel_with_safety_lane();
-        let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
-        (
-            handle,
-            ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::with_rate_limits(rx, safety_rx, snapshot_rx, backends, rate_limits),
-        )
-    }
-
     #[must_use]
     #[tracing::instrument(skip_all, fields(action_kind = "channel"))]
     pub fn channel() -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {

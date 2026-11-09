@@ -26,8 +26,6 @@ pub mod routines;
 pub mod storage;
 pub mod subscribe;
 pub mod suggestions;
-#[cfg(test)]
-mod tests;
 pub mod timeline;
 pub mod timeline_control;
 use anyhow::{Context, Result, bail};

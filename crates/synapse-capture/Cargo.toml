@@ -18,14 +18,6 @@ tracing.workspace = true
 windows.workspace = true
 windows-capture.workspace = true
 
-[dev-dependencies]
-criterion.workspace = true
-proptest.workspace = true
-
-[[bench]]
-name = "capture_loop"
-harness = false
-
 [lints.rust]
 unsafe_code = "allow"
 unused = { level = "warn", priority = -1 }

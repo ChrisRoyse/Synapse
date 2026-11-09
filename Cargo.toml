@@ -13,7 +13,6 @@ members = [
     "crates/synapse-profiles",
     "crates/synapse-models",
     "crates/synapse-telemetry",
-    "crates/synapse-test-utils",
     "crates/synapse-overlay",
 ]
 default-members = ["crates/synapse-mcp", "crates/synapse-overlay"]
@@ -119,11 +118,7 @@ fs2 = "0.4.3"
 reqwest = "0.13.3"
 sse-stream = "0.2.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
-proptest = "1.11.0"
-criterion = "0.8.2"
-insta = { version = "1.47.2", features = ["json"] }
 tempfile = "3.27.0"
-mockall = "0.14.0"
 x11rb = "0.13.2"
 
 [workspace.lints.rust]
@@ -163,7 +158,7 @@ debug = false
 
 # release is the SHIPPED profile: the daemon-reinstall flow copies
 # target/release/synapse-mcp.exe into ~/.cargo/bin. Re-tuned 2026-06-14 for FAST
-# rebuilds (the iteration loop is build-the-daemon -> reinstall -> test), while
+# rebuilds (the iteration loop is build-the-daemon -> reinstall -> verify), while
 # staying a fully optimized binary:
 #   lto = "thin"       parallel, near-fat runtime (<~3% on this IO/perception
 #                      daemon; RocksDB is C++ and unaffected by Rust LTO) but a

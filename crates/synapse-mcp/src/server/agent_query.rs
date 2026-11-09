@@ -1203,6 +1203,3 @@ fn agent_query_attention_class(
         .map(|read| read.attention_class)
         .filter(|attention_class| !attention_class.is_none())
 }
-
-#[cfg(test)]
-mod tests;

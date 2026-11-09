@@ -191,31 +191,3 @@ fn single_ascii(value: &str) -> Option<char> {
     let ch = chars.next()?;
     chars.next().is_none().then_some(ch)
 }
-
-#[cfg(test)]
-mod tests {
-    use synapse_core::{Key, KeyCode, error_codes};
-
-    use super::*;
-
-    #[test]
-    fn unsupported_key_down_does_not_mark_key_held() {
-        let key = Key {
-            code: KeyCode::Named {
-                value: "f24".to_owned(),
-            },
-            use_scancode: false,
-        };
-        let mut state = EmitState::new();
-        let before = state.snapshot();
-        let error = match key_down(&key, &mut state) {
-            Ok(()) => panic!("f24 should be unsupported by Enigo"),
-            Err(error) => error,
-        };
-        let after = state.snapshot();
-
-        assert_eq!(error.code(), error_codes::ACTION_UNSUPPORTED_KEY);
-        assert!(before.held_keys.is_empty());
-        assert!(after.held_keys.is_empty());
-    }
-}

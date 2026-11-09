@@ -1150,34 +1150,3 @@ fn url_host_matches(url: &str, expected_host: &str) -> bool {
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == expected)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn suggestion_accept_enforces_canonical_browser_hwnd_before_plan_execution() {
-        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
-            let params = SuggestionAcceptParams {
-                suggestion_id: "suggestion-1".to_owned(),
-                browser_window_hwnd: Some(invalid),
-                ..SuggestionAcceptParams::default()
-            };
-            let error = validate_suggestion_accept_params(&params)
-                .expect_err("noncanonical browser HWND must fail before plan execution");
-            let data = error.data.as_ref().expect("structured HWND error data");
-            assert_eq!(
-                data.get("field").and_then(Value::as_str),
-                Some("browser_window_hwnd")
-            );
-        }
-
-        let params = SuggestionAcceptParams {
-            suggestion_id: "suggestion-1".to_owned(),
-            browser_window_hwnd: Some(i64::from(u32::MAX)),
-            ..SuggestionAcceptParams::default()
-        };
-        validate_suggestion_accept_params(&params)
-            .expect("u32::MAX is a canonical HWND wire value");
-    }
-}

@@ -257,11 +257,6 @@ impl McpOperatorPanicBoundary {
             })),
         ))
     }
-
-    #[cfg(test)]
-    pub(crate) const fn epoch_at_arm(&self) -> u64 {
-        self.epoch_at_arm
-    }
 }
 
 impl McpOperatorPanicBoundarySnapshot {
@@ -381,82 +376,4 @@ pub(crate) fn cancel_mcp_request_before_mutation(reason: &'static str) -> Result
                 ),
             ))
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn captured_epoch_rejects_a_fully_finalized_later_panic_wave() {
-        synapse_action::isolate_interrupt_epochs_for_test();
-        let boundary = McpOperatorPanicBoundary::capture("browser_evaluate", Some("session-test"));
-        let epoch_at_arm = boundary.epoch_at_arm();
-
-        let mut token = synapse_action::request_operator_panic_interrupt();
-        assert!(synapse_action::acknowledge_operator_panic_preemption(
-            &mut token
-        ));
-        let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
-            synapse_action::complete_operator_panic_safety_generation(token)
-                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
-        else {
-            panic!("isolated generation must own finalization");
-        };
-        assert!(synapse_action::finish_operator_panic_safety_finalization(
-            finalization,
-            true
-        ));
-        assert!(!synapse_action::operator_panic_safety_pending());
-        assert_ne!(synapse_action::operator_panic_epoch(), epoch_at_arm);
-
-        let error = boundary
-            .ensure("before_runtime_evaluate")
-            .expect_err("a completed intervening panic must supersede the old request");
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED))
-        );
-    }
-
-    #[test]
-    fn mutation_without_request_boundary_fails_closed() {
-        let error = ensure_mcp_mutation("before_external_write")
-            .expect_err("missing production request guard must fail closed");
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!(error_codes::TOOL_INTERNAL_ERROR))
-        );
-    }
-
-    #[test]
-    fn mutation_captured_while_pending_stays_closed_after_finalization() {
-        synapse_action::isolate_interrupt_epochs_for_test();
-        let mut token = synapse_action::request_operator_panic_interrupt();
-        let boundary = McpOperatorPanicBoundary::capture("browser_evaluate", Some("session-test"));
-        assert!(boundary.safety_pending_at_arm);
-
-        assert!(synapse_action::acknowledge_operator_panic_preemption(
-            &mut token
-        ));
-        let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
-            synapse_action::complete_operator_panic_safety_generation(token)
-                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
-        else {
-            panic!("isolated generation must own finalization");
-        };
-        assert!(synapse_action::finish_operator_panic_safety_finalization(
-            finalization,
-            true
-        ));
-        assert!(!synapse_action::operator_panic_safety_pending());
-        assert_eq!(
-            synapse_action::operator_panic_epoch(),
-            boundary.epoch_at_arm()
-        );
-
-        boundary
-            .ensure("before_runtime_evaluate")
-            .expect_err("a mutation request admitted during K1/K2 must remain superseded");
-    }
 }

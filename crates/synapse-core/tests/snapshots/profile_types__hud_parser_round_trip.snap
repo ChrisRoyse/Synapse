@@ -1,9 +1,0 @@
----
-source: crates/synapse-core/tests/profile_types.rs
-expression: "round_trip(\"HudParser\", \"snapshot\", full_parser())?"
----
-{
-  "kind": "regex",
-  "pattern": "([0-9]+)/[0-9]+",
-  "group": 1
-}

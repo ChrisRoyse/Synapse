@@ -52,8 +52,6 @@ pub use handle::{
     SessionInputSnapshot, SessionKeyInput, SessionMouseButtonInput, SessionPadInput,
     SessionReleaseSummary,
 };
-#[cfg(feature = "test-support")]
-pub use hotkey::isolate_interrupt_epochs_for_test;
 pub use hotkey::{
     OperatorHotkeyGuard, OperatorHotkeyShutdownReport, OperatorHotkeyStatus,
     OperatorPanicSafetyCompletion, OperatorPanicSafetyFinalization, OperatorPanicSafetyReadback,

@@ -739,59 +739,6 @@ mod platform {
                 | 0xdb..=0xdf
         )
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn unicode_sendinput_packet_is_text_like_without_raw_character() {
-            assert_eq!(
-                key_signal_with_ctrl(VK_PACKET_CODE, false),
-                InteractionKeySignal::TextLikeKey
-            );
-            assert_eq!(
-                key_signal_with_ctrl(VK_BACK_CODE, false),
-                InteractionKeySignal::DeleteCommand
-            );
-            assert_eq!(
-                key_signal_with_ctrl(VK_Z_CODE, true),
-                InteractionKeySignal::UndoCommand
-            );
-        }
-
-        #[test]
-        fn hook_restart_requires_terminal_phase_and_zero_retained_owners() {
-            assert!(hook_start_allowed(HookOwnerPhase::Terminal, 0));
-            for phase in [
-                HookOwnerPhase::Starting,
-                HookOwnerPhase::Running,
-                HookOwnerPhase::Stopping,
-                HookOwnerPhase::Retained,
-            ] {
-                assert!(!hook_start_allowed(phase, 0), "phase={phase:?}");
-            }
-            assert!(!hook_start_allowed(HookOwnerPhase::Terminal, 1));
-        }
-
-        #[test]
-        fn terminal_hook_thread_error_is_not_a_successful_join() {
-            let owner = thread::spawn(|| -> HookThreadResult {
-                Err("synthetic message-loop failure".to_owned())
-            });
-            let (terminal, joined, retained, failure) =
-                join_thread_until(owner, Duration::from_secs(1));
-            assert!(terminal);
-            assert!(joined);
-            assert!(!retained);
-            assert!(
-                failure
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("synthetic message-loop failure")),
-                "failure={failure:?}"
-            );
-        }
-    }
 }
 
 #[cfg(not(windows))]

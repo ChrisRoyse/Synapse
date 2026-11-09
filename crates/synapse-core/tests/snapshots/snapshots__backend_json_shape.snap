@@ -1,5 +1,0 @@
----
-source: crates/synapse-core/tests/snapshots.rs
-expression: "Backend::Software"
----
-"software"

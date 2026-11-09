@@ -12,9 +12,6 @@ use synapse_core::error_codes;
 
 use crate::{StorageError, StorageResult, cf};
 
-#[cfg(test)]
-use std::collections::VecDeque;
-
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const GB: u64 = 1_000_000_000;
 const MB: u64 = 1_000_000;
@@ -120,27 +117,6 @@ impl Default for PressureConfig {
                 level2: LEVEL_2_FREE_BYTES,
                 level3: LEVEL_3_FREE_BYTES,
                 level4: LEVEL_4_FREE_BYTES,
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-impl PressureConfig {
-    pub fn with_thresholds(
-        interval: Duration,
-        level1_free_bytes: u64,
-        level2_free_bytes: u64,
-        level3_free_bytes: u64,
-        level4_free_bytes: u64,
-    ) -> Self {
-        Self {
-            interval,
-            thresholds: PressureThresholds {
-                level1: level1_free_bytes,
-                level2: level2_free_bytes,
-                level3: level3_free_bytes,
-                level4: level4_free_bytes,
             },
         }
     }
@@ -253,27 +229,6 @@ pub fn run_once_with_free_bytes(
     let result = apply_free_bytes(db, state, config, free_bytes);
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
-}
-
-#[cfg(test)]
-pub fn spawn_with_free_bytes(
-    db: Arc<DB>,
-    state: Arc<PressureState>,
-    path: PathBuf,
-    config: PressureConfig,
-    values: Vec<u64>,
-) -> StorageResult<PressureTask> {
-    let fallback = values.last().copied().unwrap_or(u64::MAX);
-    spawn_with_probe(
-        db,
-        state,
-        path,
-        config,
-        Arc::new(SequenceDiskProbe {
-            values: Mutex::new(values.into_iter().collect()),
-            fallback,
-        }),
-    )
 }
 
 fn spawn_with_probe(
@@ -457,23 +412,6 @@ struct Fs2DiskProbe;
 impl DiskProbe for Fs2DiskProbe {
     fn available_space(&self, path: &Path) -> StorageResult<u64> {
         fs2::available_space(path).map_err(|error| read_failed(error.to_string()))
-    }
-}
-
-#[cfg(test)]
-struct SequenceDiskProbe {
-    values: Mutex<VecDeque<u64>>,
-    fallback: u64,
-}
-
-#[cfg(test)]
-impl DiskProbe for SequenceDiskProbe {
-    fn available_space(&self, _path: &Path) -> StorageResult<u64> {
-        let mut values = self
-            .values
-            .lock()
-            .map_err(|error| read_failed(format!("pressure sequence lock poisoned: {error}")))?;
-        Ok(values.pop_front().unwrap_or(self.fallback))
     }
 }
 

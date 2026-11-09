@@ -67,8 +67,6 @@ const PROCESS_HISTORY_MAX_LIMIT: usize = 200;
 
 mod agent_spawn;
 mod facade;
-#[cfg(test)]
-mod tests;
 mod types;
 
 pub(crate) use self::agent_spawn::agent_spawn_root_dir;

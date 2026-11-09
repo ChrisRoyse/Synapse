@@ -30,7 +30,7 @@ pub(super) fn coordinate_fallback_plan(
 }
 
 #[must_use]
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn element_not_resolved(error: impl Display) -> ActionError {
     ActionError::ElementNotResolved {
         detail: error.to_string(),
@@ -38,7 +38,7 @@ pub(super) fn element_not_resolved(error: impl Display) -> ActionError {
 }
 
 #[must_use]
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn transient_element_expired(
     element_id: &ElementId,
     error: impl Display,
@@ -50,7 +50,7 @@ pub(super) fn transient_element_expired(
 }
 
 #[must_use]
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn element_pattern_unsupported(
     element_id: &ElementId,
     error: impl Display,
@@ -62,15 +62,7 @@ pub(super) fn element_pattern_unsupported(
 }
 
 #[must_use]
-#[cfg(test)]
-pub(super) fn invoke_pattern_failed(element_id: &ElementId, error: impl Display) -> ActionError {
-    ActionError::TargetInvalid {
-        detail: format!("InvokePattern.invoke failed for element {element_id}: {error}"),
-    }
-}
-
-#[must_use]
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn target_invalid(error: impl Display) -> ActionError {
     ActionError::TargetInvalid {
         detail: error.to_string(),
@@ -78,7 +70,7 @@ pub(super) fn target_invalid(error: impl Display) -> ActionError {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) struct RectEdges {
     pub(super) left: i32,
     pub(super) top: i32,
@@ -98,7 +90,7 @@ impl From<Rect> for RectEdges {
     }
 }
 
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 pub(super) fn center_from_rect_edges(rect: RectEdges) -> ActionResult<Point> {
     if rect.right <= rect.left || rect.bottom <= rect.top {
         return Err(ActionError::TargetInvalid {

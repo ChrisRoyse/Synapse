@@ -10890,11 +10890,6 @@ fn shell_job_paths_from_root(root: &Path, job_id: &str) -> ShellJobPaths {
 // caller's thread (the background monitor uses the absolute `ShellJobPaths`
 // resolved at start time), so a thread-local override fully isolates a test
 // without touching the production code path.
-#[cfg(test)]
-thread_local! {
-    static SHELL_JOB_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
 
 // The daemon acquires an OS lock against a canonical shell-job root, then
 // freezes that exact path here before recovery or request serving. Every
@@ -10973,49 +10968,9 @@ pub(crate) fn freeze_shell_job_root_for_daemon(root: &Path) -> Result<(), ErrorD
     Ok(())
 }
 
-#[cfg(test)]
-fn shell_job_root_override() -> Option<PathBuf> {
-    SHELL_JOB_ROOT_OVERRIDE.with(|cell| cell.borrow().clone())
-}
-
-#[cfg(not(test))]
 #[inline]
 fn shell_job_root_override() -> Option<PathBuf> {
     None
-}
-
-/// RAII guard that redirects the durable shell-job store to a unique temporary
-/// directory for the lifetime of a single test, then restores the previous
-/// override and drops the temp dir. Install it at the top of any test that
-/// starts durable jobs, scans the job root, or asserts cleanup counts so the
-/// test never observes — or is perturbed by — jobs written by other tests
-/// running in parallel (#1509).
-#[cfg(test)]
-struct ShellJobRootGuard {
-    previous: Option<PathBuf>,
-    _temp: tempfile::TempDir,
-}
-
-#[cfg(test)]
-impl ShellJobRootGuard {
-    fn new() -> Self {
-        let temp = tempfile::TempDir::new()
-            .unwrap_or_else(|error| panic!("create hermetic shell-jobs root: {error}"));
-        let previous = SHELL_JOB_ROOT_OVERRIDE
-            .with(|cell| cell.borrow_mut().replace(temp.path().to_path_buf()));
-        Self {
-            previous,
-            _temp: temp,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ShellJobRootGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        SHELL_JOB_ROOT_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
-    }
 }
 
 pub(crate) fn shell_job_root_dir() -> Result<PathBuf, ErrorData> {
@@ -12559,24 +12514,6 @@ struct SshEffectiveConfigReadback {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg(test)]
-struct SshRemoteTrackingPlan {
-    /// Historical tracker wire fixture only. Production rejects new durable
-    /// SSH promotion before this shape can be constructed.
-    command: String,
-    /// Canonical trusted executable identity used only for preflight and later
-    /// unattended read/cleanup replay.
-    cleanup_command: String,
-    spawn_args: Vec<String>,
-    control_args: Vec<String>,
-    effective_control_args: Vec<String>,
-    remote_identity: String,
-    remote_command: String,
-    marker: String,
-    ownership_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct ShellJobSpawnPlan {
     command: String,
     args: Vec<String>,
@@ -12836,62 +12773,6 @@ fn shell_job_cleanup_invocation(
     shell_job_ssh_command_invocation(&job.command, &job.args)
 }
 
-#[cfg(test)]
-fn ssh_remote_tracking_plan(
-    command: &str,
-    args: &[String],
-    job_id: &str,
-) -> Result<Option<SshRemoteTrackingPlan>, String> {
-    if ssh_family_client_for_executable(command) != Some("ssh") {
-        return Ok(None);
-    }
-    let Some(parts) = ssh_direct_command_parts(args) else {
-        return Ok(None);
-    };
-    let Some(remote_command) = parts.remote_command else {
-        return Ok(None);
-    };
-    if remote_command.trim().is_empty() {
-        return Ok(None);
-    }
-    let trusted_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
-        format!("SSH executable is not a trusted automatic-replay binary: {command}")
-    })?;
-    if let Some(reason) = parts.tracking_unsupported_reason {
-        return Err(format!(
-            "SSH remote command cannot be tracked safely: {reason}"
-        ));
-    }
-
-    let marker = format!("{SHELL_REMOTE_PROCESS_MARKER} job_id={job_id}");
-    let exit_marker = format!("{SHELL_REMOTE_EXIT_MARKER} job_id={job_id}");
-    let ownership_token = uuid::Uuid::new_v4().simple().to_string();
-    let remote_wrapper =
-        ssh_remote_tracking_command(&marker, &exit_marker, &ownership_token, &remote_command);
-    // The tracked durable spawn must preserve the caller's SSH connection
-    // contract exactly. The separately persisted `effective_control_args` are
-    // for unattended recovery/cleanup, where mutable ssh_config is isolated
-    // and any destination that cannot be reproduced under that policy fails
-    // closed instead of being silently retargeted. Applying the hardened
-    // replay argv to the initial command would make promotion itself observable
-    // (for example by changing StrictHostKeyChecking or ignoring ssh_config),
-    // which is the semantic split fixed by #1628.
-    let effective_control_args = hardened_ssh_automatic_replay_args(&parts.control_args)?;
-    let mut spawn_args = parts.control_args.clone();
-    spawn_args.push(remote_wrapper);
-    Ok(Some(SshRemoteTrackingPlan {
-        command: command.to_owned(),
-        cleanup_command: trusted_command.to_string_lossy().into_owned(),
-        spawn_args,
-        control_args: parts.control_args,
-        effective_control_args,
-        remote_identity: parts.remote_identity,
-        remote_command,
-        marker,
-        ownership_token,
-    }))
-}
-
 const SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY: &str = r#"import os
 import sys
 
@@ -12944,267 +12825,6 @@ def process_group_exists(expected_pgid):
         raise RuntimeError(f"probe process group {expected_pgid} failed: {error}") from error
     return True
 "#;
-
-#[cfg(test)]
-fn ssh_remote_tracking_command(
-    marker: &str,
-    exit_marker: &str,
-    ownership_token: &str,
-    remote_command: &str,
-) -> String {
-    // The group leader remains an owned guardian for the full command
-    // lifetime. Cleanup signals that guardian through a pidfd; its trap then
-    // terminates its still-anchored process group. This avoids both numeric PID
-    // reuse and the Linux <6.9 lack of PIDFD_SIGNAL_PROCESS_GROUP.
-    const GROUP_PROBE_MAIN: &str = r#"owner_pid = int(sys.argv[1])
-expected_pgid = int(sys.argv[2])
-try:
-    members = live_process_ids_in_group(expected_pgid, (owner_pid, os.getpid()))
-except Exception as error:
-    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
-    raise SystemExit(2)
-raise SystemExit(0 if members else 1)
-"#;
-    const GROUP_EXISTENCE_MAIN: &str = r#"expected_pgid = int(sys.argv[1])
-try:
-    group_exists = process_group_exists(expected_pgid)
-except Exception as error:
-    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
-    raise SystemExit(2)
-raise SystemExit(0 if group_exists else 1)
-"#;
-    let group_probe_script =
-        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_PROBE_MAIN}");
-    let group_existence_script =
-        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_EXISTENCE_MAIN}");
-    const GUARDIAN_SCRIPT: &str = r#"marker=$1
-ownership_token=$2
-ownership_token_sha256=$3
-cmd=$4
-account_shell=$5
-group_probe_script=$6
-pid=$$
-pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
-sid=$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
-boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id 2>/dev/null || true)
-stat_line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
-stat_tail=${stat_line##*) }
-set -f
-set -- $stat_tail
-start_time=${20:-}
-set +f
-case "$pid:$pgid:$sid:$start_time" in
-  *[!0123456789:]*|:*|*::*|*:)
-    printf '%s error=proc_identity_unavailable\n' "$marker" >&2
-    exit 127
-    ;;
-esac
-if [ "$pgid" != "$pid" ] || [ "$sid" != "$pid" ]; then
-  printf '%s error=guardian_scope_unavailable pid=%s pgid=%s sid=%s\n' \
-    "$marker" "$pid" "$pgid" "$sid" >&2
-  exit 127
-fi
-case "$boot_id" in
-  ????????-????-????-????-????????????) ;;
-  *)
-    printf '%s error=boot_identity_unavailable\n' "$marker" >&2
-    exit 127
-    ;;
-esac
-printf '%s pid=%s pgid=%s sid=%s boot_id=%s start_time=%s ownership_token_sha256=%s\n' \
-  "$marker" "$pid" "$pgid" "$sid" "$boot_id" "$start_time" "$ownership_token_sha256" >&2
-
-group_has_other_members() {
-  python3 -c "$group_probe_script" "$pid" "$pgid"
-}
-
-cleanup_failed=0
-payload_rc=
-natural_term_sent=0
-terminate_owned_group() {
-  cleanup_failed=0
-  trap '' TERM HUP INT
-  if ! kill -TERM -"$pgid" 2>/dev/null; then
-    printf '%s error=process_group_term_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
-    cleanup_failed=1
-    trap terminate_owned_group TERM HUP INT
-    return
-  fi
-  i=0
-  while [ "$i" -lt __GROUP_ABSENCE_PROBE_ATTEMPTS__ ]; do
-    group_has_other_members
-    group_state=$?
-    case "$group_state" in
-      0) ;;
-      1) exit 143 ;;
-      *)
-        printf '%s error=process_group_enumeration_failed pgid=%s probe_exit=%s\n' \
-          "$marker" "$pgid" "$group_state" >&2
-        cleanup_failed=1
-        trap terminate_owned_group TERM HUP INT
-        return
-        ;;
-    esac
-    i=$((i + 1))
-    sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__
-  done
-  # The guardian still anchors this PGID, so this group signal cannot target a
-  # recycled group. SIGKILL intentionally includes the guardian itself.
-  if ! kill -KILL -"$pgid" 2>/dev/null; then
-    printf '%s error=process_group_kill_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
-    cleanup_failed=1
-    trap terminate_owned_group TERM HUP INT
-    return
-  fi
-  # A successful group SIGKILL includes this guardian. Reaching this statement
-  # means the destructive result is uncertain, so remain alive and retryable.
-  cleanup_failed=1
-  trap terminate_owned_group TERM HUP INT
-}
-
-trap terminate_owned_group TERM HUP INT
-# POSIX asynchronous lists may implicitly replace stdin with /dev/null. Save
-# the SSH-provided stream before backgrounding, then explicitly pass it to the
-# account shell. Remove the guardian-only ownership token from the payload.
-exec 3<&0
-env -u SYNAPSE_REMOTE_JOB_TOKEN "$account_shell" -c "$cmd" <&3 &
-payload=$!
-exec 3<&-
-while :; do
-  if [ -z "$payload_rc" ]; then
-    wait "$payload"
-    rc=$?
-    if kill -0 "$payload" 2>/dev/null; then
-      if [ "$cleanup_failed" -ne 0 ]; then
-        sleep 1
-      fi
-      continue
-    fi
-    payload_rc=$rc
-  fi
-  # The shell payload can exit after forking/backgrounding same-PGID work. Do
-  # not let that turn into a terminal marker. TERM residual owned members while
-  # this guardian still anchors the non-reusable PGID, then remain observable
-  # until enumeration proves only the guardian/probe remain.
-  if [ "$natural_term_sent" -eq 0 ]; then
-    trap '' TERM HUP INT
-    if ! kill -TERM -"$pgid" 2>/dev/null; then
-      printf '%s error=natural_completion_group_term_failed pgid=%s\n' "$marker" "$pgid" >&2
-      cleanup_failed=1
-      trap terminate_owned_group TERM HUP INT
-      sleep 1
-      continue
-    fi
-    trap terminate_owned_group TERM HUP INT
-    natural_term_sent=1
-  fi
-  group_has_other_members
-  group_state=$?
-  case "$group_state" in
-    0) sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__ ;;
-    1) exit "$payload_rc" ;;
-    *)
-      printf '%s error=natural_completion_group_inspection_failed pgid=%s probe_exit=%s\n' \
-        "$marker" "$pgid" "$group_state" >&2
-      cleanup_failed=1
-      sleep 1
-      ;;
-  esac
-done
-"#;
-
-    const TRACKER_SCRIPT: &str = r#"marker=$1
-exit_marker=$2
-ownership_token=$3
-ownership_token_sha256=$4
-cmd=$5
-guardian_script=$6
-group_probe_script=$7
-group_existence_script=$8
-if ! command -v setsid >/dev/null 2>&1; then
-  printf '%s error=setsid_unavailable\n' "$marker" >&2
-  exit 127
-fi
-    for prerequisite in env ps tr cat python3; do
-  if ! command -v "$prerequisite" >/dev/null 2>&1; then
-    printf '%s error=remote_identity_prerequisite_unavailable prerequisite=%s\n' \
-      "$marker" "$prerequisite" >&2
-    exit 127
-  fi
-done
-if [ ! -r /proc/sys/kernel/random/boot_id ] || [ ! -r /proc/self/stat ]; then
-  printf '%s error=proc_identity_unavailable\n' "$marker" >&2
-  exit 127
-fi
-if ! python3 -c 'import os, signal; assert hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")' >/dev/null 2>&1; then
-  printf '%s error=pidfd_unavailable\n' "$marker" >&2
-  exit 127
-fi
-account_shell=$(python3 -c 'import os, pwd; shell = pwd.getpwuid(os.getuid()).pw_shell; assert shell and os.path.isabs(shell) and os.access(shell, os.X_OK); print(shell, end="")' 2>/dev/null)
-if [ -z "$account_shell" ] || [ ! -x "$account_shell" ]; then
-  printf '%s error=account_login_shell_unavailable\n' "$marker" >&2
-  exit 127
-fi
-# Preserve the caller's finite/EOF/interactive SSH stdin across the
-# asynchronous-list boundary. Without the saved descriptor, POSIX shells are
-# permitted to substitute /dev/null for the background guardian.
-exec 3<&0
-setsid env SYNAPSE_REMOTE_JOB_TOKEN="$ownership_token" \
-  sh -c "$guardian_script" synapse-remote-guardian \
-  "$marker" "$ownership_token" "$ownership_token_sha256" "$cmd" "$account_shell" "$group_probe_script" <&3 &
-child=$!
-exec 3<&-
-pgid=$child
-wait "$child"
-rc=$?
-python3 -c "$group_existence_script" "$pgid"
-group_state=$?
-case "$group_state" in
-  1)
-    printf '%s pid=%s pgid=%s ownership_token_sha256=%s exit_code=%s\n' \
-      "$exit_marker" "$child" "$pgid" "$ownership_token_sha256" "$rc" >&2
-    exit "$rc"
-    ;;
-  0)
-    printf '%s error=remote_group_survived_guardian_exit pgid=%s guardian_exit_code=%s\n' \
-      "$marker" "$pgid" "$rc" >&2
-    exit 125
-    ;;
-  *)
-    printf '%s error=post_guardian_group_inspection_failed pgid=%s probe_exit=%s guardian_exit_code=%s\n' \
-      "$marker" "$pgid" "$group_state" "$rc" >&2
-    exit 126
-    ;;
-esac
-"#;
-    let group_probe_interval_seconds = format!(
-        "{}.{:03}",
-        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS / 1_000,
-        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS % 1_000
-    );
-    let guardian_script = GUARDIAN_SCRIPT
-        .replace(
-            "__GROUP_ABSENCE_PROBE_ATTEMPTS__",
-            &SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS.to_string(),
-        )
-        .replace(
-            "__GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__",
-            &group_probe_interval_seconds,
-        );
-    let ownership_token_sha256 = sha256_hex(ownership_token.as_bytes());
-    format!(
-        "sh -c {} synapse-remote-tracker {} {} {} {} {} {} {} {}",
-        posix_single_quote(TRACKER_SCRIPT),
-        posix_single_quote(marker),
-        posix_single_quote(exit_marker),
-        posix_single_quote(ownership_token),
-        posix_single_quote(&ownership_token_sha256),
-        posix_single_quote(remote_command),
-        posix_single_quote(&guardian_script),
-        posix_single_quote(&group_probe_script),
-        posix_single_quote(&group_existence_script),
-    )
-}
 
 fn ssh_direct_command_parts(args: &[String]) -> Option<SshCommandParts> {
     let mut index = 0;
@@ -14292,14 +13912,6 @@ fn mark_shell_job_remote_already_gone_local_stale(
             "{message} Local stale transport still has remaining process ids: {remaining}"
         ));
     }
-}
-
-#[cfg(test)]
-fn parse_remote_process_metadata(
-    stderr: &str,
-    expected_job_id: &str,
-) -> Option<RemoteProcessMetadata> {
-    parse_remote_process_metadata_with_ownership(stderr, expected_job_id, None)
 }
 
 fn parse_remote_process_metadata_with_ownership(
@@ -16585,18 +16197,6 @@ async fn wait_shell_job_child_with_identity(
             Err(error) => (None, false, Some(format!("wait_failed:{error}"))),
         },
     }
-}
-
-#[cfg(test)]
-async fn wait_shell_job_child(
-    child: &mut tokio::process::Child,
-    timeout_ms: Option<u64>,
-    started: Instant,
-) -> (Option<i32>, bool, Option<String>) {
-    let identity = child
-        .id()
-        .and_then(|pid| capture_local_process_identity(pid).ok());
-    wait_shell_job_child_with_identity(child, identity.as_ref(), timeout_ms, started).await
 }
 
 fn terminal_shell_job_status(
@@ -19796,27 +19396,6 @@ async fn wait_shell_child_with_identity(
     Ok(result)
 }
 
-#[cfg(test)]
-async fn wait_shell_child(
-    child: &mut tokio::process::Child,
-    timeout_ms: u64,
-    started: Instant,
-    timeout_deadline: tokio::time::Instant,
-) -> Result<(Option<i32>, bool), ErrorData> {
-    let identity = child
-        .id()
-        .and_then(|pid| capture_local_process_identity(pid).ok());
-    wait_shell_child_with_identity(
-        child,
-        identity.as_ref(),
-        timeout_ms,
-        started,
-        timeout_deadline,
-        None,
-    )
-    .await
-}
-
 #[cfg(windows)]
 fn shell_status_open_error_is_retryable(
     kind: io::ErrorKind,
@@ -20706,6 +20285,3 @@ fn contains_any_character_class_repetition(pattern: &str) -> bool {
     .iter()
     .any(|needle| compact.contains(needle))
 }
-
-#[cfg(test)]
-mod tests;

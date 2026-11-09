@@ -5,8 +5,6 @@ mod transport;
 
 pub(crate) use auth::load_token_value;
 pub(crate) use session::current_mcp_session_id;
-#[cfg(test)]
-pub(crate) use session::with_current_mcp_session_id_for_test;
 pub(crate) use transport::http_transport_diagnostics_detail;
 
 use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};

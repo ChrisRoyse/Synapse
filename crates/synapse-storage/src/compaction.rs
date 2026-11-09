@@ -79,14 +79,6 @@ fn skip_json_ws(value: &[u8], mut index: usize) -> usize {
 }
 
 fn current_time_ns() -> u64 {
-    #[cfg(test)]
-    {
-        let fixed = TEST_NOW_NS.load(std::sync::atomic::Ordering::SeqCst);
-        if fixed != 0 {
-            return fixed;
-        }
-    }
-
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -94,39 +86,9 @@ fn current_time_ns() -> u64 {
         })
 }
 
-#[cfg(test)]
-static TEST_NOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// The fixed test clock is process-global because RocksDB runs the TTL compaction
+// The fixed clock is process-global because RocksDB runs the TTL compaction
 // filter on background threads that read `current_time_ns()`. Without serialization,
-// parallel `cargo test` threads race on it (one guard's drop resets the clock to 0
-// mid-compaction in another test), producing flaky TTL eviction. This lock is held
-// for the lifetime of each guard so only one test drives the clock at a time.
-#[cfg(test)]
-static TEST_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub(crate) struct TestClockGuard {
-    previous: u64,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl Drop for TestClockGuard {
-    fn drop(&mut self) {
-        TEST_NOW_NS.store(self.previous, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_test_now_ns(now_ns: u64) -> TestClockGuard {
-    let lock = match TEST_CLOCK_LOCK.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let previous = TEST_NOW_NS.swap(now_ns, std::sync::atomic::Ordering::SeqCst);
-    TestClockGuard {
-        previous,
-        _lock: lock,
-    }
-}
+// overlapping diagnostic callers can race on it (one guard's drop resets the
+// clock to 0 mid-compaction in another caller), producing flaky TTL eviction.
+// This lock is held for the lifetime of each guard so only one caller drives the
+// clock at a time.

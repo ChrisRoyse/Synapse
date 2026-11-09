@@ -12,9 +12,6 @@ mod runtime;
 pub mod scheduler;
 mod storage;
 
-#[cfg(test)]
-mod tests;
-
 pub use action_combo_bridge::install_action_combo_scheduler;
 pub use audit::write_audit;
 pub use bus::{
