@@ -17,9 +17,32 @@ if (Test-Path -LiteralPath (Join-Path $DbPath '.anneal')) {
 if (-not (Test-Path -LiteralPath $ProfilesDir -PathType Container)) {
     throw "Restored Synapse profiles are missing: $ProfilesDir"
 }
-# Do not launch a duplicate or touch whichever program currently owns the port.
-if (Get-NetTCPConnection -LocalPort 7700 -State Listen -ErrorAction SilentlyContinue) {
-    throw 'Port 7700 already has a listener; refusing duplicate startup.'
+# Do not launch a duplicate or touch whichever program currently owns the port. A keeper that
+# fires while this daemon is already serving is an idempotent no-op, not a failure: it is only a
+# failure when the holder is NOT this daemon, which is decided by the owning process's image path,
+# never by "something is listening".
+$existingListeners = @(Get-NetTCPConnection -LocalPort 7700 -State Listen -ErrorAction SilentlyContinue)
+if ($existingListeners.Count -gt 0) {
+    $expectedImage = (Resolve-Path -LiteralPath $ExePath).ProviderPath
+    $owners = foreach ($listener in $existingListeners) {
+        $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        # An unreadable owner is a foreign holder until proven otherwise; never assume it is ours.
+        [pscustomobject]@{
+            ProcessId = $listener.OwningProcess
+            Path      = if ($owner -and $owner.Path) { $owner.Path } else { $null }
+        }
+    }
+    $foreign = @($owners | Where-Object { $_.Path -ne $expectedImage })
+    if ($foreign.Count -gt 0) {
+        # Windows PowerShell 5.1 runs this task: no null-coalescing operator here.
+        $detail = ($foreign | ForEach-Object {
+            $image = if ($_.Path) { $_.Path } else { 'unreadable image' }
+            '{0} (pid {1})' -f $image, $_.ProcessId }) -join ', '
+        throw "Port 7700 is held by a process that is not $expectedImage : $detail. Refusing duplicate startup."
+    }
+    Write-Output ('Pre-calyx daemon already serving 7700 as {0} (pid {1}); nothing to start.' -f
+        $expectedImage, (($owners | ForEach-Object { $_.ProcessId }) -join ','))
+    exit 0
 }
 $runtimeLogDir = Join-Path $env:LOCALAPPDATA 'synapse\logs'
 New-Item -ItemType Directory -Path $runtimeLogDir -Force | Out-Null
