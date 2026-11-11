@@ -41,5 +41,12 @@ $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -Ru
 Register-ScheduledTask -TaskName $TaskName -Action $action `
     -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force |
     Out-Null
+# The task result must be the launcher's own exit code. Wrapping it (e.g. conhost.exe --headless,
+# used to hide the console flash) makes Task Scheduler record 0 even when the launcher throws:
+# measured 2026-11-11, same foreign-holder run reported 0 via conhost and 1 direct.
+$registered = @((Get-ScheduledTask -TaskName $TaskName).Actions)
+if ($registered.Count -ne 1 -or $registered[0].Execute -ne $action.Execute) {
+    throw "Registered action is not the direct launcher: $(($registered | ForEach-Object { $_.Execute }) -join ', ')"
+}
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State,
     @{ n = 'Triggers'; e = { ($_.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', ' } }
