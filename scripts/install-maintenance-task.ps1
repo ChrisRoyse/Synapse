@@ -9,6 +9,8 @@
 
       pwsh -NoProfile -File <repo>\scripts\repo-maintenance.ps1 -Apply
 
+  launched windowless through scripts\run-hidden.vbs (wscript.exe), so no terminal flashes.
+
   on a weekly cadence (default: Sunday 03:00) plus once shortly after each logon
   (a one-off catch-up if the machine was off at the scheduled time). The task
   runs as the current user (no admin needed — all it does is remove merged/stale
@@ -71,8 +73,14 @@ if (-not (Test-Path $maintScript)) { Die "Cannot find $maintScript" }
 # whole dev tree stays flat — not just Synapse.
 $scanRoot = Split-Path -Parent $repoRoot
 
-$argline = "-NoProfile -ExecutionPolicy Bypass -File `"$maintScript`" -Apply -Root `"$scanRoot`" -SweepDays $SweepDays"
-$action  = New-ScheduledTaskAction -Execute $pwsh -Argument $argline
+$argline = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$maintScript`" -Apply -Root `"$scanRoot`" -SweepDays $SweepDays"
+# Never start pwsh.exe directly from Task Scheduler: it gets a visible console that flashes on
+# screen before -WindowStyle Hidden applies. run-hidden.vbs starts it hidden from the windowless
+# wscript.exe host and returns pwsh's own exit code as the task result.
+$hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
+if (-not (Test-Path $hiddenRunner)) { Die "Cannot find $hiddenRunner" }
+$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$action  = New-ScheduledTaskAction -Execute $wscript -Argument "//B //Nologo `"$hiddenRunner`" `"$pwsh`" $argline"
 
 # Weekly trigger only. A logon trigger would require elevation to register
 # (logon triggers are machine-scoped), so instead we rely on -StartWhenAvailable
@@ -95,6 +103,11 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $tWeekly `
     -Description "Synapse: prune merged/stale git worktrees and sweep stale Cargo target/ artifacts across $scanRoot. Prevents disk buildup. Source: scripts/repo-maintenance.ps1" | Out-Null
 
 $t = Get-ScheduledTask -TaskName $TaskName
+# Fail closed if what Task Scheduler stored would open a console window on every run.
+$stored = @($t.Actions)
+if ($stored.Count -ne 1 -or $stored[0].Execute -ne $wscript -or $stored[0].Arguments -ne $action.Arguments) {
+    Die "Registered action is not the windowless runner: $(($stored | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ', ')"
+}
 Info "Installed '$TaskName': runs weekly on $DayOfWeek at $At (catches up via -StartWhenAvailable if the PC was off)."
-Info "  exec: $pwsh $argline"
+Info "  exec (hidden): $pwsh $argline"
 Info "Verify any time with:  Get-ScheduledTask -TaskName $TaskName ;  run now with:  Start-ScheduledTask -TaskName $TaskName"

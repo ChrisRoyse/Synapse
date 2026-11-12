@@ -4873,7 +4873,16 @@ function Start-SynapsePostExitSetupContinuation {
         if (Get-ScheduledTask -TaskName $continuationTaskName -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $continuationTaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-        $action = New-ScheduledTaskAction -Execute $launcherPath -Argument $taskArgument -WorkingDirectory $SourceDir
+        # Never hand Task Scheduler a console program directly: powershell.exe would flash a
+        # visible terminal before -WindowStyle Hidden applies. run-hidden.vbs starts it hidden
+        # from the windowless wscript.exe host and returns its exit code as the task result.
+        $hiddenRunner = Join-Path $SourceDir 'scripts\run-hidden.vbs'
+        if (-not (Test-Path -LiteralPath $hiddenRunner -PathType Leaf)) {
+            throw "SYNAPSE_HIDDEN_RUNNER_MISSING path=$hiddenRunner"
+        }
+        $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+        $hiddenArgument = "//B //Nologo $(Quote-WindowsCommandArgument -Value $hiddenRunner) $(Quote-WindowsCommandArgument -Value $launcherPath) -WindowStyle Hidden $taskArgument"
+        $action = New-ScheduledTaskAction -Execute $wscriptExe -Argument $hiddenArgument -WorkingDirectory $SourceDir
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
