@@ -9,10 +9,12 @@
 [CmdletBinding()]
 param(
     [string]$TaskName = 'SynapseMcpPreCalyx',
-    [string]$SourceDir = (Split-Path -Parent $PSScriptRoot),
+    [string]$SourceDir,
     [switch]$Remove
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults; resolve it here.
+if (-not $SourceDir) { $SourceDir = Split-Path -Parent $PSScriptRoot }
 
 if ($Remove) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -23,10 +25,18 @@ $launcher = Join-Path $SourceDir 'scripts\start-pre-calyx-daemon.ps1'
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Launcher is missing: $launcher"
 }
+# The task never starts a console program directly: powershell.exe launched by Task Scheduler
+# gets a visible console (an OpenConsole window under Windows Terminal) before
+# -WindowStyle Hidden applies, so the 1-minute watchdog flashed a terminal every minute.
+# The windowless wscript.exe host starts the launcher hidden and returns its exit code.
+$hiddenLauncher = Join-Path $SourceDir 'scripts\start-pre-calyx-daemon-hidden.vbs'
+if (-not (Test-Path -LiteralPath $hiddenLauncher -PathType Leaf)) {
+    throw "Hidden launcher is missing: $hiddenLauncher"
+}
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction `
-    -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`"" `
+    -Execute "$env:SystemRoot\System32\wscript.exe" `
+    -Argument "//B //Nologo `"$hiddenLauncher`"" `
     -WorkingDirectory $SourceDir
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date) `
@@ -41,12 +51,19 @@ $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -Ru
 Register-ScheduledTask -TaskName $TaskName -Action $action `
     -Trigger @($logon, $watchdog) -Settings $settings -Principal $principal -Force |
     Out-Null
-# The task result must be the launcher's own exit code. Wrapping it (e.g. conhost.exe --headless,
-# used to hide the console flash) makes Task Scheduler record 0 even when the launcher throws:
-# measured 2026-11-11, same foreign-holder run reported 0 via conhost and 1 direct.
+# Two invariants, checked against what Task Scheduler actually stored:
+# 1. No console window: the action is the windowless wscript.exe host, never a console
+#    program (powershell/pwsh/cmd/conhost/wt), which flashes a terminal on every run.
+# 2. The task result is the launcher's own exit code. The .vbs returns Run()'s exit code
+#    (measured 2026-11-11: exit 7 -> 7, throw -> 1, exit 0 -> 0). conhost.exe --headless
+#    stays rejected: it recorded 0 even when the launcher threw.
 $registered = @((Get-ScheduledTask -TaskName $TaskName).Actions)
-if ($registered.Count -ne 1 -or $registered[0].Execute -ne $action.Execute) {
-    throw "Registered action is not the direct launcher: $(($registered | ForEach-Object { $_.Execute }) -join ', ')"
+$consoleHosts = 'powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe', 'wt.exe', 'OpenConsole.exe'
+if ($registered.Count -ne 1 -or
+    $registered[0].Execute -ne $action.Execute -or
+    $registered[0].Arguments -ne $action.Arguments -or
+    $consoleHosts -contains (Split-Path -Leaf $registered[0].Execute)) {
+    throw "Registered action is not the windowless launcher: $(($registered | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ', ')"
 }
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State,
     @{ n = 'Triggers'; e = { ($_.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', ' } }
